@@ -3,7 +3,7 @@
 Builds a scratch folder under <workdir>, drives the app through window messages and
 checks results on disk / in the UI. Screenshots land in <workdir>/shots.
 """
-import os, sys, time, shutil, ctypes, ctypes.wintypes as W
+import os, sys, time, shutil, subprocess, ctypes, ctypes.wintypes as W
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import winauto
 from winauto import App, menu_items, u, children, cls, text, clipboard_text, WM_KEYDOWN, WM_SETTEXT
@@ -267,8 +267,8 @@ app.go(os.path.join(data, 'sub'), 2.0)
 TVM_GETNEXTITEM, TVM_EDITLABELW, TVM_ENDEDITLABELNOW, TVGN_CARET = 0x110A, 0x1141, 0x1116, 0x0009
 def tree_rename_box():
     # the label edit shows the caret item's name: only rename when it is the scratch
-    # 'sub' (the tree sync is deferred, the caret may still be on its parent)
-    for _ in range(12):
+    # 'sub' (the tree sync is deferred, the caret may still be on its parent; slow on CI)
+    for _ in range(30):
         sel = u.SendMessageW(app.tree, TVM_GETNEXTITEM, TVGN_CARET, 0)
         if sel:
             u.SendMessageW(app.tree, TVM_EDITLABELW, 0, sel)
@@ -524,6 +524,25 @@ check('rename with the extension hidden keeps it', wait_for(lambda: os.path.isfi
       os.listdir(data))
 app.command(IDM['EXTENSIONS']); time.sleep(1.5)
 check('extensions shown again', row_of('z.txt') >= 0, [app.item_text(i) for i in range(app.item_count())])
+
+# Windows hides a shortcut's extension whatever the setting: a rename keeps it
+lnk = os.path.join(data, 'shortcut.lnk')
+subprocess.run(['powershell', '-NoProfile', '-Command',
+                '$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:LNK); '
+                '$s.TargetPath = $env:TARGET; $s.Save()'],
+               env=dict(os.environ, LNK=lnk, TARGET=os.path.join(data, 'z.txt')), check=False)
+app.command(IDM['REFRESH'])
+wait_for(lambda: row_of('shortcut') >= 0, 5)
+app.select_name('shortcut')
+app.command(IDM['RENAME'])
+wait_for(lambda: label_edit() is not None, 3)
+ed = label_edit()
+if ed:
+    buf = ctypes.create_unicode_buffer('link')
+    u.SendMessageW(ed, WM_SETTEXT, 0, ctypes.addressof(buf))
+    u.SendMessageW(ed, WM_KEYDOWN, 0x0D, 0)
+check('renaming a shortcut keeps its hidden .lnk', wait_for(lambda: os.path.isfile(os.path.join(data, 'link.lnk')), 6),
+      os.listdir(data))
 app.close()
 
 failed = [n for n, ok in results if not ok]

@@ -21,7 +21,7 @@ static const UINT WM_LIST_COLUMNS_CHANGED = WM_APP + 60;   // posted to the list
 static int s_editIndex = -1;                 // row when the edit began (for the base-name select)
 static PITEMID_CHILD s_editPidl = nullptr;   // the item itself
 static std::wstring s_editName;              // as shown when the edit began
-static std::wstring s_editHiddenExt;         // see Item::hiddenExt / extForced
+static std::wstring s_editHiddenExt;         // the extension the shown name leaves out (ours or Windows')
 static bool s_editExtForced = false;
 static bool s_selChangePosted = false;
 
@@ -665,6 +665,12 @@ static void edit_capture(int idx) {
     s_editName = it->name;
     s_editHiddenExt = it->hiddenExt;
     s_editExtForced = it->extForced;
+    // Windows hid it ("File name extensions" off, shortcuts, .zip folders): the rename
+    // takes the name literally, so the extension has to be put back too
+    if (s_editHiddenExt.empty() && !s_editExtForced && !it->fileName.empty()) {
+        std::wstring ext = PathFindExtensionW(it->fileName.c_str());
+        if (!ext.empty() && it->fileName == it->name + ext) s_editHiddenExt = ext;
+    }
 }
 
 static void rename_commit(const std::wstring& newName) {
