@@ -951,6 +951,15 @@ void tree_rename_menu_node() {
     if (HTREEITEM h = TreeView_GetDropHilight(g_tree)) TreeView_EditLabel(g_tree, h);
 }
 
+// is the folder the current one, or one it is in? (by ID; for file-system folders also
+// by path, in case the node and the current folder were reached by different routes)
+static bool holds_current(PCIDLIST_ABSOLUTE abs) {
+    if (pidl_equal(abs, g_current) || pidl_is_ancestor(abs, g_current)) return true;
+    std::wstring p = pidl_folder_path(abs), cur = pidl_folder_path(g_current);
+    bool fs = p.size() >= 3 && ((p[1] == L':' && p[2] == L'\\') || p.compare(0, 2, L"\\\\") == 0);
+    return fs && path_within(p, cur);
+}
+
 // the folder node after h (else the one before it, else its parent) — where the
 // selection goes when h's folder is deleted
 static HTREEITEM neighbor_folder(HTREEITEM h) {
@@ -977,7 +986,7 @@ static void delete_node(HTREEITEM h, bool permanent) {
     PITEMID_CHILD abs = pidl_clone(d->abs);
     PITEMID_CHILD parentAbs = pidl_clone(d->abs);
     ILRemoveLastID(parentAbs);
-    bool current = pidl_equal(abs, g_current) || pidl_is_ancestor(abs, g_current);
+    bool current = holds_current(abs);
     PITEMID_CHILD next = nullptr;
     if (HTREEITEM n = neighbor_folder(h)) next = tree_get_pidl_of_item(n);
     if (!next) next = pidl_clone(parentAbs);
@@ -985,8 +994,10 @@ static void delete_node(HTREEITEM h, bool permanent) {
     PITEMID_CHILD own = pidl_clone(child);           // (the node may be gone after the delete)
     fileops_delete_items(g_main, parent.get(), { own }, permanent, false);
     CoTaskMemFree(own);
+    bool gone = !pidl_exists(abs);
+    if (perf_on()) perf_event("tree.delete", -1, (current ? 1 : 0) + (gone ? 2 : 0), pidl_folder_path(next).c_str());
     // (cancelled at the confirmation, or failed: the folder is still there)
-    if (!pidl_exists(abs) && current) {
+    if (gone && current) {
         navigate_in_place(next);                     // Back must not lead to the deleted folder
         next = nullptr;
     } else {
@@ -1081,7 +1092,10 @@ LRESULT tree_notify(HWND, WPARAM, LPARAM lp) {
             // only user selection navigates; programmatic syncs report TVC_UNKNOWN
             if (nm->action != TVC_BYMOUSE && nm->action != TVC_BYKEYBOARD) return 0;
             NodeData* d = node_data(g_tree, nm->itemNew.hItem);
-            if (d && d->kind == NodeKind::Folder && !pidl_equal(d->abs, g_current)) navigate_to(d->abs);
+            if (d && d->kind == NodeKind::Folder && !pidl_equal(d->abs, g_current)) {
+                if (perf_on()) perf_event("tree.select", -1, (long long)nm->action, pidl_folder_path(d->abs).c_str());
+                navigate_to(d->abs);
+            }
             return 0;
         }
         case TVN_BEGINLABELEDITW: {
@@ -1114,17 +1128,18 @@ LRESULT tree_notify(HWND, WPARAM, LPARAM lp) {
             ILRemoveLastID(parentAbs);
             // renaming the current folder or one of its ancestors: follow it (fs paths)
             std::wstring oldPath = pidl_folder_path(d->abs), cur = pidl_folder_path(g_current);
-            bool follow = (pidl_equal(d->abs, g_current) || pidl_is_ancestor(d->abs, g_current)) &&
-                          PathIsDirectoryW(oldPath.c_str()) && cur.size() >= oldPath.size();
+            bool follow = holds_current(d->abs) && PathIsDirectoryW(oldPath.c_str()) && cur.size() >= oldPath.size();
             bool renamed = fileops_rename_item(g_main, parent.get(), child, nm->item.pszText);
             if (follow && renamed) {
                 size_t slash = oldPath.find_last_of(L'\\');
                 std::wstring moved = oldPath.substr(0, slash + 1) + nm->item.pszText + cur.substr(oldPath.size());
                 PIDLIST_ABSOLUTE np = nullptr;
-                if (slash != std::wstring::npos && PathIsDirectoryW(moved.c_str()) &&
-                    SUCCEEDED(SHParseDisplayName(moved.c_str(), nullptr, &np, 0, nullptr)) && np)
-                    navigate_in_place(reinterpret_cast<PITEMID_CHILD>(np));
-
+                bool found = slash != std::wstring::npos && PathIsDirectoryW(moved.c_str()) &&
+                             SUCCEEDED(SHParseDisplayName(moved.c_str(), nullptr, &np, 0, nullptr)) && np;
+                if (perf_on()) perf_event("tree.rename.follow", -1, found ? 1 : 0, moved.c_str());
+                if (found) navigate_in_place(reinterpret_cast<PITEMID_CHILD>(np));
+            } else if (perf_on()) {
+                perf_event("tree.rename", -1, (follow ? 1 : 0) + (renamed ? 2 : 0), oldPath.c_str());
             }
             tree_refresh_node(parentAbs);          // the node's pidl changed: re-list its parent
             CoTaskMemFree(parentAbs);

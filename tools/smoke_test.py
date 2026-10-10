@@ -35,6 +35,12 @@ shutil.rmtree(data, ignore_errors=True)
 os.makedirs(os.path.join(data, 'sub'))
 os.makedirs(os.path.join(data, '.dotdir'))        # like .git: once showed a file icon in the tree
 os.makedirs(shots, exist_ok=True)
+# the app's event log (navigation, watcher, tree), kept with the screenshots: what a
+# failure on a CI runner went through
+events = os.path.join(shots, 'events.log')
+if os.path.exists(events):
+    os.remove(events)
+os.environ['EXPLORERPLUS_PERF'] = events
 for n in ('a.txt', 'b.txt'):
     with open(os.path.join(data, n), 'w') as f:
         f.write('hello ' + n)
@@ -783,5 +789,12 @@ check('Reset text size', row_h() == rows0, (row_h(), rows0))
 app.close()
 
 failed = [n for n, ok in results if not ok]
+if failed and os.path.exists(events):
+    keys = ('process.start', 'nav.', 'tree.delete', 'tree.rename', 'tree.select', 'watch.full', 'watch.dir', 'enum.start')
+    print('\nevents (%s):' % events)
+    with open(events, encoding='utf-8-sig', errors='replace') as f:
+        for line in f:
+            if any(k in line for k in keys):
+                print('  ' + line.rstrip())
 print('\n%d/%d passed' % (len(results) - len(failed), len(results)))
 sys.exit(1 if failed else 0)

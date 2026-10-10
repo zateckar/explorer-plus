@@ -2,7 +2,17 @@
 #include "navigation.h"
 #include "enumerate.h"
 #include "detailspane.h"
+#include "watcher.h"
 #include <unordered_set>
+
+// the watcher waits while an operation runs (they pump messages); deletes and renames
+// also release its handle on the folder, which may be the one they act on
+struct WatchHold {
+    explicit WatchHold(bool releaseDir) { watcher_hold_begin(releaseDir); }
+    ~WatchHold() { watcher_hold_end(); }
+    WatchHold(const WatchHold&) = delete;
+    WatchHold& operator=(const WatchHold&) = delete;
+};
 
 // ---------------------------------------------------------------
 // clipboard helpers
@@ -108,8 +118,10 @@ void fileops_delete_items(HWND hwnd, IShellFolder* parent,
     if (FAILED(SHCreateShellItemArray(nullptr, parent, (UINT)children.size(),
                                       (PCUITEMID_CHILD_ARRAY)children.data(), arr.put())) || !arr)
         return;
-    if (SUCCEEDED(fo->DeleteItems(arr.get())))
+    if (SUCCEEDED(fo->DeleteItems(arr.get()))) {
+        WatchHold hold(true);
         fo->PerformOperations();
+    }
     if (refresh) navigation_refresh();
 }
 
@@ -122,7 +134,10 @@ bool fileops_rename_item(HWND hwnd, IShellFolder* parent, PCITEMID_CHILD child,
         // the name carries an extension Windows hides: the shell's rename would add the
         // old one again ("b.txt.txt"), so set the file name as it is
         PITEMID_CHILD out = nullptr;
-        renamed = SUCCEEDED(parent->SetNameOf(hwnd, child, newName.c_str(), SHGDN_INFOLDER | SHGDN_FORPARSING, &out));
+        {
+            WatchHold hold(true);
+            renamed = SUCCEEDED(parent->SetNameOf(hwnd, child, newName.c_str(), SHGDN_INFOLDER | SHGDN_FORPARSING, &out));
+        }
         if (renamed) enum_set_pending_select(newName, false);
         if (out) CoTaskMemFree(out);
         navigation_refresh();
@@ -136,9 +151,12 @@ bool fileops_rename_item(HWND hwnd, IShellFolder* parent, PCITEMID_CHILD child,
     fo->SetOperationFlags(FOF_ALLOWUNDO | FOFX_ADDUNDORECORD);
     fo->SetOwnerWindow(hwnd);
     BOOL aborted = FALSE;
-    renamed = SUCCEEDED(fo->RenameItem(si.get(), newName.c_str(), nullptr)) &&
-              SUCCEEDED(fo->PerformOperations()) &&
-              SUCCEEDED(fo->GetAnyOperationsAborted(&aborted)) && !aborted;
+    {
+        WatchHold hold(true);
+        renamed = SUCCEEDED(fo->RenameItem(si.get(), newName.c_str(), nullptr)) &&
+                  SUCCEEDED(fo->PerformOperations()) &&
+                  SUCCEEDED(fo->GetAnyOperationsAborted(&aborted)) && !aborted;
+    }
     if (renamed) enum_set_pending_select(newName, false);     // keep the renamed item selected
     navigation_refresh();
     return renamed;
@@ -167,6 +185,7 @@ void fileops_new_folder() {
     std::wstring nm = L"New folder";
     for (int i = 2; name_exists(psf.get(), nm) && i < 1000; ++i)
         nm = L"New folder (" + std::to_wstring(i) + L")";
+    WatchHold hold(false);
     if (SUCCEEDED(fo->NewItem(dest.get(), FILE_ATTRIBUTE_DIRECTORY, nm.c_str(), nullptr, nullptr)) &&
         SUCCEEDED(fo->PerformOperations())) {
         enum_set_pending_select(nm, true);   // select + start renaming once listed

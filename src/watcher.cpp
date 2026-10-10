@@ -23,6 +23,7 @@ static std::vector<PITEMID_CHILD> s_treeParents;   // tree nodes whose children 
 static const UINT kDebounceMs = 200;    // coalesce bursts (copying 1000 files = 1 refresh)
 static const ULONGLONG kMaxWaitMs = 1000;   // ... but a steady stream (a download) still shows
 static ULONGLONG s_firstPending = 0;        // tick of the first change the timer waits for (0: none)
+static int s_hold = 0;                      // our own file operations running (watcher_hold_begin)
 
 // ------------------------------------------------------------------
 // Direct directory watch (folders on fixed drives). For changes made outside the shell,
@@ -161,8 +162,12 @@ void deregister_current_watch() {
 void watcher_register_for(PCIDLIST_ABSOLUTE folder) {
     if (!s_main) return;
     // a refresh keeps the watch: re-registering would lose the changes in between
-    if (s_regId && s_folder && (folder ? pidl_equal(s_folder, folder) : pidl_is_desktop(s_folder)))
+    // (the directory watch may have been released for a file operation: open it again)
+    if (s_regId && s_folder && (folder ? pidl_equal(s_folder, folder) : pidl_is_desktop(s_folder))) {
+        WCHAR path[MAX_PATH];
+        if (!s_dirWatch && !s_hold && folder && SHGetPathFromIDListW(folder, path)) start_dir_watch(path);
         return;
+    }
     deregister_current_watch();
     PITEMID_CHILD root = folder ? nullptr : pidl_desktop();
     s_folder = pidl_clone(folder ? folder : root);
@@ -274,9 +279,20 @@ static void arm_refresh_timer() {
     SetTimer(s_main, TIMER_WATCH_REFRESH, delay, nullptr);
 }
 
+void watcher_hold_begin(bool releaseDir) {
+    ++s_hold;
+    if (releaseDir) stop_dir_watch();
+}
+
+void watcher_hold_end() {
+    if (s_hold > 0) --s_hold;
+    if (!s_hold && (s_listChanged || !s_treeParents.empty())) arm_refresh_timer();   // what was held
+}
+
 void watcher_on_timer() {
     KillTimer(s_main, TIMER_WATCH_REFRESH);
     s_firstPending = 0;
+    if (s_hold) return;                     // (watcher_hold_end arms the timer again)
     if (s_listChanged && !navigation_leave_if_gone()) {
         ChangeApply r = s_fullRefresh ? ChangeApply::Unsupported : enum_apply_changes(s_changedPaths);
         if (r == ChangeApply::Busy) {

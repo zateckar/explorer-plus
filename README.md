@@ -110,6 +110,8 @@ python -I tools/perf.py build\explorer-plus.exe build\perf 5         # startup /
 
 The smoke test works in a scratch folder with a scratch settings file. Note that its
 delete checks send one scratch file and one empty scratch folder to the Recycle Bin.
+Next to its screenshots it keeps the app's event log (`shots\events.log`); on a failure
+it prints the navigation and watcher events from it.
 Keep the work folder out of hidden folders (e.g. `%TEMP%` is under the hidden AppData):
 the navigation pane checks need it to show up in the tree.
 

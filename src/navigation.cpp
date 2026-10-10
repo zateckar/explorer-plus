@@ -10,6 +10,7 @@
 #include "groups.h"
 #include "searchbox.h"
 #include "columns.h"
+#include "perf.h"
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -267,6 +268,7 @@ bool navigation_leave_if_gone() {
     PITEMID_CHILD up = pidl_clone(g_current);
     while (up && !pidl_is_desktop(up) && fs_folder_missing(up)) ILRemoveLastID(up);
     if (!up) return false;
+    if (perf_on()) perf_event("nav.leave_gone", -1, -1, pidl_folder_path(up).c_str());
     navigate_in_place(up);
     return true;
 }
