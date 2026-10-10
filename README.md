@@ -118,15 +118,16 @@ the navigation pane checks need it to show up in the tree.
 ## Releases
 
 `.github/workflows/build.yml` builds, smoke-tests and packages every push and pull
-request (artifact on the run). Pushing a tag publishes a GitHub release:
+request (artifact on the run). Every build of `main` that passes the smoke test is
+published as a GitHub release, nothing to do by hand:
 
-```powershell
-git tag v1.0.0
-git push origin v1.0.0
-```
+- version: the build date (UTC) and the CI run number, e.g. `2026.10.10.57`, tag
+  `v2026.10.10.57` (also in the exe's Properties → Details);
+- release notes: the commits since the previous release, subject and description, so
+  write commit messages for the people reading them.
 
-`v1.2.3-rc.1` style tags become pre-releases. To sign the exe, add the repository secrets
-`SIGNING_CERT_PFX_BASE64` (base64 of the .pfx) and `SIGNING_CERT_PASSWORD`.
+Pull requests are built and tested but not released. To sign the exe, add the
+repository secrets `SIGNING_CERT_PFX_BASE64` (base64 of the .pfx) and `SIGNING_CERT_PASSWORD`.
 
 ## Source layout
 

@@ -1,7 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 
-# Version: release builds pass the tag's number (-DEXPLORERPLUS_VERSION=1.2.3) and,
-# optionally, a label shown in the file properties (-DEXPLORERPLUS_VERSION_LABEL=1.2.3-ci.45+abc1234)
+# Version: CI passes the build date (-DEXPLORERPLUS_VERSION=2026.10.10), the run number
+# (-DEXPLORERPLUS_BUILD=57) and a label shown in the file properties
+# (-DEXPLORERPLUS_VERSION_LABEL=2026.10.10.57); local builds keep these defaults
 set(EXPLORERPLUS_VERSION "1.0.0" CACHE STRING "Product version (major.minor.patch)")
 set(EXPLORERPLUS_VERSION_LABEL "" CACHE STRING "Version text shown in the file properties (default: the version)")
 set(EXPLORERPLUS_BUILD "0" CACHE STRING "Fourth version number (CI run number)")
