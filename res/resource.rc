@@ -1,0 +1,37 @@
+#include <windows.h>
+#include "resource.h"
+#include "version.h"
+
+// (paths are relative to this file's directory, res/, which CMake puts on the RC include path)
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
+
+IDI_APP ICON "app.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    EP_VERSION_MAJOR, EP_VERSION_MINOR, EP_VERSION_PATCH, EP_VERSION_BUILD
+ PRODUCTVERSION EP_VERSION_MAJOR, EP_VERSION_MINOR, EP_VERSION_PATCH, EP_VERSION_BUILD
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Radim Zatecka"
+            VALUE "FileDescription",  "Explorer Plus - Windows 11 style file manager"
+            VALUE "FileVersion",      EP_VERSION_STRING
+            VALUE "InternalName",     "explorer-plus"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 Radim Zatecka"
+            VALUE "OriginalFilename", "explorer-plus.exe"
+            VALUE "ProductName",      "Explorer Plus"
+            VALUE "ProductVersion",   EP_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

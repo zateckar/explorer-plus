@@ -1,0 +1,130 @@
+name: Build and release
+
+# Every push / pull request: release build, smoke test, zip as a workflow artifact.
+# A tag vMAJOR.MINOR.PATCH (optionally -suffix, e.g. v1.2.0-rc.1 = pre-release) also
+# publishes a GitHub release with the zip and its SHA-256.
+#
+# Optional code signing: add the repository secrets SIGNING_CERT_PFX_BASE64 (the .pfx,
+# base64-encoded) and SIGNING_CERT_PASSWORD.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      HAS_SIGNING: ${{ secrets.SIGNING_CERT_PFX_BASE64 != '' }}
+    outputs:
+      label: ${{ steps.ver.outputs.label }}
+      prerelease: ${{ steps.ver.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: MinGW-w64 toolchain (MSYS2 UCRT64)
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+
+      - name: Version
+        id: ver
+        shell: pwsh
+        run: |
+          $ref = '${{ github.ref }}'
+          if ($ref -like 'refs/tags/v*') {
+            $tag = '${{ github.ref_name }}'
+            if ($tag -notmatch '^v(\d+\.\d+\.\d+)(-[0-9A-Za-z.-]+)?$') {
+              throw "release tags look like v1.2.3 or v1.2.3-rc.1, got $tag"
+            }
+            $version = $Matches[1]
+            $label = $tag.Substring(1)
+            $pre = [bool]$Matches[2]
+          } else {
+            $m = Select-String -Path CMakeLists.txt -Pattern 'set\(EXPLORERPLUS_VERSION "(\d+\.\d+\.\d+)"'
+            $version = $m.Matches[0].Groups[1].Value
+            $label = "$version-ci.${{ github.run_number }}." + '${{ github.sha }}'.Substring(0, 7)
+            $pre = $true
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "label=$label" >> $env:GITHUB_OUTPUT
+          "prerelease=$($pre.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          Write-Host "version $version, label $label"
+
+      - name: Signing certificate
+        if: env.HAS_SIGNING == 'true'
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String('${{ secrets.SIGNING_CERT_PFX_BASE64 }}'))
+          "SIGN_PFX=$pfx" >> $env:GITHUB_ENV
+
+      - name: Build and package
+        id: pkg
+        shell: pwsh
+        env:
+          SIGN_PFX_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        run: |
+          $env:PATH = '${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin;' + $env:PATH
+          ./tools/package.ps1 -Version '${{ steps.ver.outputs.version }}' -Label '${{ steps.ver.outputs.label }}' -Build ${{ github.run_number }}
+
+      - name: Smoke test (GUI automation)
+        # a signal, not a gate: hosted runners' desktop sessions can make UI automation flaky
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: pwsh
+        run: python -I tools/smoke_test.py build-release/explorer-plus.exe build-smoke
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: explorer-plus-${{ steps.ver.outputs.label }}
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: explorer-plus-${{ needs.build.outputs.label }}
+          path: dist
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            # re-run of the same tag: replace the files
+            gh release upload "$TAG" dist/*.zip dist/SHA256SUMS.txt --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            flags=()
+            if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); fi
+            gh release create "$TAG" dist/*.zip dist/SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" \
+              --title "Explorer Plus ${TAG#v}" --generate-notes "${flags[@]}"
+          fi
