@@ -99,9 +99,14 @@ HRESULT shell_item_for(PCIDLIST_ABSOLUTE abs, IShellItem** out);                
 std::wstring fmt_size(ULONGLONG bytes);
 std::wstring fmt_filetime(const FILETIME& ft);
 
-// system image list index for an absolute pidl (thread-safe)
-int sys_icon_index(LPCITEMIDLIST abs, bool open = false);
+bool pidl_exists(LPCITEMIDLIST abs);          // the item is (still) there
+bool fs_folder_missing(LPCITEMIDLIST abs);    // a local file-system folder that is gone (never blocks on the network)
+
+// system image list index for an absolute pidl (thread-safe); `fallback` if the shell has none
+int sys_icon_index(LPCITEMIDLIST abs, bool open = false, int fallback = 0);
+int sys_folder_icon_index(bool open);     // the stock folder icon
 HIMAGELIST sys_imagelist(int shil);       // SHIL_SMALL / SHIL_LARGE / SHIL_EXTRALARGE (shared, never destroy)
+void sys_imagelist_init();                // once, on the UI thread, before workers ask for icons
 
 // create IDataObject from child PIDLs (same parent)
 HRESULT dataobject_from_children(HWND hwnd, IShellFolder* psf,

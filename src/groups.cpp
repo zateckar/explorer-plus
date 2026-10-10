@@ -1,6 +1,7 @@
 #include "groups.h"
 #include "theme.h"
 #include <algorithm>
+#include <unordered_map>
 
 // ------------------------------------------------------------------
 // IOwnerDataCallback: undocumented, but stable since Windows 7 — the only way to show
@@ -202,22 +203,24 @@ void groups_assign(std::vector<Item*>& items) {
             break;
         }
         case GB_TYPE: {
-            std::vector<std::wstring> types;
-            for (Item* it : items) types.push_back(it->type.empty() ? L"Unspecified" : it->type);
-            std::sort(types.begin(), types.end(), [](const std::wstring& a, const std::wstring& b) {
+            // a folder has a handful of types: sort those, not one string per item (this
+            // runs for every streamed batch of a big folder)
+            static const std::wstring kUnspecified = L"Unspecified";
+            auto type_of = [](const Item* it) -> const std::wstring& { return it->type.empty() ? kUnspecified : it->type; };
+            auto less = [](const std::wstring& a, const std::wstring& b) {
                 return CompareStringEx(LOCALE_NAME_USER_DEFAULT, NORM_IGNORECASE, a.c_str(), -1,
                                        b.c_str(), -1, nullptr, nullptr, 0) == CSTR_LESS_THAN;
-            });
-            types.erase(std::unique(types.begin(), types.end()), types.end());
+            };
+            std::unordered_map<std::wstring, int> rank;
+            for (Item* it : items) rank.emplace(type_of(it), 0);
+            std::vector<std::wstring> types;
+            types.reserve(rank.size());
+            for (auto& [t, r] : rank) types.push_back(t);
+            std::sort(types.begin(), types.end(), less);
+            for (auto& [t, r] : rank)        // (types equal but for case share the first one's group)
+                r = (int)(std::lower_bound(types.begin(), types.end(), t, less) - types.begin());
             s_rankNames = types;
-            for (Item* it : items) {
-                const std::wstring& t = it->type.empty() ? L"Unspecified" : it->type;
-                it->group = (int)(std::lower_bound(types.begin(), types.end(), t,
-                    [](const std::wstring& a, const std::wstring& b) {
-                        return CompareStringEx(LOCALE_NAME_USER_DEFAULT, NORM_IGNORECASE, a.c_str(), -1,
-                                               b.c_str(), -1, nullptr, nullptr, 0) == CSTR_LESS_THAN;
-                    }) - types.begin());
-            }
+            for (Item* it : items) it->group = rank[type_of(it)];
             break;
         }
         case MODE_HOME:

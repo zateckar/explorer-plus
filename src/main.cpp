@@ -1,6 +1,7 @@
 // Explorer Plus — main window: Win11 frame with tabs in the caption, navigation
 // row (buttons, breadcrumb, search), command bar, tree / list / details, status bar.
 #include <algorithm>
+#include <cstdlib>
 using std::max;
 using std::min;
 #include "appstate.h"
@@ -26,6 +27,7 @@ using std::min;
 #include "chrome.h"
 #include "cmdbar.h"
 #include "perf.h"
+#include "workers.h"
 #include "statusbar.h"
 #include "breadcrumb.h"
 #include <uxtheme.h>
@@ -47,12 +49,8 @@ void set_view_mode(const View& v, bool persist) {
     g_view = v;
     TabState* t = tabmodel_active();
     if (t) t->view = v;
-    if (persist) {
-        settings_set_view_for(folder_settings_key(g_current), v);
-        View d = v;
-        d.groupBy = GB_AUTO;              // grouping stays with the folder it was chosen for
-        settings_set_default_view(d);
-    }
+    // remembered for this folder; other folders change only with "Apply to all folders"
+    if (persist) settings_set_view_for(folder_settings_key(g_current), v);
     statusbar_refresh();
     // (navigation re-groups when its listing arrives; only a live change re-sorts here)
     if (regroup && persist) enum_sort_items();
@@ -160,6 +158,19 @@ static void set_nav_pane_visible(bool v) {
     g_treeVisible = v;
     ShowWindow(g_tree, v ? SW_SHOWNA : SW_HIDE);
     layout_relayout();
+    if (v) tree_sync_to_current();      // (not followed while hidden)
+}
+
+// text size of the navigation pane, the list and the details pane (remembered)
+static void set_text_scale(int pct) {
+    theme_set_text_scale(pct);
+    settings_set_pref(L"textSize", text_scale());
+    tree_apply_metrics();
+    list_apply_view();                   // row spacing, tile size
+    columns_rescale();
+    InvalidateRect(g_tree, nullptr, TRUE);
+    InvalidateRect(g_list, nullptr, TRUE);
+    if (HWND pane = detailspane_hwnd()) InvalidateRect(pane, nullptr, FALSE);
 }
 
 // ------------------------------------------------------------------
@@ -213,6 +224,14 @@ static HACCEL make_accels() {
         { FVIRTKEY | FCONTROL,           '7',       IDM_TABSEL7 },
         { FVIRTKEY | FCONTROL,           '8',       IDM_TABSEL8 },
         { FVIRTKEY | FCONTROL,           '9',       IDM_TABSEL9 },
+        // text size, like a browser's zoom
+        { FVIRTKEY | FCONTROL,           VK_OEM_PLUS,  IDM_TEXT_LARGER },
+        { FVIRTKEY | FCONTROL | FSHIFT,  VK_OEM_PLUS,  IDM_TEXT_LARGER },     // Ctrl++ on US layouts
+        { FVIRTKEY | FCONTROL,           VK_ADD,       IDM_TEXT_LARGER },
+        { FVIRTKEY | FCONTROL,           VK_OEM_MINUS, IDM_TEXT_SMALLER },
+        { FVIRTKEY | FCONTROL,           VK_SUBTRACT,  IDM_TEXT_SMALLER },
+        { FVIRTKEY | FCONTROL,           '0',          IDM_TEXT_RESET },
+        { FVIRTKEY | FCONTROL,           VK_NUMPAD0,   IDM_TEXT_RESET },
     };
     return CreateAcceleratorTableW(a, ARRAYSIZE(a));
 }
@@ -228,13 +247,44 @@ static bool is_edit_focus() {
     return lstrcmpiW(cls, WC_EDITW) == 0;
 }
 static bool edit_owns_key(const MSG& m) {
-    if (m.message != WM_KEYDOWN || !is_edit_focus()) return false;
+    if ((m.message != WM_KEYDOWN && m.message != WM_SYSKEYDOWN) || !is_edit_focus()) return false;
+    // renaming in the list or the pane: every key is the edit's (a refresh, navigation or
+    // Alt+Enter would end the rename)
+    HWND parent = GetParent(GetFocus());
+    if (parent == g_list || parent == g_tree) return true;
+    if (m.message != WM_KEYDOWN) return false;
     bool ctrl = GetKeyState(VK_CONTROL) & 0x8000;
     switch (m.wParam) {
         case 'A': case 'C': case 'X': case 'V': case 'Z': case 'Y': return ctrl;
         case VK_F2: case VK_DELETE: case VK_BACK: case VK_RETURN: return true;
         default: return false;
     }
+}
+
+// Tab / F6 (Shift: backwards) move the keyboard focus around the panes like Explorer:
+// address bar, search box, navigation pane, file list. A rename box keeps its keys.
+static bool cycle_focus(const MSG& m) {
+    if (m.message != WM_KEYDOWN || (m.wParam != VK_TAB && m.wParam != VK_F6)) return false;
+    if ((GetKeyState(VK_CONTROL) & 0x8000) || (GetKeyState(VK_MENU) & 0x8000)) return false;   // Ctrl+Tab: tabs
+    HWND focus = GetFocus();
+    if (!focus || GetAncestor(focus, GA_ROOT) != g_main) return false;
+    HWND parent = GetParent(focus);
+    if (is_edit_focus() && (parent == g_list || parent == g_tree)) return false;
+    HWND panes[] = { g_address, g_search, g_tree, g_list };
+    constexpr int n = (int)(sizeof(panes) / sizeof(panes[0]));
+    int cur = -1;
+    for (HWND h = focus; h && h != g_main && cur < 0; h = GetParent(h))
+        for (int i = 0; i < n; ++i)
+            if (panes[i] == h) cur = i;
+    int dir = (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1;
+    for (int k = 1; k <= n; ++k) {
+        int i = cur < 0 ? (dir > 0 ? k - 1 : n - k) : ((cur + dir * k) % n + n) % n;
+        if (panes[i] && IsWindowVisible(panes[i]) && IsWindowEnabled(panes[i])) {
+            SetFocus(panes[i]);                // (the address bar starts editing)
+            return true;
+        }
+    }
+    return false;
 }
 
 // ------------------------------------------------------------------
@@ -304,6 +354,13 @@ static void on_command(WORD id) {
             settings_set_pref(L"showExtensions", g_showExtensions);
             navigation_refresh();
             break;
+        case IDM_TEXT_LARGER:  set_text_scale(text_scale_step(text_scale(), +1)); break;
+        case IDM_TEXT_SMALLER: set_text_scale(text_scale_step(text_scale(), -1)); break;
+        case IDM_TEXT_RESET:   set_text_scale(100); break;
+        case IDM_VIEW_APPLY_ALL: views_apply_to_all(); break;
+        case IDM_VIEW_RESET_ALL: views_reset_all(); break;
+        case IDM_TREE_DELETE:      tree_delete_selected(false); break;
+        case IDM_TREE_DELETE_PERM: tree_delete_selected(true); break;
 
         case IDM_NEW_MENU: case IDM_SORT_MENU: case IDM_VIEW_MENU: case IDM_MORE_MENU:
             cmdbar_show_menu(id);
@@ -408,6 +465,32 @@ static void tree_context_menu(HWND hwnd, POINT pt) {
 // window proc
 static UINT s_watchMsg = 0;
 
+// persist the window's place, the panes, the tabs and the settings
+static void save_window_state(HWND hwnd) {
+    SplitMode s = settings_splitter();
+    s.width = g_splitterX;
+    s.widthRight = g_splitterRight;
+    s.detailsVisible = detailspane_visible();
+    s.treeVisible = g_treeVisible;
+    WINDOWPLACEMENT wpl{ sizeof(wpl) };
+    if (GetWindowPlacement(hwnd, &wpl)) {
+        // the normal position is in workspace coordinates (relative to the work area);
+        // the restore at startup works in screen coordinates
+        RECT r = wpl.rcNormalPosition;
+        MONITORINFO mi{ sizeof(mi) };
+        if (GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mi))
+            OffsetRect(&r, mi.rcWork.left - mi.rcMonitor.left, mi.rcWork.top - mi.rcMonitor.top);
+        s.maximized = wpl.showCmd == SW_SHOWMAXIMIZED;
+        s.x = (int)r.left;
+        s.y = (int)r.top;
+        s.winW = (int)(r.right - r.left);
+        s.winH = (int)(r.bottom - r.top);
+    }
+    settings_set_splitter(s);
+    tabs_persist_now();
+    settings_save_all();
+}
+
 static void on_theme_changed(HWND hwnd) {
     theme_apply_controls();
     groups_theme_changed();
@@ -437,6 +520,7 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             theme_set_dpi((int)GetDpiForWindow(hwnd));
             chrome_init(hwnd);
             layout_create_splitters();
+            if (!g_treeVisible) ShowWindow(g_tree, SW_HIDE);   // hidden when the app was closed
             address_create(hwnd);
             build_search();
             g_navbar = navbar_create(hwnd);
@@ -561,6 +645,13 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (GET_XBUTTON_WPARAM(wp) == XBUTTON1) navigation_go_back();
             else if (GET_XBUTTON_WPARAM(wp) == XBUTTON2) navigation_go_forward();
             return TRUE;
+        case WM_APPCOMMAND:  // the same buttons over a child window (list, tree, ...) arrive as this
+            switch (GET_APPCOMMAND_LPARAM(lp)) {
+                case APPCOMMAND_BROWSER_BACKWARD: navigation_go_back(); return TRUE;
+                case APPCOMMAND_BROWSER_FORWARD:  navigation_go_forward(); return TRUE;
+                case APPCOMMAND_BROWSER_REFRESH:  navigation_refresh(); return TRUE;
+            }
+            break;
 
         case WM_NOTIFY: {
             NMHDR* hdr = (NMHDR*)lp;
@@ -584,33 +675,25 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             const RECT* r = (const RECT*)lp;
             SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
+            tree_apply_metrics();
             list_apply_view();           // row heights, tile size
+            columns_rescale();
             layout_relayout();
             return 0;
         }
 
         case WM_CLOSE: DestroyWindow(hwnd); return 0;
 
+        case WM_ENDSESSION:
+            // Windows is shutting down / logging off: the process ends without WM_DESTROY
+            if (wp) save_window_state(hwnd);
+            return 0;
+
         case WM_DESTROY: {
             perf_flush();
-            // persist settings + tabs
+            workers_shutdown();             // no new background work, results dropped
             RemoveClipboardFormatListener(hwnd);
-            SplitMode s = settings_splitter();
-            s.width = g_splitterX;
-            s.widthRight = g_splitterRight;
-            s.detailsVisible = detailspane_visible();
-            s.treeVisible = g_treeVisible;
-            WINDOWPLACEMENT wpl{ sizeof(wpl) };
-            if (GetWindowPlacement(hwnd, &wpl)) {
-                s.maximized = wpl.showCmd == SW_SHOWMAXIMIZED;
-                s.x = (int)wpl.rcNormalPosition.left;
-                s.y = (int)wpl.rcNormalPosition.top;
-                s.winW = (int)(wpl.rcNormalPosition.right - wpl.rcNormalPosition.left);
-                s.winH = (int)(wpl.rcNormalPosition.bottom - wpl.rcNormalPosition.top);
-            }
-            settings_set_splitter(s);
-            tabs_persist_now();
-            settings_save_all();
+            save_window_state(hwnd);
             dnd_unregister_all();
             deregister_current_watch();
             if (s_searchBrush) { DeleteObject(s_searchBrush); s_searchBrush = nullptr; }
@@ -624,14 +707,14 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // ------------------------------------------------------------------
 // init & run
 
-static ATOM register_class(HICON hIcon) {
+static ATOM register_class(HICON hIcon, HICON hIconSm) {
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.hInstance = g_hinst;
     wc.lpfnWndProc = main_proc;
     wc.lpszClassName = APP_CLASS;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hIcon = hIcon;
-    wc.hIconSm = hIcon;
+    wc.hIconSm = hIconSm;
     wc.style = CS_DBLCLKS;
     return RegisterClassExW(&wc);
 }
@@ -662,6 +745,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     int compact = settings_pref(L"compactView", -1);
     g_compactView = compact < 0 ? windows_compact_view() : compact != 0;
     g_showExtensions = std::clamp(settings_pref(L"showExtensions", -1), -1, 1);
+    theme_set_text_scale(settings_pref(L"textSize", 100));
     SplitMode sp = settings_splitter();
     if (sp.width >= 120 && sp.width <= 1200) g_splitterX = sp.width;
     if (sp.widthRight >= 140 && sp.widthRight <= 480) g_splitterRight = sp.widthRight;
@@ -675,23 +759,33 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
         for (int i = 1; argv && i < argc; ++i) {
             if (lstrcmpiW(argv[i], L"--new-window") == 0) newWindow = true;
-            else openPath = argv[i];
+            else openPath += (openPath.empty() ? L"" : L" ") + std::wstring(argv[i]);   // an unquoted path with spaces
         }
         if (argv) LocalFree(argv);
+        // "explorer-plus.exe ..\docs": relative to the working directory
+        if (!openPath.empty() && PathIsRelativeW(openPath.c_str()) && openPath.find(L':') == std::wstring::npos &&
+            openPath.rfind(L"\\\\", 0) != 0) {
+            WCHAR full[MAX_PATH * 4]{};
+            DWORD n = GetFullPathNameW(openPath.c_str(), ARRAYSIZE(full), full, nullptr);
+            if (n && n < ARRAYSIZE(full) && PathIsDirectoryW(full)) openPath = full;
+        }
     }
     perf_event("settings");
     tabmodel_init(openPath, !newWindow);          // restored tabs (+ command-line folder)
+    // the system image list is set up here, once: workers asking for icons while it is
+    // still being initialized get no index (and the tree showed "unknown file" icons)
+    sys_imagelist_init();
     if (TabState* t = tabmodel_active(); t && g_treeVisible) tree_prefetch(t->current);   // ready by WM_CREATE
     perf_event("tabs");
     detailspane_set_mode(settings_pref(L"paneMode", PANE_DETAILS) == PANE_PREVIEW ? PANE_PREVIEW : PANE_DETAILS);
     detailspane_set_visible(sp.detailsVisible);   // sets flags only (window created later)
 
-    HICON appIcon = nullptr;
-    {   // the shell's folder icon, like Explorer's
-        SHSTOCKICONINFO sii{ sizeof(sii) };
-        if (SUCCEEDED(SHGetStockIconInfo(SIID_FOLDER, SHGSI_ICON | SHGSI_LARGEICON, &sii))) appIcon = sii.hIcon;
-    }
-    register_class(appIcon ? appIcon : LoadIconW(nullptr, IDI_APPLICATION));
+    // the exe's own icon (taskbar, Alt+Tab, title bar), at the sizes the system uses
+    HICON appIcon = nullptr, appIconSm = nullptr;
+    LoadIconMetric(hInst, MAKEINTRESOURCEW(IDI_APP), LIM_LARGE, &appIcon);
+    LoadIconMetric(hInst, MAKEINTRESOURCEW(IDI_APP), LIM_SMALL, &appIconSm);
+    if (!appIcon) appIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    register_class(appIcon, appIconSm ? appIconSm : appIcon);
 
     // restore window rect, clamped to the work area of the monitor nearest the saved rect
     int wx = CW_USEDEFAULT, wy = CW_USEDEFAULT;
@@ -731,6 +825,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     HACCEL acc = make_accels();
     MSG m{};
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
+        if (cycle_focus(m)) continue;
         if ((m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN) && !edit_owns_key(m) &&
             TranslateAcceleratorW(g_main, acc, &m))
             continue;
@@ -756,5 +851,9 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     if (g_iconFont) DeleteObject(g_iconFont);
     if (g_mdl2Font) DeleteObject(g_mdl2Font);
     if (appIcon) DestroyIcon(appIcon);
-    return (int)m.wParam;
+    if (appIconSm) DestroyIcon(appIconSm);
+    // Detached workers (listing, thumbnails, icons, previews) may still be running:
+    // returning would run the static destructors under them. Everything is saved by
+    // now and the clipboard is flushed at copy time, so end the process here.
+    std::_Exit((int)m.wParam);
 }

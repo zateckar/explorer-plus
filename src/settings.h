@@ -21,7 +21,8 @@ void settings_set_default_view(const View& v);
 const View* settings_view_for(const std::wstring& folderKey);
 void settings_set_view_for(const std::wstring& folderKey, const View& v);
 const std::wstring* settings_columns_for(const std::wstring& folderKey);   // persisted column set
-void settings_set_columns_for(const std::wstring& folderKey, const std::wstring& cols);
+void settings_set_columns_for(const std::wstring& folderKey, const std::wstring& cols);   // empty: forget
+void settings_forget_fs_folders();      // drop every file-system folder's own view and columns
 bool settings_show_hidden();
 void settings_set_show_hidden(bool b);
 SplitMode settings_splitter();

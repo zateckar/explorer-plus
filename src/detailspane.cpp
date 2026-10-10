@@ -7,6 +7,10 @@
 #include "preview.h"
 #include <wincodec.h>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <cwctype>
+#include <cstdlib>
 #include <algorithm>
 using std::min;
 using std::max;
@@ -22,6 +26,7 @@ static HWND s_pane = nullptr;
 static HWND s_hostWnd = nullptr;          // preview handlers draw into this child
 static HBITMAP s_preview = nullptr;    // owned thumbnail
 static int   s_prevW = 0, s_prevH = 0;
+static bool  s_prevAlpha = false;      // s_preview has transparency (icons, PNGs)
 static std::atomic<unsigned> s_gen{ 0 };   // async thumbnail generation id
 static std::wstring s_message;         // preview mode: "Select a file to preview."
 static const UINT_PTR kTimerPreview = 1;   // the selection settled: load its preview
@@ -31,23 +36,34 @@ static std::vector<std::pair<std::wstring, std::wstring>> s_lines;
 static std::wstring s_title;
 
 // ------------------------------------------------------------------
-// thumbnail thread: big thumbnail (+ image dimensions) for the selected item
+// worker: big thumbnail (+ image dimensions) for the selected item, free space of the
+// folder's drive. One thread; a request replaces the one still waiting, so arrowing
+// through files never queues up work (and a slow drive never blocks the UI).
 struct PrevReq {
     unsigned gen;
-    PITEMID_CHILD abs = nullptr;   // owned
+    PITEMID_CHILD abs = nullptr;   // owned; nullptr: no thumbnail
     int size = 220;
+    std::wstring spaceRoot;        // "C:\": report its free space
 };
 
 struct PrevResult {
     unsigned gen;
     HBITMAP hbm = nullptr;         // owned
     int w = 0, h = 0;
+    bool alpha = false;            // hbm is 32bpp with a real (premultiplied) alpha channel
     std::wstring dims;             // "1920 × 1080" for images
+    std::wstring space;            // "12.3 GB free of 476 GB"
 };
+
+static std::mutex s_reqMx;
+static std::condition_variable s_reqCv;
+static PrevReq* s_reqPending = nullptr;
+static bool s_reqThread = false;
 
 static void clear_preview() {
     if (s_preview) { DeleteObject(s_preview); s_preview = nullptr; }
     s_prevW = s_prevH = 0;
+    s_prevAlpha = false;
 }
 
 static void apply_preview(void* payload) {
@@ -57,7 +73,9 @@ static void apply_preview(void* payload) {
         s_preview = r->hbm;
         s_prevW = r->w; s_prevH = r->h;
         r->hbm = nullptr;
+        s_prevAlpha = r->alpha;
         if (s_mode == PANE_DETAILS && !r->dims.empty()) s_lines.push_back({ L"Dimensions", r->dims });
+        if (s_mode == PANE_DETAILS && !r->space.empty()) s_lines.push_back({ L"Space", r->space });
         if (s_mode == PANE_PREVIEW && !s_preview) s_message = L"No preview available.";
         if (s_pane) InvalidateRect(s_pane, nullptr, TRUE);
     }
@@ -65,8 +83,17 @@ static void apply_preview(void* payload) {
     delete r;
 }
 
-static void prev_worker(PrevReq* r) {
-    ComInit ci;
+// does a 32bpp bitmap carry alpha? (photos often come back with an all-zero channel)
+static bool has_alpha(HBITMAP hbm) {
+    DIBSECTION ds{};
+    if (GetObjectW(hbm, sizeof(ds), &ds) != sizeof(ds) || ds.dsBm.bmBitsPixel != 32 || !ds.dsBm.bmBits) return false;
+    const DWORD* p = static_cast<const DWORD*>(ds.dsBm.bmBits);
+    size_t n = (size_t)ds.dsBm.bmWidth * (size_t)std::abs(ds.dsBm.bmHeight);
+    for (size_t i = 0; i < n; ++i) if (p[i] & 0xFF000000) return true;
+    return false;
+}
+
+static void prev_work(PrevReq* r) {
     PrevResult* res = new PrevResult{ r->gen };
     com_ptr<IShellItem2> si;
     if (r->abs && SUCCEEDED(SHCreateItemFromIDList(r->abs, IID_PPV_ARGS(si.put()))) && si) {
@@ -79,6 +106,7 @@ static void prev_worker(PrevReq* r) {
                 BITMAP bi{};
                 GetObjectW(res->hbm, sizeof(bi), &bi);
                 res->w = bi.bmWidth; res->h = bi.bmHeight;
+                res->alpha = has_alpha(res->hbm);
             }
         }
         // image dimensions from the property system (no full decode)
@@ -90,9 +118,47 @@ static void prev_worker(PrevReq* r) {
             res->dims = d;
         }
     }
+    if (!r->spaceRoot.empty()) {
+        ULARGE_INTEGER avail{}, total{}, totalfree{};
+        if (GetDiskFreeSpaceExW(r->spaceRoot.c_str(), &avail, &total, &totalfree)) {
+            WCHAR a[64]{}, b[64]{};
+            StrFormatByteSizeW(totalfree.QuadPart, a, 64);
+            StrFormatByteSizeW(total.QuadPart, b, 64);
+            res->space = std::wstring(a) + L" free of " + b;
+        }
+    }
+    post_async(apply_preview, res);
+}
+
+static void free_req(PrevReq* r) {
+    if (!r) return;
     if (r->abs) CoTaskMemFree(r->abs);
     delete r;
-    post_async(apply_preview, res);
+}
+
+static void prev_thread() {
+    ComInit ci;
+    for (;;) {
+        PrevReq* r = nullptr;
+        {
+            std::unique_lock<std::mutex> lk(s_reqMx);
+            s_reqCv.wait(lk, [] { return s_reqPending != nullptr; });
+            r = s_reqPending;
+            s_reqPending = nullptr;
+        }
+        if (r->gen == s_gen.load()) prev_work(r);    // (else the selection moved on meanwhile)
+        free_req(r);
+    }
+}
+
+static void submit(PrevReq* r) {
+    {
+        std::lock_guard<std::mutex> lk(s_reqMx);
+        free_req(s_reqPending);        // superseded before it was started
+        s_reqPending = r;
+        if (!s_reqThread) { s_reqThread = true; std::thread(prev_thread).detach(); }
+    }
+    s_reqCv.notify_one();
 }
 
 static void request_thumbnail(PITEMID_CHILD abs /*adopted*/, int size) {
@@ -100,7 +166,7 @@ static void request_thumbnail(PITEMID_CHILD abs /*adopted*/, int size) {
     r->gen = s_gen.load();
     r->abs = abs;
     r->size = size;
-    std::thread(prev_worker, r).detach();
+    submit(r);
 }
 
 // ------------------------------------------------------------------
@@ -134,18 +200,12 @@ static void gather_for_selection() {
         std::wstring path = pidl_folder_path(g_current);
         if (path.rfind(L"::", 0) != 0) add_line(L"Path", path);   // virtual folders have no path
         add_line(L"Items", std::to_wstring(count));
-        // free space if drive root
-        WCHAR root[MAX_PATH]{}; wcsncpy_s(root, path.c_str(), MAX_PATH - 1);
-        if (wcslen(root) >= 2 && root[1] == L':') {
-            root[3] = 0;
-            ULARGE_INTEGER avail{}, total{}, totalfree{};
-            if (GetDiskFreeSpaceExW(root, &avail, &total, &totalfree)) {
-                WCHAR a[64]{}, b[64]{};
-                StrFormatByteSizeW(totalfree.QuadPart, a, 64);
-                StrFormatByteSizeW(total.QuadPart, b, 64);
-                std::wstring f = a; f += L" free of "; f += b;
-                add_line(L"Space", f);
-            }
+        // free space of the folder's drive (on the worker: a mapped drive can be offline)
+        if (path.size() >= 3 && iswalpha(path[0]) && path[1] == L':' && path[2] == L'\\') {
+            PrevReq* r = new PrevReq;
+            r->gen = s_gen.load();
+            r->spaceRoot = path.substr(0, 3);
+            submit(r);
         }
         return;
     }
@@ -199,9 +259,15 @@ static void blit_fit(HDC dc, int x, int y, int maxW, int maxH, bool vcenter) {
     int dw = max(1, (int)(w * sc)), dh = max(1, (int)(h * sc));
     HDC bm = CreateCompatibleDC(dc);
     HGDIOBJ old = SelectObject(bm, s_preview);
-    SetStretchBltMode(dc, HALFTONE);
-    SetBrushOrgEx(dc, 0, 0, nullptr);
-    StretchBlt(dc, x + (maxW - dw) / 2, y + (vcenter ? (maxH - dh) / 2 : 0), dw, dh, bm, 0, 0, w, h, SRCCOPY);
+    int dx = x + (maxW - dw) / 2, dy = y + (vcenter ? (maxH - dh) / 2 : 0);
+    if (s_prevAlpha) {              // transparent parts show the pane, not black
+        BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        AlphaBlend(dc, dx, dy, dw, dh, bm, 0, 0, w, h, bf);
+    } else {
+        SetStretchBltMode(dc, HALFTONE);
+        SetBrushOrgEx(dc, 0, 0, nullptr);
+        StretchBlt(dc, dx, dy, dw, dh, bm, 0, 0, w, h, SRCCOPY);
+    }
     SelectObject(bm, old);
     DeleteDC(bm);
 }
@@ -220,24 +286,24 @@ static void paint_details(HDC mem, const RECT& rc) {
     }
     // title
     if (!s_title.empty()) {
-        SelectObject(mem, ui_font_bold());
+        SelectObject(mem, content_font_bold());
         SetTextColor(mem, p.text);
-        RECT tr{ pad, y, pad + cx, y + S(60) };
+        RECT tr{ pad, y, pad + cx, y + SC(60) };
         int th = DrawTextW(mem, s_title.c_str(), -1, &tr,
                            DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX | DT_EDITCONTROL);
         y += th + S(16);
-        SelectObject(mem, g_font);
     }
+    SelectObject(mem, content_font());
     // properties: name in secondary text, value aside
-    int keyW = min(S(110), cx / 2);
+    int keyW = min(SC(110), cx / 2);
     for (auto& [k, v] : s_lines) {
-        RECT kr{ pad, y, pad + keyW, y + S(22) };
+        RECT kr{ pad, y, pad + keyW, y + SC(22) };
         SetTextColor(mem, p.textSecondary);
         DrawTextW(mem, k.c_str(), -1, &kr, DT_LEFT | DT_END_ELLIPSIS | DT_SINGLELINE | DT_NOPREFIX);
-        RECT vr{ pad + keyW + S(8), y, pad + cx, y + S(22) };
+        RECT vr{ pad + keyW + S(8), y, pad + cx, y + SC(22) };
         SetTextColor(mem, p.text);
         DrawTextW(mem, v.c_str(), -1, &vr, DT_LEFT | DT_END_ELLIPSIS | DT_SINGLELINE | DT_NOPREFIX);
-        y += S(24);
+        y += SC(24);
     }
 }
 
@@ -248,7 +314,7 @@ static void paint_preview(HDC mem, const RECT& rc) {
         return;
     }
     if (s_message.empty()) return;
-    SelectObject(mem, g_font);
+    SelectObject(mem, content_font());
     SetTextColor(mem, pal().textSecondary);
     RECT t{ pad, 0, rc.right - pad, rc.bottom };
     DrawTextW(mem, s_message.c_str(), -1, &t, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
@@ -364,6 +430,16 @@ void detailspane_toggle(PaneMode m) {
     if (s_visible && s_mode == m) { detailspane_set_visible(false); return; }
     detailspane_set_mode(m);
     detailspane_set_visible(true);
+}
+
+// before a file operation: a preview handler can hold the previewed file open, so
+// delete / rename / move would fail with "the file is open in Explorer Plus". The
+// preview comes back with the next selection change (the operation refreshes the list).
+void detailspane_release_files() {
+    if (!preview_active()) return;
+    preview_close();
+    if (s_hostWnd) ShowWindow(s_hostWnd, SW_HIDE);
+    if (s_pane) InvalidateRect(s_pane, nullptr, TRUE);
 }
 
 void detailspane_theme_changed() {

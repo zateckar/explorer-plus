@@ -1,5 +1,6 @@
 #include "flyout.h"
 #include "theme.h"
+#include "acc.h"
 #include <dwmapi.h>
 #include <algorithm>
 using std::max;
@@ -187,6 +188,9 @@ void set_hot(Fly& f, int btn, int entry) {
     f.hotBtn = btn;
     f.hotEntry = entry;
     InvalidateRect(f.hwnd, nullptr, FALSE);
+    // screen readers follow the highlight like a menu's (the flyout never has focus)
+    if (btn >= 0) acc_notify(f.hwnd, EVENT_OBJECT_FOCUS, btn);
+    else if (entry >= 0) acc_notify(f.hwnd, EVENT_OBJECT_FOCUS, (int)f.row.size() + entry);
 }
 
 void finish(Fly& f, UINT id) {
@@ -346,10 +350,64 @@ void on_char(Fly& f, wchar_t ch) {
     set_hot(f, -1, it == hits.end() ? hits[0] : *it);
 }
 
+// screen readers: a menu of the icon row's buttons, then the entries. Their actions
+// come back as kAccAction (the flyout's own loop runs them).
+const UINT kAccAction = WM_APP + 51;
+const AccSource s_acc = [] {
+    AccSource a;
+    a.name = L"Context";
+    a.role = ROLE_SYSTEM_MENUPOPUP;
+    a.count = [] { return s_fly ? (int)(s_fly->row.size() + s_fly->entries.size()) : 0; };
+    a.child = [](int i) {
+        AccChild c;
+        Fly& f = *s_fly;
+        int nb = (int)f.row.size();
+        if (i < nb) {
+            const FlyButton& b = f.row[i];
+            size_t paren = b.tip.find(L" (");
+            c.name = b.tip.substr(0, paren);
+            if (paren != std::wstring::npos && !b.tip.empty() && b.tip.back() == L')')
+                c.shortcut = b.tip.substr(paren + 2, b.tip.size() - paren - 3);
+            c.role = ROLE_SYSTEM_PUSHBUTTON;
+            c.rc = i < (int)f.btnRects.size() ? f.btnRects[i] : RECT{};
+            if (b.disabled) c.state |= STATE_SYSTEM_UNAVAILABLE;
+            if (f.hotBtn == i) c.state |= STATE_SYSTEM_FOCUSED | STATE_SYSTEM_HOTTRACKED;
+            c.action = L"Press";
+            return c;
+        }
+        int e = i - nb;
+        const FlyEntry& en = f.entries[e];
+        c.rc = e < (int)f.entryRects.size() ? f.entryRects[e] : RECT{};
+        if (en.kind == FlyEntry::Separator) { c.role = ROLE_SYSTEM_SEPARATOR; return c; }
+        c.name = en.text;
+        c.shortcut = en.accel;
+        c.role = ROLE_SYSTEM_MENUITEM;
+        if (en.kind == FlyEntry::Submenu) c.state |= STATE_SYSTEM_HASPOPUP;
+        if (en.disabled) c.state |= STATE_SYSTEM_UNAVAILABLE;
+        if (en.checked) c.state |= STATE_SYSTEM_CHECKED;
+        if (f.hotEntry == e) c.state |= STATE_SYSTEM_FOCUSED | STATE_SYSTEM_HOTTRACKED;
+        c.action = en.kind == FlyEntry::Submenu ? L"Open" : L"Execute";
+        return c;
+    };
+    a.action = [](int i) { if (s_fly) PostMessageW(s_fly->hwnd, kAccAction, (WPARAM)i, 0); };
+    a.focus = [] {
+        if (!s_fly) return -1;
+        return s_fly->hotBtn >= 0 ? s_fly->hotBtn : s_fly->hotEntry >= 0 ? (int)s_fly->row.size() + s_fly->hotEntry : -1;
+    };
+    return a;
+}();
+
 LRESULT CALLBACK fly_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     Fly* f = s_fly;
     if (!f || f->hwnd != hwnd) return DefWindowProcW(hwnd, msg, wp, lp);
     switch (msg) {
+        case WM_GETOBJECT: return acc_get_object(hwnd, wp, lp, &s_acc);
+        case kAccAction: {
+            int i = (int)wp, nb = (int)f->row.size();
+            if (i < nb) { if (!f->row[i].disabled) finish(*f, f->row[i].id); }
+            else choose_entry(*f, i - nb);
+            return 0;
+        }
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: {
@@ -456,6 +514,7 @@ UINT flyout_track(HWND owner, POINT pt, const std::vector<FlyButton>& row, const
     COLORREF border = menu_border();
     DwmSetWindowAttribute(f.hwnd, 34 /*DWMWA_BORDER_COLOR*/, &border, sizeof(border));
     SetWindowPos(f.hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    NotifyWinEvent(EVENT_SYSTEM_MENUPOPUPSTART, f.hwnd, OBJID_CLIENT, CHILDID_SELF);
     // tooltips for the icon row ("Cut (Ctrl+X)"); destroyed with the flyout
     if (!f.row.empty()) {
         HWND tip = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, TOOLTIPS_CLASSW, nullptr,
@@ -501,6 +560,7 @@ UINT flyout_track(HWND owner, POINT pt, const std::vector<FlyButton>& row, const
         }
     }
     if (GetCapture() == f.hwnd) ReleaseCapture();
+    NotifyWinEvent(EVENT_SYSTEM_MENUPOPUPEND, f.hwnd, OBJID_CLIENT, CHILDID_SELF);
     s_fly = nullptr;
     DestroyWindow(f.hwnd);
     return f.result;

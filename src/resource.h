@@ -72,6 +72,15 @@
 #define IDM_COPY_PATH     40135
 #define IDM_VIEW_NAVPANE  40136
 #define IDM_NEW_WINDOW    40137
+#define IDM_VIEW_APPLY_ALL 40138    // this folder's view + columns become every folder's
+#define IDM_VIEW_RESET_ALL 40139    // forget every folder's own view + columns
+// text size of the navigation pane, the list and the details pane
+#define IDM_TEXT_LARGER   40100
+#define IDM_TEXT_SMALLER  40101
+#define IDM_TEXT_RESET    40102
+// Delete / Shift+Delete on the navigation pane's selected folder
+#define IDM_TREE_DELETE      40103
+#define IDM_TREE_DELETE_PERM 40104
 // Group by: IDM_GROUP_BASE + GB_* (GB_AUTO .. GB_SIZE)
 #define IDM_GROUP_BASE    40140
 #define IDM_GROUP_LAST    40145

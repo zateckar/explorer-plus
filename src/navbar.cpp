@@ -2,6 +2,7 @@
 #include "navigation.h"
 #include "tabs.h"
 #include "theme.h"
+#include "acc.h"
 
 // Segoe Fluent Icons / MDL2 share these code points
 // The last one, "...", holds the command bar's commands while that row is hidden.
@@ -68,8 +69,34 @@ static void add_tooltips(HWND hwnd) {
     }
 }
 
+// screen readers: the buttons by name, shortcut and whether they can be used now
+static const wchar_t* kName[] = { L"Back", L"Forward", L"Up", L"Refresh", L"See more" };
+static const wchar_t* kKeys[] = { L"Alt+Left Arrow", L"Alt+Right Arrow", L"Alt+Up Arrow", L"F5", L"" };
+static const AccSource s_acc = [] {
+    AccSource a;
+    a.name = L"Navigation";
+    a.role = ROLE_SYSTEM_TOOLBAR;
+    a.count = [] { return count(); };
+    a.child = [](int i) {
+        AccChild c;
+        c.name = kName[i];
+        c.shortcut = kKeys[i];
+        c.role = kCmd[i] == IDM_TOOLS_MENU ? ROLE_SYSTEM_BUTTONMENU : ROLE_SYSTEM_PUSHBUTTON;
+        RECT rc{}; GetClientRect(s_bar, &rc);
+        c.rc = btn_rect(i, rc.bottom);
+        if (!btn_enabled(i)) c.state |= STATE_SYSTEM_UNAVAILABLE;
+        if (s_hover == i) c.state |= STATE_SYSTEM_HOTTRACKED;
+        if (s_pressed == i) c.state |= STATE_SYSTEM_PRESSED;
+        c.action = L"Press";
+        return c;
+    };
+    a.action = [](int i) { PostMessageW(g_main, WM_COMMAND, MAKEWPARAM(kCmd[i], 0), 0); };
+    return a;
+}();
+
 static LRESULT CALLBACK bar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+        case WM_GETOBJECT: return acc_get_object(hwnd, wp, lp, &s_acc);
         case WM_CREATE: add_tooltips(hwnd); return 0;
         case WM_SIZE: update_tips(hwnd); return 0;
         case WM_ERASEBKGND: return 1;
@@ -141,6 +168,7 @@ void navbar_refresh() {
     if (!s_bar) return;
     update_tips(s_bar);
     InvalidateRect(s_bar, nullptr, FALSE);
+    acc_notify(s_bar, EVENT_OBJECT_STATECHANGE, -1);    // Back / Forward / Up may have changed
 }
 
 POINT navbar_menu_point() {

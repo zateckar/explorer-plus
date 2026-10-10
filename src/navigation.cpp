@@ -9,10 +9,11 @@
 #include "detailspane.h"
 #include "groups.h"
 #include "searchbox.h"
+#include "columns.h"
 #include <algorithm>
 #include <atomic>
 #include <memory>
-#include <thread>
+#include "workers.h"
 
 static std::vector<std::wstring> g_addrHistory;
 // bumped by every navigation; a typed path resolved after that is dropped
@@ -65,6 +66,27 @@ View view_for_folder(PCIDLIST_ABSOLUTE abs) {
     if (is_this_pc_folder(abs)) return View{ LV_VIEW_TILE, 0, GB_AUTO };   // drive tiles
     if (search_is_results(abs)) return View{ LV_VIEW_DETAILS, 0, GB_AUTO };
     return settings_default_view();
+}
+
+// Folder Options' "Apply to Folders": this folder's view and columns become the
+// default of every file-system folder, and the ones folders kept for themselves are
+// dropped (virtual folders, This PC, search results keep theirs)
+void views_apply_to_all() {
+    if (!columns_can_apply_to_all()) { MessageBeep(MB_ICONASTERISK); return; }
+    columns_set_default_from_current();
+    settings_set_default_view(g_view);
+    settings_forget_fs_folders();
+}
+
+// "Reset Folders": every file-system folder back to Details with the standard columns
+void views_reset_all() {
+    settings_forget_fs_folders();
+    columns_forget_default();
+    settings_set_default_view(View{ LV_VIEW_DETAILS, 0, GB_AUTO });
+    if (TabState* t = tabmodel_active()) {
+        t->view = view_for_folder(t->current);
+        navigate_replace(t);            // lists again with the folder's (default) columns
+    }
 }
 
 // ordinary navigation within the active tab (pushes history)
@@ -172,7 +194,22 @@ void navigate_path_text(const std::wstring& text) {
     if (!pidl_is_desktop(g_current) &&
         SHGetPathFromIDListW(const_cast<LPITEMIDLIST>((LPCITEMIDLIST)g_current), fsDir))
         job->fsDir = fsDir;
-    std::thread(typed_worker, job).detach();
+    worker_submit([job] { typed_worker(job); });
+}
+
+// an argument for CommandLineToArgvW: quoted, with the backslashes before the closing
+// quote doubled ("C:\" would otherwise arrive as C:")
+static std::wstring quote_arg(const std::wstring& s) {
+    std::wstring q = L"\"";
+    size_t slashes = 0;
+    for (wchar_t c : s) {
+        if (c == L'\\') { ++slashes; q += c; continue; }
+        if (c == L'"') q.append(slashes + 1, L'\\');      // (not in paths; kept correct anyway)
+        slashes = 0;
+        q += c;
+    }
+    q.append(slashes, L'\\');
+    return q + L"\"";
 }
 
 // another window on `folder` (a separate process, as each window keeps its own
@@ -181,7 +218,7 @@ void navigation_open_new_window(PCIDLIST_ABSOLUTE folder) {
     WCHAR exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     std::wstring path = pidl_is_desktop(folder) ? L"::desktop" : pidl_folder_path(folder);
-    std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --new-window \"" + path + L"\"";
+    std::wstring cmd = quote_arg(exe) + L" --new-window " + quote_arg(path);
     STARTUPINFOW si{ sizeof(si) };
     PROCESS_INFORMATION pi{};
     if (CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
@@ -190,13 +227,27 @@ void navigation_open_new_window(PCIDLIST_ABSOLUTE folder) {
     }
 }
 
+// history moves show each folder in its own remembered view (not the one just left)
 void navigation_go_back() {
     if (!tabmodel_go_back()) return;
-    navigate_replace(tabmodel_active());
+    TabState* t = tabmodel_active();
+    t->view = view_for_folder(t->current);
+    navigate_replace(t);
 }
 void navigation_go_forward() {
     if (!tabmodel_go_forward()) return;
-    navigate_replace(tabmodel_active());
+    TabState* t = tabmodel_active();
+    t->view = view_for_folder(t->current);
+    navigate_replace(t);
+}
+
+// replace the current folder without a history entry (it was deleted, renamed, ...)
+void navigate_in_place(PITEMID_CHILD pidl) {
+    tabmodel_on_navigate(pidl, false);  // adopts pidl
+    TabState* t = tabmodel_active();
+    if (!t) return;
+    t->view = view_for_folder(t->current);
+    navigate_replace(t);
 }
 bool navigation_can_up() { return !pidl_is_desktop(g_current); }
 void navigation_go_up() {
@@ -208,3 +259,14 @@ void navigation_go_up() {
     navigate_owned(parent);
 }
 void navigation_refresh() { start_enum_current(true); }
+
+// The current folder was deleted or moved away behind our back: go to the nearest
+// folder above it that still exists, in place (Back must not lead into the void).
+bool navigation_leave_if_gone() {
+    if (search_is_results(g_current) || !fs_folder_missing(g_current)) return false;
+    PITEMID_CHILD up = pidl_clone(g_current);
+    while (up && !pidl_is_desktop(up) && fs_folder_missing(up)) ILRemoveLastID(up);
+    if (!up) return false;
+    navigate_in_place(up);
+    return true;
+}

@@ -11,6 +11,8 @@ static Palette s_pal{};
 static int s_dpi = 96;
 static ULONG_PTR s_gdipToken = 0;
 static HFONT s_bold = nullptr;
+static HFONT s_content = nullptr, s_contentBold = nullptr;
+static int s_textScale = 100;
 static HFONT s_glyphFonts[64]{};     // per 96-dpi pixel size (index = px), current DPI
 static bool s_fluent = true;         // Segoe Fluent Icons present (else MDL2 Assets)
 
@@ -123,6 +125,8 @@ void theme_init() {
 void theme_shutdown() {
     for (auto& f : s_glyphFonts) if (f) { DeleteObject(f); f = nullptr; }
     if (s_bold) { DeleteObject(s_bold); s_bold = nullptr; }
+    if (s_content) { DeleteObject(s_content); s_content = nullptr; }
+    if (s_contentBold) { DeleteObject(s_contentBold); s_contentBold = nullptr; }
     if (s_gdipToken) Gdiplus::GdiplusShutdown(s_gdipToken);
 }
 
@@ -138,9 +142,9 @@ bool theme_reload() {
 
 int theme_dpi() { return s_dpi; }
 
-static HFONT make_ui_font(int dpi, int weight) {
+static HFONT make_ui_font(int dpi, int weight, int pct = 100) {
     LOGFONTW lf{};
-    lf.lfHeight = -MulDiv(9, dpi, 72);
+    lf.lfHeight = -MulDiv(9 * pct, dpi, 72 * 100);
     lf.lfWeight = weight;
     lf.lfCharSet = DEFAULT_CHARSET;
     lf.lfQuality = CLEARTYPE_QUALITY;
@@ -171,30 +175,81 @@ static HFONT make_icon_font(const wchar_t* face, int pt, int dpi) {
     return CreateFontIndirectW(&lf);
 }
 
+// the content fonts at the current DPI and text size; the old ones stay alive until
+// the controls have the new ones
+static void make_content_fonts(HFONT* oldContent, HFONT* oldBold) {
+    *oldContent = s_content;
+    *oldBold = s_contentBold;
+    s_content = make_ui_font(s_dpi, FW_REGULAR, s_textScale);
+    s_contentBold = make_ui_font(s_dpi, FW_SEMIBOLD, s_textScale);
+}
+
+// the panes' own windows get the content font, everything else the UI font. Only the
+// main window's direct children: nested ones (the breadcrumb's edit, a preview
+// handler's window) are their owners' business.
+static void push_fonts() {
+    if (!g_main) return;
+    EnumChildWindows(g_main, [](HWND h, LPARAM) -> BOOL {
+        if (GetParent(h) != g_main) return TRUE;
+        bool content = h == g_tree || h == g_list;
+        SendMessageW(h, WM_SETFONT, (WPARAM)(content ? s_content : g_font), TRUE);
+        return TRUE;
+    }, 0);
+}
+
 void theme_set_dpi(int dpi) {
     if (dpi <= 0) dpi = 96;
     bool first = !g_font;
     if (!first && dpi == s_dpi) return;
     s_dpi = dpi;
     HFONT oldUi = g_font, oldIcon = g_iconFont, oldMdl2 = g_mdl2Font, oldBold = s_bold;
+    HFONT oldContent = nullptr, oldContentBold = nullptr;
     g_font = make_ui_font(dpi, FW_REGULAR);
     s_bold = make_ui_font(dpi, FW_SEMIBOLD);
+    make_content_fonts(&oldContent, &oldContentBold);
     g_iconFont = make_icon_font(L"Segoe Fluent Icons", 11, dpi);
     g_mdl2Font = make_icon_font(L"Segoe MDL2 Assets", 11, dpi);
     for (auto& f : s_glyphFonts) if (f) { DeleteObject(f); f = nullptr; }
-    if (g_main) {
-        EnumChildWindows(g_main, [](HWND h, LPARAM) -> BOOL {
-            SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
-            return TRUE;
-        }, 0);
-    }
+    push_fonts();
     if (oldUi) DeleteObject(oldUi);
     if (oldIcon) DeleteObject(oldIcon);
     if (oldMdl2) DeleteObject(oldMdl2);
     if (oldBold) DeleteObject(oldBold);
+    if (oldContent) DeleteObject(oldContent);
+    if (oldContentBold) DeleteObject(oldContentBold);
 }
 
 HFONT ui_font_bold() { return s_bold ? s_bold : g_font; }
+
+// Explorer-like zoom steps
+static const int kTextScales[] = { 80, 90, 100, 110, 125, 150, 175, 200 };
+
+int text_scale() { return s_textScale; }
+
+int text_scale_step(int pct, int dir) {
+    if (dir > 0) {
+        for (int s : kTextScales) if (s > pct) return s;
+        return kTextScales[ARRAYSIZE(kTextScales) - 1];
+    }
+    for (int i = ARRAYSIZE(kTextScales) - 1; i >= 0; --i) if (kTextScales[i] < pct) return kTextScales[i];
+    return kTextScales[0];
+}
+
+void theme_set_text_scale(int pct) {
+    pct = std::clamp(pct, kTextScales[0], kTextScales[ARRAYSIZE(kTextScales) - 1]);
+    if (pct == s_textScale && s_content) return;
+    s_textScale = pct;
+    if (!g_font) return;                 // before the first theme_set_dpi: made there
+    HFONT oldContent = nullptr, oldBold = nullptr;
+    make_content_fonts(&oldContent, &oldBold);
+    if (g_tree) SendMessageW(g_tree, WM_SETFONT, (WPARAM)s_content, TRUE);
+    if (g_list) SendMessageW(g_list, WM_SETFONT, (WPARAM)s_content, TRUE);
+    if (oldContent) DeleteObject(oldContent);
+    if (oldBold) DeleteObject(oldBold);
+}
+
+HFONT content_font() { return s_content ? s_content : g_font; }
+HFONT content_font_bold() { return s_contentBold ? s_contentBold : ui_font_bold(); }
 
 HFONT glyph_font(int px96) {
     if (px96 <= 0 || px96 >= 64) px96 = 16;

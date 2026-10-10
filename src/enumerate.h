@@ -10,6 +10,13 @@ void enumerate_start(PCIDLIST_ABSOLUTE folderAbs, bool keepView);
 // After the next listing is applied, select (and optionally start renaming) this item.
 void enum_set_pending_select(const std::wstring& name, bool beginRename);
 
+// Files changed in the folder shown (full paths from change notifications): their items
+// are read again on a worker and replaced, added or removed in place — no re-listing.
+// Busy: try again shortly (a listing or a rename is under way). Unsupported: the folder
+// isn't a plain directory (refresh it instead).
+enum class ChangeApply { Started, Busy, Unsupported };
+ChangeApply enum_apply_changes(const std::vector<std::wstring>& paths);
+
 // UI-thread entry points (called from main.cpp)
 void enum_apply_op(HeapEnumOp* op);      // WM_ENUM_DONE handler (takes ownership of op)
 void enum_on_stream_timer();             // TIMER_ENUM_STREAM: show the rows found so far

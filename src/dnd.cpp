@@ -1,6 +1,7 @@
 #include "dnd.h"
 #include "listview.h"
 #include "tree.h"
+#include "detailspane.h"
 
 // ---------------------------------------------------------------
 // IDropSource
@@ -102,6 +103,7 @@ private:
             if (h != m_treeHover) { TreeView_SelectDropTarget(m_hwnd, h); m_treeHover = h; }
             if (!h || !(th.flags & TVHT_ONITEM)) return 0;
             PITEMID_CHILD abs = tree_get_pidl_of_item(h);
+            if (!abs) return 0;         // a separator (nullptr isn't the Desktop here)
             ULONGLONG key = pidl_sig(abs) | 1;
             if (key != m_targetKey) target_for_item(abs, out.put());
             if (abs) CoTaskMemFree(abs);
@@ -190,6 +192,7 @@ public:
         HRESULT hr = S_OK;
         if (m_target) {
             DWORD eff = allowed;
+            detailspane_release_files();    // a moved file may be the one previewed
             hr = m_target->Drop(pdo, keys, pt, &eff);
             *peffect = eff;
         } else {
@@ -229,6 +232,7 @@ void dnd_begin_list_drag() {
     if (FAILED(dataobject_from_children(g_main, psf.get(), sel, pdo.put())) || !pdo) return;
     DWORD effect = 0;
     DropSource* src = new DropSource;
+    detailspane_release_files();        // the drop may move the previewed file elsewhere
     SHDoDragDrop(g_main, pdo.get(), src, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK, &effect);
     src->Release();
 }

@@ -458,6 +458,8 @@ static void show_cm(HWND hwnd, POINT pt, IShellFolder* parent, PCIDLIST_ABSOLUTE
         } else if (verb == L"rename") {
             if (src == MenuSource::List) list_rename_selected();
             else tree_rename_menu_node();
+        } else if (verb == L"delete" && src == MenuSource::Tree) {
+            tree_delete_menu_node(key_down(VK_SHIFT));     // moves on to the next folder
         } else if ((verb == L"cut" || verb == L"copy") && src == MenuSource::List) {
             list_copy_selection(verb == L"cut");
         } else {

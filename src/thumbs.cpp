@@ -138,6 +138,21 @@ void thumb_reset_for_new_folder() {
     for (Item* it : g_items) { it->thumbReady.store(0); it->thumbIndex = -1; }
 }
 
+// the image list may hold this many thumbnails (~256 MB): beyond it they start over —
+// the rows on screen ask again (scrolling through thousands of photos)
+static int max_images(int extra) { int px = thumb_px(extra); return (256 << 20) / (px * px * 4); }
+
+// A refresh of the same folder: the new items kept their thumbnails (enum_apply_op
+// carried them over), only the requests still queued are for the old ones. Images of
+// items that went stay in the list until it is worth starting over.
+void thumb_keep_for_refresh(size_t kept) {
+    ++s_opId;
+    drop_queued();
+    HIMAGELIST il = g_view.thumbsExtra ? s_lists[g_view.thumbsExtra] : nullptr;
+    int count = il ? ImageList_GetImageCount(il) : 0;
+    if (count > 2 * (int)kept + 512 || count >= max_images(g_view.thumbsExtra)) thumb_reset_for_new_folder();
+}
+
 // Called with g_itemsMx held (from LVN_GETDISPINFO).
 void thumb_get_or_request(Item* it, int, int* outImageIndex) {
     *outImageIndex = -1;
@@ -163,23 +178,30 @@ static void apply_result(void* payload) {
         delete m;
         return;
     }
-    int imgIndex = -1;
-    if (m->hbm) {
-        imgIndex = ImageList_Add(ensure_list(m->extra), m->hbm, nullptr);
-        DeleteObject(m->hbm);
+    HIMAGELIST il = ensure_list(m->extra);
+    if (il && ImageList_GetImageCount(il) >= max_images(m->extra)) {
+        // full: start over; the rows on screen ask again as they repaint
+        if (m->hbm) DeleteObject(m->hbm);
+        delete m;
+        thumb_reset_for_new_folder();
+        InvalidateRect(g_list, nullptr, FALSE);
+        return;
     }
-    // find the row by signature (the list may have been re-sorted meanwhile)
+    // find the row by signature (the list may have been re-sorted meanwhile); an item
+    // that went meanwhile gets no slot in the image list
     int row = -1;
     {
         std::lock_guard<std::mutex> lk(g_itemsMx);
         for (size_t i = 0; i < g_items.size(); ++i) {
             if (g_items[i]->sig != m->sig) continue;
             row = (int)i;
+            int imgIndex = m->hbm && il ? ImageList_Add(il, m->hbm, nullptr) : -1;
             if (imgIndex >= 0) { g_items[i]->thumbIndex = imgIndex; g_items[i]->thumbReady.store(2); }
-            // failure: leave "queued" so we don't retry forever; the row stays imageless
+            // failure: leave "queued" so we don't retry forever; the row keeps its icon
             break;
         }
     }
+    if (m->hbm) DeleteObject(m->hbm);
     if (row >= 0) ListView_RedrawItems(g_list, row, row);
     delete m;
 }

@@ -188,8 +188,7 @@ void search_submit() {
     }
     if (refining) {
         // refining a search replaces the results in place (no extra history entry)
-        tabmodel_on_navigate(results, false);
-        navigate_replace(tabmodel_active());
+        navigate_in_place(results);
     } else {
         navigate_owned(results);
     }

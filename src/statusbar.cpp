@@ -1,5 +1,6 @@
 #include "statusbar.h"
 #include "theme.h"
+#include "acc.h"
 
 static std::wstring s_left, s_right;
 static int s_hover = -1;
@@ -24,8 +25,39 @@ static bool toggle_on(int i) {
                   : (g_view.lvView == LV_VIEW_ICON && g_view.thumbsExtra == 1);
 }
 
+// screen readers: the status text, then the two view buttons
+static const wchar_t* kName[] = { L"Details", L"Large icons" };
+static const wchar_t* kKeys[] = { L"Ctrl+Shift+6", L"Ctrl+Shift+2" };
+static const AccSource s_acc = [] {
+    AccSource a;
+    a.name = L"Status";
+    a.role = ROLE_SYSTEM_STATUSBAR;
+    a.count = [] { return 3; };
+    a.child = [](int i) {
+        AccChild c;
+        RECT rc{}; GetClientRect(g_status, &rc);
+        if (i == 0) {
+            c.name = s_right.empty() ? s_left : s_left + L", " + s_right;
+            c.role = ROLE_SYSTEM_STATICTEXT;
+            c.state = STATE_SYSTEM_READONLY;
+            c.rc = { S(12), 0, rc.right - S(80), rc.bottom };
+        } else {
+            c.name = kName[i - 1];
+            c.shortcut = kKeys[i - 1];
+            c.role = ROLE_SYSTEM_PUSHBUTTON;
+            c.action = L"Press";
+            c.rc = toggle_rect(rc, i - 1);
+            if (toggle_on(i - 1)) c.state |= STATE_SYSTEM_PRESSED;
+        }
+        return c;
+    };
+    a.action = [](int i) { if (i > 0) PostMessageW(g_main, WM_COMMAND, kCmd[i - 1], 0); };
+    return a;
+}();
+
 static LRESULT CALLBACK status_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+        case WM_GETOBJECT: return acc_get_object(hwnd, wp, lp, &s_acc);
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: {
             BufferedPaint bp(hwnd);
@@ -105,6 +137,7 @@ void statusbar_set(const std::wstring& left, const std::wstring& right) {
     std::wstring all = right.empty() ? left : left + L" | " + right;
     SetWindowTextW(g_status, all.c_str());
     InvalidateRect(g_status, nullptr, FALSE);
+    acc_notify(g_status, EVENT_OBJECT_NAMECHANGE, 0);
 }
 
 void statusbar_refresh() {

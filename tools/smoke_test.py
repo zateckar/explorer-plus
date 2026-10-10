@@ -3,7 +3,7 @@
 Builds a scratch folder under <workdir>, drives the app through window messages and
 checks results on disk / in the UI. Screenshots land in <workdir>/shots.
 """
-import os, sys, time, shutil, subprocess, ctypes, ctypes.wintypes as W
+import os, sys, time, shutil, struct, subprocess, atexit, ctypes, ctypes.wintypes as W
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import winauto
 from winauto import App, menu_items, u, children, cls, text, clipboard_text, WM_KEYDOWN, WM_SETTEXT
@@ -13,13 +13,27 @@ IDM = dict(NEWFOLDER=40010, NEWTAB=40011, CLOSETAB=40012, COPY=40031, PASTE=4003
            LIST=40055, HIDDEN=40056, BACK=40070, FWD=40071, UP=40072, REFRESH=40073, INVERT=40035,
            NEW_MENU=40130, COPY_PATH=40135, NEW_WINDOW=40137, FOCUS_ADDRESS=40096,
            GROUP_NONE=40141, GROUP_TYPE=40144, XLARGE=40150, CHECKBOXES=40152, EXTENSIONS=40153,
-           PREVIEW=40154, COMPACT=40155, TOOLS_MENU=40156, CMDBAR=40157, SORT_COL=40160)
+           PREVIEW=40154, COMPACT=40155, TOOLS_MENU=40156, CMDBAR=40157, SORT_COL=40160,
+           VIEW_MENU=40132, MORE_MENU=40133, APPLY_ALL=40138, RESET_ALL=40139,
+           TEXT_LARGER=40100, TEXT_SMALLER=40101, TEXT_RESET=40102, TREE_DELETE=40103)
+LV_VIEW_DETAILS, LV_VIEW_LIST, LV_VIEW_TILE = 1, 3, 4
+LVM_GETVIEW, TVM_GETITEMHEIGHT = 0x108F, 0x111C
 
 exe, work = os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2])
+# the test deletes <workdir>\testdata and recycles files in it: never a drive root, a
+# profile or system folder, or a folder that already holds something else
+home = os.path.abspath(os.path.expanduser('~'))
+protected = {os.path.normcase(p) for p in (home, os.path.dirname(home), os.environ.get('SystemRoot', r'C:\Windows'),
+                                           os.environ.get('ProgramFiles', r'C:\Program Files'))}
+if (os.path.dirname(work) == work or os.path.normcase(work) in protected
+        or (os.path.isdir(work) and [n for n in os.listdir(work)
+                                     if n not in ('testdata', 'shots') and not n.startswith('settings.ini')])):
+    sys.exit('refusing to use %s as the scratch folder: give a new or empty folder' % work)
 data = os.path.join(work, 'testdata')
 shots = os.path.join(work, 'shots')
 shutil.rmtree(data, ignore_errors=True)
 os.makedirs(os.path.join(data, 'sub'))
+os.makedirs(os.path.join(data, '.dotdir'))        # like .git: once showed a file icon in the tree
 os.makedirs(shots, exist_ok=True)
 for n in ('a.txt', 'b.txt'):
     with open(os.path.join(data, n), 'w') as f:
@@ -27,6 +41,19 @@ for n in ('a.txt', 'b.txt'):
 wall = r'C:\Windows\Web\Wallpaper\Windows\img0.jpg'
 if os.path.exists(wall):
     shutil.copy(wall, os.path.join(data, 'photo.jpg'))
+else:   # Server / trimmed images: the checks only need a big .jpg without a preview handler
+    with open(os.path.join(data, 'photo.jpg'), 'wb') as f:
+        f.write(b'\xff\xd8\xff\xe0' + bytes(256 * 1024))
+
+# the test copies paths to the clipboard: put back the text that was there (other
+# formats can't be restored) and never leave an app instance running, whatever happens
+saved_clip = clipboard_text()
+def cleanup():
+    for a in winauto.started:
+        if a.proc.poll() is None:
+            a.proc.kill()
+    winauto.set_clipboard_text(saved_clip)
+atexit.register(cleanup)
 
 results = []
 def check(name, ok, detail=''):
@@ -68,12 +95,80 @@ expected = len(os.listdir(data))
 check('lists folder', wait_for(lambda: app.item_count() == expected), (app.item_count(), expected))
 app.screenshot(os.path.join(shots, '01_details.png'))
 
+# the window (and so the taskbar button) carries the exe's own icon, not a folder
+def class_icon():
+    u.GetClassLongPtrW.restype = ctypes.c_void_p
+    u.GetClassLongPtrW.argtypes = [W.HWND, ctypes.c_int]
+    return u.GetClassLongPtrW(app.hwnd, -14)                         # GCLP_HICON
+def exe_icon():
+    k = ctypes.windll.kernel32
+    k.LoadLibraryExW.restype = ctypes.c_void_p
+    k.LoadLibraryExW.argtypes = [W.LPCWSTR, W.HANDLE, W.DWORD]
+    u.LoadImageW.restype = ctypes.c_void_p
+    u.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, W.UINT, ctypes.c_int, ctypes.c_int, W.UINT]
+    mod = k.LoadLibraryExW(exe, None, 0x20 | 0x2)                    # AS_IMAGE_RESOURCE | AS_DATAFILE
+    return u.LoadImageW(mod, 1, 1, 32, 32, 0) if mod else None       # IDI_APP
+def folder_icon():
+    info = ctypes.create_string_buffer(544)                          # SHSTOCKICONINFO
+    struct.pack_into('<I', info, 0, 544)
+    ctypes.windll.shell32.SHGetStockIconInfo(3, 0x100, info)         # SIID_FOLDER, SHGSI_ICON
+    return struct.unpack_from('<Q', info, 8)[0]
+mine, own, folder = class_icon(), exe_icon(), folder_icon()
+if mine and own and folder:
+    px = winauto.icon_pixels(mine)
+    d_own, d_folder = winauto.pixel_distance(px, winauto.icon_pixels(own)), winauto.pixel_distance(px, winauto.icon_pixels(folder))
+    check('window icon is the exe icon (taskbar)', d_own < 8 and d_own < d_folder, (round(d_own, 1), round(d_folder, 1)))
+else:
+    check('window icon is the exe icon (taskbar)', False, (mine, own, folder))
+
+# navigation pane: every folder node has a folder icon (index 0 is the system list's
+# generic file icon; startup races once left .git-like folders with it)
+wait_for(lambda: any(app.tree_item(h)[0] == '.dotdir' for h in app.tree_nodes()), 5)
+nodes = [app.tree_item(h) for h in app.tree_nodes()]
+check('tree shows the scratch folder\'s subfolders', any(t == '.dotdir' for t, _ in nodes), [t for t, _ in nodes])
+bad = [(t, i) for t, i in nodes if t and i <= 0]
+check('no tree node has the generic file icon', not bad, bad)
+
+# List view rows keep the Details row spacing (were packed edge to edge)
+def row_h(i=0):
+    r = app.item_rect(i, 0)
+    return r[3] - r[1]
+details_h = row_h()
+app.command(IDM['LIST']); time.sleep(0.8)
+list_h = row_h()
+check('List view rows are spaced like Details', list_h >= details_h - 1 and list_h > 20, (list_h, details_h))
+app.screenshot(os.path.join(shots, '01_list.png'))
+app.command(IDM['DETAILS']); time.sleep(0.5)
+
+# a double-click on empty space below the items goes up a level
+rc = W.RECT()
+u.GetClientRect(app.list, ctypes.byref(rc))
+pt = ((rc.bottom - 8) << 16) | 60
+last = app.item_rect(app.item_count() - 1, 0)
+if last[3] < rc.bottom - 8:
+    u.PostMessageW(app.list, 0x0203, 1, pt); u.PostMessageW(app.list, 0x0202, 0, pt)   # DBLCLK, UP
+    check('double-click on empty list space goes up',
+          wait_for(lambda: app.title().startswith(os.path.basename(work)), 3), app.title())
+else:
+    check('double-click on empty list space goes up', False, 'no empty space below the items')
+app.go(data)
+r = app.item_rect(app.select_name('sub'), 0)
+pt = (((r[1] + r[3]) // 2) << 16) | (r[0] + 30)
+u.PostMessageW(app.list, 0x0203, 1, pt); u.PostMessageW(app.list, 0x0202, 0, pt)
+check('double-click on an item still opens it', wait_for(lambda: app.title().startswith('sub'), 3), app.title())
+app.go(data)
+
 app.command(IDM['MEDIUM'])
 time.sleep(2)
 app.screenshot(os.path.join(shots, '02_medium.png'))
 app.command(IDM['TILES'])
 time.sleep(1)
 app.screenshot(os.path.join(shots, '03_tiles.png'))
+# a tile's lines under the name are its Type / Size sub-items (sub-item 0 is the name
+# again: it showed the title twice until the tile was hovered)
+tile_row = next((i for i in range(app.item_count()) if app.item_text(i) == 'a.txt'), 0)
+tcols = app.tile_columns(tile_row)
+check('tiles show type / size under the name, not the name again', tcols and 0 not in tcols, tcols)
 app.command(IDM['DETAILS'])
 
 # select all / invert: must not deadlock
@@ -157,6 +252,33 @@ check('"..." lists the command bar commands', all(s in entries for s in ('New', 
 if fly:
     u.PostMessageW(fly, 0x0102, ord('b'), 0)       # "Show command &bar"
 check('"Show command bar" brings the row back', wait_for(cmdbar_visible, 3))
+def open_popup(cmd):
+    """Post a command that shows a classic popup menu: (menu window, item texts)."""
+    u.PostMessageW(app.hwnd, 0x0111, cmd, 0)
+    for _ in range(20):
+        time.sleep(0.25)
+        menu = next((h for h in winauto.top_windows(app.proc.pid) if cls(h) == '#32768' and u.IsWindowVisible(h)), None)
+        if menu:
+            return menu, menu_items(u.SendMessageW(menu, 0x01E1, 0, 0))
+    return None, []
+def choose(menu, items, label):
+    idx = next((i for i, s in enumerate(items) if s.replace('&', '').split('\t')[0] == label), -1)
+    if menu and idx >= 0:
+        u.SendMessageW(menu, 0x01E5, idx, 0)                       # MN_SELECTITEM
+        u.PostMessageW(menu, WM_KEYDOWN, 0x0D, 0)
+    else:
+        app.close_menus()
+    return idx >= 0
+menu, items = open_popup(IDM['VIEW_MENU'])
+clean = [s.replace('&', '').split('\t')[0] for s in items]
+check('View menu offers Text size and Apply / Reset all folders',
+      all(s in clean for s in ('Text size', 'Apply this view to all folders', 'Reset all folders')), clean)
+app.close_menus()
+menu, items = open_popup(IDM['MORE_MENU'])
+check('the bar\'s "..." menu has "Hide command bar"', choose(menu, items, 'Hide command bar'), items)
+check('"Hide command bar" hides the row', wait_for(lambda: not cmdbar_visible(), 3))
+app.command(IDM['CMDBAR'])
+check('View > Command bar toggles it back', wait_for(cmdbar_visible, 3))
 app.command(IDM['CMDBAR'])
 check('command bar hidden again', wait_for(lambda: not cmdbar_visible(), 3))
 
@@ -251,6 +373,31 @@ check('Ctrl+L shows the address edit with the path',
 u.SendMessageW(app.addr_edit, WM_KEYDOWN, 0x1B, 0)
 time.sleep(0.3)
 check('Esc returns to the breadcrumb', not u.IsWindowVisible(app.addr_edit))
+
+# F6 / Tab move the keyboard focus around the panes: address bar (editing), search box,
+# navigation pane, file list
+class GUITHREADINFO(ctypes.Structure):
+    _fields_ = [('cbSize', W.DWORD), ('flags', W.DWORD), ('hwndActive', W.HWND), ('hwndFocus', W.HWND),
+                ('hwndCapture', W.HWND), ('hwndMenuOwner', W.HWND), ('hwndMoveSize', W.HWND),
+                ('hwndCaret', W.HWND), ('rcCaret', W.RECT)]
+def focused():
+    gi = GUITHREADINFO(cbSize=ctypes.sizeof(GUITHREADINFO))
+    tid = u.GetWindowThreadProcessId(app.hwnd, None)
+    return gi.hwndFocus if u.GetGUIThreadInfo(tid, ctypes.byref(gi)) else None
+search = winauto.child_by_id(app.hwnd, App.IDC_SEARCH)
+if focused() and focused() == app.list:
+    seen = []
+    for key, want in ((0x75, app.addr_edit), (0x75, search), (0x09, app.tree), (0x09, app.list)):   # F6 F6 Tab Tab
+        u.PostMessageW(focused(), WM_KEYDOWN, key, 0)
+        wait_for(lambda: focused() == want, 2)
+        seen.append(cls(focused()) if focused() else None)
+        if focused() != want:
+            break
+    check('F6 / Tab cycle the focus: address, search, navigation pane, list',
+          len(seen) == 4 and focused() == app.list, seen)
+    check('... and leaving the address bar ends its edit', not u.IsWindowVisible(app.addr_edit))
+else:
+    print('  (skipped the focus cycle: the list does not have the focus)', focused())
 
 # Ctrl+N opens a second window on the same folder (separate process)
 before = set(winauto.windows_of_class('ExplorerPlusMainWnd'))
@@ -543,6 +690,96 @@ if ed:
     u.SendMessageW(ed, WM_KEYDOWN, 0x0D, 0)
 check('renaming a shortcut keeps its hidden .lnk', wait_for(lambda: os.path.isfile(os.path.join(data, 'link.lnk')), 6),
       os.listdir(data))
+
+def dialogs():
+    return [h for h in winauto.top_windows(app.proc.pid) if cls(h) == '#32770' and u.IsWindowVisible(h)]
+def view():
+    return u.SendMessageW(app.list, LVM_GETVIEW, 0, 0)
+
+# View > Apply this view to all folders: a folder never opened before gets this
+# folder's view and columns; Reset all folders brings every folder back to Details
+app.command(IDM['DETAILS']); time.sleep(0.5)
+base_cols = header_count()
+choose_column('Date created')
+applied_cols = header_count()
+app.command(IDM['LIST']); time.sleep(0.5)
+app.command(IDM['APPLY_ALL']); time.sleep(0.5)
+fresh = os.path.join(data, 'fresh')
+os.makedirs(fresh)
+app.go(fresh)
+check('Apply to all folders: a new folder opens in that view', view() == LV_VIEW_LIST, view())
+check('Apply to all folders: a new folder gets those columns', header_count() == applied_cols, (header_count(), applied_cols))
+app.go(os.path.join(data, 'sub'))
+check('Apply to all folders: folders with their own view follow too', view() == LV_VIEW_LIST, view())
+app.command(IDM['RESET_ALL']); time.sleep(1)
+check('Reset all folders: back to Details', view() == LV_VIEW_DETAILS, view())
+app.go(fresh)
+check('Reset all folders: default columns again', view() == LV_VIEW_DETAILS and header_count() == base_cols,
+      (view(), header_count(), base_cols))
+app.go(data)
+
+# text size: list and tree rows grow, the menu limits hold, the size survives a restart
+rows0, tree0 = row_h(), u.SendMessageW(app.tree, TVM_GETITEMHEIGHT, 0, 0)
+app.command(IDM['TEXT_LARGER']); app.command(IDM['TEXT_LARGER']); time.sleep(0.5)
+rows1, tree1 = row_h(), u.SendMessageW(app.tree, TVM_GETITEMHEIGHT, 0, 0)
+check('Larger text grows list and tree rows', rows1 > rows0 and tree1 > tree0, (rows0, rows1, tree0, tree1))
+app.screenshot(os.path.join(shots, '11_text_larger.png'))
+app.command(IDM['TEXT_SMALLER']); time.sleep(0.3)
+check('Smaller text shrinks them again', rows0 < row_h() < rows1, (rows0, row_h(), rows1))
+app.command(IDM['TEXT_LARGER']); time.sleep(0.3)
+
+# a folder in the profile, inside the hidden AppData: the tree walks there under This PC
+# (the path's own pidl goes by way of the user's folder) and shows AppData on the way
+temp = os.environ.get('TEMP', '')
+if temp.lower().startswith(os.path.expanduser('~').lower() + '\\appdata\\'):
+    app.go(temp, 2.0)
+    check('the tree follows into a folder inside the hidden AppData',
+          wait_for(lambda: app.tree_item(app.tree_caret())[0].lower() == os.path.basename(temp).lower(), 8),
+          app.tree_item(app.tree_caret()))
+    app.go(data)
+
+# deleting the open folder in the navigation pane opens the next folder, no error
+for n in ('del1', 'del2'):
+    os.makedirs(os.path.join(data, n))
+app.go(os.path.join(data, 'del1'), 2.0)
+caret_ok = wait_for(lambda: app.tree_item(app.tree_caret())[0] == 'del1', 8)
+check('the tree selects a folder created while the app runs', caret_ok, app.tree_item(app.tree_caret()))
+if not caret_ok:                                                     # never delete the wrong node
+    app.close(); sys.exit('aborting: the tree is not on the scratch folder')
+u.PostMessageW(app.tree, WM_KEYDOWN, 0x2E, 0)                        # Del in the tree (TVN_KEYDOWN)
+errors, seen = [], set()
+def tree_delete_done():
+    for h in dialogs():
+        if 'Delete' in text(h):                                      # recycle confirmation: Yes
+            seen.add(text(h))
+            for c in children(h):
+                if cls(c) == 'Button' and u.GetDlgCtrlID(c) == 6:
+                    u.PostMessageW(c, 0x00F5, 0, 0)                  # BM_CLICK
+        else:
+            errors.append(text(h)); u.PostMessageW(h, 0x0010, 0, 0)
+    return not os.path.exists(os.path.join(data, 'del1')) and app.title().startswith('del2')
+check('tree Delete removes the open folder and opens the next one', wait_for(tree_delete_done, 10),
+      (os.path.exists(os.path.join(data, 'del1')), app.title(), seen))
+time.sleep(1.5)
+errors += [text(h) for h in dialogs()]
+check('tree Delete shows no "Location is not available"', not errors, errors)
+
+# the open folder removed behind the app's back: it goes to the parent, no error
+os.rmdir(os.path.join(data, 'del2'))
+check('a folder deleted externally leaves for its parent', wait_for(lambda: app.title().startswith('testdata'), 6), app.title())
+time.sleep(1.5)
+errors = [text(h) for h in dialogs()]
+check('... without an error dialog', not errors, errors)
+for h in dialogs():
+    u.PostMessageW(h, 0x0010, 0, 0)
+
+app.close()
+check('exits cleanly after the second run', app.proc.returncode == 0, app.proc.returncode)
+app = App(exe, data, settings=ini)
+app.wait_idle(2)
+check('text size remembered after restart', row_h() == rows1, (row_h(), rows1))
+app.command(IDM['TEXT_RESET']); time.sleep(0.5)
+check('Reset text size', row_h() == rows0, (row_h(), rows0))
 app.close()
 
 failed = [n for n, ok in results if not ok]

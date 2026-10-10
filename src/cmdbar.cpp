@@ -10,6 +10,7 @@ using std::min;
 #include "columns.h"
 #include "flyout.h"
 #include "navbar.h"
+#include "acc.h"
 #include <vector>
 
 enum class Kind { Button, Separator, Spacer };
@@ -201,10 +202,26 @@ static HMENU build_sort_menu() {
     return m;
 }
 
+static HMENU build_text_size_menu() {
+    HMENU m = CreatePopupMenu();
+    int pct = text_scale();
+    AppendMenuW(m, MF_STRING | (text_scale_step(pct, +1) == pct ? MF_GRAYED : 0), IDM_TEXT_LARGER, L"Larger\tCtrl++");
+    AppendMenuW(m, MF_STRING | (text_scale_step(pct, -1) == pct ? MF_GRAYED : 0), IDM_TEXT_SMALLER, L"Smaller\tCtrl+-");
+    std::wstring reset = L"Reset (" + std::to_wstring(pct) + L"%)\tCtrl+0";
+    AppendMenuW(m, MF_STRING | (pct == 100 ? MF_GRAYED : 0), IDM_TEXT_RESET, reset.c_str());
+    return m;
+}
+
 static HMENU build_view_menu() {
     HMENU m = menu_view_modes();
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | menu_flag(g_compactView), IDM_VIEW_COMPACT, L"Compact view");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)build_text_size_menu(), L"Text size");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | (columns_can_apply_to_all() ? 0 : MF_GRAYED), IDM_VIEW_APPLY_ALL,
+                L"Apply this view to all folders");
+    AppendMenuW(m, MF_STRING, IDM_VIEW_RESET_ALL, L"Reset all folders");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     HMENU show = CreatePopupMenu();
     AppendMenuW(show, MF_STRING | menu_flag(g_cmdBarVisible), IDM_VIEW_CMDBAR, L"Command bar");
     AppendMenuW(show, MF_STRING | menu_flag(g_treeVisible), IDM_VIEW_NAVPANE, L"Navigation pane");
@@ -230,6 +247,8 @@ static HMENU build_more_menu() {
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_NEW_WINDOW, L"New window\tCtrl+N");
     AppendMenuW(m, MF_STRING, IDM_OPTIONS, L"Options");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, IDM_VIEW_CMDBAR, L"Hide command bar");   // back into the nav row's "..."
     return m;
 }
 
@@ -313,9 +332,46 @@ void cmdbar_show_tools() {
 }
 
 // ------------------------------------------------------------------
+// screen readers: the buttons (not separators / the spacer), named by their label or the
+// tip's text before "(shortcut)"
+
+static std::vector<int> acc_buttons() {
+    std::vector<int> v;
+    for (int i = 0; i < kCount; ++i)
+        if (kItems[i].kind == Kind::Button) v.push_back(i);
+    return v;
+}
+static const AccSource s_acc = [] {
+    AccSource a;
+    a.name = L"Commands";
+    a.role = ROLE_SYSTEM_TOOLBAR;
+    a.count = [] { return (int)acc_buttons().size(); };
+    a.child = [](int n) {
+        int i = acc_buttons()[n];
+        const CmdItem& it = kItems[i];
+        AccChild c;
+        std::wstring tip = it.tip ? it.tip : L"";
+        size_t paren = tip.find(L" (");
+        c.name = it.label ? it.label : tip.substr(0, paren);
+        if (paren != std::wstring::npos && tip.back() == L')')
+            c.shortcut = tip.substr(paren + 2, tip.size() - paren - 3);
+        bool menu = it.dropdown || it.cmd == IDM_MORE_MENU;
+        c.role = menu ? ROLE_SYSTEM_BUTTONMENU : ROLE_SYSTEM_PUSHBUTTON;
+        c.action = menu ? L"Open" : L"Press";
+        if (i < (int)s_rects.size()) c.rc = s_rects[i];
+        if (!enabled(it.cmd)) c.state |= STATE_SYSTEM_UNAVAILABLE;
+        if (toggled(it.cmd)) c.state |= STATE_SYSTEM_CHECKED;
+        if (s_hover == i) c.state |= STATE_SYSTEM_HOTTRACKED;
+        return c;
+    };
+    // (posted: a menu opened from inside the screen reader's call would block it)
+    a.action = [](int n) { PostMessageW(g_main, WM_COMMAND, MAKEWPARAM(kItems[acc_buttons()[n]].cmd, 0), 0); };
+    return a;
+}();
 
 static LRESULT CALLBACK bar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+        case WM_GETOBJECT: return acc_get_object(hwnd, wp, lp, &s_acc);
         case WM_SIZE: layout(hwnd); InvalidateRect(hwnd, nullptr, FALSE); return 0;
         case WM_SETFONT: layout(hwnd); return 0;
         case WM_ERASEBKGND: return 1;
@@ -357,6 +413,17 @@ static LRESULT CALLBACK bar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CAPTURECHANGED:
             if (s_pressed >= 0) { s_pressed = -1; InvalidateRect(hwnd, nullptr, FALSE); }
             return 0;
+        case WM_CONTEXTMENU: {
+            // right-click on the bar: hide it again
+            POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            if (pt.x == -1 && pt.y == -1) { pt = { S(8), S(8) }; ClientToScreen(hwnd, &pt); }
+            HMENU m = CreatePopupMenu();
+            AppendMenuW(m, MF_STRING, IDM_VIEW_CMDBAR, L"Hide command bar");
+            UINT id = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, g_main, nullptr);
+            DestroyMenu(m);
+            if (id) SendMessageW(g_main, WM_COMMAND, MAKEWPARAM(id, 0), 0);
+            return 0;
+        }
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -387,5 +454,7 @@ HWND cmdbar_create(HWND parent) {
 }
 
 void cmdbar_refresh() {
-    if (s_bar) InvalidateRect(s_bar, nullptr, FALSE);
+    if (!s_bar) return;
+    InvalidateRect(s_bar, nullptr, FALSE);
+    acc_notify(s_bar, EVENT_OBJECT_STATECHANGE, -1);    // what can be used follows the selection
 }

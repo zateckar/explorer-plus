@@ -52,6 +52,8 @@ add_executable(explorer-plus WIN32
     src/flyout.cpp
     src/perf.cpp
     src/crash.cpp
+    src/workers.cpp
+    src/acc.cpp
     res/resource.rc
 )
 
@@ -65,8 +67,24 @@ target_compile_options(explorer-plus PRIVATE -O2 -Wall -Wextra -Wno-unused-param
 target_compile_definitions(explorer-plus PRIVATE UNICODE _UNICODE)
 target_link_options(explorer-plus PRIVATE -municode)
 target_link_options(explorer-plus PRIVATE -mwindows -static -static-libgcc -static-libstdc++)
-# release: no symbols in the shipped exe (crash dumps are read against a symbol build)
-target_link_options(explorer-plus PRIVATE $<$<CONFIG:Release>:-s>)
+# ASLR (64-bit), DEP: recent binutils default to these, older ones don't
+target_link_options(explorer-plus PRIVATE -Wl,--dynamicbase -Wl,--nxcompat -Wl,--high-entropy-va)
+
+# release: the debug info goes to explorer-plus.debug next to the exe, the shipped exe is
+# stripped. Keep the .debug of every published build: a crash dump's module offsets are
+# resolved against it (addr2line -f -C -e explorer-plus.debug 0x<address>).
+target_compile_options(explorer-plus PRIVATE $<$<CONFIG:Release>:-g>)
+if(CMAKE_OBJCOPY AND CMAKE_STRIP)
+    add_custom_command(TARGET explorer-plus POST_BUILD
+        COMMAND "$<$<CONFIG:Release>:${CMAKE_OBJCOPY};--only-keep-debug;$<TARGET_FILE:explorer-plus>;$<TARGET_FILE_DIR:explorer-plus>/explorer-plus.debug>"
+        COMMAND "$<$<CONFIG:Release>:${CMAKE_STRIP};--strip-all;$<TARGET_FILE:explorer-plus>>"
+        COMMAND "$<$<CONFIG:Release>:${CMAKE_OBJCOPY};--add-gnu-debuglink=explorer-plus.debug;$<TARGET_FILE:explorer-plus>>"
+        WORKING_DIRECTORY "$<TARGET_FILE_DIR:explorer-plus>"
+        COMMAND_EXPAND_LISTS
+        VERBATIM)
+else()
+    target_link_options(explorer-plus PRIVATE $<$<CONFIG:Release>:-s>)
+endif()
 
 target_link_libraries(explorer-plus PRIVATE
-    comctl32 shell32 ole32 oleaut32 shlwapi uuid uxtheme comdlg32 gdi32 user32 propsys windowscodecs gdiplus dwmapi msimg32)
+    comctl32 shell32 ole32 oleaut32 shlwapi uuid uxtheme comdlg32 gdi32 user32 propsys windowscodecs gdiplus dwmapi msimg32 oleacc)

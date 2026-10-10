@@ -38,6 +38,15 @@ inline int S(int px) { return MulDiv(px, theme_dpi(), 96); }
 HFONT glyph_font(int px96);          // Segoe Fluent Icons (MDL2 fallback) at a 96-dpi pixel size
 HFONT ui_font_bold();                // semibold UI font (headings)
 
+// --- text size of the content (navigation pane, list, details pane) ---
+// a percentage of the UI font; the chrome (tabs, address, command bar) keeps its size
+int   text_scale();
+void  theme_set_text_scale(int pct); // recreates the content fonts and pushes them to tree + list
+int   text_scale_step(int pct, int dir);   // the next / previous preset size
+HFONT content_font();
+HFONT content_font_bold();
+inline int SC(int px) { return MulDiv(S(px), text_scale(), 100); }   // content metric
+
 // --- drawing ---
 // rounded rectangle (anti-aliased); border = CLR_NONE for none
 void fill_rrect(HDC hdc, const RECT& r, int radius, COLORREF fill, COLORREF border = CLR_NONE);

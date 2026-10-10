@@ -1,11 +1,12 @@
 name: Build and release
 
-# Every push / pull request: release build, smoke test, zip as a workflow artifact.
+# Every push / pull request: release build, smoke test, zips as a workflow artifact.
 # A tag vMAJOR.MINOR.PATCH (optionally -suffix, e.g. v1.2.0-rc.1 = pre-release) also
-# publishes a GitHub release with the zip and its SHA-256.
+# publishes a GitHub release with the zip, the symbols zip (for crash dumps) and their
+# SHA-256 — only if the smoke test passed.
 #
-# Optional code signing: add the repository secrets SIGNING_CERT_PFX_BASE64 (the .pfx,
-# base64-encoded) and SIGNING_CERT_PASSWORD.
+# Optional code signing of tag builds: add the repository secrets SIGNING_CERT_PFX_BASE64
+# (the .pfx, base64-encoded) and SIGNING_CERT_PASSWORD.
 
 on:
   push:
@@ -44,13 +45,18 @@ jobs:
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
 
+      # values from the event reach scripts through env:, never pasted into the script text
       - name: Version
         id: ver
         shell: pwsh
+        env:
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
-          $ref = '${{ github.ref }}'
-          if ($ref -like 'refs/tags/v*') {
-            $tag = '${{ github.ref_name }}'
+          if ($env:REF -like 'refs/tags/v*') {
+            $tag = $env:REF_NAME
             if ($tag -notmatch '^v(\d+\.\d+\.\d+)(-[0-9A-Za-z.-]+)?$') {
               throw "release tags look like v1.2.3 or v1.2.3-rc.1, got $tag"
             }
@@ -60,7 +66,7 @@ jobs:
           } else {
             $m = Select-String -Path CMakeLists.txt -Pattern 'set\(EXPLORERPLUS_VERSION "(\d+\.\d+\.\d+)"'
             $version = $m.Matches[0].Groups[1].Value
-            $label = "$version-ci.${{ github.run_number }}." + '${{ github.sha }}'.Substring(0, 7)
+            $label = "$version-ci.$env:RUN_NUMBER." + $env:SHA.Substring(0, 7)
             $pre = $true
           }
           "version=$version" >> $env:GITHUB_OUTPUT
@@ -68,29 +74,50 @@ jobs:
           "prerelease=$($pre.ToString().ToLower())" >> $env:GITHUB_OUTPUT
           Write-Host "version $version, label $label"
 
+      # only release (tag) builds are signed: branch and pull-request builds never see the key
       - name: Signing certificate
-        if: env.HAS_SIGNING == 'true'
+        if: env.HAS_SIGNING == 'true' && startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
+        env:
+          PFX_BASE64: ${{ secrets.SIGNING_CERT_PFX_BASE64 }}
         run: |
           $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
-          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String('${{ secrets.SIGNING_CERT_PFX_BASE64 }}'))
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_BASE64))
           "SIGN_PFX=$pfx" >> $env:GITHUB_ENV
 
       - name: Build and package
         id: pkg
         shell: pwsh
         env:
-          SIGN_PFX_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+          SIGN_PFX_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.SIGNING_CERT_PASSWORD || '' }}
+          MSYS2_DIR: ${{ steps.msys2.outputs.msys2-location }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          LABEL: ${{ steps.ver.outputs.label }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
-          $env:PATH = '${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin;' + $env:PATH
-          ./tools/package.ps1 -Version '${{ steps.ver.outputs.version }}' -Label '${{ steps.ver.outputs.label }}' -Build ${{ github.run_number }}
+          $env:PATH = "$env:MSYS2_DIR\ucrt64\bin;" + $env:PATH
+          ./tools/package.ps1 -Version $env:VERSION -Label $env:LABEL -Build $env:RUN_NUMBER
+
+      - name: Remove signing certificate
+        if: always() && env.SIGN_PFX != ''
+        shell: pwsh
+        run: Remove-Item -Force -ErrorAction SilentlyContinue $env:SIGN_PFX
 
       - name: Smoke test (GUI automation)
-        # a signal, not a gate: hosted runners' desktop sessions can make UI automation flaky
-        continue-on-error: true
+        id: smoke
+        # gates releases; on branches a signal only (hosted desktop sessions can be flaky)
+        continue-on-error: ${{ !startsWith(github.ref, 'refs/tags/') }}
         timeout-minutes: 10
         shell: pwsh
         run: python -I tools/smoke_test.py build-release/explorer-plus.exe build-smoke
+
+      - name: Smoke test screenshots
+        if: always() && steps.smoke.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-shots-${{ steps.ver.outputs.label }}
+          path: build-smoke/shots
+          if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v7
         with:

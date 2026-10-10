@@ -13,4 +13,5 @@ void detailspane_set_mode(PaneMode m);
 PaneMode detailspane_mode();
 void detailspane_toggle(PaneMode m);   // Alt+Shift+P / Alt+P: show that pane, or hide it when shown
 void detailspane_theme_changed();
+void detailspane_release_files();      // unload the preview handler (before delete / rename / move)
 HWND detailspane_hwnd();

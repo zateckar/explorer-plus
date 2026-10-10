@@ -60,9 +60,21 @@ try {
     if (Test-Path $zip) { Remove-Item -Force $zip }
     Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip
     Remove-Item -Recurse -Force $stage
+    $zips = @($zip)
 
-    $sum = "{0}  {1}" -f (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower(), (Split-Path -Leaf $zip)
-    Set-Content -Path (Join-Path $OutDir "SHA256SUMS.txt") -Value $sum -Encoding ascii
+    # the split-off debug info: crash dumps from this build are resolved against it
+    $dbg = Join-Path $BuildDir "explorer-plus.debug"
+    if (Test-Path $dbg) {
+        $symZip = Join-Path $OutDir "$name-symbols.zip"
+        if (Test-Path $symZip) { Remove-Item -Force $symZip }
+        Compress-Archive -Path $dbg -DestinationPath $symZip
+        $zips += $symZip
+    }
+
+    $sums = foreach ($z in $zips) {
+        "{0}  {1}" -f (Get-FileHash $z -Algorithm SHA256).Hash.ToLower(), (Split-Path -Leaf $z)
+    }
+    Set-Content -Path (Join-Path $OutDir "SHA256SUMS.txt") -Value $sums -Encoding ascii
     Write-Host "packaged $zip ($ver)"
     if ($env:GITHUB_OUTPUT) {
         "zip=$zip" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT

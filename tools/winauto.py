@@ -84,6 +84,42 @@ def clipboard_text():
         u.CloseClipboard()
 
 
+def set_clipboard_text(s):
+    """Put s on the clipboard as text; None empties the clipboard."""
+    k = ctypes.windll.kernel32
+    k.GlobalAlloc.restype = ctypes.c_void_p
+    k.GlobalAlloc.argtypes = [W.UINT, ctypes.c_size_t]
+    k.GlobalLock.restype = ctypes.c_void_p
+    k.GlobalLock.argtypes = [ctypes.c_void_p]
+    k.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    k.GlobalFree.argtypes = [ctypes.c_void_p]
+    u.SetClipboardData.restype = ctypes.c_void_p
+    u.SetClipboardData.argtypes = [W.UINT, ctypes.c_void_p]
+    for _ in range(10):
+        if u.OpenClipboard(None):
+            break
+        time.sleep(0.05)
+    else:
+        return False
+    try:
+        u.EmptyClipboard()
+        if s is None:
+            return True
+        data = (s + '\0').encode('utf-16-le')
+        h = k.GlobalAlloc(0x0002, len(data))          # GMEM_MOVEABLE
+        if not h:
+            return False
+        p = k.GlobalLock(h)
+        ctypes.memmove(p, data, len(data))
+        k.GlobalUnlock(h)
+        if not u.SetClipboardData(13, h):             # CF_UNICODETEXT; the system owns h on success
+            k.GlobalFree(h)
+            return False
+        return True
+    finally:
+        u.CloseClipboard()
+
+
 def children(h):
     out = []
     def cb(c, _):
@@ -97,6 +133,9 @@ def child_by_id(h, cid):
     return u.GetDlgItem(h, cid)
 
 
+started = []          # every App launched, for the test's cleanup
+
+
 class App:
     IDC_TREE, IDC_LIST, IDC_ADDRESS, IDC_SEARCH, IDC_STATUS = 1001, 1002, 1003, 1004, 1006
 
@@ -105,6 +144,7 @@ class App:
         if settings:
             env['EXPLORERPLUS_SETTINGS'] = settings   # never touch the user's settings.ini
         self.proc = subprocess.Popen([exe, *args], env=env)
+        started.append(self)
         self.hwnd = None
         for _ in range(60):
             for h in top_windows(self.proc.pid):
@@ -221,6 +261,62 @@ class App:
             k.VirtualFreeEx(hp, mem, 0, 0x8000)
             k.CloseHandle(hp)
 
+    def tree_item(self, hitem):
+        """(text, image index) of a navigation pane node (TVM_GETITEMW through the app's memory)."""
+        k = ctypes.windll.kernel32
+        k.ReadProcessMemory.argtypes = [W.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+        hp, mem = self._remote(2048)
+        try:
+            # TVITEMW (x64): mask, hItem +8, pszText +24, cchTextMax +32, iImage +36; the text at +512
+            item = struct.pack('<I4xQII', 0x0001 | 0x0002 | 0x0010, hitem, 0, 0) + struct.pack('<QiiiiQ', mem + 512, 256, 0, 0, 0, 0)
+            k.WriteProcessMemory(hp, mem, item, len(item), None)
+            u.SendMessageW(self.tree, 0x113E, 0, mem)                          # TVM_GETITEMW
+            head = ctypes.create_string_buffer(56)
+            k.ReadProcessMemory(hp, mem, head, 56, None)
+            image = struct.unpack_from('<i', head.raw, 36)[0]
+            buf = ctypes.create_unicode_buffer(256)
+            k.ReadProcessMemory(hp, mem + 512, buf, 512, None)
+            return buf.value, image
+        finally:
+            k.VirtualFreeEx(hp, mem, 0, 0x8000)
+            k.CloseHandle(hp)
+
+    def tree_nodes(self):
+        """Every node the navigation pane shows (expanded branches), in display order."""
+        TVM_GETNEXTITEM, TVGN_NEXTVISIBLE, TVGN_FIRSTVISIBLE, TVGN_ROOT = 0x110A, 0x0006, 0x0005, 0x0000
+        out = []
+        h = u.SendMessageW(self.tree, TVM_GETNEXTITEM, TVGN_ROOT, 0)
+        while h:
+            out.append(h)
+            h = u.SendMessageW(self.tree, TVM_GETNEXTITEM, TVGN_NEXTVISIBLE, h)
+        return out
+
+    def tree_caret(self):
+        return u.SendMessageW(self.tree, 0x110A, 0x0009, 0)                   # TVGN_CARET
+
+    def tile_columns(self, i):
+        """The sub-items a tile shows under item i's name (LVM_GETITEMW with LVIF_COLUMNS)."""
+        k = ctypes.windll.kernel32
+        k.ReadProcessMemory.argtypes = [W.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+        hp, mem = self._remote(1024)
+        try:
+            # LVITEMW (x64): mask, iItem +4, cColumns +56, puColumns +64, piColFmt +72; arrays at +512 / +576
+            item = bytearray(88)
+            struct.pack_into('<Ii', item, 0, 0x0200, i)                       # LVIF_COLUMNS
+            struct.pack_into('<I', item, 56, 4)
+            struct.pack_into('<QQ', item, 64, mem + 512, mem + 576)
+            k.WriteProcessMemory(hp, mem, bytes(item), len(item), None)
+            u.SendMessageW(self.list, 0x104B, 0, mem)                          # LVM_GETITEMW
+            head = ctypes.create_string_buffer(88)
+            k.ReadProcessMemory(hp, mem, head, 88, None)
+            n = struct.unpack_from('<I', head.raw, 56)[0]
+            cols = ctypes.create_string_buffer(16)
+            k.ReadProcessMemory(hp, mem + 512, cols, 16, None)
+            return list(struct.unpack('<4I', cols.raw))[:min(n, 4)]
+        finally:
+            k.VirtualFreeEx(hp, mem, 0, 0x8000)
+            k.CloseHandle(hp)
+
     def search(self, q):
         """Type into the search box and press Enter (a recursive search of the folder)."""
         buf = ctypes.create_unicode_buffer(q)
@@ -305,6 +401,26 @@ class App:
             self.proc.wait(10)
         except subprocess.TimeoutExpired:
             self.proc.kill()
+
+
+def icon_pixels(hicon, size=32):
+    """BGRA pixels of an icon drawn at size x size (icons are shared across processes)."""
+    hdc = u.GetDC(None)
+    mem = g.CreateCompatibleDC(hdc)
+    bmp = g.CreateCompatibleBitmap(hdc, size, size)
+    old = g.SelectObject(mem, bmp)
+    u.DrawIconEx.argtypes = [W.HDC, ctypes.c_int, ctypes.c_int, W.HICON, ctypes.c_int, ctypes.c_int, W.UINT, W.HBRUSH, W.UINT]
+    u.DrawIconEx(mem, 0, 0, hicon, size, size, 0, None, 0x0003)            # DI_NORMAL
+    bi = struct.pack('<IiiHHIIiiII', 40, size, -size, 1, 32, 0, 0, 0, 0, 0, 0)
+    buf = ctypes.create_string_buffer(size * size * 4)
+    g.SelectObject(mem, old)
+    g.GetDIBits(mem, bmp, 0, size, buf, bi, 0)
+    g.DeleteObject(bmp); g.DeleteDC(mem); u.ReleaseDC(None, hdc)
+    return buf.raw
+
+
+def pixel_distance(a, b):
+    return sum(abs(x - y) for x, y in zip(a, b)) / max(1, len(a))
 
 
 def menu_items(hmenu):

@@ -76,6 +76,30 @@ std::wstring pidl_folder_path(LPCITEMIDLIST abs) {
     return pidl_parsingname(abs);
 }
 
+bool pidl_exists(LPCITEMIDLIST abs) {
+    if (pidl_is_desktop(abs)) return true;
+    WCHAR path[MAX_PATH]{};
+    if (SHGetPathFromIDListW(const_cast<LPITEMIDLIST>(abs), path))
+        return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+    com_ptr<IShellItem> si;
+    SFGAOF a = SFGAO_VALIDATE;
+    return SUCCEEDED(SHCreateItemFromIDList(abs, IID_PPV_ARGS(si.put()))) && si &&
+           SUCCEEDED(si->GetAttributes(SFGAO_VALIDATE, &a));
+}
+
+// a file-system folder known to be missing (not found, as opposed to unreadable / a
+// drive without its disk); asks the file system only for local drives
+bool fs_folder_missing(LPCITEMIDLIST abs) {
+    WCHAR path[MAX_PATH]{};
+    if (pidl_is_desktop(abs) || !SHGetPathFromIDListW(const_cast<LPITEMIDLIST>(abs), path)) return false;
+    if (path[0] == L'\\' || path[1] != L':') return false;          // UNC: could block
+    WCHAR root[4] = { path[0], L':', L'\\', 0 };
+    if (GetDriveTypeW(root) == DRIVE_REMOTE) return false;
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) return false;
+    DWORD e = GetLastError();
+    return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND;
+}
+
 std::wstring child_name(IShellFolder* psf, PCUITEMID_CHILD child, SHGDNF flags) {
     std::wstring out;
     if (!psf || !child) return out;
@@ -183,14 +207,42 @@ std::wstring fmt_filetime(const FILETIME& ft) {
     return out;
 }
 
-int sys_icon_index(LPCITEMIDLIST abs, bool open) {
+int sys_icon_index(LPCITEMIDLIST abs, bool open, int fallback) {
     PITEMID_CHILD root = nullptr;
     if (!abs) { root = pidl_desktop(); abs = root; }
     SHFILEINFOW si{};
     UINT flags = SHGFI_SYSICONINDEX | SHGFI_PIDL | SHGFI_SMALLICON | (open ? SHGFI_OPENICON : 0);
-    DWORD_PTR r = SHGetFileInfoW(reinterpret_cast<LPCWSTR>(abs), 0, &si, sizeof(si), flags);
+    // (a lookup can fail while another thread is adding to the image list: ask again)
+    DWORD_PTR r = 0;
+    for (int attempt = 0; attempt < 3 && !r; ++attempt) {
+        if (attempt) Sleep(10);
+        r = SHGetFileInfoW(reinterpret_cast<LPCWSTR>(abs), 0, &si, sizeof(si), flags);
+    }
     if (root) CoTaskMemFree(root);
-    return r ? si.iIcon : 0;
+    return r ? si.iIcon : fallback;
+}
+
+int sys_folder_icon_index(bool open) {
+    SHSTOCKICONINFO sii{ sizeof(sii) };
+    if (SUCCEEDED(SHGetStockIconInfo(open ? SIID_FOLDEROPEN : SIID_FOLDER, SHGSI_SYSICONINDEX, &sii)))
+        return sii.iSysImageIndex;
+    return 0;
+}
+
+void sys_imagelist_init() {
+    // FileIconInit: the full system image list, as Explorer has it (shell32 #660; not
+    // in every SDK's import library)
+    using FileIconInitFn = BOOL (WINAPI*)(BOOL);
+    if (HMODULE sh = GetModuleHandleW(L"shell32.dll")) {
+        auto init = (FileIconInitFn)(void*)GetProcAddress(sh, "FileIconInit");
+        if (!init) init = (FileIconInitFn)(void*)GetProcAddress(sh, MAKEINTRESOURCEA(660));
+        if (init) init(TRUE);
+    }
+    sys_imagelist(SHIL_SMALL);
+    sys_imagelist(SHIL_LARGE);
+    sys_imagelist(SHIL_EXTRALARGE);
+    sys_folder_icon_index(false);            // the stock folder icons are in it from now on
+    sys_folder_icon_index(true);
 }
 
 HIMAGELIST sys_imagelist(int shil) {

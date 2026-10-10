@@ -9,6 +9,10 @@ using std::min;
 #include "layout.h"
 #include "searchbox.h"
 #include <unordered_map>
+#include <memory>
+#include "workers.h"
+#include "acc.h"
+#include <cwctype>
 
 // ------------------------------------------------------------------
 // model
@@ -40,6 +44,14 @@ static TabState make_tab(PITEMID_CHILD adoptCurrent) {
     return t;
 }
 
+static TabState make_tab_named(PITEMID_CHILD adoptCurrent, const std::wstring& name) {
+    TabState t;
+    t.id = s_nextTabId++;
+    t.current = adoptCurrent ? adoptCurrent : pidl_desktop();
+    t.name = name;
+    return t;
+}
+
 static int index_of_id(int id) {
     for (int i = 0; i < (int)s_tabs.size(); ++i) if (s_tabs[i].id == id) return i;
     return -1;
@@ -61,6 +73,11 @@ void tabmodel_on_navigate(PITEMID_CHILD newAbs, bool pushHistory) {
     }
     t->current = newAbs;                                    // adopt new
     if (pushHistory) { for (auto p : t->fwd) CoTaskMemFree(p); t->fwd.clear(); }
+    // in place onto the folder right behind (a deleted folder's parent): Back skips it
+    if (!pushHistory && !t->back.empty() && pidl_equal(t->back.back(), newAbs)) {
+        CoTaskMemFree(t->back.back());
+        t->back.pop_back();
+    }
     t->name = name_of(newAbs);
     if (t->back.size() > 200) { CoTaskMemFree(t->back.front()); t->back.erase(t->back.begin()); }
 }
@@ -171,6 +188,9 @@ void tabmodel_close_others(int idx) {
 int tabmodel_move_tab(int from, int to) {
     if (from < 0 || from >= (int)s_tabs.size()) return from;
     to = max(0, min(to, (int)s_tabs.size()));
+    // pinned tabs stay first: a pinned tab moves among the pinned ones, others after them
+    int pinnedCount = (int)std::count_if(s_tabs.begin(), s_tabs.end(), [](const TabState& t) { return t.pinned; });
+    to = s_tabs[from].pinned ? min(to, pinnedCount) : max(to, pinnedCount);
     if (to == from || to == from + 1) return from;
     int activeId = tabmodel_active()->id;
     TabState t = std::move(s_tabs[from]);
@@ -220,8 +240,23 @@ void tabs_persist_now() {
     settings_set_tabs(lines, active);        // writes the ini immediately
 }
 
+// a share or a mapped network drive: parsing it would wait for the server
+static bool is_network_path(const std::wstring& path) {
+    if (path.rfind(L"\\\\", 0) == 0) return path.rfind(L"\\\\?\\", 0) != 0;
+    if (path.size() >= 2 && iswalpha(path[0]) && path[1] == L':') {
+        WCHAR root[4] = { path[0], L':', L'\\', 0 };
+        return GetDriveTypeW(root) == DRIVE_REMOTE;
+    }
+    return false;
+}
+
 static PITEMID_CHILD parse_persisted(const std::wstring& path) {
     if (path.empty() || path == L"::desktop") return pidl_desktop();
+    // network tabs open without asking the server (it may be offline: startup would wait
+    // for its timeout); the listing, on a worker, finds out whether it is there
+    if (is_network_path(path))
+        if (PIDLIST_ABSOLUTE simple = SHSimpleIDListFromPath(path.c_str()))
+            return reinterpret_cast<PITEMID_CHILD>(simple);
     PIDLIST_ABSOLUTE p = nullptr;
     if (SUCCEEDED(SHParseDisplayName(path.c_str(), nullptr, &p, 0, nullptr)) && p)
         return reinterpret_cast<PITEMID_CHILD>(p);
@@ -256,7 +291,9 @@ void tabs_deserialize(const std::wstring& tabs, int active) {
             p2 = s + 1;
         }
         while (f.size() < 4) f.push_back(L"");
-        TabState t = make_tab(parse_persisted(f[0]));
+        TabState t = is_network_path(f[0]) && !f[1].empty()
+                   ? make_tab_named(parse_persisted(f[0]), f[1])     // (its name needs no server either)
+                   : make_tab(parse_persisted(f[0]));
         t.view = int_to_view(_wtoi(f[2].c_str()));
         t.pinned = (f[3] == L"1");
         s_tabs.push_back(std::move(t));
@@ -269,8 +306,9 @@ void tabs_deserialize(const std::wstring& tabs, int active) {
             dp = nullptr;
         s_tabs.push_back(make_tab(reinterpret_cast<PITEMID_CHILD>(dp)));
     }
-    sort_pinned_first();
+    // `active` indexes the saved order: pick the tab first, then let the sort keep it active
     g_activeTab = max(0, min(active, (int)s_tabs.size() - 1));
+    sort_pinned_first();
     current_replace(pidl_clone(tabmodel_active()->current));
 }
 
@@ -329,12 +367,38 @@ static std::unordered_map<ULONGLONG, int> s_iconCache;   // pidl signature -> sy
 
 struct TabUI { RECT rect; RECT close; };
 
+// A tab's icon is looked up on a worker (a share's icon can take the server's timeout);
+// the plain folder icon stands in until it is known.
+struct TabIconJob { ULONGLONG sig; PITEMID_CHILD abs; int icon; };
+static constexpr int kIconPending = -2;
+
+static void tab_icon_apply(void* payload) {
+    std::unique_ptr<TabIconJob> job(static_cast<TabIconJob*>(payload));
+    auto it = s_iconCache.find(job->sig);
+    if (it == s_iconCache.end() || it->second != kIconPending) return;   // cache was cleared meanwhile
+    it->second = job->icon;
+    if (s_strip) InvalidateRect(s_strip, nullptr, FALSE);
+}
+
+static void tab_icon_worker(TabIconJob* job) {
+    ComInit ci;
+    job->icon = sys_icon_index(job->abs, false, sys_folder_icon_index(false));
+    CoTaskMemFree(job->abs);
+    job->abs = nullptr;
+    post_async(tab_icon_apply, job);
+}
+
 static int tab_icon(PCIDLIST_ABSOLUTE p) {
     ULONGLONG sig = pidl_sig(p);
     auto it = s_iconCache.find(sig);
-    if (it != s_iconCache.end()) return it->second;
+    if (it != s_iconCache.end()) return it->second == kIconPending ? sys_folder_icon_index(false) : it->second;
     if (s_iconCache.size() > 256) s_iconCache.clear();
-    return s_iconCache[sig] = sys_icon_index(p);
+    if (PITEMID_CHILD abs = pidl_clone(p)) {
+        s_iconCache[sig] = kIconPending;
+        auto* job = new TabIconJob{ sig, abs, -1 };
+        worker_submit([job] { tab_icon_worker(job); });
+    }
+    return sys_folder_icon_index(false);
 }
 
 static int tab_top() { return S(8); }
@@ -402,7 +466,8 @@ static void paint_strip(HWND hwnd) {
     layout_tabs(bp.rc.right, uis, &plus);
     COLORREF sepColor = blend(bg, p.text, 0.22);
     HIMAGELIST il = sys_imagelist(SHIL_SMALL);
-    int iconSz = GetSystemMetrics(SM_CXSMICON);
+    int iconW = 0, iconH = 0;
+    ImageList_GetIconSize(il, &iconW, &iconH);     // (the list's own size, not this monitor's metric)
     for (size_t i = 0; i < uis.size(); ++i) {
         const TabUI& u = uis[i];
         bool active = (int)i == g_activeTab;
@@ -427,7 +492,7 @@ static void paint_strip(HWND hwnd) {
             draw_glyph(bp.dc, L'\xE718', pr, active ? p.accent : p.textSecondary, 12);
         } else {
             int icon = tab_icon(s_tabs[i].current);
-            if (icon >= 0) ImageList_Draw(il, icon, bp.dc, x, cy - iconSz / 2, ILD_TRANSPARENT);
+            if (icon >= 0) ImageList_Draw(il, icon, bp.dc, x, cy - iconH / 2, ILD_TRANSPARENT);
         }
         x += S(16) + S(10);
         RECT tr{ x, u.rect.top, (s_tabs[i].pinned ? u.rect.right - S(8) : u.close.left - S(4)), u.rect.bottom };
@@ -443,8 +508,55 @@ static void paint_strip(HWND hwnd) {
     draw_glyph(bp.dc, L'\xE710', plus, p.text, 12);
 }
 
+// screen readers: each tab (selected = the active one), its close button, then "New tab"
+struct AccTabsItem { int tab; bool close; bool plus; };
+static std::vector<AccTabsItem> acc_items() {
+    std::vector<AccTabsItem> v;
+    for (int i = 0; i < (int)s_tabs.size(); ++i) {
+        v.push_back({ i, false, false });
+        if (!s_tabs[i].pinned) v.push_back({ i, true, false });
+    }
+    v.push_back({ -1, false, true });
+    return v;
+}
+static const AccSource s_acc = [] {
+    AccSource a;
+    a.name = L"Tabs";
+    a.role = ROLE_SYSTEM_PAGETABLIST;
+    a.count = [] { return (int)acc_items().size(); };
+    a.child = [](int i) {
+        AccChild c;
+        AccTabsItem it = acc_items()[i];
+        std::vector<TabUI> uis;
+        RECT rc{}, plus{};
+        GetClientRect(s_strip, &rc);
+        layout_tabs(rc.right, uis, &plus);
+        if (it.plus) {
+            c.name = L"New tab"; c.shortcut = L"Ctrl+T"; c.action = L"Press"; c.rc = plus;
+        } else if (it.close) {
+            c.name = L"Close tab " + s_tabs[it.tab].name; c.shortcut = L"Ctrl+W"; c.action = L"Press";
+            c.rc = uis[it.tab].close;
+        } else {
+            c.name = s_tabs[it.tab].name + (s_tabs[it.tab].pinned ? L" (pinned)" : L"");
+            c.role = ROLE_SYSTEM_PAGETAB;
+            c.state = STATE_SYSTEM_SELECTABLE | (it.tab == g_activeTab ? STATE_SYSTEM_SELECTED : 0);
+            c.action = L"Switch";
+            c.rc = uis[it.tab].rect;
+        }
+        return c;
+    };
+    a.action = [](int i) {
+        AccTabsItem it = acc_items()[i];
+        if (it.plus) tabmodel_new_tab();
+        else if (it.close) tabmodel_close_tab(it.tab);
+        else tabmodel_switch_to(it.tab);
+    };
+    return a;
+}();
+
 static LRESULT CALLBACK strip_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+        case WM_GETOBJECT: return acc_get_object(hwnd, wp, lp, &s_acc);
         case WM_NCHITTEST: {
             // empty strip area belongs to the title bar (drag, double-click, snap)
             POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
@@ -568,5 +680,12 @@ HWND tabstrip_create(HWND parent) {
 HWND tabstrip_hwnd() { return s_strip; }
 
 void tabstrip_refresh() {
-    if (s_strip) InvalidateRect(s_strip, nullptr, FALSE);
+    if (!s_strip) return;
+    InvalidateRect(s_strip, nullptr, FALSE);
+    // the tab list or the active tab may have changed
+    acc_notify(s_strip, EVENT_OBJECT_REORDER, -1);
+    for (int i = 0, n = 0; i < (int)s_tabs.size(); ++i, ++n) {
+        if (i == g_activeTab) { acc_notify(s_strip, EVENT_OBJECT_SELECTION, n); break; }
+        if (!s_tabs[i].pinned) ++n;                     // (its close button)
+    }
 }

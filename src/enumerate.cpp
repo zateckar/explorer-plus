@@ -4,8 +4,9 @@
 #include "detailspane.h"
 #include "groups.h"
 #include "columns.h"
+#include "searchbox.h"
 #include <propsys.h>
-#include <thread>
+#include "workers.h"
 #include <memory>
 #include <algorithm>
 #include <unordered_map>
@@ -157,6 +158,7 @@ static Item* make_item(IShellFolder* psf, IShellIcon* icons, PCIDLIST_ABSOLUTE f
         std::wstring parsing = child_name(psf, child, SHGDN_INFOLDER | SHGDN_FORPARSING);
         it->type = fs_type_for(parsing.empty() ? it->name : parsing, plainFolder);
         it->fileName = PathFindFileNameW(parsing.c_str());     // (search results: a full path)
+        if (parsing.find(L'\\') != std::wstring::npos) it->path = parsing;
         // shortcuts keep their extension hidden whatever the setting, like Explorer
         if (!plainFolder && !(attrs & SFGAO_LINK)) apply_ext_choice(it, it->fileName, ext);
     }
@@ -174,6 +176,8 @@ static Item* make_item(IShellFolder* psf, IShellIcon* icons, PCIDLIST_ABSOLUTE f
     }
     it->icon = idx;
     columns_fill(si.get(), cols, it);      // the folder's extra columns (after driveType)
+    it->key = !it->path.empty() ? it->path : !it->fileName.empty() ? it->fileName : it->name;
+    CharLowerBuffW(it->key.data(), (DWORD)it->key.size());
     return it;
 }
 
@@ -237,20 +241,20 @@ static void sort_items() {
 }
 
 // a streamed batch joins the sorted listing: sort just the batch and merge it in, so
-// a 100k-item folder is not re-sorted for every batch. Grouped views re-sort all: a new
-// group (a new type, say) can renumber the others.
+// a 100k-item folder is not re-sorted for every batch. Group ranks are worked out for
+// all items: a new group (a new type, say) renumbers the others — but in the same order,
+// so the shown part stays sorted (checked: Group by Date moves on at midnight).
 static void merge_batch(std::vector<Item*>& batch) {
-    if (groups_effective() != GB_NONE || groups_keep_enum_order()) {
-        g_items.insert(g_items.end(), batch.begin(), batch.end());
-        sort_items();
-        return;
-    }
     columns_prepare_sort();
-    groups_assign(batch);
-    std::stable_sort(batch.begin(), batch.end(), item_less);
     size_t mid = g_items.size();
     g_items.insert(g_items.end(), batch.begin(), batch.end());
-    std::inplace_merge(g_items.begin(), g_items.begin() + mid, g_items.end(), item_less);
+    groups_assign(g_items);
+    if (!std::is_sorted(g_items.begin(), g_items.begin() + mid, item_less)) {
+        std::stable_sort(g_items.begin(), g_items.end(), item_less);
+    } else {
+        std::stable_sort(g_items.begin() + mid, g_items.end(), item_less);
+        std::inplace_merge(g_items.begin(), g_items.begin() + mid, g_items.end(), item_less);
+    }
     groups_record(g_items);
 }
 
@@ -291,9 +295,16 @@ struct OverlayBatch {
     std::vector<std::pair<int, int>> results;
 };
 
+// Overlays match items by `seq`, so they wait until their whole listing is on screen
+// (they can overtake it: the async queue's wake may already be posted ahead of
+// WM_ENUM_DONE, or the listing is still streaming in).
+static UINT s_completeOpId = 0;                 // listing applied in full
+static std::vector<OverlayBatch*> s_deferredOverlays;
+
 static void overlay_apply(void* payload) {
     std::unique_ptr<OverlayBatch> b(static_cast<OverlayBatch*>(payload));
     if (b->opId != g_enumId.load() || b->results.empty()) return;   // another listing by now
+    if (b->opId != s_completeOpId) { s_deferredOverlays.push_back(b.release()); return; }
     {
         std::lock_guard<std::mutex> lk(g_itemsMx);
         std::unordered_map<int, Item*> bySeq;
@@ -307,22 +318,33 @@ static void overlay_apply(void* payload) {
     InvalidateRect(g_list, nullptr, FALSE);
 }
 
+// the listing `opId` is complete on screen: overlays that came early go on now
+static void listing_complete(UINT opId) {
+    s_completeOpId = opId;
+    std::vector<OverlayBatch*> early;
+    early.swap(s_deferredOverlays);
+    for (OverlayBatch* b : early) overlay_apply(b);   // (takes ownership; drops other listings')
+}
+
 static void overlay_pass(UINT opId, IShellIconOverlay* overlays, std::vector<std::pair<int, PITEMID_CHILD>>& ids) {
     double t0 = perf_on() ? perf_now() : 0;
     auto batch = std::make_unique<OverlayBatch>();
     batch->opId = opId;
     size_t done = 0, with = 0;
+    ULONGLONG lastPost = GetTickCount64();
     for (auto& [seq, child] : ids) {
         if (opId != g_enumId.load()) break;          // navigated on: the rest is not needed
         int ov = 0;
         if (FAILED(overlays->GetOverlayIndex(child, &ov)) || ov < 0 || ov > 15) ov = 0;
         batch->results.push_back({ seq, ov });
         with += ov != 0;
-        // the first rows' overlays go out quickly, the rest in big batches
-        if (++done == 200 || done % 5000 == 0) {
+        // the first rows' overlays go out quickly, the rest in big batches — or after a
+        // moment, when the handlers are slow
+        if (++done == 200 || done % 5000 == 0 || GetTickCount64() - lastPost > 150) {
             post_async(overlay_apply, batch.release());
             batch = std::make_unique<OverlayBatch>();
             batch->opId = opId;
+            lastPost = GetTickCount64();
         }
     }
     if (!batch->results.empty()) post_async(overlay_apply, batch.release());
@@ -344,7 +366,11 @@ static void worker(EnumJob* job) {
     com_ptr<IShellFolder> psf;
     com_ptr<IShellIconOverlay> overlays;
     std::vector<std::pair<int, PITEMID_CHILD>> overlayIds;   // (seq, copy of the item's ID)
-    HRESULT hr = ci.ok() ? bind_list(job->folder, IID_PPV_ARGS(psf.put())) : ci.hr;
+    // a folder that is gone fails quietly (the shell would put up "Location is not
+    // available" over the window)
+    HRESULT hr = !ci.ok() ? ci.hr
+               : fs_folder_missing(job->folder) ? HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND)
+               : bind_list(job->folder, IID_PPV_ARGS(psf.put()));
     if (SUCCEEDED(hr) && psf) {
         com_ptr<IShellIcon> icons;
         psf->QueryInterface(IID_PPV_ARGS(icons.put()));
@@ -429,17 +455,53 @@ static std::wstring s_pendingSelect;
 static bool s_pendingRename = false;
 static std::unordered_set<std::wstring> s_pendingSelSnapshot;   // selection when it was requested
 
-static std::wstring item_name_at(int idx) {
+// what identifies an item across listings (Item::key): its path where the folder mixes
+// folders (search results), else its file name — not the display name, which changes
+// when file name extensions are switched, nor the ID, which changes with size and date
+static const std::wstring& item_key(const Item* it) { return it->key; }
+
+static std::wstring item_key_at(int idx) {
     if (idx < 0 || idx >= (int)g_items.size()) return {};
-    return g_items[idx]->name;
+    return item_key(g_items[idx]);
 }
 
-static std::unordered_set<std::wstring> selected_names() {
+static std::unordered_set<std::wstring> selected_keys() {
     std::unordered_set<std::wstring> out;
     std::lock_guard<std::mutex> lk(g_itemsMx);
     int i = -1;
-    while ((i = ListView_GetNextItem(g_list, i, LVNI_SELECTED)) != -1) out.insert(item_name_at(i));
+    while ((i = ListView_GetNextItem(g_list, i, LVNI_SELECTED)) != -1) out.insert(item_key_at(i));
     return out;
+}
+
+// selection and focus by item, across a change of order (sort, merged batch)
+struct SelectionByItem {
+    std::unordered_set<Item*> sel;
+    Item* focus = nullptr;
+    bool any() const { return !sel.empty() || focus; }
+};
+
+static SelectionByItem capture_selection() {     // (called with g_itemsMx held)
+    SelectionByItem s;
+    for (int i = -1; (i = ListView_GetNextItem(g_list, i, LVNI_SELECTED)) != -1;)
+        if (i < (int)g_items.size()) s.sel.insert(g_items[i]);
+    int f = ListView_GetNextItem(g_list, -1, LVNI_FOCUSED);
+    if (f >= 0 && f < (int)g_items.size()) s.focus = g_items[f];
+    return s;
+}
+
+static void locate_selection(const SelectionByItem& s, std::vector<int>& reselect, int& focusIdx) {   // (g_itemsMx held)
+    reselect.clear();
+    focusIdx = -1;
+    if (!s.any()) return;
+    for (int i = 0; i < (int)g_items.size(); ++i) {
+        if (s.sel.count(g_items[i])) reselect.push_back(i);
+        if (g_items[i] == s.focus) focusIdx = i;
+    }
+}
+
+static void reapply_selection(const std::vector<int>& reselect, int focusIdx) {   // (not under the lock)
+    for (int i : reselect) ListView_SetItemState(g_list, i, LVIS_SELECTED, LVIS_SELECTED);
+    if (focusIdx >= 0) ListView_SetItemState(g_list, focusIdx, LVIS_FOCUSED, LVIS_FOCUSED);
 }
 
 // select (and optionally rename) `name` when the next listing arrives — unless the
@@ -447,7 +509,7 @@ static std::unordered_set<std::wstring> selected_names() {
 void enum_set_pending_select(const std::wstring& name, bool beginRename) {
     s_pendingSelect = name;
     s_pendingRename = beginRename;
-    s_pendingSelSnapshot = selected_names();
+    s_pendingSelSnapshot = selected_keys();
 }
 
 const std::wstring& enum_last_error() { return s_lastError; }
@@ -489,7 +551,7 @@ void enumerate_start(PCIDLIST_ABSOLUTE folderAbs, bool keepView) {
         job->stream = s_stream;
         SetTimer(g_main, TIMER_ENUM_STREAM, kFirstStreamMs, nullptr);
     }
-    std::thread(worker, job).detach();
+    worker_submit([job] { worker(job); });
 }
 
 void enum_on_stream_timer() {
@@ -527,6 +589,191 @@ static void set_error(HRESULT hr) {
     while (!s_lastError.empty() && iswspace(s_lastError.back())) s_lastError.pop_back();
 }
 
+// A refresh's or a change's new items take over what the old ones with the same key
+// had: the overlay (until the overlay pass has the new one: no blinking arrows) and the
+// thumbnail, while the ID is the same (an unchanged file). Returns the thumbnails kept.
+static size_t carry_over(const std::vector<Item*>& old, std::vector<Item*>& fresh) {   // (g_itemsMx held)
+    struct Carry { int overlay; int thumbIndex; ULONGLONG sig; };
+    std::unordered_map<std::wstring, Carry> carry;
+    for (Item* it : old) {
+        int thumb = it->thumbReady.load() == 2 ? it->thumbIndex : -1;
+        if (it->overlay || thumb >= 0) carry.emplace(it->key, Carry{ it->overlay, thumb, it->sig });
+    }
+    size_t kept = 0;
+    if (carry.empty()) return kept;
+    for (Item* it : fresh) {
+        auto f = carry.find(it->key);
+        if (f == carry.end()) continue;
+        if (!it->overlay) it->overlay = f->second.overlay;
+        if (f->second.thumbIndex >= 0 && f->second.sig == it->sig) {
+            it->thumbIndex = f->second.thumbIndex;
+            it->thumbReady.store(2);
+            ++kept;
+        }
+    }
+    return kept;
+}
+
+// ---------------------------------------------------------------
+// changes in the folder shown (from the watcher), item by item
+
+struct ChangeJob {
+    UINT opId = 0;
+    PITEMID_CHILD folder = nullptr;   // owned
+    std::vector<std::wstring> names;  // in-folder names to read again
+    bool showHidden = false, showSuperHidden = false;
+    ExtMode ext;
+    ColumnSet columns;
+};
+struct ChangeResult {
+    UINT opId = 0;
+    std::vector<std::wstring> keys;   // every name touched (lowercased): its item is replaced or goes
+    std::vector<Item*> items;         // the ones that are there (and shown) now
+};
+static bool s_changeRunning = false;  // one at a time: results can't overtake each other
+
+static void change_apply(void* payload);
+
+static void change_worker(ChangeJob* job) {
+    std::unique_ptr<ChangeJob> own(job);
+    ComInit ci;
+    auto* res = new ChangeResult;
+    res->opId = job->opId;
+    com_ptr<IShellFolder> psf;
+    if (ci.ok() && SUCCEEDED(bind_list(job->folder, IID_PPV_ARGS(psf.put()))) && psf) {
+        com_ptr<IShellIcon> icons;
+        psf->QueryInterface(IID_PPV_ARGS(icons.put()));
+        com_ptr<IShellIconOverlay> overlays;
+        psf->QueryInterface(kIID_IShellIconOverlay, (void**)overlays.put());
+        for (auto& name : job->names) {
+            std::wstring key = name;
+            CharLowerBuffW(key.data(), (DWORD)key.size());
+            res->keys.push_back(key);
+            if (job->opId != g_enumId.load()) break;         // another listing: it has them
+            PIDLIST_RELATIVE rel = nullptr;
+            std::wstring n = name;
+            // (parsing reads the file now: gone = no item, the old one goes)
+            if (FAILED(psf->ParseDisplayName(nullptr, nullptr, n.data(), nullptr, &rel, nullptr)) || !rel) continue;
+            auto child = reinterpret_cast<PITEMID_CHILD>(rel);
+            SFGAOF attrs = SFGAO_HIDDEN | SFGAO_SYSTEM | SFGAO_FOLDER | SFGAO_STREAM |
+                           SFGAO_FILESYSTEM | SFGAO_LINK | SFGAO_SHARE | SFGAO_GHOSTED | SFGAO_DROPTARGET;
+            psf->GetAttributesOf(1, const_cast<PCUITEMID_CHILD*>(&child), &attrs);
+            // what the listing would leave out (SHCONTF without / with INCLUDEHIDDEN)
+            bool hidden = (attrs & SFGAO_HIDDEN) != 0;
+            bool protectedOs = hidden && (attrs & SFGAO_SYSTEM);
+            if ((hidden && !job->showHidden) || (protectedOs && !job->showSuperHidden)) {
+                CoTaskMemFree(child);
+                continue;
+            }
+            int ov = 0;
+            if (overlays && (FAILED(overlays->GetOverlayIndex(child, &ov)) || ov < 0 || ov > 15)) ov = 0;
+            Item* it = make_item(psf.get(), icons.get(), job->folder, child, attrs, false, job->columns, job->ext);
+            it->overlay = ov;
+            res->items.push_back(it);
+        }
+    }
+    CoTaskMemFree(job->folder);
+    post_async(change_apply, res);
+}
+
+static void change_apply(void* payload) {
+    std::unique_ptr<ChangeResult> r(static_cast<ChangeResult*>(payload));
+    s_changeRunning = false;
+    // another listing started meanwhile: it lists the folder as it is now
+    if (r->opId != g_enumId.load() || r->opId != s_completeOpId || r->keys.empty()) {
+        free_items(r->items);
+        return;
+    }
+    PerfScope ps("enum.changes");
+    ps.n = (long long)r->keys.size();
+    std::unordered_set<std::wstring> selected = selected_keys();
+    std::wstring focused;
+    std::vector<int> reselect;
+    int focusIdx = -1, n = 0;
+    bool selectionTouched = false;
+    {
+        std::lock_guard<std::mutex> lk(g_itemsMx);
+        focused = item_key_at(ListView_GetNextItem(g_list, -1, LVNI_FOCUSED));
+        std::unordered_set<std::wstring> touched(r->keys.begin(), r->keys.end());
+        for (Item* it : r->items) touched.insert(it->key);
+        for (auto& k : touched) selectionTouched |= selected.count(k) > 0 || k == focused;
+        std::vector<Item*> gone;
+        int seq = 0;
+        auto keepEnd = std::stable_partition(g_items.begin(), g_items.end(), [&](Item* it) {
+            seq = std::max(seq, it->seq + 1);
+            return !touched.count(it->key);
+        });
+        gone.assign(keepEnd, g_items.end());
+        g_items.erase(keepEnd, g_items.end());
+        carry_over(gone, r->items);
+        free_items(gone);
+        for (Item* it : r->items) it->seq = seq++;
+        merge_batch(r->items);                       // (sorted / grouped in)
+        r->items.clear();                            // (now owned by g_items)
+        n = (int)g_items.size();
+        for (int i = 0; i < n; ++i) {
+            const std::wstring& k = g_items[i]->key;
+            if (selected.count(k)) reselect.push_back(i);
+            if (!focused.empty() && k == focused) focusIdx = i;
+        }
+    }
+    // (not under the lock: these notify handlers that take it)
+    ListView_SetItemState(g_list, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+    groups_apply();
+    ListView_SetItemCountEx(g_list, n, LVSICF_NOSCROLL);
+    reapply_selection(reselect, focusIdx);
+    InvalidateRect(g_list, nullptr, TRUE);
+    status_update();
+    if (selectionTouched) detailspane_update();     // the selected file changed
+}
+
+// is `path` directly inside the directory `dir`? (case-insensitive)
+static bool directly_in(const std::wstring& path, const std::wstring& dir) {
+    const wchar_t* name = PathFindFileNameW(path.c_str());
+    size_t parentLen = (size_t)(name - path.c_str());
+    if (parentLen && path[parentLen - 1] == L'\\' && parentLen > 1 && dir.back() != L'\\') --parentLen;
+    return parentLen == dir.size() &&
+           CompareStringOrdinal(path.c_str(), (int)parentLen, dir.c_str(), (int)dir.size(), TRUE) == CSTR_EQUAL;
+}
+
+ChangeApply enum_apply_changes(const std::vector<std::wstring>& paths) {
+    // only a plain directory: virtual folders, libraries and search results list items
+    // that a path doesn't name
+    if (!g_current || search_scope_of(g_current)) return ChangeApply::Unsupported;
+    std::wstring dir = pidl_folder_path(g_current);
+    bool fsDir = dir.size() >= 3 && dir.find(L"::") == std::wstring::npos &&
+                 ((dir[1] == L':' && dir[2] == L'\\') || dir.rfind(L"\\\\", 0) == 0);
+    if (!fsDir) return ChangeApply::Unsupported;
+    // a listing on the way (it may or may not see the change: wait and re-read after it),
+    // a change being read, a rename box on a row (rows must not move under it)
+    if (s_stream || g_enumId.load() != s_completeOpId || s_changeRunning || ListView_GetEditControl(g_list))
+        return ChangeApply::Busy;
+    if (s_shownFolderSig != pidl_sig(g_current)) return ChangeApply::Unsupported;
+    auto job = std::make_unique<ChangeJob>();
+    std::unordered_set<std::wstring> seen;
+    for (auto& p : paths) {
+        if (!directly_in(p, dir)) continue;                 // a sibling (the parent's watch)
+        std::wstring name = PathFindFileNameW(p.c_str());
+        std::wstring key = name;
+        CharLowerBuffW(key.data(), (DWORD)key.size());
+        if (!name.empty() && seen.insert(key).second) job->names.push_back(name);
+    }
+    if (job->names.empty()) return ChangeApply::Started;    // nothing in this folder
+    job->opId = g_enumId.load();
+    job->folder = pidl_clone(g_current);
+    job->showHidden = g_showHidden.load();
+    SHELLSTATEW ss{};
+    SHGetSetSettings(&ss, SSF_SHOWSUPERHIDDEN, FALSE);
+    job->showSuperHidden = ss.fShowSuperHidden != 0;
+    job->ext.windows = windows_shows_extensions();
+    job->ext.show = g_showExtensions.load() < 0 ? job->ext.windows : g_showExtensions.load() != 0;
+    job->columns = g_columns;
+    s_changeRunning = true;
+    ChangeJob* raw = job.release();
+    worker_submit([raw] { change_worker(raw); });
+    return ChangeApply::Started;
+}
+
 // a later batch of the listing on screen: merge it in. The user may already be working
 // with the first rows, so selection and focus follow their items, not their row numbers.
 static void append_batch(HeapEnumOp* op) {
@@ -537,28 +784,18 @@ static void append_batch(HeapEnumOp* op) {
     bool hadSelection = false;
     {
         std::lock_guard<std::mutex> lk(g_itemsMx);
-        std::unordered_set<Item*> sel;
-        Item* focus = nullptr;
-        for (int i = -1; (i = ListView_GetNextItem(g_list, i, LVNI_SELECTED)) != -1;)
-            if (i < (int)g_items.size()) sel.insert(g_items[i]);
-        int f = ListView_GetNextItem(g_list, -1, LVNI_FOCUSED);
-        if (f >= 0 && f < (int)g_items.size()) focus = g_items[f];
-        hadSelection = !sel.empty() || focus;
+        SelectionByItem sel = capture_selection();
+        hadSelection = sel.any();
         merge_batch(op->items);
         op->items.clear();                         // (now owned by g_items)
         n = (int)g_items.size();
-        if (hadSelection)
-            for (int i = 0; i < n; ++i) {
-                if (sel.count(g_items[i])) reselect.push_back(i);
-                if (g_items[i] == focus) focusIdx = i;
-            }
+        locate_selection(sel, reselect, focusIdx);
     }
     // (not under the lock: these notify handlers that take it)
     if (hadSelection) ListView_SetItemState(g_list, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
     groups_apply();
     ListView_SetItemCountEx(g_list, n, LVSICF_NOSCROLL);
-    for (int i : reselect) ListView_SetItemState(g_list, i, LVIS_SELECTED, LVIS_SELECTED);
-    if (focusIdx >= 0) ListView_SetItemState(g_list, focusIdx, LVIS_FOCUSED, LVIS_FOCUSED);
+    reapply_selection(reselect, focusIdx);
     InvalidateRect(g_list, nullptr, TRUE);
     status_update();
 }
@@ -577,6 +814,7 @@ void enum_apply_op(HeapEnumOp* op) {
             stream_stop();
             set_error(op->enumHr);
             detailspane_update();
+            listing_complete(op->opId);
         }
         delete op;
         return;
@@ -590,9 +828,9 @@ void enum_apply_op(HeapEnumOp* op) {
     std::wstring focused;
     bool keep = s_pendingKeepView;
     if (keep) {
-        selected = selected_names();
+        selected = selected_keys();
         std::lock_guard<std::mutex> lk(g_itemsMx);
-        focused = item_name_at(ListView_GetNextItem(g_list, -1, LVNI_FOCUSED));
+        focused = item_key_at(ListView_GetNextItem(g_list, -1, LVNI_FOCUSED));
     }
     // a pending select is for the first listing after the request; the user choosing
     // other items meanwhile (or navigating away) cancels it
@@ -609,15 +847,13 @@ void enum_apply_op(HeapEnumOp* op) {
     // the header first (not under g_itemsMx: it repaints through LVN_GETDISPINFO), then
     // the items it describes
     columns_apply(op->columns);
+    size_t thumbsKept = 0;
     {
         std::lock_guard<std::mutex> lk(g_itemsMx);
-        if (keep) {     // a refresh: overlays stay until the overlay pass has them (no blinking arrows)
-            std::unordered_map<ULONGLONG, int> ov;
-            for (Item* it : g_items)
-                if (it->overlay) ov.emplace(it->sig, it->overlay);
-            if (!ov.empty())
-                for (Item* it : op->items)
-                    if (auto f = ov.find(it->sig); f != ov.end()) it->overlay = f->second;
+        if (keep) {
+            // a refresh: overlays stay until the overlay pass has them (no blinking arrows),
+            // and thumbnails of unchanged files stay
+            thumbsKept = carry_over(g_items, op->items);
         }
         free_items(g_items);
         g_items = std::move(op->items);
@@ -625,7 +861,8 @@ void enum_apply_op(HeapEnumOp* op) {
     }
     s_shownFolderSig = s_pendingFolderSig;
     set_error(op->enumHr);
-    thumb_reset_for_new_folder();
+    if (keep) thumb_keep_for_refresh(thumbsKept);
+    else thumb_reset_for_new_folder();
     ListView_SetItemState(g_list, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
     groups_apply();
     ListView_SetItemCountEx(g_list, (int)g_items.size(), keep ? LVSICF_NOSCROLL : 0);
@@ -642,14 +879,14 @@ void enum_apply_op(HeapEnumOp* op) {
             if (!pendingName.empty() && (StrCmpIW(n.c_str(), pendingName.c_str()) == 0 ||
                                          StrCmpIW(g_items[i]->fileName.c_str(), pendingName.c_str()) == 0))
                 pendingIdx = i;
-            if (!keep) continue;
-            if (selected.count(n)) reselect.push_back(i);
-            if (n == focused) focusIdx = i;
+            if (!keep || (selected.empty() && focused.empty())) continue;
+            std::wstring k = item_key(g_items[i]);
+            if (selected.count(k)) reselect.push_back(i);
+            if (k == focused) focusIdx = i;
         }
     }
     // (state changes notify LVN_ITEMCHANGED, whose handlers take g_itemsMx — so not under the lock)
-    for (int i : reselect) ListView_SetItemState(g_list, i, LVIS_SELECTED, LVIS_SELECTED);
-    if (focusIdx >= 0) ListView_SetItemState(g_list, focusIdx, LVIS_FOCUSED, LVIS_FOCUSED);
+    reapply_selection(reselect, focusIdx);
     if (pendingIdx >= 0) {
         ListView_SetItemState(g_list, -1, 0, LVIS_SELECTED);
         ListView_SetItemState(g_list, pendingIdx, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
@@ -663,20 +900,27 @@ void enum_apply_op(HeapEnumOp* op) {
     status_update();
     detailspane_update();
     if (op->final && perf_on()) perf_event("enum.complete", -1, (long long)g_items.size());
+    if (op->final) listing_complete(op->opId);
     delete op;
 }
 
 void enum_sort_items() {
     PerfScope ps("sort");
     int n = 0;
+    std::vector<int> reselect;
+    int focusIdx = -1;
     {
         std::lock_guard<std::mutex> lk(g_itemsMx);
+        SelectionByItem sel = capture_selection();   // the selection follows its items
         sort_items();
         n = (int)g_items.size();
+        locate_selection(sel, reselect, focusIdx);
     }
     ListView_SetItemState(g_list, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
     groups_apply();                                  // group ranges move with the order
     ListView_SetItemCountEx(g_list, n, LVSICF_NOSCROLL);
+    reapply_selection(reselect, focusIdx);
+    if (focusIdx >= 0) ListView_EnsureVisible(g_list, focusIdx, FALSE);
     enum_update_header_arrows();
     InvalidateRect(g_list, nullptr, TRUE);
 }

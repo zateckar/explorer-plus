@@ -15,7 +15,14 @@ File Explorer while starting in well under 100 ms.
   Network; children listed in the background; follows the current folder.
 - **Views**: Details (with Win11 row spacing, or Compact like Windows' setting), Extra large /
   Large / Medium / Small icons, List, Tiles; per-folder columns (any shell property), sort,
-  Group by; item check boxes; This PC drive tiles with free-space bars.
+  Group by; item check boxes; This PC drive tiles with free-space bars. Each folder
+  remembers its own view; View ▸ "Apply this view to all folders" makes the current view
+  and columns the default (like Explorer's Folder Options), "Reset all folders" goes back.
+  Double-click on empty space goes up a level.
+- **Text size**: View ▸ Text size, or Ctrl+Plus / Ctrl+Minus / Ctrl+0, scales the text of
+  the navigation pane, the file list and the details pane (80–200 %), remembered.
+- **Command bar**: folded into the "…" menu by default; "…" ▸ Show command bar puts the
+  row back, and its own "…" menu (or a right-click on it) has "Hide command bar".
 - **Search**: Windows Search where the folder is indexed, otherwise a recursive search;
   results as their own location with a Folder column.
 - **Compact context menu** like Windows 11: icon row (Cut / Copy / Rename / Share /
@@ -23,7 +30,9 @@ File Explorer while starting in well under 100 ms.
   the common verbs, and "Show more options" for the full classic menu (Shift+right-click /
   Shift+F10).
 - **File operations** through the shell (`IFileOperation`): copy, move, rename, delete to
-  the Recycle Bin, new folder / New ▸ items, drag and drop, clipboard.
+  the Recycle Bin, new folder / New ▸ items, drag and drop, clipboard. Deleting the open
+  folder in the navigation pane (Del, Shift+Del) opens the folder next to it; a folder
+  removed by another program sends the view to its parent.
 - **Large folders**: listings stream in; 30,000 files are on screen in ~60 ms and
   complete in under 0.2 s.
 
@@ -100,7 +109,9 @@ python -I tools/perf.py build\explorer-plus.exe build\perf 5         # startup /
 ```
 
 The smoke test works in a scratch folder with a scratch settings file. Note that its
-delete check sends one scratch file to the Recycle Bin.
+delete checks send one scratch file and one empty scratch folder to the Recycle Bin.
+Keep the work folder out of hidden folders (e.g. `%TEMP%` is under the hidden AppData):
+the navigation pane checks need it to show up in the tree.
 
 ## Releases
 

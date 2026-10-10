@@ -1,5 +1,6 @@
 #include "appstate.h"
 #include "perf.h"
+#include "workers.h"
 
 // globals
 HWND g_main = nullptr, g_address = nullptr, g_search = nullptr,
@@ -50,14 +51,22 @@ struct AsyncEntry { AsyncHandler apply; void* payload; };
 static std::mutex s_asyncMx;
 static std::deque<AsyncEntry> s_async;
 
+static bool s_wakePosted = false;          // a WM_ASYNC_WAKE is on its way (under s_asyncMx)
+
 void post_async(AsyncHandler apply, void* payload) {
+    if (workers_stopping()) return;        // exiting: the window is going, results are dropped
     bool wake;
     {
         std::lock_guard<std::mutex> lk(s_asyncMx);
-        wake = s_async.empty();            // one wake message per batch
         s_async.push_back({ apply, payload });
+        wake = !s_wakePosted;              // one wake message per batch
+        s_wakePosted = true;
     }
-    if (wake) PostMessageW(g_main, WM_ASYNC_WAKE, 0, 0);
+    // a wake that couldn't be posted (queue full, no window yet) is retried by the next post
+    if (wake && !(g_main && PostMessageW(g_main, WM_ASYNC_WAKE, 0, 0))) {
+        std::lock_guard<std::mutex> lk(s_asyncMx);
+        s_wakePosted = false;
+    }
 }
 
 void drain_async() {
@@ -65,7 +74,9 @@ void drain_async() {
     {
         std::lock_guard<std::mutex> lk(s_asyncMx);
         batch.swap(s_async);
+        s_wakePosted = false;
     }
+    if (workers_stopping()) return;
     double tAll = perf_on() ? perf_now() : 0;
     for (auto& e : batch) {
         if (!perf_on()) { e.apply(e.payload); continue; }

@@ -5,6 +5,7 @@ using std::min;
 #include "theme.h"
 #include "navigation.h"
 #include "listview.h"
+#include "acc.h"
 #include <algorithm>
 
 struct Crumb {
@@ -114,7 +115,8 @@ static void paint(HWND hwnd) {
     }
     // location icon
     if (s_iconIndex >= 0) {
-        int sz = GetSystemMetrics(SM_CXSMICON);
+        int sz = 0, szH = 0;
+        ImageList_GetIconSize(sys_imagelist(SHIL_SMALL), &sz, &szH);   // the list's size, not this monitor's metric
         ImageList_Draw(sys_imagelist(SHIL_SMALL), s_iconIndex, bp.dc,
                        s_icon.left + (s_icon.right - s_icon.left - sz) / 2, (bp.rc.bottom - sz) / 2, ILD_TRANSPARENT);
     }
@@ -251,9 +253,10 @@ static void show_history_menu() {
 
 static void end_edit(bool focusList) {
     if (!IsWindowVisible(s_edit)) return;
+    // focus first: hiding the focused edit hands focus to the box, which would edit again
+    if (focusList && g_list) SetFocus(g_list);
     ShowWindow(s_edit, SW_HIDE);
     InvalidateRect(s_box, nullptr, FALSE);
-    if (focusList && g_list) SetFocus(g_list);
 }
 
 static void place_edit() {
@@ -270,6 +273,11 @@ static void place_edit() {
 
 void address_begin_edit() {
     if (!s_edit) return;
+    if (IsWindowVisible(s_edit)) {      // already editing (F4 / Ctrl+L again): keep what is typed
+        SetFocus(s_edit);
+        SendMessageW(s_edit, EM_SETSEL, 0, -1);
+        return;
+    }
     // autocomplete on first use: setting it up costs ~10 ms at startup
     static bool autoComplete = false;
     if (!autoComplete) {
@@ -315,9 +323,71 @@ static LRESULT CALLBACK edit_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // ------------------------------------------------------------------
+// screen readers: "Address" with the path as its value; the visible crumbs (each its
+// chevron, then its name), the overflow and the history buttons. Actions are posted
+// back (kAccAction): the menus are modal.
+
+static const UINT kAccAction = WM_APP + 50;
+struct AccCrumb { int hit; };          // a hit code (see s_hover)
+static std::vector<AccCrumb> acc_items() {
+    std::vector<AccCrumb> v;
+    if (!IsRectEmpty(&s_overflow)) v.push_back({ kHitOverflow });
+    for (int i = s_firstVisible; i < (int)s_crumbs.size(); ++i) {
+        v.push_back({ 2 * i });
+        v.push_back({ 2 * i + 1 });
+    }
+    v.push_back({ kHitHistory });
+    return v;
+}
+static const AccSource s_acc = [] {
+    AccSource a;
+    a.name = L"Address";
+    a.role = ROLE_SYSTEM_TOOLBAR;
+    a.value = [] { return current_display_path(); };
+    a.count = [] { return (int)acc_items().size(); };
+    a.child = [](int n) {
+        int h = acc_items()[n].hit;
+        AccChild c;
+        if (h == kHitOverflow) {
+            c.name = L"Earlier locations"; c.role = ROLE_SYSTEM_BUTTONMENU; c.action = L"Open"; c.rc = s_overflow;
+        } else if (h == kHitHistory) {
+            c.name = L"Recent locations"; c.role = ROLE_SYSTEM_BUTTONMENU; c.action = L"Open"; c.rc = s_history;
+        } else if (h % 2 == 0) {
+            int i = h / 2;
+            c.name = L"Folders in " + (i > 0 ? s_crumbs[i - 1].name : std::wstring(L"Desktop"));
+            c.role = ROLE_SYSTEM_BUTTONMENU; c.action = L"Open"; c.rc = s_crumbs[i].chevron;
+        } else {
+            int i = h / 2;
+            c.name = s_crumbs[i].name;
+            c.role = ROLE_SYSTEM_PUSHBUTTON; c.action = L"Open"; c.rc = s_crumbs[i].text;
+        }
+        if (s_hover == h) c.state |= STATE_SYSTEM_HOTTRACKED;
+        return c;
+    };
+    a.action = [](int n) { PostMessageW(s_box, kAccAction, (WPARAM)acc_items()[n].hit, 0); };
+    return a;
+}();
 
 static LRESULT CALLBACK box_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+        case WM_GETOBJECT: return acc_get_object(hwnd, wp, lp, &s_acc);
+        case WM_SETFOCUS:
+            // reached with Tab / F6: type a path, like Explorer's address bar (but focus
+            // falling back from the edit as it hides goes on to the list)
+            if ((HWND)wp == s_edit) { if (g_list) SetFocus(g_list); }
+            else address_begin_edit();
+            return 0;
+        case kAccAction: {
+            int h = (int)wp;
+            if (h == kHitHistory) show_history_menu();
+            else if (h == kHitOverflow) show_overflow_menu();
+            else if (h >= 0 && h / 2 < (int)s_crumbs.size()) {
+                if (h % 2 == 0) show_chevron_menu(h / 2);
+                else if (h / 2 == (int)s_crumbs.size() - 1) navigation_refresh();
+                else navigate_to(s_crumbs[h / 2].abs);
+            }
+            return 0;
+        }
         case WM_SETTEXT:
             // callers set the address text after navigating: resync the crumbs
             DefWindowProcW(hwnd, msg, wp, lp);
@@ -325,6 +395,8 @@ static LRESULT CALLBACK box_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             layout_crumbs();
             if (s_edit && GetFocus() != s_edit) SetWindowTextW(s_edit, (LPCWSTR)lp);
             InvalidateRect(hwnd, nullptr, FALSE);
+            acc_notify(hwnd, EVENT_OBJECT_VALUECHANGE, -1);
+            acc_notify(hwnd, EVENT_OBJECT_REORDER, -1);
             return TRUE;
         case WM_SIZE:
             layout_crumbs();
@@ -392,8 +464,10 @@ static LRESULT CALLBACK box_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MEASUREITEM: {
             auto* mi = (MEASUREITEMSTRUCT*)lp;
             if (mi->CtlType != ODT_MENU) break;
-            mi->itemWidth = GetSystemMetrics(SM_CXSMICON) + S(4);
-            mi->itemHeight = GetSystemMetrics(SM_CYSMICON);
+            int w = 0, h = 0;
+            ImageList_GetIconSize(sys_imagelist(SHIL_SMALL), &w, &h);   // what is drawn
+            mi->itemWidth = w + S(4);
+            mi->itemHeight = h;
             return TRUE;
         }
         case WM_DRAWITEM: {
@@ -401,7 +475,8 @@ static LRESULT CALLBACK box_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (di->CtlType != ODT_MENU) break;
             UINT id = di->itemID;
             if (id >= 1 && id <= s_menuEntries.size() && s_menuEntries[id - 1].icon >= 0) {
-                int sz = GetSystemMetrics(SM_CXSMICON);
+                int w = 0, sz = 0;
+                ImageList_GetIconSize(sys_imagelist(SHIL_SMALL), &w, &sz);
                 ImageList_Draw(sys_imagelist(SHIL_SMALL), s_menuEntries[id - 1].icon, di->hDC,
                                di->rcItem.left, di->rcItem.top + (di->rcItem.bottom - di->rcItem.top - sz) / 2,
                                ILD_TRANSPARENT);

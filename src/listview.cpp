@@ -23,27 +23,29 @@ static PITEMID_CHILD s_editPidl = nullptr;   // the item itself
 static std::wstring s_editName;              // as shown when the edit began
 static std::wstring s_editHiddenExt;         // the extension the shown name leaves out (ours or Windows')
 static bool s_editExtForced = false;
+static PITEMID_CHILD s_editFolder = nullptr;  // absolute pidl of the folder the renamed item is in
 static bool s_selChangePosted = false;
 
 // ---------------------------------------------------------------
 // view application
 
-// Row spacing: Win11 spaces Details rows out unless "Compact view" is on. Report
-// views make rows as tall as their image lists, but draw an image with the row's
-// height (so the next image of the strip shows under a short icon). Details
-// therefore gets blank image lists of the row height, which only reserve the icon
-// and check box slots; icons, overlays and boxes are drawn in item post-paint.
+// Row spacing: Win11 spaces Details, List and Small icons rows out unless "Compact
+// view" is on. These views make rows as tall as their small image list, but draw an
+// image with the row's height (so the next image of the strip shows under a short
+// icon). They therefore get blank image lists of the row height, which only reserve
+// the icon and check box slots; icons, overlays and boxes are drawn in item post-paint.
 static HIMAGELIST s_padSmall = nullptr, s_padState = nullptr;
 static int s_padKey = -1;
 static HTHEME s_boxTheme = nullptr;      // "Button" theme of the list (check boxes)
 static int s_boxW = 0;
 
-static bool padded_rows() { return g_view.lvView == LV_VIEW_DETAILS; }
+static bool padded_view(UINT v) { return v == LV_VIEW_DETAILS || v == LV_VIEW_LIST || v == LV_VIEW_SMALLICON; }
+static bool padded_rows() { return padded_view(g_view.lvView); }
 
 static void apply_image_lists(UINT v) {
     HIMAGELIST small = sys_imagelist(SHIL_SMALL);
     if (s_boxTheme) { CloseThemeData(s_boxTheme); s_boxTheme = nullptr; }
-    if (v != LV_VIEW_DETAILS) {
+    if (!padded_view(v)) {
         // the control's own drawing: its check boxes (if any) and the shell icons
         if (s_padState && ListView_GetImageList(g_list, LVSIL_STATE) == s_padState) {
             ListView_SetImageList(g_list, nullptr, LVSIL_STATE);
@@ -58,7 +60,7 @@ static void apply_image_lists(UINT v) {
     s_boxTheme = OpenThemeData(g_list, L"Button");
     int cx = 16, cy = 16;
     ImageList_GetIconSize(small, &cx, &cy);
-    int h = std::max(cy, S(g_compactView ? 21 : 29));
+    int h = std::max(cy, SC(g_compactView ? 21 : 29));
     s_boxW = S(16);
     int key = (h << 16) ^ (cx << 8) ^ s_boxW;
     if (key != s_padKey || !s_padSmall) {
@@ -83,8 +85,8 @@ void list_apply_view() {
         tv.cbSize = sizeof(tv);
         tv.dwMask = LVTVIM_TILESIZE | LVTVIM_COLUMNS;
         tv.dwFlags = LVTVIF_FIXEDSIZE;
-        tv.sizeTile.cx = S(280);
-        tv.sizeTile.cy = S(68);
+        tv.sizeTile.cx = SC(280);
+        tv.sizeTile.cy = SC(68);
         tv.cLines = 2;
         ListView_SetTileViewInfo(g_list, &tv);
     }
@@ -134,6 +136,17 @@ static bool toggle_check_at(POINT pt) {
 
 static bool toggle_group_at(POINT pt);
 
+// no item and no group header under the point (the list's background, also between
+// a group's items)
+static bool on_empty_space(POINT pt) {
+    LVHITTESTINFO ht{};
+    ht.pt = pt;
+    int i = (int)SendMessageW(g_list, LVM_HITTEST, (WPARAM)-1, (LPARAM)&ht);   // -1: group hits too
+    const UINT groupParts = LVHT_EX_GROUP_HEADER | LVHT_EX_GROUP_FOOTER | LVHT_EX_GROUP_COLLAPSE |
+                            LVHT_EX_GROUP_STATEICON | LVHT_EX_GROUP_SUBSETLINK;
+    return i < 0 && !(ht.flags & (groupParts | LVHT_ONITEM));
+}
+
 // a press on a group header's chevron toggles the group instead of selecting its items
 static LRESULT CALLBACK list_subclass(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
     static bool swallowUp = false;
@@ -150,6 +163,12 @@ static LRESULT CALLBACK list_subclass(HWND h, UINT msg, WPARAM wp, LPARAM lp, UI
         case WM_LBUTTONDBLCLK: {
             POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             if (toggle_group_at(pt) || toggle_check_at(pt)) { swallowUp = true; return 0; }
+            if (msg == WM_LBUTTONDBLCLK && on_empty_space(pt)) {
+                // a double-click on the background goes up a level
+                LRESULT r = DefSubclassProc(h, msg, wp, lp);
+                PostMessageW(g_main, WM_COMMAND, MAKEWPARAM(IDM_NAV_UP, 0), 0);
+                return r;
+            }
             break;
         }
         case WM_LBUTTONUP:
@@ -196,7 +215,7 @@ void list_create() {
                   LVS_REPORT | LVS_SHOWSELALWAYS | LVS_OWNERDATA | LVS_EDITLABELS | LVS_SHAREIMAGELISTS;
     g_list = CreateWindowExW(0, WC_LISTVIEWW, L"", style,
                              0, 0, 100, 100, g_main, (HMENU)IDC_LIST, g_hinst, nullptr);
-    fix_font(g_list);
+    SendMessageW(g_list, WM_SETFONT, (WPARAM)content_font(), FALSE);
     ListView_SetExtendedListViewStyle(g_list,
         LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_INFOTIP | LVS_EX_HEADERDRAGDROP);
     columns_apply(columns_defaults(nullptr, nullptr));   // Name / Date modified / Type / Size until a folder lists
@@ -272,8 +291,11 @@ void list_copy_selection(bool cut) {
         }
         if (FAILED(pdo->SetData(&fe, &sm, TRUE))) GlobalFree(sm.hGlobal);
     }
-    if (SUCCEEDED(OleSetClipboard(pdo.get()))) OleFlushClipboard();
-    fileops_set_cut_items(cut ? sel : std::vector<PCITEMID_CHILD>{});
+    // (another program may hold the clipboard: then nothing is cut, and no row is ghosted)
+    bool onClipboard = SUCCEEDED(OleSetClipboard(pdo.get()));
+    if (onClipboard) OleFlushClipboard();
+    else MessageBeep(MB_ICONASTERISK);
+    fileops_set_cut_items(cut && onClipboard ? sel : std::vector<PCITEMID_CHILD>{});
     InvalidateRect(g_list, nullptr, FALSE);
 }
 
@@ -373,11 +395,17 @@ static void handle_getdispinfo(LV_DISPINFOW* di) {
         }
     }
     if ((di->item.mask & LVIF_COLUMNS) && g_view.lvView == LV_VIEW_TILE) {
-        // tiles: type + size under the name
+        // tiles: type + size under the name. The control passes its own arrays with
+        // cColumns slots: fill them (with a pointer of ours it reads its zeroed buffer,
+        // and column 0 is the name)
         UINT n = 0;
         const UINT* cols = columns_tile_lines(&n);
-        di->item.cColumns = n;
-        di->item.puColumns = const_cast<UINT*>(cols);
+        n = std::min(n, di->item.cColumns);
+        for (UINT k = 0; k < n; ++k) {
+            if (di->item.puColumns) di->item.puColumns[k] = cols[k];
+            if ((di->item.mask & LVIF_COLFMT) && di->item.piColFmt) di->item.piColFmt[k] = LVCFMT_LEFT;
+        }
+        di->item.cColumns = di->item.puColumns ? n : 0;
     }
 }
 
@@ -398,7 +426,7 @@ static LRESULT draw_group_header(NMLVCUSTOMDRAW* cd) {
     bool collapsed = ListView_GetGroupState(g_list, id, LVGS_COLLAPSED) & LVGS_COLLAPSED;
     RECT chev = group_chevron_rect(r);
     draw_glyph(dc, collapsed ? L'\xE76C' : L'\xE70D', chev, p.textSecondary, 10);
-    HGDIOBJ of = SelectObject(dc, ui_font_bold());
+    HGDIOBJ of = SelectObject(dc, content_font_bold());
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, p.text);
     RECT t{ chev.right + S(4), r.top, r.right - S(8), r.bottom };
@@ -511,8 +539,8 @@ static void draw_row_images(NMLVCUSTOMDRAW* cd) {
     }
     HDC dc = cd->nmcd.hdc;
     int saved = SaveDC(dc);
-    // stay inside the Name column (it may be narrow, scrolled or moved)
-    if (HWND hdr = ListView_GetHeader(g_list)) {
+    // Details: stay inside the Name column (it may be narrow, scrolled or moved)
+    if (HWND hdr = g_view.lvView == LV_VIEW_DETAILS ? ListView_GetHeader(g_list) : nullptr) {
         RECT hr{};
         if (Header_GetItemRect(hdr, 0, &hr)) {
             MapWindowPoints(hdr, g_list, (POINT*)&hr, 2);
@@ -650,6 +678,7 @@ static void handle_keydown(LV_KEYDOWN* kd) {
 static void edit_forget() {
     s_editIndex = -1;
     if (s_editPidl) { CoTaskMemFree(s_editPidl); s_editPidl = nullptr; }
+    if (s_editFolder) { CoTaskMemFree(s_editFolder); s_editFolder = nullptr; }
     s_editName.clear();
     s_editHiddenExt.clear();
     s_editExtForced = false;
@@ -662,6 +691,7 @@ static void edit_capture(int idx) {
     const Item* it = g_items[idx];
     s_editIndex = idx;
     s_editPidl = pidl_clone(it->pidl);
+    s_editFolder = pidl_clone(g_current);       // the folder the item is in, whatever happens meanwhile
     s_editName = it->name;
     s_editHiddenExt = it->hiddenExt;
     s_editExtForced = it->extForced;
@@ -674,19 +704,20 @@ static void edit_capture(int idx) {
 }
 
 static void rename_commit(const std::wstring& newName) {
-    PITEMID_CHILD child = s_editPidl;
-    s_editPidl = nullptr;
+    PITEMID_CHILD child = s_editPidl, folder = s_editFolder;
+    s_editPidl = s_editFolder = nullptr;
     bool unchanged = newName == s_editName;
     // the shown name may differ from Windows' own (File name extensions): rename to the
     // file name the user means — a hidden extension stays, a shown one is taken as typed
     std::wstring target = newName + s_editHiddenExt;
     bool exact = s_editExtForced;
     edit_forget();
-    if (!child) return;
     com_ptr<IShellFolder> psf;
-    if (!newName.empty() && !unchanged && SUCCEEDED(bind_list(g_current, IID_PPV_ARGS(psf.put()))) && psf)
+    if (child && folder && !newName.empty() && !unchanged &&
+        SUCCEEDED(bind_list(folder, IID_PPV_ARGS(psf.put()))) && psf)
         fileops_rename_item(g_main, psf.get(), child, target, exact);
-    CoTaskMemFree(child);
+    if (child) CoTaskMemFree(child);
+    if (folder) CoTaskMemFree(folder);
 }
 
 // select the base name in the label editor ("report" of "report.txt"), like Explorer
@@ -752,10 +783,8 @@ LRESULT list_notify(HWND, WPARAM, LPARAM lp) {
         case LVN_ITEMCHANGED:
         case LVN_ODSTATECHANGED: {
             // Ctrl+A on 10k items sends 10k notifications: coalesce into one update
-            if (!s_selChangePosted) {
-                s_selChangePosted = true;
-                PostMessageW(g_main, WM_SELECTION_CHANGED, 0, 0);
-            }
+            if (!s_selChangePosted)       // (not posted: the next change tries again)
+                s_selChangePosted = PostMessageW(g_main, WM_SELECTION_CHANGED, 0, 0) != FALSE;
             return 0;
         }
         case LVN_ITEMACTIVATE:      // double-click and Enter

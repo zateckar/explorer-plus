@@ -166,6 +166,14 @@ void columns_fill(IShellItem2* si, const ColumnSet& cols, Item* it) {
 // ------------------------------------------------------------------
 // UI thread
 
+// the columns "Apply to all folders" made every file-system folder's default
+static const wchar_t kDefaultKey[] = L"::fs-default";
+
+static bool is_fs_folder(PCIDLIST_ABSOLUTE folder) {
+    WCHAR path[MAX_PATH];
+    return folder && !ILIsEmpty(folder) && !search_is_results(folder) && SHGetPathFromIDListW(folder, path);
+}
+
 ColumnSet columns_for_folder(PCIDLIST_ABSOLUTE folder) {
     const std::wstring* s = settings_columns_for(folder_settings_key(folder));
     if (s) return columns_parse(*s);
@@ -176,8 +184,12 @@ ColumnSet columns_for_folder(PCIDLIST_ABSOLUTE folder) {
         normalize(cols);
         return cols;
     }
+    if (is_fs_folder(folder))
+        if (const std::wstring* d = settings_columns_for(kDefaultKey)) return columns_parse(*d);
     return {};
 }
+
+bool columns_can_apply_to_all() { return is_fs_folder(g_current) && !g_columns.empty(); }
 
 static bool same_set(const ColumnSet& a, const ColumnSet& b) {
     if (a.size() != b.size()) return false;
@@ -186,8 +198,13 @@ static bool same_set(const ColumnSet& a, const ColumnSet& b) {
     return true;
 }
 
+// the folder the shown columns belong to: g_current changes as soon as a navigation
+// starts, the columns only when its listing arrives
+static std::wstring s_columnsKey;
+
 void columns_apply(const ColumnSet& cols) {
     if (cols.empty() || !g_list) return;
+    s_columnsKey = folder_settings_key(g_current);     // (called with the listing of g_current)
     // a sort by a column this folder doesn't have falls back to Name
     if (g_sortColumn == COL_EXTRA &&
         std::none_of(cols.begin(), cols.end(), [](const Column& c) { return same_key(c.key, g_sortKey); })) {
@@ -203,7 +220,7 @@ void columns_apply(const ColumnSet& cols) {
         LVCOLUMNW c{};
         c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT | LVCF_SUBITEM;
         c.fmt = g_columns[i].fmt;
-        c.cx = S(g_columns[i].width96);
+        c.cx = SC(g_columns[i].width96);
         c.pszText = const_cast<LPWSTR>(g_columns[i].title.c_str());
         c.iSubItem = i;
         ListView_InsertColumn(g_list, i, &c);
@@ -289,8 +306,15 @@ int columns_compare_extra(const Item* a, const Item* b) {
 // ------------------------------------------------------------------
 // persistence of the shown set (display order, current widths)
 
-static void save_current() {
-    if (g_columns.empty()) return;
+// the shown set in display order with the current widths
+// widths are kept at 96 dpi and 100% text size; on screen they grow with both
+static int width96_of(int px) { return MulDiv(px, 96 * 100, theme_dpi() * text_scale()); }
+
+void columns_rescale() {
+    for (int i = 0; i < (int)g_columns.size(); ++i) ListView_SetColumnWidth(g_list, i, SC(g_columns[i].width96));
+}
+
+static std::wstring current_serialized() {
     int n = (int)g_columns.size();
     std::vector<int> order(n);
     if (!ListView_GetColumnOrderArray(g_list, n, order.data()))
@@ -300,17 +324,28 @@ static void save_current() {
         if (i < 0 || i >= n) continue;
         Column c = g_columns[i];
         int w = ListView_GetColumnWidth(g_list, i);
-        if (w > 0) c.width96 = MulDiv(w, 96, theme_dpi());
+        if (w > 0) c.width96 = width96_of(w);
         ordered.push_back(c);
     }
-    settings_set_columns_for(folder_settings_key(g_current), columns_serialize(ordered));
+    return columns_serialize(ordered);
 }
 
+static void save_current() {
+    if (g_columns.empty() || s_columnsKey.empty()) return;
+    settings_set_columns_for(s_columnsKey, current_serialized());
+}
+
+void columns_set_default_from_current() {
+    if (!columns_can_apply_to_all()) return;
+    settings_set_columns_for(kDefaultKey, current_serialized());
+}
+
+void columns_forget_default() { settings_set_columns_for(kDefaultKey, L""); }
+
 void columns_widths_changed() {
-    int dpi = theme_dpi();
     for (int i = 0; i < (int)g_columns.size(); ++i) {
         int w = ListView_GetColumnWidth(g_list, i);
-        if (w > 0) g_columns[i].width96 = MulDiv(w, 96, dpi);
+        if (w > 0) g_columns[i].width96 = width96_of(w);
     }
     save_current();
 }

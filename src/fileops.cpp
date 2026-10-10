@@ -1,6 +1,7 @@
 #include "fileops.h"
 #include "navigation.h"
 #include "enumerate.h"
+#include "detailspane.h"
 #include <unordered_set>
 
 // ---------------------------------------------------------------
@@ -49,8 +50,9 @@ bool fileops_is_cut(PCITEMID_CHILD child) {
 
 // Drop `pdo` onto a folder through the folder's own drop target — the same path
 // Explorer uses for paste, so collisions, "- Copy" naming, archives, undo and
-// cross-volume rules behave identically.
+// cross-volume rules behave identically. False when the folder refused it.
 static bool drop_into_folder(PCIDLIST_ABSOLUTE folder, IDataObject* pdo, DWORD effect) {
+    detailspane_release_files();        // a moved file may be the one previewed
     com_ptr<IShellFolder> psf;
     if (FAILED(bind_list(folder, IID_PPV_ARGS(psf.put()))) || !psf) return false;
     com_ptr<IDropTarget> dt;
@@ -62,6 +64,8 @@ static bool drop_into_folder(PCIDLIST_ABSOLUTE folder, IDataObject* pdo, DWORD e
         return false;
     }
     eff = effect;
+    // (the effect written back isn't checked: shell targets report DROPEFFECT_NONE for
+    // optimized moves and asynchronous copies that did happen)
     return SUCCEEDED(dt->Drop(pdo, 0, pt, &eff));
 }
 
@@ -81,19 +85,22 @@ void fileops_paste_into_current() {
 }
 
 void fileops_delete_items(HWND hwnd, IShellFolder* parent,
-                          const std::vector<PCITEMID_CHILD>& children, bool permanent) {
+                          const std::vector<PCITEMID_CHILD>& children, bool permanent, bool refresh) {
     if (!parent || children.empty()) return;
+    detailspane_release_files();        // the preview handler may hold the file open
     com_ptr<IFileOperation> fo;
     if (FAILED(CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL,
                                 IID_PPV_ARGS(fo.put()))) || !fo) return;
     // permanent delete always asks "Are you sure...?"; recycling asks only when the
-    // Recycle Bin's "Display delete confirmation dialog" setting is on (as Explorer)
+    // Recycle Bin's "Display delete confirmation dialog" setting is on (as Explorer) —
+    // but an item that can't be recycled (network, too big) still asks before it is
+    // deleted for good
     DWORD flags = permanent ? FOFX_EARLYFAILURE
                             : (FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOFX_ADDUNDORECORD);
     if (!permanent) {
         SHELLSTATEW ss{};
         SHGetSetSettings(&ss, SSF_NOCONFIRMRECYCLE, FALSE);
-        if (ss.fNoConfirmRecycle) flags |= FOF_NOCONFIRMATION;
+        if (ss.fNoConfirmRecycle) flags |= FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING;
     }
     fo->SetOperationFlags(flags);
     fo->SetOwnerWindow(hwnd);
@@ -103,35 +110,38 @@ void fileops_delete_items(HWND hwnd, IShellFolder* parent,
         return;
     if (SUCCEEDED(fo->DeleteItems(arr.get())))
         fo->PerformOperations();
-    navigation_refresh();
+    if (refresh) navigation_refresh();
 }
 
-void fileops_rename_item(HWND hwnd, IShellFolder* parent, PCITEMID_CHILD child,
+bool fileops_rename_item(HWND hwnd, IShellFolder* parent, PCITEMID_CHILD child,
                          const std::wstring& newName, bool exactFileName) {
-    if (!parent || !child || newName.empty()) return;
+    if (!parent || !child || newName.empty()) return false;
+    detailspane_release_files();        // the preview handler may hold the file open
+    bool renamed = false;
     if (exactFileName) {
         // the name carries an extension Windows hides: the shell's rename would add the
         // old one again ("b.txt.txt"), so set the file name as it is
         PITEMID_CHILD out = nullptr;
-        if (SUCCEEDED(parent->SetNameOf(hwnd, child, newName.c_str(), SHGDN_INFOLDER | SHGDN_FORPARSING, &out)))
-            enum_set_pending_select(newName, false);
+        renamed = SUCCEEDED(parent->SetNameOf(hwnd, child, newName.c_str(), SHGDN_INFOLDER | SHGDN_FORPARSING, &out));
+        if (renamed) enum_set_pending_select(newName, false);
         if (out) CoTaskMemFree(out);
         navigation_refresh();
-        return;
+        return renamed;
     }
     com_ptr<IShellItem> si;
-    if (FAILED(create_item(parent, child, IID_PPV_ARGS(si.put()))) || !si) return;
+    if (FAILED(create_item(parent, child, IID_PPV_ARGS(si.put()))) || !si) return false;
     com_ptr<IFileOperation> fo;
     if (FAILED(CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL,
-                                IID_PPV_ARGS(fo.put()))) || !fo) return;
+                                IID_PPV_ARGS(fo.put()))) || !fo) return false;
     fo->SetOperationFlags(FOF_ALLOWUNDO | FOFX_ADDUNDORECORD);
     fo->SetOwnerWindow(hwnd);
     BOOL aborted = FALSE;
-    if (SUCCEEDED(fo->RenameItem(si.get(), newName.c_str(), nullptr)) &&
-        SUCCEEDED(fo->PerformOperations()) &&
-        SUCCEEDED(fo->GetAnyOperationsAborted(&aborted)) && !aborted)
-        enum_set_pending_select(newName, false);     // keep the renamed item selected
+    renamed = SUCCEEDED(fo->RenameItem(si.get(), newName.c_str(), nullptr)) &&
+              SUCCEEDED(fo->PerformOperations()) &&
+              SUCCEEDED(fo->GetAnyOperationsAborted(&aborted)) && !aborted;
+    if (renamed) enum_set_pending_select(newName, false);     // keep the renamed item selected
     navigation_refresh();
+    return renamed;
 }
 
 static bool name_exists(IShellFolder* psf, const std::wstring& name) {

@@ -34,7 +34,7 @@ void layout_create_splitters() {
                       TVS_TRACKSELECT | TVS_FULLROWSELECT | TVS_NOHSCROLL | TVS_EDITLABELS;
     g_tree = CreateWindowExW(0, WC_TREEVIEWW, L"", treeStyle,
                              0, 0, 100, 100, g_main, (HMENU)IDC_TREE, g_hinst, nullptr);
-    fix_font(g_tree);
+    SendMessageW(g_tree, WM_SETFONT, (WPARAM)content_font(), FALSE);
 }
 
 // The splitters are the gaps between the panes (main-window client area).
@@ -115,8 +115,11 @@ void layout_resize(HWND main, int w, int h) {
     int top = y, bottom = max(top + 50, h - stH);
     s_details = details_shown(w);
     int sw = splitter_w();
-    int treeW = g_treeVisible ? S(g_splitterX) : 0;
-    int paneW = s_details ? S(g_splitterRight) : 0;
+    // clamp the saved widths to this window (they may come from a larger monitor / DPI);
+    // the preferences themselves are kept
+    int minList = S(200);
+    int treeW = g_treeVisible ? max(0, min((int)S(g_splitterX), w - sw - minList)) : 0;
+    int paneW = s_details ? max(0, min((int)S(g_splitterRight), w - treeW - 2 * sw - minList)) : 0;
     s_tree = { 0, top, treeW, bottom };
     int listX = g_treeVisible ? treeW + sw : 0;
     int listR = s_details ? w - paneW - sw : w;

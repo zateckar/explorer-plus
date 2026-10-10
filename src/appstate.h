@@ -33,6 +33,7 @@ using ColumnSet = std::vector<Column>;
 struct Item {
     std::wstring    name;      // in-folder display name (file name extensions per g_showExtensions)
     std::wstring    fileName;  // file-system items: the real in-folder name ("a.txt")
+    std::wstring    path;      // full parsing path where the folder gives one (search results, Home), else empty
     std::wstring    hiddenExt; // the extension `name` leaves out where Windows itself would show it
     bool            extForced = false;      // `name` shows an extension Windows would hide
     std::wstring    size;      // formatted display size, empty for folders
@@ -41,7 +42,12 @@ struct Item {
     ULONGLONG       bytes = 0;
     FILETIME        modified{};
     PITEMID_CHILD   pidl = nullptr;         // child pidl relative to current folder
-    ULONGLONG       sig  = 0;               // identity signature
+    // Identity. `key` names the item across listings and changes: selection, focus,
+    // overlays and change notifications go by it (lowercased path where the folder gives
+    // one, else file name, else display name). `sig` hashes the ID, which also holds size
+    // and date: the thumbnail goes by it, so a changed file gets a new one.
+    std::wstring    key;
+    ULONGLONG       sig  = 0;
     SFGAOF          attrs = 0;
     int             icon = 0;               // system image list index
     int             overlay = 0;            // 1-based overlay index (0 = none)

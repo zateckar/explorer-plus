@@ -8,9 +8,11 @@ void fileops_set_cut_items(const std::vector<PCITEMID_CHILD>& children);   // em
 bool fileops_is_cut(PCITEMID_CHILD child);    // ghost this row (cut, not yet pasted)
 
 // FileOperations via IFileOperation
+// (synchronous; refresh = list the current folder again afterwards)
 void fileops_delete_items(HWND hwnd, IShellFolder* parent,
-                          const std::vector<PCITEMID_CHILD>& children, bool permanent);
-// exactFileName: newName is the complete file name, even where Windows hides extensions
-void fileops_rename_item(HWND hwnd, IShellFolder* parent, PCITEMID_CHILD child,
+                          const std::vector<PCITEMID_CHILD>& children, bool permanent, bool refresh = true);
+// exactFileName: newName is the complete file name, even where Windows hides extensions;
+// true when the item was renamed (not cancelled, not failed)
+bool fileops_rename_item(HWND hwnd, IShellFolder* parent, PCITEMID_CHILD child,
                          const std::wstring& newName, bool exactFileName = false);
 void fileops_new_folder();
