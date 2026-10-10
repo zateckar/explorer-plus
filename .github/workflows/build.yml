@@ -92,7 +92,7 @@ jobs:
         shell: pwsh
         run: python -I tools/smoke_test.py build-release/explorer-plus.exe build-smoke
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: explorer-plus-${{ steps.ver.outputs.label }}
           path: |
