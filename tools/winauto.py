@@ -185,12 +185,21 @@ class App:
             time.sleep(0.25)
         if not self.hwnd:
             raise RuntimeError('main window not found')
-        self.list = child_by_id(self.hwnd, self.IDC_LIST)
-        self.tree = child_by_id(self.hwnd, self.IDC_TREE)
-        self.address = child_by_id(self.hwnd, self.IDC_ADDRESS)
-        self.search_box = child_by_id(self.hwnd, self.IDC_SEARCH)
-        self.status = child_by_id(self.hwnd, self.IDC_STATUS)
-        self.addr_edit = [c for c in children(self.address) if cls(c) == 'Edit'][0]
+        # the main window is findable while it is still creating its controls (a
+        # slow runner can look in between): wait until they are all there
+        for _ in range(60):
+            self.list = child_by_id(self.hwnd, self.IDC_LIST)
+            self.tree = child_by_id(self.hwnd, self.IDC_TREE)
+            self.address = child_by_id(self.hwnd, self.IDC_ADDRESS)
+            self.search_box = child_by_id(self.hwnd, self.IDC_SEARCH)
+            self.status = child_by_id(self.hwnd, self.IDC_STATUS)
+            edits = [c for c in children(self.address) if cls(c) == 'Edit'] if self.address else []
+            if all((self.list, self.tree, self.search_box, self.status)) and edits:
+                self.addr_edit = edits[0]
+                break
+            time.sleep(0.25)
+        else:
+            raise RuntimeError('main window controls not found')
 
     def wait_idle(self, t=1.5):
         time.sleep(t)
