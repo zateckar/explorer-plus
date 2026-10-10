@@ -31,7 +31,7 @@ jobs:
       label: ${{ steps.ver.outputs.label }}
       prerelease: ${{ steps.ver.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: MinGW-w64 toolchain (MSYS2 UCRT64)
         id: msys2
