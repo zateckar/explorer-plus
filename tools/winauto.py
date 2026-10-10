@@ -3,7 +3,7 @@
 Everything works through window messages and PrintWindow: the user's mouse and
 keyboard focus are never touched.
 """
-import ctypes, ctypes.wintypes as W, subprocess, time, os, struct
+import ctypes, ctypes.wintypes as W, subprocess, time, os, struct, zlib
 
 u = ctypes.windll.user32
 g = ctypes.windll.gdi32
@@ -284,13 +284,20 @@ class App:
         buf = ctypes.create_string_buffer(w * h * 4)
         g.GetDIBits(mem, bmp, 0, h, buf, bi, 0)
         g.DeleteObject(bmp); g.DeleteDC(mem); u.ReleaseDC(self.hwnd, hdc)
-        bmp_path = path + '.bmp'
-        with open(bmp_path, 'wb') as f:
-            f.write(b'BM' + struct.pack('<IHHI', 14 + 40 + len(buf.raw), 0, 0, 54))
-            f.write(bi)
-            f.write(buf.raw)
-        subprocess.run(['ffmpeg', '-loglevel', 'error', '-y', '-i', bmp_path, path], check=False)
-        os.remove(bmp_path)
+        # BGRX top-down -> 8-bit RGB PNG (no external tools: CI runners have no ffmpeg)
+        bgrx = buf.raw
+        rgb = bytearray(w * h * 3)
+        rgb[0::3], rgb[1::3], rgb[2::3] = bgrx[2::4], bgrx[1::4], bgrx[0::4]
+        stride = w * 3
+        raw = b''.join(b'\0' + rgb[y * stride:(y + 1) * stride] for y in range(h))
+
+        def chunk(tag, data):
+            return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data) & 0xFFFFFFFF)
+        with open(path, 'wb') as f:
+            f.write(b'\x89PNG\r\n\x1a\n'
+                    + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+                    + chunk(b'IDAT', zlib.compress(raw, 6))
+                    + chunk(b'IEND', b''))
 
     def close(self):
         u.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
