@@ -1,5 +1,5 @@
-"""Draw the app icon (a white folder on a blue-violet tile with an amber plus badge) at
-every size Windows asks for.
+"""Draw the app icon (the familiar yellow file folder with an orange plus badge) at every
+size Windows asks for. The folder fills the canvas, so the icon reads at taskbar sizes.
 
 Usage: python -I tools/make_icon.py res/app.ico [preview-dir]
 
@@ -15,9 +15,10 @@ import zlib
 SIZES = [16, 20, 24, 32, 40, 48, 64, 96, 128, 256]
 SUB = 4
 
-TILE_A, TILE_B = (64, 120, 255), (132, 60, 240)       # top-left -> bottom-right
-FOLDER, FOLDER_TAB = (255, 255, 255), (222, 230, 255)
-BADGE_A, BADGE_B = (255, 196, 64), (255, 128, 16)
+BACK_A, BACK_B = (236, 170, 44), (214, 140, 20)       # tab and back panel, top -> bottom
+FRONT_A, FRONT_B = (255, 216, 102), (252, 186, 46)    # front panel, top -> bottom
+FRONT_LIP = (255, 234, 166)                           # light top edge of the front panel
+BADGE_A, BADGE_B = (255, 140, 30), (232, 78, 12)
 PLUS = (255, 255, 255)
 
 
@@ -44,25 +45,37 @@ def in_tri(x, y, a, b, c):
 def shade(x, y, size):
     """colour at a point of the 32-unit grid, or None (transparent); front to back"""
     small = size <= 24                      # bolder shapes where pixels are scarce
-    # plus badge, with a gap in the tile colour around it
-    bx, by = 23.0, 23.0
-    br = 7.0 if small else 6.4
+    k = 32.0 / size                         # grid units per pixel
+
+    def snap(v):                            # edges on pixel boundaries keep small sizes crisp
+        return round(v / k) * k
+
+    # plus badge, cut out of the folder by a transparent ring; the plus bars are a whole
+    # number of pixels wide, centred on a pixel boundary (even width) or centre (odd)
+    br = 8.0 if small else 7.0
+    bar = max(2, round((3.2 if small else 2.8) / k))
+    bx = by = 24.0 + (k / 2 if bar % 2 else 0.0)
     d2 = (x - bx) ** 2 + (y - by) ** 2
     if d2 <= br * br:
-        arm, half = (4.6, 1.5) if small else (3.8, 1.15)
+        half, arm = bar * k / 2, snap(br * 0.64)
         if (abs(x - bx) <= half and abs(y - by) <= arm) or (abs(y - by) <= half and abs(x - bx) <= arm):
             return PLUS
         return mix(BADGE_A, BADGE_B, (y - by + br) / (2 * br))
-    gap = br + (1.0 if small else 1.4)
-    in_gap = d2 <= gap * gap
-    if not in_gap:
-        # folder: tab behind, body in front
-        if in_rrect(x, y, 6.5, 11.5, 25.5, 24.5, 1.8):
-            return FOLDER
-        if in_rrect(x, y, 6.5, 8.5, 14.5, 13, 1.3) or in_tri(x, y, (14, 8.5), (17, 11.6), (14, 11.6)):
-            return FOLDER_TAB
-    if in_rrect(x, y, 1, 1, 31, 31, 7):
-        return mix(TILE_A, TILE_B, (x + y - 2) / 60)
+    gap = br + max(1.3, k)
+    if d2 <= gap * gap:
+        return None
+    # folder: front panel, then the back panel and its tab
+    left, right, top, bottom = snap(1), snap(31), snap(11), snap(28)
+    if in_rrect(x, y, left, top, right, bottom, 2.2):
+        if not small and y < top + 0.9:
+            return FRONT_LIP
+        return mix(FRONT_A, FRONT_B, (y - top) / (bottom - top))
+    back = mix(BACK_A, BACK_B, (y - 4) / (bottom - 4))
+    if in_rrect(x, y, left, snap(7), right, bottom, 2.2):
+        return back
+    tab, tab_end = snap(4), snap(12)
+    if in_rrect(x, y, left, tab, tab_end, snap(9), 1.6) or in_tri(x, y, (tab_end - 1, tab), (tab_end + 3, snap(7.5)), (tab_end - 1, snap(7.5))):
+        return back
     return None
 
 
