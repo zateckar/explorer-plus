@@ -24,6 +24,8 @@ struct Fly {
     int subPending = -1;                  // submenu entry waiting for the hover delay
     int subOpen = -1;                     // entry whose submenu is open
     bool switchTo = false;                // the submenu was closed for another hovered entry
+    UINT replayMsg = 0;                   // the press elsewhere that dismissed it (WM_xBUTTONDOWN)...
+    POINT replayAt{};                     // ... and where (screen): handed on once closed
 };
 
 Fly* s_fly = nullptr;
@@ -198,6 +200,40 @@ void finish(Fly& f, UINT id) {
     f.done = true;
 }
 
+// dismissed by a press outside: the press still counts where it landed (one click picks
+// another file, not one to close the menu and one more to select)
+void dismiss_by_press(Fly& f, UINT msg, POINT screen) {
+    f.replayMsg = msg;
+    f.replayAt = screen;
+    finish(f, 0);
+}
+
+// hand the dismissing press on to the window under the pointer — only the app's own
+// windows (another program's never gets messages from us), and only while the button
+// is still down: the real button-up then follows as usual (a click, or a drag)
+void replay_press(const Fly& f) {
+    if (!f.replayMsg) return;
+    int vk = f.replayMsg == WM_LBUTTONDOWN ? VK_LBUTTON : f.replayMsg == WM_RBUTTONDOWN ? VK_RBUTTON : VK_MBUTTON;
+    if (GetSystemMetrics(SM_SWAPBUTTON) && vk != VK_MBUTTON) vk = vk == VK_LBUTTON ? VK_RBUTTON : VK_LBUTTON;
+    if (!(GetAsyncKeyState(vk) & 0x8000)) return;
+    HWND target = WindowFromPoint(f.replayAt);
+    DWORD pid = 0;
+    if (!target || !GetWindowThreadProcessId(target, &pid) || pid != GetCurrentProcessId() ||
+        !IsWindowEnabled(GetAncestor(target, GA_ROOT)))
+        return;
+    LRESULT ht = SendMessageW(target, WM_NCHITTEST, 0, MAKELPARAM(f.replayAt.x, f.replayAt.y));
+    if (ht == HTCLIENT) {
+        POINT pt = f.replayAt;
+        ScreenToClient(target, &pt);
+        WPARAM keys = (f.replayMsg == WM_LBUTTONDOWN ? MK_LBUTTON : f.replayMsg == WM_RBUTTONDOWN ? MK_RBUTTON : MK_MBUTTON) |
+                      (GetKeyState(VK_SHIFT) < 0 ? MK_SHIFT : 0) | (GetKeyState(VK_CONTROL) < 0 ? MK_CONTROL : 0);
+        PostMessageW(target, f.replayMsg, keys, MAKELPARAM(pt.x, pt.y));
+    } else if (ht != HTNOWHERE && ht != HTTRANSPARENT && ht != HTERROR) {
+        UINT nc = f.replayMsg - WM_LBUTTONDOWN + WM_NCLBUTTONDOWN;    // (same order: L, -, -, R, -, -, M)
+        PostMessageW(target, nc, (WPARAM)ht, MAKELPARAM(f.replayAt.x, f.replayAt.y));
+    }
+}
+
 void hit(Fly& f, POINT pt, int* btn, int* entry);
 
 // The submenu's modal loop owns the mouse; this filter sees its messages, so hovering
@@ -264,8 +300,12 @@ void open_sub(Fly& f, int i) {
         GetCursorPos(&cur);
         RECT wr;
         GetWindowRect(f.hwnd, &wr);
-        bool button = (GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON)) & 0x8000;
-        if (button && !PtInRect(&wr, cur)) { finish(f, 0); return; }
+        bool left = GetAsyncKeyState(VK_LBUTTON) & 0x8000, right = GetAsyncKeyState(VK_RBUTTON) & 0x8000;   // (physical)
+        if ((left || right) && !PtInRect(&wr, cur)) {
+            bool primary = left != (GetSystemMetrics(SM_SWAPBUTTON) != 0);
+            dismiss_by_press(f, primary ? WM_LBUTTONDOWN : WM_RBUTTONDOWN, cur);
+            return;
+        }
         SetCapture(f.hwnd);
         // back in the flyout: highlight what the pointer is on
         ScreenToClient(f.hwnd, &cur);
@@ -433,7 +473,10 @@ LRESULT CALLBACK fly_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: {
             POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
             RECT rc; GetClientRect(hwnd, &rc);
-            if (!PtInRect(&rc, pt)) finish(*f, 0);     // a press elsewhere dismisses
+            if (!PtInRect(&rc, pt)) {                  // a press elsewhere dismisses
+                ClientToScreen(hwnd, &pt);
+                dismiss_by_press(*f, msg, pt);
+            }
             return 0;
         }
         case WM_LBUTTONUP: case WM_RBUTTONUP: {
@@ -563,5 +606,6 @@ UINT flyout_track(HWND owner, POINT pt, const std::vector<FlyButton>& row, const
     NotifyWinEvent(EVENT_SYSTEM_MENUPOPUPEND, f.hwnd, OBJID_CLIENT, CHILDID_SELF);
     s_fly = nullptr;
     DestroyWindow(f.hwnd);
+    replay_press(f);                                 // (handled once the caller is back in its loop)
     return f.result;
 }

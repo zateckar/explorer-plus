@@ -210,6 +210,33 @@ if fly:
 check('compact menu access key runs the verb',
       wait_for(lambda: clipboard_text() == '"%s"' % os.path.join(data, 'a.txt'), 5), clipboard_text())
 app.close_menus()
+# a real click on another file while the compact menu is open closes the menu and
+# selects that file: one click, not one to close the menu and another to select
+u.WindowFromPoint.argtypes = [W.POINT]
+u.WindowFromPoint.restype = W.HWND
+ia = app.select_name('a.txt')
+app.select_name('b.txt')
+l, t, r, b = app.item_rect(ia, 2)                                    # LVIR_LABEL
+pt = W.POINT((l + r) // 2, (t + b) // 2)
+u.ClientToScreen(app.list, ctypes.byref(pt))
+if (u.WindowFromPoint(pt) or 0) == app.list:
+    cursor = W.POINT()
+    u.GetCursorPos(ctypes.byref(cursor))                            # (put back: menus opened by
+    fly = app.open_context_flyout()                                 # keyboard later must not be hovered)
+    if fly:
+        u.SetCursorPos(pt.x, pt.y)
+        time.sleep(0.2)
+        u.mouse_event(0x0002, 0, 0, 0, 0); time.sleep(0.05)       # MOUSEEVENTF_LEFTDOWN
+        u.mouse_event(0x0004, 0, 0, 0, 0)                          # MOUSEEVENTF_LEFTUP
+    def picked():
+        return u.SendMessageW(app.list, 0x100C, -1, 0x0002)         # LVM_GETNEXTITEM, LVNI_SELECTED
+    check('one click beside the compact menu closes it and selects the file there',
+          fly and wait_for(lambda: app.flyout() is None and app.selected_count() == 1 and picked() == ia, 3),
+          (bool(fly), app.flyout(), app.selected_count(), picked(), ia))
+    app.close_menus()
+    u.SetCursorPos(cursor.x, cursor.y)
+else:
+    print('  (skipped the click beside the menu: the list is covered at', (pt.x, pt.y), ')')
 # background flyout: View / Sort by / Group by / New, with our own submenus
 app.command(IDM['SELNONE'])
 fly = app.open_context_flyout()
@@ -639,16 +666,20 @@ check('check box again removes it', wait_for(lambda: app.selected_count() == 1, 
 app.command(IDM['CHECKBOXES']); time.sleep(0.3)
 
 # Compact view (starts as Windows' own setting): toggling changes the Details row
-# spacing, toggling back restores it
+# spacing and the navigation pane's along with it, toggling back restores them
 def row_h():
     r = app.item_rect(0, 0)
     return r[3] - r[1]
-first = row_h()
+def tree_h():
+    return u.SendMessageW(app.tree, TVM_GETITEMHEIGHT, 0, 0)
+first, tfirst = row_h(), tree_h()
 app.command(IDM['COMPACT']); time.sleep(0.5)
-second = row_h()
+second, tsecond = row_h(), tree_h()
 check('Compact view changes the Details row spacing', 0 < min(first, second) and first != second, (first, second))
+check('... and the navigation pane\'s, the same way',
+      0 < min(tfirst, tsecond) and (tfirst < tsecond) == (first < second) and tfirst != tsecond, (tfirst, tsecond))
 app.command(IDM['COMPACT']); time.sleep(0.5)
-check('Compact view toggled back restores the spacing', row_h() == first, row_h())
+check('Compact view toggled back restores the spacing', row_h() == first and tree_h() == tfirst, (row_h(), tree_h()))
 
 # Preview pane: a text file shows through its shell preview handler (a window in the host)
 app.command(IDM['PREVIEW']); time.sleep(0.5)

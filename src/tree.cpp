@@ -601,10 +601,11 @@ static void cached_pins_worker(PinsJob* job) {
     post_async(cached_pins_apply, job);
 }
 
-// row height and indent follow the DPI and the text size
+// row height and indent follow the DPI, the text size and Compact view (which tightens
+// the navigation pane too, as in Explorer, matching the list's Details rows)
 void tree_apply_metrics() {
     if (!g_tree) return;
-    TreeView_SetItemHeight(g_tree, SC(28));
+    TreeView_SetItemHeight(g_tree, SC(g_compactView ? 22 : 28));
     TreeView_SetIndent(g_tree, S(12));
 }
 

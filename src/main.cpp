@@ -346,7 +346,9 @@ static void on_command(WORD id) {
             g_compactView = !g_compactView;
             settings_set_pref(L"compactView", g_compactView);
             list_apply_view();
+            tree_apply_metrics();
             InvalidateRect(g_list, nullptr, TRUE);
+            InvalidateRect(g_tree, nullptr, TRUE);
             break;
         case IDM_VIEW_EXTENSIONS:
             // our own choice from now on; Windows' setting stays as it is
