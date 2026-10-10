@@ -610,6 +610,11 @@ static LRESULT handle_custom_draw(NMLVCUSTOMDRAW* cd) {
             return CDRF_NOTIFYITEMDRAW;
         case CDDS_ITEMPREPAINT: {
             int idx = (int)cd->nmcd.dwItemSpec;
+            // a hover also has the control custom-draw the item once with an empty
+            // rectangle on the window's own DC, outside any paint (a measuring pass): our
+            // background, icon and tiles go by the item's real rectangle and would land on
+            // screen over the row, hiding its text until the next repaint
+            if (IsRectEmpty(&cd->nmcd.rc)) return CDRF_DODEFAULT;
             DriveTile t;
             if (drive_tile(idx, &t)) return draw_drive_tile(cd, &t, idx);
             draw_item_background(cd);

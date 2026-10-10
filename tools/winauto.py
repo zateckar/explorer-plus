@@ -21,6 +21,36 @@ u.GetMenuItemID.argtypes = [W.HMENU, ctypes.c_int]
 u.GetMenuItemID.restype = W.UINT
 EnumProc = ctypes.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
 
+
+def screen_pixels(x, y, w, h):
+    """BGRX bytes (top-down) of a screen rectangle, as shown right now."""
+    # own handles on the DLLs: the prototypes set here stay out of the shared u / g
+    g, u = ctypes.WinDLL('gdi32'), ctypes.WinDLL('user32')
+    g.CreateCompatibleDC.restype = W.HDC
+    g.CreateCompatibleBitmap.restype = W.HBITMAP
+    g.CreateCompatibleBitmap.argtypes = [W.HDC, ctypes.c_int, ctypes.c_int]
+    g.SelectObject.argtypes = [W.HDC, W.HGDIOBJ]
+    g.SelectObject.restype = W.HGDIOBJ
+    g.BitBlt.argtypes = [W.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, W.HDC, ctypes.c_int, ctypes.c_int, W.DWORD]
+    g.GetDIBits.argtypes = [W.HDC, W.HBITMAP, W.UINT, W.UINT, ctypes.c_void_p, ctypes.c_void_p, W.UINT]
+    g.DeleteObject.argtypes = [W.HGDIOBJ]
+    g.DeleteDC.argtypes = [W.HDC]
+    u.GetDC.restype = W.HDC
+    u.ReleaseDC.argtypes = [W.HWND, W.HDC]
+    sdc = u.GetDC(None)
+    mem = g.CreateCompatibleDC(sdc)
+    bmp = g.CreateCompatibleBitmap(sdc, w, h)
+    old = g.SelectObject(mem, bmp)
+    g.BitBlt(mem, 0, 0, w, h, sdc, x, y, 0x00CC0020)             # SRCCOPY
+    bi = ctypes.create_string_buffer(struct.pack('<IiiHHIIiiII', 40, w, -h, 1, 32, 0, 0, 0, 0, 0, 0), 44)
+    buf = ctypes.create_string_buffer(w * h * 4)
+    g.GetDIBits(mem, bmp, 0, h, buf, bi, 0)
+    g.SelectObject(mem, old)
+    g.DeleteObject(bmp)
+    g.DeleteDC(mem)
+    u.ReleaseDC(None, sdc)
+    return buf.raw
+
 WM_SETTEXT, WM_GETTEXT, WM_GETTEXTLENGTH = 0x000C, 0x000D, 0x000E
 WM_KEYDOWN, WM_COMMAND, WM_CONTEXTMENU, WM_CANCELMODE, WM_CLOSE = 0x0100, 0x0111, 0x007B, 0x001F, 0x0010
 MN_GETHMENU = 0x01E1
@@ -394,6 +424,22 @@ class App:
                     + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
                     + chunk(b'IDAT', zlib.compress(raw, 6))
                     + chunk(b'IEND', b''))
+
+    def row_has_text(self, i, code=2):
+        """Does row i show text on the screen right now? (the screen's pixels, not
+        PrintWindow, which makes the control paint afresh: a stale or overpainted row
+        only shows on screen). Text: pixels far from the row's dominant colour."""
+        l, t, r, b = self.item_rect(i, code)
+        pt = W.POINT(l, t)
+        u.ClientToScreen(self.list, ctypes.byref(pt))
+        px = screen_pixels(pt.x, pt.y, r - l, b - t)
+        colours = {}
+        for o in range(0, len(px), 4):
+            c = px[o:o + 3]
+            colours[c] = colours.get(c, 0) + 1
+        bg = max(colours, key=colours.get)
+        far = sum(n for c, n in colours.items() if sum(abs(c[k] - bg[k]) for k in range(3)) > 150)
+        return far >= 12
 
     def close(self):
         u.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)

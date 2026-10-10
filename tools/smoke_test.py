@@ -234,6 +234,19 @@ if (u.WindowFromPoint(pt) or 0) == app.list:
           fly and wait_for(lambda: app.flyout() is None and app.selected_count() == 1 and picked() == ia, 3),
           (bool(fly), app.flyout(), app.selected_count(), picked(), ia))
     app.close_menus()
+    # the pointer glides off the selected row and back: the row keeps its text (a hover
+    # once had the control custom-draw the row off-screen, and our highlight then
+    # covered the row's text on screen until the next repaint)
+    def glide(x0, y0, x1, y1):
+        for k in range(1, 26):
+            u.SetCursorPos(x0 + (x1 - x0) * k // 25, y0 + (y1 - y0) * k // 25); time.sleep(0.012)
+    if picked() == ia:
+        kept = []
+        for dx, dy in ((150, 90), (300, 0), (40, 160)):
+            glide(pt.x, pt.y, pt.x + dx, pt.y + dy); time.sleep(0.3)
+            glide(pt.x + dx, pt.y + dy, pt.x, pt.y); time.sleep(0.8)
+            kept.append(app.row_has_text(ia))
+        check('a selected row keeps its text when the pointer comes back over it', all(kept), kept)
     u.SetCursorPos(cursor.x, cursor.y)
 else:
     print('  (skipped the click beside the menu: the list is covered at', (pt.x, pt.y), ')')
