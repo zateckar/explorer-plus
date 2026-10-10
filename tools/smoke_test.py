@@ -44,9 +44,12 @@ def wait_for(pred, timeout=5.0):
 ini = os.path.join(work, 'settings.ini')
 if os.path.exists(ini):
     os.remove(ini)
-# promote a classic menu item every machine has into the compact menu (UTF-16 INI)
+# promote a classic menu item every machine has into the compact menu (UTF-16 INI);
+# file name extensions on whatever Windows does (fresh images hide them): the checks
+# find items by their full file name
 with open(ini, 'w', encoding='utf-16') as f:
-    f.write('[contextmenu]\npromote1=Send to|%SystemRoot%\\System32\\shell32.dll,4\n')
+    f.write('[contextmenu]\npromote1=Send to|%SystemRoot%\\System32\\shell32.dll,4\n'
+            '[prefs]\nshowExtensions=1\n')
 uni = os.path.join(data, 'Stažené = [x]; 50%')     # non-ASCII + INI-hostile characters
 os.makedirs(uni)
 
