@@ -26,7 +26,18 @@ struct Fly {
     bool switchTo = false;                // the submenu was closed for another hovered entry
     UINT replayMsg = 0;                   // the press elsewhere that dismissed it (WM_xBUTTONDOWN)...
     POINT replayAt{};                     // ... and where (screen): handed on once closed
+    POINT pointer{};                      // where the pointer was last seen (screen)
 };
+
+// the pointer really moved (screen pt). Windows also sends mouse moves when a window
+// appears under a resting pointer or the capture changes: like Windows' menus, those
+// don't hot-track (a menu opened by the keyboard would highlight, and after the hover
+// delay open, whatever entry it happened to appear under)
+bool pointer_moved(Fly& f, POINT pt) {
+    if (pt.x == f.pointer.x && pt.y == f.pointer.y) return false;
+    f.pointer = pt;
+    return true;
+}
 
 Fly* s_fly = nullptr;
 HHOOK s_subHook = nullptr;
@@ -244,7 +255,7 @@ LRESULT CALLBACK sub_filter(int code, WPARAM wp, LPARAM lp) {
     Fly* f = s_fly;
     if (code == MSGF_MENU && f && f->inSub) {
         const MSG* m = (const MSG*)lp;
-        if (m->message == WM_MOUSEMOVE || m->message == WM_NCMOUSEMOVE) {
+        if ((m->message == WM_MOUSEMOVE || m->message == WM_NCMOUSEMOVE) && pointer_moved(*f, m->pt)) {
             POINT pt = m->pt;
             ScreenToClient(f->hwnd, &pt);
             RECT rc;
@@ -458,6 +469,9 @@ LRESULT CALLBACK fly_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_MOUSEMOVE: {
             POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
+            POINT screen = pt;
+            ClientToScreen(hwnd, &screen);
+            if (!pointer_moved(*f, screen)) return 0;
             int b, e;
             hit(*f, pt, &b, &e);
             RECT rc; GetClientRect(hwnd, &rc);
@@ -529,6 +543,7 @@ UINT flyout_track(HWND owner, POINT pt, const std::vector<FlyButton>& row, const
     }
     Fly f;
     f.owner = owner;
+    GetCursorPos(&f.pointer);
     f.row = row;
     f.entries = entries;
     std::wstring names;                              // window text: the entries (accessibility, tests)

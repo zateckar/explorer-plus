@@ -329,6 +329,26 @@ check('compact menu View submenu chooses a view',
       wait_for(lambda: app.flyout() is None and send(app.list, 0x108F, 0, 0) == 3, 4), sub_items)
 app.close_menus()
 app.command(IDM['DETAILS'])
+# opened by the keyboard under a resting pointer: the entry under it isn't hovered (its
+# submenu once opened by itself after the hover delay, and the arrow keys started there)
+def classic_menu():
+    return next((h for h in winauto.top_windows(app.proc.pid) if cls(h) == '#32768' and u.IsWindowVisible(h)), None)
+fly = app.open_context_flyout()
+if fly:
+    rc = W.RECT()
+    u.GetWindowRect(fly, ctypes.byref(rc))
+    app.close_menus()
+    cursor = W.POINT()
+    u.GetCursorPos(ctypes.byref(cursor))
+    u.SetCursorPos((rc.left + rc.right) // 2, rc.top + (rc.bottom - rc.top) * 2 // 3)   # (a submenu entry: New)
+    fly = app.open_context_flyout()
+    time.sleep(1.0)                                                 # past the hover delay
+    check('compact menu under a resting pointer opens no submenu', fly and classic_menu() is None,
+          menu_items(send(classic_menu(), 0x01E1, 0, 0)) if classic_menu() else None)
+    app.close_menus(); app.close_menus()
+    u.SetCursorPos(cursor.x, cursor.y)
+else:
+    skip('compact menu under a resting pointer opens no submenu', 'no flyout')
 check('no menu left open', app.flyout() is None)
 
 # the command bar row is folded into the nav row's "..." by default
