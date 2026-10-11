@@ -1,4 +1,4 @@
-"""Draw the app icon (the familiar yellow file folder with an orange plus badge) at every
+"""Draw the app icon (the familiar yellow file folder with a green plus badge) at every
 size Windows asks for. The folder fills the canvas, so the icon reads at taskbar sizes.
 
 Usage: python -I tools/make_icon.py res/app.ico [preview-dir]
@@ -18,7 +18,7 @@ SUB = 4
 BACK_A, BACK_B = (236, 170, 44), (214, 140, 20)       # tab and back panel, top -> bottom
 FRONT_A, FRONT_B = (255, 216, 102), (252, 186, 46)    # front panel, top -> bottom
 FRONT_LIP = (255, 234, 166)                           # light top edge of the front panel
-BADGE_A, BADGE_B = (255, 140, 30), (232, 78, 12)
+BADGE_A, BADGE_B = (84, 200, 84), (16, 124, 16)        # top -> bottom (Windows' success green)
 PLUS = (255, 255, 255)
 
 
@@ -52,12 +52,12 @@ def shade(x, y, size):
 
     # plus badge, cut out of the folder by a transparent ring; the plus bars are a whole
     # number of pixels wide, centred on a pixel boundary (even width) or centre (odd)
-    br = 8.0 if small else 7.0
-    bar = max(2, round((3.2 if small else 2.8) / k))
-    bx = by = 24.0 + (k / 2 if bar % 2 else 0.0)
+    br = 9.0 if small else 8.5
+    bar = max(2, round((3.8 if small else 3.4) / k))
+    bx = by = 32.0 - br - (0.5 if small else 0.8) + (k / 2 if bar % 2 else 0.0)
     d2 = (x - bx) ** 2 + (y - by) ** 2
     if d2 <= br * br:
-        half, arm = bar * k / 2, snap(br * 0.64)
+        half, arm = bar * k / 2, snap(br * 0.74)
         if (abs(x - bx) <= half and abs(y - by) <= arm) or (abs(y - by) <= half and abs(x - bx) <= arm):
             return PLUS
         return mix(BADGE_A, BADGE_B, (y - by + br) / (2 * br))

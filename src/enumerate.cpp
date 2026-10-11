@@ -5,6 +5,7 @@
 #include "groups.h"
 #include "columns.h"
 #include "searchbox.h"
+#include "foldersizes.h"
 #include <propsys.h>
 #include "workers.h"
 #include <memory>
@@ -318,13 +319,17 @@ static void overlay_apply(void* payload) {
     InvalidateRect(g_list, nullptr, FALSE);
 }
 
-// the listing `opId` is complete on screen: overlays that came early go on now
+// the listing `opId` is complete on screen: overlays that came early go on now, and the
+// subfolders' sizes are worked out
 static void listing_complete(UINT opId) {
     s_completeOpId = opId;
     std::vector<OverlayBatch*> early;
     early.swap(s_deferredOverlays);
     for (OverlayBatch* b : early) overlay_apply(b);   // (takes ownership; drops other listings')
+    foldersizes_start(nullptr);
 }
+
+bool enum_listing_complete() { return g_enumId.load() == s_completeOpId; }
 
 static void overlay_pass(UINT opId, IShellIconOverlay* overlays, std::vector<std::pair<int, PITEMID_CHILD>>& ids) {
     double t0 = perf_on() ? perf_now() : 0;
@@ -591,13 +596,15 @@ static void set_error(HRESULT hr) {
 
 // A refresh's or a change's new items take over what the old ones with the same key
 // had: the overlay (until the overlay pass has the new one: no blinking arrows) and the
-// thumbnail, while the ID is the same (an unchanged file). Returns the thumbnails kept.
+// thumbnail, while the ID is the same (an unchanged file), and a folder its size (until
+// the folder sizes are worked out again). Returns the thumbnails kept.
 static size_t carry_over(const std::vector<Item*>& old, std::vector<Item*>& fresh) {   // (g_itemsMx held)
-    struct Carry { int overlay; int thumbIndex; ULONGLONG sig; };
+    struct Carry { int overlay; int thumbIndex; ULONGLONG sig; const Item* folder; };
     std::unordered_map<std::wstring, Carry> carry;
     for (Item* it : old) {
         int thumb = it->thumbReady.load() == 2 ? it->thumbIndex : -1;
-        if (it->overlay || thumb >= 0) carry.emplace(it->key, Carry{ it->overlay, thumb, it->sig });
+        const Item* folder = it->isFolder && !it->driveType && !it->size.empty() ? it : nullptr;
+        if (it->overlay || thumb >= 0 || folder) carry.emplace(it->key, Carry{ it->overlay, thumb, it->sig, folder });
     }
     size_t kept = 0;
     if (carry.empty()) return kept;
@@ -605,6 +612,10 @@ static size_t carry_over(const std::vector<Item*>& old, std::vector<Item*>& fres
         auto f = carry.find(it->key);
         if (f == carry.end()) continue;
         if (!it->overlay) it->overlay = f->second.overlay;
+        if (const Item* folder = f->second.folder; folder && it->isFolder && it->size.empty()) {
+            it->bytes = folder->bytes;
+            it->size = folder->size;
+        }
         if (f->second.thumbIndex >= 0 && f->second.sig == it->sig) {
             it->thumbIndex = f->second.thumbIndex;
             it->thumbReady.store(2);
@@ -691,10 +702,10 @@ static void change_apply(void* payload) {
     std::vector<int> reselect;
     int focusIdx = -1, n = 0;
     bool selectionTouched = false;
+    std::unordered_set<std::wstring> touched(r->keys.begin(), r->keys.end());
     {
         std::lock_guard<std::mutex> lk(g_itemsMx);
         focused = item_key_at(ListView_GetNextItem(g_list, -1, LVNI_FOCUSED));
-        std::unordered_set<std::wstring> touched(r->keys.begin(), r->keys.end());
         for (Item* it : r->items) touched.insert(it->key);
         for (auto& k : touched) selectionTouched |= selected.count(k) > 0 || k == focused;
         std::vector<Item*> gone;
@@ -725,6 +736,7 @@ static void change_apply(void* payload) {
     InvalidateRect(g_list, nullptr, TRUE);
     status_update();
     if (selectionTouched) detailspane_update();     // the selected file changed
+    foldersizes_start(&touched);                     // a changed folder: its size again
 }
 
 // is `path` directly inside the directory `dir`? (case-insensitive)

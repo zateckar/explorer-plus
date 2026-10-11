@@ -62,22 +62,23 @@ int entry_h(const FlyEntry& e) { return e.kind == FlyEntry::Separator ? S(9) : S
 void layout(Fly& f, int* outW, int* outH) {
     HDC dc = GetDC(f.hwnd);
     HGDIOBJ old = SelectObject(dc, g_font);
-    int textW = 0, accelW = 0;
-    bool anySub = false;
+    // snug like Win11's menus: as wide as the widest row (its text, shortcut and submenu
+    // arrow together); a very long entry is cut short with an ellipsis
+    int w = 0;
     for (auto& e : f.entries) {
         if (e.kind == FlyEntry::Separator) continue;
         SelectObject(dc, e.bold ? ui_font_bold() : g_font);
-        textW = max(textW, text_width(dc, e.text.c_str()));
+        int rowW = S(44) + text_width(dc, e.text.c_str()) + S(12);
         SelectObject(dc, g_font);
-        if (!e.accel.empty()) accelW = max(accelW, text_width(dc, e.accel.c_str()));
-        anySub |= e.kind == FlyEntry::Submenu;
+        if (!e.accel.empty()) rowW += S(16) + text_width(dc, e.accel.c_str());
+        if (e.kind == FlyEntry::Submenu) rowW += S(24);
+        w = max(w, rowW);
     }
     SelectObject(dc, old);
     ReleaseDC(f.hwnd, dc);
     int pad = S(4);
-    int w = S(44) + textW + S(24) + (accelW ? accelW + S(16) : 0) + (anySub ? S(24) : 0) + S(12);
-    int rowW = pad * 2 + (int)f.row.size() * (S(40) + S(4));
-    w = std::clamp(max(w, rowW), S(240), S(520));
+    int rowW = pad * 2 + S(4) + (int)f.row.size() * S(44);
+    w = std::clamp(max(w, rowW), S(200), S(360));
     int y = pad;
     f.btnRects.clear();
     if (!f.row.empty()) {

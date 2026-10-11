@@ -11,6 +11,7 @@ using std::min;
 #include "flyout.h"
 #include "navbar.h"
 #include "acc.h"
+#include "foldersizes.h"
 #include <vector>
 
 enum class Kind { Button, Separator, Spacer };
@@ -231,6 +232,7 @@ static HMENU build_view_menu() {
     AppendMenuW(show, MF_STRING | menu_flag(g_checkBoxes), IDM_VIEW_CHECKBOXES, L"Item check boxes");
     AppendMenuW(show, MF_STRING | menu_flag(show_extensions_effective()), IDM_VIEW_EXTENSIONS, L"File name extensions");
     AppendMenuW(show, MF_STRING | menu_flag(g_showHidden), IDM_VIEW_HIDDEN, L"Hidden items");
+    AppendMenuW(show, MF_STRING | menu_flag(foldersizes_enabled()), IDM_VIEW_FOLDERSIZES, L"Folder sizes");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)show, L"Show");
     return m;
 }

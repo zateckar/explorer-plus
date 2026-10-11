@@ -93,6 +93,7 @@
 #define IDM_TOOLS_MENU       40156
 #define IDM_VIEW_CMDBAR      40157
 #define IDM_PERF_MARK        40158
+#define IDM_VIEW_FOLDERSIZES 40159
 // Sort by the folder's columns: IDM_SORT_COL_BASE + column (subitem) index
 #define IDM_SORT_COL_BASE 40160
 #define IDM_SORT_COL_LAST 40199

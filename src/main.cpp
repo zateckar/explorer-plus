@@ -30,6 +30,7 @@ using std::min;
 #include "workers.h"
 #include "statusbar.h"
 #include "breadcrumb.h"
+#include "foldersizes.h"
 #include <uxtheme.h>
 
 static WNDPROC s_searchProc = nullptr;
@@ -349,6 +350,10 @@ static void on_command(WORD id) {
             tree_apply_metrics();
             InvalidateRect(g_list, nullptr, TRUE);
             InvalidateRect(g_tree, nullptr, TRUE);
+            break;
+        case IDM_VIEW_FOLDERSIZES:
+            foldersizes_set_enabled(!foldersizes_enabled());
+            settings_set_pref(L"folderSizes", foldersizes_enabled());
             break;
         case IDM_VIEW_EXTENSIONS:
             // our own choice from now on; Windows' setting stays as it is
@@ -747,6 +752,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     int compact = settings_pref(L"compactView", -1);
     g_compactView = compact < 0 ? windows_compact_view() : compact != 0;
     g_showExtensions = std::clamp(settings_pref(L"showExtensions", -1), -1, 1);
+    foldersizes_set_enabled(settings_pref(L"folderSizes", 1) != 0);
     theme_set_text_scale(settings_pref(L"textSize", 100));
     SplitMode sp = settings_splitter();
     if (sp.width >= 120 && sp.width <= 1200) g_splitterX = sp.width;

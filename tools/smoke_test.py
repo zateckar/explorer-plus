@@ -13,7 +13,7 @@ IDM = dict(NEWFOLDER=40010, NEWTAB=40011, CLOSETAB=40012, COPY=40031, PASTE=4003
            LIST=40055, HIDDEN=40056, BACK=40070, FWD=40071, UP=40072, REFRESH=40073, INVERT=40035,
            NEW_MENU=40130, COPY_PATH=40135, NEW_WINDOW=40137, FOCUS_ADDRESS=40096,
            GROUP_NONE=40141, GROUP_TYPE=40144, XLARGE=40150, CHECKBOXES=40152, EXTENSIONS=40153,
-           PREVIEW=40154, COMPACT=40155, TOOLS_MENU=40156, CMDBAR=40157, SORT_COL=40160,
+           PREVIEW=40154, COMPACT=40155, TOOLS_MENU=40156, CMDBAR=40157, FOLDERSIZES=40159, SORT_COL=40160,
            VIEW_MENU=40132, MORE_MENU=40133, APPLY_ALL=40138, RESET_ALL=40139,
            TEXT_LARGER=40100, TEXT_SMALLER=40101, TEXT_RESET=40102, TREE_DELETE=40103)
 LV_VIEW_DETAILS, LV_VIEW_LIST, LV_VIEW_TILE = 1, 3, 4
@@ -106,23 +106,38 @@ def class_icon():
     u.GetClassLongPtrW.restype = ctypes.c_void_p
     u.GetClassLongPtrW.argtypes = [W.HWND, ctypes.c_int]
     return u.GetClassLongPtrW(app.hwnd, -14)                         # GCLP_HICON
-def exe_icon():
+def icon_size(hicon):
+    # the window's icon has the DPI's size (LoadIconMetric): compare at that size, so
+    # neither image is scaled
+    info = ctypes.create_string_buffer(32)                           # ICONINFO
+    if not hicon or not u.GetIconInfo(ctypes.c_void_p(hicon), info):
+        return 32
+    mask, color = struct.unpack_from('<QQ', info, 16)
+    bm = ctypes.create_string_buffer(32)                             # BITMAP
+    ctypes.windll.gdi32.GetObjectW(ctypes.c_void_p(color or mask), 32, bm)
+    for h in (color, mask):
+        if h: ctypes.windll.gdi32.DeleteObject(ctypes.c_void_p(h))
+    return struct.unpack_from('<i', bm, 4)[0] or 32
+def exe_icon(size):
     k = ctypes.windll.kernel32
     k.LoadLibraryExW.restype = ctypes.c_void_p
     k.LoadLibraryExW.argtypes = [W.LPCWSTR, W.HANDLE, W.DWORD]
     u.LoadImageW.restype = ctypes.c_void_p
     u.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, W.UINT, ctypes.c_int, ctypes.c_int, W.UINT]
     mod = k.LoadLibraryExW(exe, None, 0x20 | 0x2)                    # AS_IMAGE_RESOURCE | AS_DATAFILE
-    return u.LoadImageW(mod, 1, 1, 32, 32, 0) if mod else None       # IDI_APP
+    return u.LoadImageW(mod, 1, 1, size, size, 0) if mod else None   # IDI_APP
 def folder_icon():
     info = ctypes.create_string_buffer(544)                          # SHSTOCKICONINFO
     struct.pack_into('<I', info, 0, 544)
     ctypes.windll.shell32.SHGetStockIconInfo(3, 0x100, info)         # SIID_FOLDER, SHGSI_ICON
     return struct.unpack_from('<Q', info, 8)[0]
-mine, own, folder = class_icon(), exe_icon(), folder_icon()
+mine = class_icon()
+isz = icon_size(mine)
+own, folder = exe_icon(isz), folder_icon()
 if mine and own and folder:
-    px = winauto.icon_pixels(mine)
-    d_own, d_folder = winauto.pixel_distance(px, winauto.icon_pixels(own)), winauto.pixel_distance(px, winauto.icon_pixels(folder))
+    px = winauto.icon_pixels(mine, isz)
+    d_own = winauto.pixel_distance(px, winauto.icon_pixels(own, isz))
+    d_folder = winauto.pixel_distance(px, winauto.icon_pixels(folder, isz))
     check('window icon is the exe icon (taskbar)', d_own < 8 and d_own < d_folder, (round(d_own, 1), round(d_folder, 1)))
 else:
     check('window icon is the exe icon (taskbar)', False, (mine, own, folder))
@@ -657,6 +672,30 @@ check('Sort by Size (largest first)', row_of('photo.jpg') < row_of('external.txt
       (row_of('photo.jpg'), row_of('external.txt')))
 app.command(IDM['SORT_COL'] + 0); time.sleep(0.8)
 check('Sort by Name', row_of('external.txt') < row_of('photo.jpg'), (row_of('external.txt'), row_of('photo.jpg')))
+
+# folder sizes (on by default): a subfolder's Size is everything under it, every level
+sized = os.path.join(data, 'sized')
+os.makedirs(os.path.join(sized, 'deep', 'deeper'))
+with open(os.path.join(sized, 'top.bin'), 'wb') as f:
+    f.write(bytes(1000))
+with open(os.path.join(sized, 'deep', 'deeper', 'low.bin'), 'wb') as f:
+    f.write(bytes(300000))
+def byte_size(n):                                                   # as the app formats it
+    buf = ctypes.create_unicode_buffer(64)
+    ctypes.windll.shlwapi.StrFormatByteSizeEx(ctypes.c_ulonglong(n), 2, buf, 64)
+    return buf.value
+def size_of(name):
+    i = row_of(name)
+    return app.item_text(i, 3) if i >= 0 else None                  # Name, Date modified, Type, Size
+app.command(IDM['REFRESH'])
+check('folder size in the Size column', wait_for(lambda: size_of('sized') == byte_size(301000), 5),
+      (size_of('sized'), byte_size(301000)))
+app.command(IDM['FOLDERSIZES']); time.sleep(0.5)
+check('Folder sizes off: no folder size', size_of('sized') == '', size_of('sized'))
+app.command(IDM['FOLDERSIZES'])
+check('Folder sizes on again', wait_for(lambda: size_of('sized') == byte_size(301000), 5), size_of('sized'))
+shutil.rmtree(sized)
+check('removed folder leaves the list', wait_for(lambda: row_of('sized') < 0, 5))
 
 # view modes: Extra large / Medium icons are icon views
 app.command(IDM['XLARGE']); time.sleep(1.5)

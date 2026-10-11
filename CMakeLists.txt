@@ -55,6 +55,7 @@ add_executable(explorer-plus WIN32
     src/crash.cpp
     src/workers.cpp
     src/acc.cpp
+    src/foldersizes.cpp
     res/resource.rc
 )
 

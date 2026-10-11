@@ -4,6 +4,7 @@
 #include "navigation.h"
 #include "theme.h"
 #include "searchbox.h"
+#include "foldersizes.h"
 #include <propsys.h>
 #include <propvarutil.h>
 #include <algorithm>
@@ -419,4 +420,6 @@ void columns_header_menu(POINT screen) {
     columns_apply(next);
     save_current();
     if (fetch) navigation_refresh();           // read the new column's values
+    else if (!pick.shown && kind_of(pick.key) == COL_SIZE && enum_listing_complete())
+        foldersizes_start(nullptr);            // the folders' sizes for the new Size column
 }

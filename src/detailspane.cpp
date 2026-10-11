@@ -219,7 +219,7 @@ static void gather_for_selection() {
     Item* it = sel[0];
     s_title = it->name;
     add_line(L"Type", it->type);
-    if (!it->isFolder && !it->size.empty()) add_line(L"Size", it->size);
+    if (!it->size.empty()) add_line(L"Size", it->size);      // (a folder's once worked out)
     add_line(L"Date modified", it->date);
     // queue preview thumbnail + image dimensions
     if (PITEMID_CHILD full = static_cast<PITEMID_CHILD>(ILCombine(g_current, it->pidl)))

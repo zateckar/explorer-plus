@@ -24,3 +24,4 @@ void enum_sort_items();                  // re-sort / re-group g_items (g_sortCo
 void enum_update_header_arrows();        // put sort arrows in the details header
 void enum_clear_items();                 // drop all items (navigation away)
 const std::wstring& enum_last_error();   // non-empty when the current folder failed to list
+bool enum_listing_complete();            // the current listing is on screen in full

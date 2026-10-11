@@ -19,6 +19,10 @@ File Explorer while starting in well under 100 ms.
   remembers its own view; View ▸ "Apply this view to all folders" makes the current view
   and columns the default (like Explorer's Folder Options), "Reset all folders" goes back.
   Double-click on empty space goes up a level.
+- **Folder sizes**: the Size column shows each subfolder's total (all levels, hidden files
+  included; junctions and symbolic links not followed), worked out in the background
+  after the listing and filled in as known; sorting by Size takes them into account.
+  View ▸ Show ▸ Folder sizes turns it off.
 - **Text size**: View ▸ Text size, or Ctrl+Plus / Ctrl+Minus / Ctrl+0, scales the text of
   the navigation pane, the file list and the details pane (80–200 %), remembered.
 - **Command bar**: folded into the "…" menu by default; "…" ▸ Show command bar puts the
@@ -135,7 +139,7 @@ repository secrets `SIGNING_CERT_PFX_BASE64` (base64 of the .pfx) and `SIGNING_C
 src/main.cpp           wWinMain, main window, command routing
 src/chrome, tabs, navbar, breadcrumb, searchbox, cmdbar, statusbar, layout   window parts
 src/tree               navigation pane
-src/listview, enumerate, columns, groups, thumbs   content view and listing
+src/listview, enumerate, columns, groups, thumbs, foldersizes   content view and listing
 src/contextmenu, flyout    classic + Win11 compact context menus
 src/fileops, dnd, watcher  file operations, drag and drop, change notifications
 src/detailspane, preview   details / preview pane

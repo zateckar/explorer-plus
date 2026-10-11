@@ -36,7 +36,7 @@ struct Item {
     std::wstring    path;      // full parsing path where the folder gives one (search results, Home), else empty
     std::wstring    hiddenExt; // the extension `name` leaves out where Windows itself would show it
     bool            extForced = false;      // `name` shows an extension Windows would hide
-    std::wstring    size;      // formatted display size, empty for folders
+    std::wstring    size;      // formatted display size; folders: empty until worked out (foldersizes)
     std::wstring    type;
     std::wstring    date;
     ULONGLONG       bytes = 0;
