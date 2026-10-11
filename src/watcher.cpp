@@ -285,6 +285,10 @@ void watcher_on_message(WPARAM wp, LPARAM lp) {
         SHChangeNotification_Unlock(lock);
         return;
     }
+    // a whole-folder update may stand for subfolders made or removed: the shell sends one
+    // instead of RMDIR when a big folder is deleted (its many events collapsed into one)
+    if ((event & SHCNE_UPDATEDIR) && pidls && pidls[0])
+        if (PIDLIST_ABSOLUTE f = pidl_clone(pidls[0])) s_treeParents.push_back(f);
     // (a rename can move an item in or out: either name counts)
     bool rename = (event & (SHCNE_RENAMEITEM | SHCNE_RENAMEFOLDER)) != 0;
     if (!pidls || !pidls[0] || touches_folder(pidls[0]) || (rename && pidls[1] && touches_folder(pidls[1]))) {

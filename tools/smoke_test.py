@@ -942,6 +942,29 @@ check('... without an error dialog', not errors, errors)
 for h in dialogs():
     u.PostMessageW(h, 0x0010, 0, 0)
 
+# a big folder deleted in the list leaves the navigation pane too (the shell reports it
+# as one "folder updated", not "folder removed")
+big = os.path.join(data, 'bigdir')
+for i in range(2000):
+    d = os.path.join(big, 'd%d' % (i // 50))
+    os.makedirs(d, exist_ok=True)
+    open(os.path.join(d, '%d.txt' % i), 'w').close()
+def big_in_tree():
+    return any(app.tree_item(h)[0] == 'bigdir' for h in app.tree_nodes())
+send(app.tree, 0x1102, 0x0002, app.tree_caret())                    # TVM_EXPAND (TVE_EXPAND)
+check('the tree shows a big folder made while the app runs', wait_for(big_in_tree, 8))
+wait_for(lambda: row_of('bigdir') >= 0, 5)
+app.select_name('bigdir')
+u.PostMessageW(app.hwnd, 0x0111, IDM['DELETE'], 0)
+def big_gone():
+    for h in dialogs():
+        if 'Delete' in text(h):
+            u.PostMessageW(h, 0x0111, 6, 0)                          # IDYES
+    return not os.path.exists(big)
+check('a big folder deleted in the list goes from the tree',
+      wait_for(big_gone, 15) and wait_for(lambda: not big_in_tree(), 5),
+      ('on disk' if os.path.exists(big) else 'gone from disk', 'in tree' if big_in_tree() else 'gone from tree'))
+
 app.close()
 check('exits cleanly after the second run', app.proc.returncode == 0, app.proc.returncode)
 app = App(exe, data, settings=ini)
