@@ -2,6 +2,7 @@
 #include "navigation.h"
 #include "tree.h"
 #include "enumerate.h"
+#include "foldersizes.h"
 #include "perf.h"
 #include <algorithm>
 #include <memory>
@@ -311,7 +312,10 @@ static void arm_refresh_timer() {
 
 void watcher_hold_begin(bool releaseDir) {
     ++s_hold;
-    if (releaseDir) stop_dir_watch();
+    if (releaseDir) {
+        stop_dir_watch();
+        foldersizes_release_watch();     // (watching again once the folder is listed again)
+    }
 }
 
 void watcher_hold_end() {

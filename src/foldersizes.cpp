@@ -2,10 +2,12 @@
 #include "enumerate.h"
 #include "columns.h"
 #include "detailspane.h"
+#include "perf.h"
 #include "workers.h"
 #include <algorithm>
 #include <cwctype>
 #include <memory>
+#include <thread>
 #include <unordered_map>
 
 namespace {
@@ -28,6 +30,7 @@ struct Result {
     std::wstring path;                    // the \\?\ path walked, lowercased (the cache's key)
     ULONGLONG bytes;
     bool known;                           // false: no size (a size shown from before goes)
+    ULONGLONG walkMs;                     // how long the walk took
 };
 
 struct Walk {
@@ -48,9 +51,11 @@ struct Batch {
 };
 
 struct CachedSize {
-    ULONGLONG bytes, tick;
+    ULONGLONG bytes, tick, walkMs;
 };
 std::unordered_map<std::wstring, CachedSize> s_cache;      // UI thread only
+// folders being walked (cache key -> the listing the walk is for), UI thread only
+std::unordered_map<std::wstring, UINT> s_walking;
 
 std::wstring lower(std::wstring s) {
     CharLowerBuffW(s.data(), (DWORD)s.size());
@@ -164,11 +169,12 @@ void walker(const std::shared_ptr<Walk>& w) {
     for (;;) {
         size_t i = w->next++;
         if (i >= w->folders.size() || w->cancelled()) break;
-        ULONGLONG bytes = 0;
+        ULONGLONG bytes = 0, t0 = GetTickCount64();
         WalkEnd end = folder_bytes(*w, w->folders[i].second, &bytes);
         if (end == WalkEnd::Cancelled) break;
         std::lock_guard<std::mutex> lk(w->mx);
-        w->done.push_back({ w->folders[i].first, lower(w->folders[i].second), bytes, end == WalkEnd::Done });
+        w->done.push_back({ w->folders[i].first, lower(w->folders[i].second), bytes, end == WalkEnd::Done,
+                            GetTickCount64() - t0 });
         if (GetTickCount64() - w->lastPost >= kPostMs) post(*w, false);
     }
     if (--w->running == 0) {
@@ -178,9 +184,10 @@ void walker(const std::shared_ptr<Walk>& w) {
 }
 
 void remember(const Result& r, ULONGLONG now) {
+    s_walking.erase(r.path);
     if (!r.known) { s_cache.erase(r.path); return; }
     if (s_cache.size() >= kCacheMax) s_cache.clear();     // (rarely: start over)
-    s_cache[r.path] = { r.bytes, now };
+    s_cache[r.path] = { r.bytes, now, r.walkMs };
 }
 
 void apply(void* payload) {
@@ -218,15 +225,212 @@ bool has_size_column() {
     return false;
 }
 
+// ------------------------------------------------------------------
+// The shown folder's whole tree is watched: a file made, removed or grown anywhere inside
+// a subfolder walks that subfolder again. (Changes directly in the folder come through
+// the listing's own watcher, and a changed folder item is walked again from there.)
+// A subfolder that keeps changing (a browser's cache) is walked at most every
+// kDeepMinMs, or ten times as long as its last walk took, whichever is longer.
+
+constexpr ULONGLONG kDeepQuietMs = 1500;     // a burst of changes: walk once it settles...
+constexpr ULONGLONG kDeepMaxWaitMs = 5000;   // ... or this long after it began
+constexpr ULONGLONG kDeepMinMs = 5000;
+
+struct DeepWatch {
+    HANDLE dir = INVALID_HANDLE_VALUE;
+    HANDLE ev = nullptr;                  // overlapped completion
+    HANDLE stop = nullptr;                // set by the UI thread
+    UINT gen = 0;
+    ~DeepWatch() {
+        if (dir != INVALID_HANDLE_VALUE) CloseHandle(dir);
+        if (ev) CloseHandle(ev);
+        if (stop) CloseHandle(stop);
+    }
+};
+
+struct DeepChanges {
+    UINT gen = 0;
+    std::unordered_set<std::wstring> names;   // subfolders changed inside (lowercased)
+    bool all = false;                         // too many changes to name: every subfolder
+    bool ended = false;                       // the watch failed and its thread is gone
+};
+
+std::shared_ptr<DeepWatch> s_deep;           // UI thread
+UINT s_deepGen = 0;                          // bumped when the watch goes: its late changes are dropped
+std::wstring s_deepDir;                      // the folder watched (ends in '\')
+std::unordered_set<std::wstring> s_dirty;    // subfolders (Item::key) changed and not walked again yet
+bool s_dirtyAll = false;
+
+void deep_apply(void* payload);
+
+void deep_post(const DeepWatch& w, std::unordered_set<std::wstring>& names, bool& all, bool ended = false) {
+    auto* c = new DeepChanges;
+    c->gen = w.gen;
+    c->names.swap(names);
+    c->all = all;
+    c->ended = ended;
+    all = false;
+    post_async(deep_apply, c);
+}
+
+void deep_thread(std::shared_ptr<DeepWatch> w) {
+    std::vector<DWORD> buf(16 * 1024);                  // 64 KB (DWORD-aligned)
+    const DWORD filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SIZE;
+    std::unordered_set<std::wstring> names;
+    bool all = false;
+    ULONGLONG first = 0, last = 0;                      // the burst being collected (0: none)
+    for (;;) {
+        OVERLAPPED ov{};
+        ov.hEvent = w->ev;
+        if (!ReadDirectoryChangesW(w->dir, buf.data(), (DWORD)(buf.size() * sizeof(DWORD)), TRUE, filter,
+                                   nullptr, &ov, nullptr))
+            break;
+        DWORD r;
+        for (;;) {                                      // waiting for changes, hand on a burst that settled
+            DWORD timeout = INFINITE;
+            if (first) {
+                ULONGLONG due = std::min(last + kDeepQuietMs, first + kDeepMaxWaitMs), now = GetTickCount64();
+                timeout = due > now ? (DWORD)(due - now) : 0;
+            }
+            HANDLE hs[2] = { w->ev, w->stop };
+            r = WaitForMultipleObjects(2, hs, FALSE, timeout);
+            if (r != WAIT_TIMEOUT) break;
+            deep_post(*w, names, all);
+            first = 0;
+        }
+        DWORD got = 0;
+        if (r != WAIT_OBJECT_0) {
+            CancelIoEx(w->dir, &ov);
+            GetOverlappedResult(w->dir, &ov, &got, TRUE);   // (the buffer stays ours until then)
+            return;
+        }
+        if (!GetOverlappedResult(w->dir, &ov, &got, FALSE)) break;
+        if (got == 0) {
+            all = true;                                 // more than the buffer holds
+        } else {
+            auto* p = reinterpret_cast<const BYTE*>(buf.data());
+            for (;;) {
+                auto* fni = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(p);
+                std::wstring name(fni->FileName, fni->FileNameLength / sizeof(WCHAR));
+                size_t cut = name.find(L'\\');
+                if (cut != std::wstring::npos) names.insert(lower(name.substr(0, cut)));   // inside a subfolder
+                if (!fni->NextEntryOffset) break;
+                p += fni->NextEntryOffset;
+            }
+        }
+        if (all || !names.empty()) {
+            last = GetTickCount64();
+            if (!first) first = last;
+        }
+    }
+    // the watch failed (the folder went): what it saw still counts, and the UI lets go of
+    // the folder (the handle would keep a deleted folder "delete pending")
+    deep_post(*w, names, all, true);
+}
+
+void deep_stop() {
+    ++s_deepGen;
+    s_dirty.clear();
+    s_dirtyAll = false;
+    if (g_main) KillTimer(g_main, TIMER_FOLDER_SIZES);
+    s_deepDir.clear();
+    if (!s_deep) return;
+    SetEvent(s_deep->stop);
+    s_deep.reset();                                     // (the thread holds its own reference)
+}
+
+void deep_start(const std::wstring& dir) {
+    if (s_deep && CompareStringOrdinal(dir.c_str(), -1, s_deepDir.c_str(), -1, TRUE) == CSTR_EQUAL) return;
+    deep_stop();
+    auto w = std::make_shared<DeepWatch>();
+    w->gen = s_deepGen;
+    // share everything: the folder and what is in it can still be renamed or deleted
+    w->dir = CreateFileW(long_path(dir).c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
+    w->ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    w->stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (w->dir == INVALID_HANDLE_VALUE || !w->ev || !w->stop) return;
+    try {
+        std::thread(deep_thread, w).detach();
+    } catch (...) {
+        return;                                         // (sizes still follow F5)
+    }
+    s_deep = w;
+    s_deepDir = dir;
+}
+
+// the changed subfolders that may be walked now; the others wait for the timer
+void walk_dirty() {
+    if (g_main) KillTimer(g_main, TIMER_FOLDER_SIZES);
+    if (!s_deep || (s_dirty.empty() && !s_dirtyAll)) return;
+    std::wstring dir = pidl_folder_path(g_current);
+    if (!dir.empty() && dir.back() != L'\\') dir += L'\\';
+    if (CompareStringOrdinal(dir.c_str(), -1, s_deepDir.c_str(), -1, TRUE) != CSTR_EQUAL) {
+        s_dirty.clear();                                // on the way to another folder
+        s_dirtyAll = false;
+        return;
+    }
+    if (!enum_listing_complete()) {                     // a refresh on the way: after it
+        SetTimer(g_main, TIMER_FOLDER_SIZES, (UINT)kDeepQuietMs, nullptr);
+        return;
+    }
+    ULONGLONG now = GetTickCount64(), wait = 0;
+    auto later = [&](ULONGLONG ms) { wait = wait ? std::min(wait, ms) : ms; };
+    std::unordered_set<std::wstring> walk, still;
+    {
+        std::lock_guard<std::mutex> lk(g_itemsMx);
+        for (Item* it : g_items) {
+            if (!it->isFolder || it->fileName.empty() || !(s_dirtyAll || s_dirty.count(it->key))) continue;
+            std::wstring ck = lower(long_path(dir + it->fileName));
+            if (auto b = s_walking.find(ck); b != s_walking.end() && b->second == g_enumId.load()) {
+                still.insert(it->key);                  // being walked: it may have read past the change
+                later(kDeepMinMs);
+                continue;
+            }
+            if (auto c = s_cache.find(ck); c != s_cache.end()) {
+                ULONGLONG gap = std::max(kDeepMinMs, 10 * c->second.walkMs), age = now - c->second.tick;
+                if (age < gap) {
+                    still.insert(it->key);
+                    later(gap - age);
+                    continue;
+                }
+            }
+            walk.insert(it->key);
+        }
+    }
+    s_dirty.swap(still);
+    s_dirtyAll = false;
+    if (perf_on()) perf_event("sizes.changed", -1, (long long)walk.size(), nullptr);
+    if (!walk.empty()) foldersizes_start(&walk);
+    if (wait) SetTimer(g_main, TIMER_FOLDER_SIZES, (UINT)wait, nullptr);
+}
+
+void deep_apply(void* payload) {
+    std::unique_ptr<DeepChanges> c(static_cast<DeepChanges*>(payload));
+    if (c->gen != s_deepGen) return;
+    s_dirty.insert(c->names.begin(), c->names.end());
+    s_dirtyAll |= c->all;
+    walk_dirty();
+    if (c->ended) deep_stop();           // (the next listing of the folder watches it again)
+}
+
 }  // namespace
 
 bool foldersizes_enabled() { return s_enabled; }
 
 void foldersizes_start(const std::unordered_set<std::wstring>* keys, SizeReuse reuse) {
-    if (!s_enabled || !g_current || !g_list || !has_size_column()) return;
+    if (!s_enabled || !g_current || !g_list || !has_size_column()) {
+        if (!keys) deep_stop();
+        return;
+    }
     std::wstring dir = pidl_folder_path(g_current);
     bool fsDir = is_fs_path(dir);
     if (fsDir && dir.back() != L'\\') dir += L'\\';
+    // a listing complete: watch what is inside its folders (a plain folder on an internal disk)
+    if (!keys) {
+        if (fsDir && dir[1] == L':' && path_on_internal_drive(dir)) deep_start(dir);
+        else deep_stop();
+    }
     auto w = std::make_shared<Walk>();
     w->opId = g_enumId.load();
     w->gen = s_gen.load();
@@ -257,6 +461,7 @@ void foldersizes_start(const std::unordered_set<std::wstring>* keys, SizeReuse r
                 }
                 s_cache.erase(c);                            // stale, or it changed
             }
+            s_walking[ck] = w->opId;
             w->folders.push_back({ it->key, std::move(lp) });
         }
     }
@@ -271,10 +476,29 @@ void foldersizes_start(const std::unordered_set<std::wstring>* keys, SizeReuse r
     for (int i = 0; i < n; ++i) worker_submit([w] { walker(w); }, JobKind::Bulk);
 }
 
+void foldersizes_on_timer() { walk_dirty(); }
+
+void foldersizes_release_watch() { deep_stop(); }
+
+void foldersizes_forget_shown() {
+    if (!g_current) return;
+    std::wstring dir = pidl_folder_path(g_current);
+    if (is_fs_path(dir)) {                               // a plain folder: everything inside it
+        std::wstring prefix = lower(long_path(dir));
+        if (prefix.back() != L'\\') prefix += L'\\';
+        std::erase_if(s_cache, [&](const auto& e) { return e.first.rfind(prefix, 0) == 0; });
+    }
+    std::lock_guard<std::mutex> lk(g_itemsMx);           // search results, Home: the items' own paths
+    for (Item* it : g_items)
+        if (it->isFolder && is_fs_path(it->path)) s_cache.erase(lower(long_path(it->path)));
+}
+
 void foldersizes_set_enabled(bool on) {
     if (on == s_enabled) return;
     s_enabled = on;
     ++s_gen;
+    s_walking.clear();                                   // (the walks running stop)
+    if (!on) deep_stop();
     if (!g_list) return;
     if (on) {
         if (enum_listing_complete()) foldersizes_start(nullptr, SizeReuse::Recent);   // (else when it is)

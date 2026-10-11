@@ -114,6 +114,7 @@ enum : UINT_PTR {
     TIMER_ENUM_STREAM = 3,          // take the rows a listing has produced so far
     TIMER_TABS_PERSIST = 4,         // save the tab set (debounced: tabs_persist_soon)
     TIMER_ENUM_HELD = 5,            // listing results held while a rename box is open
+    TIMER_FOLDER_SIZES = 6,         // folders changed inside, waiting to be walked again
 };
 
 // heap op passed via WM_ENUM_DONE

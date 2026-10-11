@@ -572,7 +572,10 @@ void enumerate_start(PCIDLIST_ABSOLUTE folderAbs, bool keepView) {
     if (perf_on()) perf_event("enum.start", -1, id, pidl_folder_path(folderAbs).c_str());
     s_pendingFolderSig = pidl_sig(folderAbs);
     s_pendingKeepView = keepView && s_pendingFolderSig == s_shownFolderSig;
-    if (!s_pendingKeepView) enum_clear_items();
+    if (!s_pendingKeepView) {
+        enum_clear_items();
+        foldersizes_release_watch();     // another folder (its listing watches that one)
+    }
     EnumJob* job = new EnumJob;
     job->opId = id;
     job->folder = folderAbs ? pidl_clone(folderAbs) : pidl_desktop();

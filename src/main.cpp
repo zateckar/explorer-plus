@@ -397,6 +397,7 @@ static void on_command(WORD id) {
         case IDM_NAV_UP:      navigation_go_up(); break;
         case IDM_NAV_REFRESH:
         case IDM_VIEW_REFRESH:
+            foldersizes_forget_shown();         // a refresh asked for: sizes too, not the ones kept
             navigation_refresh();
             break;
 
@@ -707,6 +708,7 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == TIMER_ENUM_STREAM) { enum_on_stream_timer(); return 0; }
             if (wp == TIMER_TABS_PERSIST) { tabs_persist_now(); return 0; }
             if (wp == TIMER_ENUM_HELD) { enum_on_held_timer(); return 0; }
+            if (wp == TIMER_FOLDER_SIZES) { foldersizes_on_timer(); return 0; }
             break;
         case WM_SETTINGCHANGE:
             if (((lp && lstrcmpW((LPCWSTR)lp, L"ImmersiveColorSet") == 0) || wp == SPI_SETHIGHCONTRAST) && theme_reload())

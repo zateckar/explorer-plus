@@ -773,6 +773,16 @@ if subprocess.run(['cmd', '/c', 'mklink', '/J', sized_link, sized], capture_outp
     os.rmdir(sized_link)                                            # (the junction, not its target)
 else:
     skip('junction: no folder size', 'mklink /J failed')
+# a file removed deep inside: the size follows by itself (the cache from a moment ago
+# waits a few seconds); a file added and F5 at once: the size is walked again, not reused
+os.remove(os.path.join(sized, 'deep', 'deeper', 'low.bin'))
+check('a file removed deep inside a folder updates its size', wait_for(lambda: size_of('sized') == byte_size(1000), 10),
+      (size_of('sized'), byte_size(1000)))
+with open(os.path.join(sized, 'deep', 'deeper', 'new.bin'), 'wb') as f:
+    f.write(bytes(500000))
+app.command(IDM['REFRESH'])
+check('F5 walks the folder sizes again', wait_for(lambda: size_of('sized') == byte_size(501000), 1.2),
+      (size_of('sized'), byte_size(501000)))
 shutil.rmtree(sized)
 check('removed folder leaves the list', wait_for(lambda: row_of('sized') < 0, 5))
 
