@@ -11,6 +11,9 @@ File Explorer while starting in well under 100 ms.
   Refresh, breadcrumb address bar, search, "…" menu with the command bar's commands),
   navigation pane, details / preview pane, status bar with view toggles. Dark and light
   mode follow Windows, Per-Monitor DPI v2.
+- **Pinned tabs** (right-click a tab ▸ Pin tab) stay first, can't be closed, and keep
+  their folder: a folder opened from one (file list, navigation pane, address bar, Up,
+  search) comes up in a new tab, whose Back leads to the pinned folder.
 - **Navigation pane**: Home, Gallery, OneDrive, pinned Quick access folders, This PC,
   Network; children listed in the background; follows the current folder.
 - **Views**: Details (with Win11 row spacing, or Compact like Windows' setting), Extra large /

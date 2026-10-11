@@ -3,6 +3,7 @@
 using std::max;
 using std::min;
 #include "navigation.h"
+#include "navbar.h"
 #include "enumerate.h"
 #include "settings.h"
 #include "theme.h"
@@ -85,12 +86,13 @@ void tabmodel_on_navigate(PIDLIST_ABSOLUTE newAbs, bool pushHistory) {
     tabs_persist_soon();
 }
 
-bool tabmodel_can_back() { TabState* t = tabmodel_active(); return t && !t->back.empty(); }
-bool tabmodel_can_forward() { TabState* t = tabmodel_active(); return t && !t->fwd.empty(); }
+// a pinned tab stays on its folder: no Back / Forward (the history comes back on unpin)
+bool tabmodel_can_back() { TabState* t = tabmodel_active(); return t && !t->pinned && !t->back.empty(); }
+bool tabmodel_can_forward() { TabState* t = tabmodel_active(); return t && !t->pinned && !t->fwd.empty(); }
 
 bool tabmodel_go_back() {
     TabState* t = tabmodel_active();
-    if (!t || t->back.empty()) return false;
+    if (!tabmodel_can_back()) return false;
     t->fwd.push_back(t->current);
     t->current = t->back.back();
     t->back.pop_back();
@@ -100,7 +102,7 @@ bool tabmodel_go_back() {
 }
 bool tabmodel_go_forward() {
     TabState* t = tabmodel_active();
-    if (!t || t->fwd.empty()) return false;
+    if (!tabmodel_can_forward()) return false;
     t->back.push_back(t->current);
     t->current = t->fwd.back();
     t->fwd.pop_back();
@@ -124,6 +126,18 @@ void tabmodel_new_tab() {
     navigate_replace(tabmodel_active());
     tabs_persist_soon();
     tabstrip_refresh();
+}
+
+// a folder opened from a pinned tab: its own tab, whose Back returns to the pinned folder
+void tabmodel_open_in_new_tab(PIDLIST_ABSOLUTE abs) {
+    PIDLIST_ABSOLUTE from = tabmodel_active() ? pidl_clone(tabmodel_active()->current) : nullptr;
+    TabState t = make_tab(abs);
+    if (from) t.back.push_back(from);
+    t.view = view_for_folder(t.current);
+    s_tabs.push_back(std::move(t));
+    g_activeTab = (int)s_tabs.size() - 1;
+    navigate_replace(tabmodel_active());
+    tabs_persist_soon();
 }
 
 bool tabmodel_is_pinned(int idx) {
@@ -158,6 +172,7 @@ void tabmodel_toggle_pin(int idx) {
     s_tabs[idx].pinned = !s_tabs[idx].pinned;
     sort_pinned_first();
     tabstrip_refresh();
+    navbar_refresh();                            // Back / Forward (off while pinned)
     tabs_persist_soon();
 }
 

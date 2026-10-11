@@ -100,6 +100,11 @@ void navigate_owned(PIDLIST_ABSOLUTE pidl) {
         navigation_refresh();
         return;
     }
+    if (t && t->pinned) {                           // a pinned tab keeps its folder
+        tabmodel_open_in_new_tab(pidl);             // adopts pidl
+        address_history_add(current_display_path());
+        return;
+    }
     tabmodel_on_navigate(pidl, true);   // adopts pidl
     if (t) t->view = view_for_folder(t->current);
     navigate_replace(tabmodel_active());

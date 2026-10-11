@@ -200,7 +200,7 @@ void search_cancel() {
     if (!cur) return;
     // back to the searched folder: through history when it is right behind us
     TabState* t = tabmodel_active();
-    if (t && !t->back.empty() && pidl_equal(t->back.back(), cur->scope)) navigation_go_back();
+    if (t && tabmodel_can_back() && pidl_equal(t->back.back(), cur->scope)) navigation_go_back();
     else navigate_to(cur->scope);
 }
 

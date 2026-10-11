@@ -9,7 +9,8 @@ struct TabState {
     std::vector<PIDLIST_ABSOLUTE> fwd;
     View view{ LV_VIEW_DETAILS, 0 };
     std::wstring name;                            // display name shown in the tab
-    bool pinned = false;                          // pinned: no close button, no Ctrl+W, sorted first
+    bool pinned = false;                          // pinned: no close button, no Ctrl+W, sorted first,
+                                                  // its folder fixed (folders open in new tabs)
 };
 
 extern int g_activeTab;
@@ -17,6 +18,7 @@ extern int g_activeTab;
 // model ops (navigation.cpp calls into these)
 void   tabmodel_init(const std::wstring& openPath, bool restore);   // restored tabs (+ openPath as active tab)
 void   tabmodel_new_tab();                         // duplicate current folder
+void   tabmodel_open_in_new_tab(PIDLIST_ABSOLUTE abs);   // adopts; new active tab, Back = the folder left
 void   tabmodel_close_tab(int idx);                // -1 = active; closes window when last
 void   tabmodel_switch_to(int idx);
 void   tabmodel_next_tab(int delta);               // Ctrl+PgUp/Dn / Ctrl+Tab
