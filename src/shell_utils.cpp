@@ -1,21 +1,24 @@
 #include "shell_utils.h"
+#include "cmdline.h"
 #include "pkeys_compat_def.h"
+#include <winioctl.h>
+#include <cstddef>
 #include <cwctype>
 
-bool pidl_is_desktop(LPCITEMIDLIST pidl) { return !pidl || ILIsEmpty(pidl); }
+bool pidl_is_desktop(PCUIDLIST_RELATIVE pidl) { return !pidl || ILIsEmpty(pidl); }
 
-PITEMID_CHILD pidl_desktop() {
+PIDLIST_ABSOLUTE pidl_desktop() {
     // the namespace root is the empty list: just the 2-byte terminator
-    auto p = static_cast<PITEMID_CHILD>(CoTaskMemAlloc(sizeof(USHORT)));
+    auto p = static_cast<PIDLIST_ABSOLUTE>(CoTaskMemAlloc(sizeof(USHORT)));
     if (p) p->mkid.cb = 0;
     return p;
 }
 
-std::wstring pidl_abs_dispname(LPCITEMIDLIST abs) {
+std::wstring pidl_abs_dispname(PCIDLIST_ABSOLUTE abs) {
     std::wstring out;
     PIDLIST_ABSOLUTE root = nullptr;
-    LPCITEMIDLIST p = abs;
-    if (!p) { root = reinterpret_cast<PIDLIST_ABSOLUTE>(pidl_desktop()); p = root; }
+    PCIDLIST_ABSOLUTE p = abs;
+    if (!p) { root = pidl_desktop(); p = root; }
     PWSTR dn = nullptr;
     if (p && SUCCEEDED(SHGetNameFromIDList(p, SIGDN_NORMALDISPLAY, &dn)) && dn) {
         out = dn; CoTaskMemFree(dn);
@@ -24,7 +27,7 @@ std::wstring pidl_abs_dispname(LPCITEMIDLIST abs) {
     return out;
 }
 
-std::wstring pidl_parsingname(LPCITEMIDLIST abs) {
+std::wstring pidl_parsingname(PCIDLIST_ABSOLUTE abs) {
     if (!abs) return {};
     PWSTR dn = nullptr;
     std::wstring out;
@@ -34,7 +37,7 @@ std::wstring pidl_parsingname(LPCITEMIDLIST abs) {
     return out;
 }
 
-std::wstring pidl_editingname(LPCITEMIDLIST abs) {
+std::wstring pidl_editingname(PCIDLIST_ABSOLUTE abs) {
     if (pidl_is_desktop(abs)) return pidl_abs_dispname(nullptr);
     PWSTR dn = nullptr;
     std::wstring out;
@@ -45,12 +48,17 @@ std::wstring pidl_editingname(LPCITEMIDLIST abs) {
     return out;
 }
 
-PITEMID_CHILD pidl_clone(LPCITEMIDLIST pidl) {
+PIDLIST_ABSOLUTE pidl_clone(PCIDLIST_ABSOLUTE pidl) {
     if (!pidl) return nullptr;
-    return static_cast<PITEMID_CHILD>(ILClone(pidl));
+    return static_cast<PIDLIST_ABSOLUTE>(ILClone(pidl));
 }
 
-bool pidl_equal(LPCITEMIDLIST a, LPCITEMIDLIST b) {
+PITEMID_CHILD pidl_clone_child(PCUITEMID_CHILD child) {
+    if (!child) return nullptr;
+    return static_cast<PITEMID_CHILD>(ILClone(child));
+}
+
+bool pidl_equal(PCIDLIST_ABSOLUTE a, PCIDLIST_ABSOLUTE b) {
     bool da = pidl_is_desktop(a), db = pidl_is_desktop(b);
     if (da || db) return da == db;
     com_ptr<IShellFolder> dsf;
@@ -59,27 +67,27 @@ bool pidl_equal(LPCITEMIDLIST a, LPCITEMIDLIST b) {
     return SUCCEEDED(r) && (SHORT)HRESULT_CODE(r) == 0;
 }
 
-ULONGLONG pidl_sig(LPCITEMIDLIST pidl) {
+ULONGLONG pidl_sig(PCUIDLIST_RELATIVE pidl) {
     // FNV-1a over the pidl bytes
     if (!pidl) return 0;
     ULONGLONG s = 1469598103934665603ULL;
-    const UINT cb = ILGetSize(const_cast<LPITEMIDLIST>(pidl));
+    const UINT cb = ILGetSize(pidl);
     const BYTE* p = reinterpret_cast<const BYTE*>(pidl);
     for (UINT i = 0; i < cb; ++i) { s ^= p[i]; s *= 1099511628211ULL; }
     return s;
 }
 
-std::wstring pidl_folder_path(LPCITEMIDLIST abs) {
+std::wstring pidl_folder_path(PCIDLIST_ABSOLUTE abs) {
     if (!abs) return {};
     WCHAR buf[MAX_PATH]{};
-    if (!ILIsEmpty(abs) && SHGetPathFromIDListW(const_cast<LPITEMIDLIST>(abs), buf)) return buf;
+    if (!ILIsEmpty(abs) && SHGetPathFromIDListW(abs, buf)) return buf;
     return pidl_parsingname(abs);
 }
 
-bool pidl_exists(LPCITEMIDLIST abs) {
+bool pidl_exists(PCIDLIST_ABSOLUTE abs) {
     if (pidl_is_desktop(abs)) return true;
     WCHAR path[MAX_PATH]{};
-    if (SHGetPathFromIDListW(const_cast<LPITEMIDLIST>(abs), path))
+    if (SHGetPathFromIDListW(abs, path))
         return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
     com_ptr<IShellItem> si;
     SFGAOF a = SFGAO_VALIDATE;
@@ -87,14 +95,70 @@ bool pidl_exists(LPCITEMIDLIST abs) {
            SUCCEEDED(si->GetAttributes(SFGAO_VALIDATE, &a));
 }
 
+// "C:\..." or "\\?\C:\...": the drive letter, else 0
+static wchar_t drive_letter(const std::wstring& path) {
+    size_t at = path.rfind(L"\\\\?\\", 0) == 0 ? 4 : 0;
+    if (path.size() >= at + 2 && iswalpha(path[at]) && path[at + 1] == L':') return (wchar_t)towupper(path[at]);
+    return 0;
+}
+
+bool path_is_network(const std::wstring& path) {
+    if (path.rfind(L"\\\\?\\UNC\\", 0) == 0) return true;
+    if (wchar_t d = drive_letter(path)) {
+        WCHAR root[4] = { d, L':', L'\\', 0 };
+        return GetDriveTypeW(root) == DRIVE_REMOTE;
+    }
+    return path.rfind(L"\\\\", 0) == 0 && path.rfind(L"\\\\?\\", 0) != 0 && path.rfind(L"\\\\.\\", 0) != 0;
+}
+
+// the storage bus of a drive letter's disk; USB / SD / FireWire disks can report
+// DRIVE_FIXED. Asked once per drive (the answer is kept for a minute: letters move).
+static bool drive_on_external_bus(wchar_t d) {
+    static std::mutex mx;
+    static ULONGLONG checked[26]{};
+    static bool external[26]{};
+    int i = d - L'A';
+    if (i < 0 || i >= 26) return false;
+    ULONGLONG now = GetTickCount64();
+    {
+        std::lock_guard<std::mutex> lk(mx);
+        if (checked[i] && now - checked[i] < 60000) return external[i];
+    }
+    bool ext = false;
+    WCHAR dev[8] = { L'\\', L'\\', L'.', L'\\', d, L':', 0 };
+    HANDLE h = CreateFileW(dev, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        STORAGE_PROPERTY_QUERY q{};
+        q.PropertyId = StorageDeviceProperty;
+        q.QueryType = PropertyStandardQuery;
+        BYTE buf[512]{};
+        DWORD got = 0;
+        if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof(q), buf, sizeof(buf), &got, nullptr) &&
+            got >= offsetof(STORAGE_DEVICE_DESCRIPTOR, BusType) + sizeof(STORAGE_BUS_TYPE)) {
+            auto bus = reinterpret_cast<const STORAGE_DEVICE_DESCRIPTOR*>(buf)->BusType;
+            ext = bus == BusTypeUsb || bus == BusType1394 || bus == BusTypeSd || bus == BusTypeMmc;
+        }
+        CloseHandle(h);
+    }
+    std::lock_guard<std::mutex> lk(mx);
+    checked[i] = now;
+    external[i] = ext;
+    return ext;
+}
+
+bool path_on_internal_drive(const std::wstring& path) {
+    wchar_t d = drive_letter(path);
+    if (!d) return false;
+    WCHAR root[4] = { d, L':', L'\\', 0 };
+    return GetDriveTypeW(root) == DRIVE_FIXED && !drive_on_external_bus(d);
+}
+
 // a file-system folder known to be missing (not found, as opposed to unreadable / a
 // drive without its disk); asks the file system only for local drives
-bool fs_folder_missing(LPCITEMIDLIST abs) {
+bool fs_folder_missing(PCIDLIST_ABSOLUTE abs) {
     WCHAR path[MAX_PATH]{};
-    if (pidl_is_desktop(abs) || !SHGetPathFromIDListW(const_cast<LPITEMIDLIST>(abs), path)) return false;
-    if (path[0] == L'\\' || path[1] != L':') return false;          // UNC: could block
-    WCHAR root[4] = { path[0], L':', L'\\', 0 };
-    if (GetDriveTypeW(root) == DRIVE_REMOTE) return false;
+    if (pidl_is_desktop(abs) || !SHGetPathFromIDListW(abs, path)) return false;
+    if (path[1] != L':' || path_is_network(path)) return false;     // a share: could block
     if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) return false;
     DWORD e = GetLastError();
     return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND;
@@ -114,25 +178,14 @@ std::wstring child_name(IShellFolder* psf, PCUITEMID_CHILD child, SHGDNF flags) 
 HRESULT parse_typed(const std::wstring& text, PIDLIST_ABSOLUTE* out) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    std::wstring t = text;
-    while (!t.empty() && iswspace(t.back())) t.pop_back();
-    size_t st = 0; while (st < t.size() && iswspace(t[st])) ++st;
-    t.erase(0, st);
-    // Strip quotes often pasted from command lines
-    if (t.size() >= 2 && t.front() == L'"' && t.back() == L'"') t = t.substr(1, t.size() - 2);
+    std::wstring t = typed_text_clean(text);
     if (t.empty()) return E_INVALIDARG;
-    // %USERPROFILE%\... and friends
-    if (t.find(L'%') != std::wstring::npos) {
-        WCHAR exp[4096]{};
-        DWORD n = ExpandEnvironmentStringsW(t.c_str(), exp, ARRAYSIZE(exp));
-        if (n && n <= ARRAYSIZE(exp)) t = exp;
-    }
     PIDLIST_ABSOLUTE p = nullptr;
     HRESULT hr = SHParseDisplayName(t.c_str(), nullptr, &p, 0, nullptr);
     if (SUCCEEDED(hr) && p) { *out = p; return S_OK; }
     // display names of well-known roots ("Desktop", "This PC", ...)
     if (StrCmpIW(t.c_str(), pidl_abs_dispname(nullptr).c_str()) == 0) {
-        *out = reinterpret_cast<PIDLIST_ABSOLUTE>(pidl_desktop());
+        *out = pidl_desktop();
         return *out ? S_OK : E_OUTOFMEMORY;
     }
     return FAILED(hr) ? hr : HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
@@ -143,7 +196,7 @@ void shell_open_abs(HWND hwnd, PCIDLIST_ABSOLUTE abs) {
     SHELLEXECUTEINFOW sei{ sizeof(sei) };
     sei.fMask  = SEE_MASK_INVOKEIDLIST | SEE_MASK_ASYNCOK | SEE_MASK_FLAG_LOG_USAGE;
     sei.hwnd   = hwnd;
-    sei.lpIDList = const_cast<LPITEMIDLIST>(abs);
+    sei.lpIDList = const_cast<PIDLIST_ABSOLUTE>(abs);
     sei.nShow  = SW_SHOWNORMAL;
     ShellExecuteExW(&sei);
 }
@@ -176,12 +229,20 @@ HRESULT shell_item_for(PCIDLIST_ABSOLUTE abs, IShellItem** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!abs) {
-        PITEMID_CHILD root = pidl_desktop();
+        PIDLIST_ABSOLUTE root = pidl_desktop();
         HRESULT hr = root ? SHCreateItemFromIDList(root, IID_PPV_ARGS(out)) : E_OUTOFMEMORY;
         if (root) CoTaskMemFree(root);
         return hr;
     }
     return SHCreateItemFromIDList(abs, IID_PPV_ARGS(out));
+}
+
+// the Size column of files and folders, as in Explorer: whole kilobytes, rounded up
+// ("1 KB" for a 1-byte file), with the locale's digit grouping and unit text
+std::wstring fmt_size_kb(ULONGLONG bytes) {
+    WCHAR buf[64]{};
+    if (StrFormatKBSizeW((LONGLONG)bytes, buf, 64)) return buf;
+    return std::to_wstring((bytes + 1023) / 1024) + L" KB";
 }
 
 std::wstring fmt_size(ULONGLONG bytes) {
@@ -207,8 +268,8 @@ std::wstring fmt_filetime(const FILETIME& ft) {
     return out;
 }
 
-int sys_icon_index(LPCITEMIDLIST abs, bool open, int fallback) {
-    PITEMID_CHILD root = nullptr;
+int sys_icon_index(PCIDLIST_ABSOLUTE abs, bool open, int fallback) {
+    PIDLIST_ABSOLUTE root = nullptr;
     if (!abs) { root = pidl_desktop(); abs = root; }
     SHFILEINFOW si{};
     UINT flags = SHGFI_SYSICONINDEX | SHGFI_PIDL | SHGFI_SMALLICON | (open ? SHGFI_OPENICON : 0);

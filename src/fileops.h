@@ -4,6 +4,9 @@
 // clipboard
 bool clipboard_has_files();
 void fileops_paste_into_current();
+void fileops_paste_into(PCIDLIST_ABSOLUTE folder);
+// put the items on the clipboard as Copy or Cut; false when the clipboard was busy
+bool fileops_set_clipboard(IShellFolder* parent, const std::vector<PCITEMID_CHILD>& children, bool cut);
 void fileops_set_cut_items(const std::vector<PCITEMID_CHILD>& children);   // empty = clear
 bool fileops_is_cut(PCITEMID_CHILD child);    // ghost this row (cut, not yet pasted)
 

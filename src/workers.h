@@ -8,7 +8,12 @@
 // cap, and threads idle for a while end. Each thread has COM initialized (STA).
 // A job that throws is dropped, the app goes on. Results go to the UI thread with
 // post_async as before.
-void worker_submit(std::function<void()> job);
+//
+// Bulk jobs (folder-size walks, prefetching) wait behind every other queued job and
+// only a few run at a time, so work the user is waiting for (the listing on screen, a
+// node being expanded, a typed address) always finds a thread.
+enum class JobKind { Normal, Bulk };
+void worker_submit(std::function<void()> job, JobKind kind = JobKind::Normal);
 
 // Stop taking jobs and drop the queued ones (at exit). Running jobs finish on their
 // own; their post_async results are discarded.

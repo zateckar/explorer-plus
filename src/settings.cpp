@@ -1,4 +1,5 @@
 #include "settings.h"
+#include "ini.h"
 #include <algorithm>
 #include <functional>
 #include <map>
@@ -45,157 +46,35 @@ static std::wstring ini_path() {
 }
 
 // ------------------------------------------------------------------
-// the INI document: sections and lines in file order (comments kept)
+// the file (the INI document itself: ini.h)
 
-static bool ieq(const std::wstring& a, const std::wstring& b) {
-    return CompareStringOrdinal(a.c_str(), (int)a.size(), b.c_str(), (int)b.size(), TRUE) == CSTR_EQUAL;
-}
-
-static std::wstring trim(const std::wstring& s) {
-    size_t b = 0, e = s.size();
-    while (b < e && (s[b] == L' ' || s[b] == L'\t')) ++b;
-    while (e > b && (s[e - 1] == L' ' || s[e - 1] == L'\t')) --e;
-    return s.substr(b, e - b);
-}
-
-using KeyValues = std::vector<std::pair<std::wstring, std::wstring>>;
-
-struct IniLine {
-    bool entry = false;            // key=value (else a comment / blank line, kept as `raw`)
-    std::wstring key, value, raw;
-};
-struct IniSection {
-    std::wstring name;             // "" for lines before the first header
-    std::vector<IniLine> lines;
-};
-
-struct IniDoc {
-    std::vector<IniSection> sections;
-
-    IniSection* find(const std::wstring& name, bool create = false) {
-        for (auto& s : sections) if (!s.name.empty() && ieq(s.name, name)) return &s;
-        if (!create) return nullptr;
-        sections.push_back({ name, {} });
-        return &sections.back();
-    }
-    const IniSection* find(const std::wstring& name) const {
-        return const_cast<IniDoc*>(this)->find(name, false);
-    }
-    const std::wstring* get(const std::wstring& sec, const std::wstring& key) const {
-        if (const IniSection* s = find(sec))
-            for (auto& l : s->lines) if (l.entry && ieq(l.key, key)) return &l.value;
-        return nullptr;
-    }
-    // a key set again moves to the end of its section: the order is "least recently
-    // written first", which is what pruning goes by
-    void set(const std::wstring& sec, const std::wstring& key, const std::wstring& value) {
-        IniSection* s = find(sec, true);
-        erase_in(s, key);
-        IniLine l;
-        l.entry = true; l.key = key; l.value = value;
-        s->lines.push_back(std::move(l));
-    }
-    void erase(const std::wstring& sec, const std::wstring& key) {
-        if (IniSection* s = find(sec)) erase_in(s, key);
-    }
-    KeyValues entries(const std::wstring& sec) const {
-        KeyValues out;
-        if (const IniSection* s = find(sec))
-            for (auto& l : s->lines) if (l.entry) out.push_back({ l.key, l.value });
-        return out;
-    }
-    void replace(const std::wstring& sec, const KeyValues& kv) {
-        IniSection* s = find(sec, true);
-        s->lines.clear();
-        for (auto& [k, v] : kv) { IniLine l; l.entry = true; l.key = k; l.value = v; s->lines.push_back(std::move(l)); }
-    }
-private:
-    static void erase_in(IniSection* s, const std::wstring& key) {
-        s->lines.erase(std::remove_if(s->lines.begin(), s->lines.end(),
-                                      [&](const IniLine& l) { return l.entry && ieq(l.key, key); }),
-                       s->lines.end());
-    }
-};
-
-// UTF-16LE (with BOM, as written here), UTF-8 (a file edited in Notepad) or ANSI (very old)
-static std::wstring decode(const std::string& raw) {
-    auto widen = [&](UINT cp, size_t skip, DWORD flags, std::wstring& out) {
-        int len = (int)(raw.size() - skip);
-        if (len <= 0) { out.clear(); return true; }
-        int n = MultiByteToWideChar(cp, flags, raw.data() + skip, len, nullptr, 0);
-        if (n <= 0) return false;
-        out.resize(n);
-        MultiByteToWideChar(cp, flags, raw.data() + skip, len, out.data(), n);
-        return true;
-    };
-    std::wstring text;
-    if (raw.size() >= 2 && (unsigned char)raw[0] == 0xFF && (unsigned char)raw[1] == 0xFE) {
-        text.assign(reinterpret_cast<const wchar_t*>(raw.data() + 2), (raw.size() - 2) / sizeof(wchar_t));
-    } else if (raw.size() >= 3 && (unsigned char)raw[0] == 0xEF && (unsigned char)raw[1] == 0xBB &&
-               (unsigned char)raw[2] == 0xBF) {
-        widen(CP_UTF8, 3, 0, text);
-    } else if (!widen(CP_UTF8, 0, MB_ERR_INVALID_CHARS, text)) {
-        widen(CP_ACP, 0, 0, text);
-    }
-    return text;
-}
-
-static IniDoc parse(const std::wstring& text) {
-    IniDoc d;
-    d.sections.push_back({ L"", {} });
-    size_t pos = 0;
-    while (pos <= text.size()) {
-        size_t nl = text.find(L'\n', pos);
-        std::wstring line = text.substr(pos, nl == std::wstring::npos ? std::wstring::npos : nl - pos);
-        pos = nl == std::wstring::npos ? text.size() + 1 : nl + 1;
-        if (!line.empty() && line.back() == L'\r') line.pop_back();
-        std::wstring t = trim(line);
-        if (t.size() >= 2 && t[0] == L'[' && t.find(L']') != std::wstring::npos) {
-            d.sections.push_back({ trim(t.substr(1, t.find(L']') - 1)), {} });
-            continue;
-        }
-        IniLine l;
-        size_t eq = t.find(L'=');
-        if (!t.empty() && t[0] != L';' && eq != std::wstring::npos && eq > 0) {
-            l.entry = true;
-            l.key = trim(t.substr(0, eq));
-            l.value = trim(t.substr(eq + 1));
-            // (the profile APIs dropped quotes around a value: files they wrote read the same)
-            if (l.value.size() >= 2 && l.value.front() == L'"' && l.value.back() == L'"')
-                l.value = l.value.substr(1, l.value.size() - 2);
-        } else {
-            if (t.empty() && pos > text.size()) break;    // (the final newline)
-            l.raw = line;
-        }
-        d.sections.back().lines.push_back(std::move(l));
-    }
-    return d;
-}
-
-static std::wstring serialize(const IniDoc& d) {
-    std::wstring out;
-    for (auto& s : d.sections) {
-        if (!s.name.empty()) out += L"[" + s.name + L"]\r\n";
-        for (auto& l : s.lines) out += (l.entry ? l.key + L"=" + l.value : l.raw) + L"\r\n";
-    }
-    return out;
-}
-
-// the file as it is now (empty when there is none)
-static IniDoc read_doc(const std::wstring& p) {
+// the file as it is now (empty when there is none). False: it is there but couldn't be
+// read (locked, no access, too big) — not the same as empty: it must not be written over
+static bool read_doc(const std::wstring& p, IniDoc& out) {
+    out = ini_parse(L"");
     HANDLE h = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return parse(L"");
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD e = GetLastError();
+        return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND;
+    }
     LARGE_INTEGER size{};
     std::string raw;
-    if (GetFileSizeEx(h, &size) && size.QuadPart > 0 && size.QuadPart < (64LL << 20)) {
+    bool ok = GetFileSizeEx(h, &size) && size.QuadPart >= 0 && size.QuadPart < (64LL << 20);
+    if (ok && size.QuadPart > 0) {
         raw.resize((size_t)size.QuadPart);
         DWORD got = 0;
-        if (!ReadFile(h, raw.data(), (DWORD)raw.size(), &got, nullptr)) got = 0;
-        raw.resize(got);
+        ok = ReadFile(h, raw.data(), (DWORD)raw.size(), &got, nullptr) && got == raw.size();
     }
     CloseHandle(h);
-    return parse(decode(raw));
+    if (ok) out = ini_parse(ini_decode(raw));
+    return ok;
+}
+
+static IniDoc read_doc(const std::wstring& p) {       // for reading only: what could be read
+    IniDoc d;
+    read_doc(p, d);
+    return d;
 }
 
 // replace the file in one step: a crash mid-write leaves the old file, never half a one
@@ -203,7 +82,7 @@ static bool write_doc(const std::wstring& p, const IniDoc& d) {
     std::wstring tmp = p + L".tmp" + std::to_wstring(GetCurrentProcessId());
     HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
-    std::wstring text = serialize(d);
+    std::wstring text = ini_serialize(d);
     WCHAR bom = 0xFEFF;
     DWORD wr = 0;
     bool ok = WriteFile(h, &bom, sizeof(bom), &wr, nullptr) &&
@@ -226,9 +105,12 @@ static bool update_file(const std::function<void(IniDoc&)>& change) {
     HANDLE mx = CreateMutexW(nullptr, FALSE, L"Local\\ExplorerPlus.Settings");
     DWORD w = mx ? WaitForSingleObject(mx, 3000) : WAIT_FAILED;
     bool owned = w == WAIT_OBJECT_0 || w == WAIT_ABANDONED;
-    IniDoc d = read_doc(p);
-    change(d);
-    bool ok = write_doc(p, d);
+    IniDoc d;
+    bool ok = read_doc(p, d);          // (a file that couldn't be read isn't written over: all else in it would go)
+    if (ok) {
+        change(d);
+        ok = write_doc(p, d);
+    }
     if (owned) ReleaseMutex(mx);
     if (mx) CloseHandle(mx);
     return ok;
@@ -236,36 +118,6 @@ static bool update_file(const std::function<void(IniDoc&)>& change) {
 
 // ------------------------------------------------------------------
 // keys
-
-// INI keys cannot hold '=', ';', '[', ']' or leading/trailing blanks; '\' is
-// stored as '|' (illegal in paths, keeps legacy files readable), the rest as %XX.
-static std::wstring escape_key(const std::wstring& k) {
-    std::wstring out;
-    for (size_t i = 0; i < k.size(); ++i) {
-        WCHAR c = k[i];
-        bool edgeBlank = (c == L' ' || c == L'\t') && (i == 0 || i + 1 == k.size());
-        if (c == L'\\') out += L'|';
-        else if (c == L'=' || c == L';' || c == L'[' || c == L']' || c == L'%' || c == L'|' ||
-                 c == L'"' || edgeBlank || c < 0x20) {
-            WCHAR hex[8];
-            swprintf(hex, 8, L"%%%02X", (unsigned)c & 0xFF);
-            out += hex;
-        } else out += c;
-    }
-    return out;
-}
-
-static std::wstring unescape_key(const std::wstring& k) {
-    std::wstring out;
-    for (size_t i = 0; i < k.size(); ++i) {
-        if (k[i] == L'|') out += L'\\';
-        else if (k[i] == L'%' && i + 2 < k.size() && iswxdigit(k[i + 1]) && iswxdigit(k[i + 2])) {
-            out += (WCHAR)wcstoul(k.substr(i + 1, 2).c_str(), nullptr, 16);
-            i += 2;
-        } else out += k[i];
-    }
-    return out;
-}
 
 // keys of file-system folders ("C:\...", "\\server\share\..."), not virtual ones
 // ("::{...}", "::search-results")
@@ -347,8 +199,8 @@ void settings_load_all() {
         s_tabLines.push_back(*v);
     }
     // per-folder views and columns ("escaped-key=value"), small integer preferences
-    for (auto& [k, v] : d.entries(L"views")) s_byFolder[unescape_key(k)] = int_to_view(_wtoi(v.c_str()));
-    for (auto& [k, v] : d.entries(L"columns")) s_columns[unescape_key(k)] = v;
+    for (auto& [k, v] : d.entries(L"views")) s_byFolder[ini_unescape_key(k)] = int_to_view(_wtoi(v.c_str()));
+    for (auto& [k, v] : d.entries(L"columns")) s_columns[ini_unescape_key(k)] = v;
     for (auto& [k, v] : d.entries(L"prefs")) s_prefs[k] = _wtoi(v.c_str());
     s_mainLoaded = main_now();
 }
@@ -362,7 +214,7 @@ static void prune(IniDoc& d, const wchar_t* sec, size_t cap) {
     if (count() <= cap) return;
     auto gone = [](const IniLine& l) {
         if (!l.entry) return false;
-        std::wstring k = unescape_key(l.key);
+        std::wstring k = ini_unescape_key(l.key);
         if (k.size() < 3 || !iswalpha(k[0]) || k[1] != L':' || k[2] != L'\\') return false;
         WCHAR root[4] = { k[0], L':', L'\\', 0 };
         if (GetDriveTypeW(root) != DRIVE_FIXED) return false;       // (never wait for a network drive)
@@ -378,10 +230,10 @@ static void prune(IniDoc& d, const wchar_t* sec, size_t cap) {
     }
 }
 
-void settings_save_all() {
+bool settings_save_all() {
     MainValues now = main_now();
     const MainValues& was = s_mainLoaded;
-    update_file([&](IniDoc& d) {
+    bool saved = update_file([&](IniDoc& d) {
         auto put = [&](const wchar_t* key, int v) { d.set(L"main", key, std::to_wstring(v)); };
         // [main]: only what changed here (another window may have saved its own since)
         if (view_to_int(now.defaultView) != view_to_int(was.defaultView)) put(L"defaultView", view_to_int(now.defaultView));
@@ -400,16 +252,16 @@ void settings_save_all() {
         if (s_forgetFs)
             for (const wchar_t* sec : { L"views", L"columns" })
                 for (auto& [k, v] : d.entries(sec))
-                    if (fs_key(unescape_key(k))) d.erase(sec, k);
+                    if (fs_key(ini_unescape_key(k))) d.erase(sec, k);
         for (auto& k : s_viewsDirty) {
             auto it = s_byFolder.find(k);
-            if (it == s_byFolder.end()) d.erase(L"views", escape_key(k));
-            else d.set(L"views", escape_key(k), std::to_wstring(view_to_int(it->second)));
+            if (it == s_byFolder.end()) d.erase(L"views", ini_escape_key(k));
+            else d.set(L"views", ini_escape_key(k), std::to_wstring(view_to_int(it->second)));
         }
         for (auto& k : s_columnsDirty) {
             auto it = s_columns.find(k);
-            if (it == s_columns.end()) d.erase(L"columns", escape_key(k));
-            else d.set(L"columns", escape_key(k), it->second);
+            if (it == s_columns.end()) d.erase(L"columns", ini_escape_key(k));
+            else d.set(L"columns", ini_escape_key(k), it->second);
         }
         for (auto& k : s_prefsDirty) {
             auto it = s_prefs.find(k);
@@ -419,11 +271,13 @@ void settings_save_all() {
         prune(d, L"views", kMaxViews);
         prune(d, L"columns", kMaxColumns);
     });
+    if (!saved) return false;            // (not saved: still to do, the next save tries again)
     s_viewsDirty.clear();
     s_columnsDirty.clear();
     s_prefsDirty.clear();
     s_forgetFs = false;
     s_mainLoaded = now;
+    return true;
 }
 
 // [contextmenu] promoteN=<item text or verb>[|<icon file>[,<index>]]: classic menu

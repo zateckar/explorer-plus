@@ -11,4 +11,4 @@ void search_on_timer();                    // TIMER_SEARCH
 void search_on_navigated();                // keep the box text in step with the location
 bool search_is_results(PCIDLIST_ABSOLUTE abs);
 PCIDLIST_ABSOLUTE search_scope_of(PCIDLIST_ABSOLUTE abs);   // folder a result set searched, or nullptr
-PITEMID_CHILD search_real_location(PCIDLIST_ABSOLUTE resultItem);   // new pidl of the item itself, or nullptr
+PIDLIST_ABSOLUTE search_real_location(PCIDLIST_ABSOLUTE resultItem);   // new pidl of the item itself, or nullptr

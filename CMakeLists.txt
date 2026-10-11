@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-# Version: CI passes the build date (-DEXPLORERPLUS_VERSION=2026.10.10), the run number
+# Version: CI passes the commit's date (-DEXPLORERPLUS_VERSION=2026.10.10), the run number
 # (-DEXPLORERPLUS_BUILD=57) and a label shown in the file properties
 # (-DEXPLORERPLUS_VERSION_LABEL=2026.10.10.57); local builds keep these defaults
 set(EXPLORERPLUS_VERSION "1.0.0" CACHE STRING "Product version (major.minor.patch)")
@@ -56,6 +56,8 @@ add_executable(explorer-plus WIN32
     src/workers.cpp
     src/acc.cpp
     src/foldersizes.cpp
+    src/ini.cpp
+    src/cmdline.cpp
     res/resource.rc
 )
 
@@ -66,7 +68,12 @@ set_source_files_properties(res/resource.rc PROPERTIES
     OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/res/app.manifest;${CMAKE_CURRENT_SOURCE_DIR}/res/app.ico;${CMAKE_CURRENT_SOURCE_DIR}/src/resource.h;${CMAKE_CURRENT_BINARY_DIR}/generated/version.h")
 
 target_compile_options(explorer-plus PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-cast-function-type)
-target_compile_definitions(explorer-plus PRIVATE UNICODE _UNICODE)
+# STRICT_TYPED_ITEMIDS: absolute ID lists and child IDs are different types, so the compiler
+# tells an absolute pidl passed where a child belongs (and the other way round)
+target_compile_definitions(explorer-plus PRIVATE UNICODE _UNICODE STRICT_TYPED_ITEMIDS)
+# stack buffer overruns end the process instead of returning through a smashed frame
+target_compile_options(explorer-plus PRIVATE -fstack-protector-strong)
+target_link_options(explorer-plus PRIVATE -fstack-protector-strong)
 target_link_options(explorer-plus PRIVATE -municode)
 target_link_options(explorer-plus PRIVATE -mwindows -static -static-libgcc -static-libstdc++)
 # ASLR (64-bit), DEP: recent binutils default to these, older ones don't
@@ -90,3 +97,17 @@ endif()
 
 target_link_libraries(explorer-plus PRIVATE
     comctl32 shell32 ole32 oleaut32 shlwapi uuid uxtheme comdlg32 gdi32 user32 propsys windowscodecs gdiplus dwmapi msimg32 oleacc)
+
+# unit tests of the pure text handling (settings INI, command line, typed paths):
+# ctest --test-dir build --output-on-failure
+option(EXPLORERPLUS_TESTS "Build the unit tests" ON)
+if(EXPLORERPLUS_TESTS)
+    enable_testing()
+    add_executable(explorer-plus-tests tests/unit_tests.cpp src/ini.cpp src/cmdline.cpp)
+    target_include_directories(explorer-plus-tests PRIVATE src)
+    target_compile_options(explorer-plus-tests PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
+    target_compile_definitions(explorer-plus-tests PRIVATE UNICODE _UNICODE)
+    target_link_options(explorer-plus-tests PRIVATE -municode -static -static-libgcc -static-libstdc++)
+    target_link_libraries(explorer-plus-tests PRIVATE shell32)
+    add_test(NAME unit COMMAND explorer-plus-tests)
+endif()

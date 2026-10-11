@@ -9,6 +9,8 @@ void enumerate_start(PCIDLIST_ABSOLUTE folderAbs, bool keepView);
 
 // After the next listing is applied, select (and optionally start renaming) this item.
 void enum_set_pending_select(const std::wstring& name, bool beginRename);
+// select `name` (an in-folder file name) when `folder` is next listed: opening a file's folder
+void enum_select_on_arrival(const std::wstring& name, PCIDLIST_ABSOLUTE folder);
 
 // Files changed in the folder shown (full paths from change notifications): their items
 // are read again on a worker and replaced, added or removed in place — no re-listing.
@@ -20,6 +22,7 @@ ChangeApply enum_apply_changes(const std::vector<std::wstring>& paths);
 // UI-thread entry points (called from main.cpp)
 void enum_apply_op(HeapEnumOp* op);      // WM_ENUM_DONE handler (takes ownership of op)
 void enum_on_stream_timer();             // TIMER_ENUM_STREAM: show the rows found so far
+void enum_on_held_timer();               // TIMER_ENUM_HELD: apply what waited for a rename box
 void enum_sort_items();                  // re-sort / re-group g_items (g_sortColumn, g_view.groupBy) and refresh
 void enum_update_header_arrows();        // put sort arrows in the details header
 void enum_clear_items();                 // drop all items (navigation away)

@@ -5,6 +5,7 @@
 using std::max;
 using std::min;
 #include "appstate.h"
+#include "cmdline.h"
 #include "enumerate.h"
 #include "groups.h"
 #include "tree.h"
@@ -31,7 +32,9 @@ using std::min;
 #include "statusbar.h"
 #include "breadcrumb.h"
 #include "foldersizes.h"
+#include "preview.h"
 #include <uxtheme.h>
+#include <oleacc.h>
 
 static WNDPROC s_searchProc = nullptr;
 static HBRUSH s_searchBrush = nullptr;
@@ -83,7 +86,11 @@ void status_update() {
         if (selBytes) b += L"  " + fmt_size(selBytes);
     }
     const std::wstring& err = enum_last_error();
-    if (!err.empty()) { a = L"Can't open this location"; b = err; }
+    if (!err.empty()) {
+        // nothing listed, or a listing that stopped part way (some items are missing)
+        a = count ? a + L" (listing stopped)" : L"Can't open this location";
+        b = err;
+    }
 
     statusbar_set(a, b);
     cmdbar_refresh();
@@ -117,6 +124,19 @@ static void build_search() {
     s_searchProc = (WNDPROC)SetWindowLongPtrW(g_search, GWLP_WNDPROC, (LONG_PTR)search_proc);
 }
 
+// a screen reader's name for a control without a label (the edits: their placeholder
+// isn't one)
+static void set_accessible_name(HWND h, const std::wstring& name) {
+    // (the GUIDs here: oleacc.h only declares them)
+    static const CLSID kAccPropServices = { 0xb5f8350b, 0x0548, 0x48b1, { 0xa6, 0xee, 0x88, 0xbd, 0x00, 0xb4, 0xa5, 0xe7 } };
+    static const GUID kAccName = { 0x608d3df8, 0x8128, 0x4aa7, { 0xa4, 0x28, 0xf5, 0x5e, 0x49, 0x26, 0x72, 0x91 } };
+    static const IID kIAccPropServices = { 0x6e26e776, 0x04f0, 0x495d, { 0x80, 0xe4, 0x33, 0x30, 0x35, 0x2e, 0x31, 0x69 } };
+    static com_ptr<IAccPropServices> s_props;
+    if (!s_props && FAILED(CoCreateInstance(kAccPropServices, nullptr, CLSCTX_INPROC_SERVER, kIAccPropServices, (void**)s_props.put())))
+        return;
+    if (s_props) s_props->SetHwndPropStr(h, (DWORD)OBJID_CLIENT, CHILDID_SELF, kAccName, name.c_str());
+}
+
 // "Search <folder>" placeholder, like Explorer
 void search_update_cue() {
     if (!g_search) return;
@@ -124,25 +144,20 @@ void search_update_cue() {
     PCIDLIST_ABSOLUTE scope = search_scope_of(g_current);
     std::wstring cue = L"Search " + (scope ? pidl_abs_dispname(scope) : t ? t->name : std::wstring());
     SendMessageW(g_search, EM_SETCUEBANNER, TRUE, (LPARAM)cue.c_str());
+    set_accessible_name(g_search, cue);
 }
 
 // ------------------------------------------------------------------
 // commands that need a little glue
 
-// selected items' paths (or the folder's), quoted, one per line -> clipboard text
-static void copy_path_to_clipboard() {
+// paths, quoted, one per line -> clipboard text
+static void copy_paths_to_clipboard(const std::vector<PCIDLIST_ABSOLUTE>& items) {
     std::wstring text;
-    auto sel = list_selected_pidls();
-    auto add = [&](PCIDLIST_ABSOLUTE abs) {
+    for (PCIDLIST_ABSOLUTE abs : items) {
         std::wstring s = pidl_folder_path(abs);
-        if (s.empty()) return;
+        if (s.empty()) continue;
         if (!text.empty()) text += L"\r\n";
         text += L"\"" + s + L"\"";
-    };
-    if (sel.empty()) add(g_current);
-    for (auto c : sel) {
-        PIDLIST_ABSOLUTE abs = ILCombine(g_current, c);
-        if (abs) { add(abs); CoTaskMemFree(abs); }
     }
     if (text.empty() || !OpenClipboard(g_main)) return;
     EmptyClipboard();
@@ -153,6 +168,49 @@ static void copy_path_to_clipboard() {
         if (!SetClipboardData(CF_UNICODETEXT, hg)) GlobalFree(hg);
     }
     CloseClipboard();
+}
+
+// selected items' paths, or the folder's
+static void copy_path_to_clipboard() {
+    std::vector<PIDLIST_ABSOLUTE> own;
+    for (auto c : list_selected_pidls())
+        if (PIDLIST_ABSOLUTE abs = ILCombine(g_current, c)) own.push_back(abs);
+    std::vector<PCIDLIST_ABSOLUTE> items(own.begin(), own.end());
+    if (items.empty()) items.push_back(g_current);
+    copy_paths_to_clipboard(items);
+    for (auto p : own) CoTaskMemFree(p);
+}
+
+// Edit shortcuts typed in the navigation pane act on its folder, not on the list's
+// selection, which can't be seen from there (Ctrl+X would cut files the user isn't
+// looking at). True when the command was the tree's.
+static bool tree_key_command(WORD id) {
+    switch (id) {
+        case IDM_EDIT_CUT: case IDM_EDIT_COPY: case IDM_EDIT_PASTE:
+        case IDM_FILE_PROPERTIES: case IDM_COPY_PATH:
+            break;
+        case IDM_EDIT_SELALL: return true;      // nothing to select there
+        default: return false;
+    }
+    PIDLIST_ABSOLUTE abs = tree_get_pidl_of_item(TreeView_GetSelection(g_tree));
+    if (!abs) { MessageBeep(MB_ICONASTERISK); return true; }
+    switch (id) {
+        case IDM_EDIT_CUT:
+        case IDM_EDIT_COPY: {
+            com_ptr<IShellFolder> parent;
+            PCUITEMID_CHILD child = nullptr;
+            if (SUCCEEDED(bind_parent(abs, parent.put(), &child)) && child)
+                fileops_set_clipboard(parent.get(), { child }, id == IDM_EDIT_CUT);
+            else
+                MessageBeep(MB_ICONASTERISK);      // a root (Home, This PC) can't be copied
+            break;
+        }
+        case IDM_EDIT_PASTE:      fileops_paste_into(abs); break;
+        case IDM_FILE_PROPERTIES: contextmenu_properties_of(g_main, abs); break;
+        case IDM_COPY_PATH:       copy_paths_to_clipboard({ abs }); break;
+    }
+    CoTaskMemFree(abs);
+    return true;
 }
 
 static void set_nav_pane_visible(bool v) {
@@ -176,6 +234,14 @@ static void set_text_scale(int pct) {
 
 // ------------------------------------------------------------------
 // accelerator table
+static HACCEL s_accel = nullptr;
+static UINT s_accelCount = 0;
+
+HACCEL app_accelerators(UINT* count) {
+    if (count) *count = s_accelCount;
+    return s_accel;
+}
+
 static HACCEL make_accels() {
     ACCEL a[] = {
         { FVIRTKEY | FALT,               VK_LEFT,   IDM_NAV_BACK },
@@ -234,7 +300,28 @@ static HACCEL make_accels() {
         { FVIRTKEY | FCONTROL,           '0',          IDM_TEXT_RESET },
         { FVIRTKEY | FCONTROL,           VK_NUMPAD0,   IDM_TEXT_RESET },
     };
+    s_accelCount = ARRAYSIZE(a);
     return CreateAcceleratorTableW(a, ARRAYSIZE(a));
+}
+
+// Ctrl with the key that types "+" or "-" on the user's layout (German, Nordic, Japanese,
+// ... have them on other keys than US): text size. The digit keys stay Ctrl+1..9 (tabs),
+// as in browsers, also where a digit key types "+" unshifted (Czech, Slovak).
+static bool text_size_key(const MSG& m) {
+    if (m.message != WM_KEYDOWN || GetKeyState(VK_CONTROL) >= 0 || GetKeyState(VK_MENU) < 0) return false;
+    UINT vk = (UINT)m.wParam;
+    if ((vk >= '0' && vk <= '9') || (vk >= VK_NUMPAD0 && vk <= VK_DIVIDE)) return false;   // (the table has the numpad)
+    BYTE state[256];
+    if (!GetKeyboardState(state)) return false;
+    state[VK_CONTROL] = state[VK_LCONTROL] = state[VK_RCONTROL] = 0;    // the character without Ctrl
+    WCHAR ch[4]{};
+    UINT scan = (UINT)((m.lParam >> 16) & 0xFF);
+    // (flag 4: leaves the keyboard's dead-key state alone)
+    if (ToUnicodeEx(vk, scan, state, ch, ARRAYSIZE(ch), 4, GetKeyboardLayout(0)) != 1) return false;
+    UINT cmd = ch[0] == L'+' ? IDM_TEXT_LARGER : ch[0] == L'-' ? IDM_TEXT_SMALLER : 0;
+    if (!cmd) return false;
+    PostMessageW(g_main, WM_COMMAND, MAKEWPARAM(cmd, 1), 0);
+    return true;
 }
 
 // Keys an edit control needs for itself (text clipboard, select-all, F2 does nothing
@@ -263,7 +350,8 @@ static bool edit_owns_key(const MSG& m) {
 }
 
 // Tab / F6 (Shift: backwards) move the keyboard focus around the panes like Explorer:
-// address bar, search box, navigation pane, file list. A rename box keeps its keys.
+// tabs, navigation buttons, address bar, search box, command bar, navigation pane, file
+// list, preview. A rename box keeps its keys.
 static bool cycle_focus(const MSG& m) {
     if (m.message != WM_KEYDOWN || (m.wParam != VK_TAB && m.wParam != VK_F6)) return false;
     if ((GetKeyState(VK_CONTROL) & 0x8000) || (GetKeyState(VK_MENU) & 0x8000)) return false;   // Ctrl+Tab: tabs
@@ -271,7 +359,10 @@ static bool cycle_focus(const MSG& m) {
     if (!focus || GetAncestor(focus, GA_ROOT) != g_main) return false;
     HWND parent = GetParent(focus);
     if (is_edit_focus() && (parent == g_list || parent == g_tree)) return false;
-    HWND panes[] = { g_address, g_search, g_tree, g_list };
+    // (the preview pane, while a handler shows a file: the handler takes the focus itself)
+    HWND preview = preview_active() ? detailspane_hwnd() : nullptr;
+    // (in the order they are on screen, as in Explorer; the painted rows take arrow keys)
+    HWND panes[] = { tabstrip_hwnd(), g_navbar, g_address, g_search, cmdbar_hwnd(), g_tree, g_list, preview };
     constexpr int n = (int)(sizeof(panes) / sizeof(panes[0]));
     int cur = -1;
     for (HWND h = focus; h && h != g_main && cur < 0; h = GetParent(h))
@@ -280,10 +371,13 @@ static bool cycle_focus(const MSG& m) {
     int dir = (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1;
     for (int k = 1; k <= n; ++k) {
         int i = cur < 0 ? (dir > 0 ? k - 1 : n - k) : ((cur + dir * k) % n + n) % n;
-        if (panes[i] && IsWindowVisible(panes[i]) && IsWindowEnabled(panes[i])) {
-            SetFocus(panes[i]);                // (the address bar starts editing)
-            return true;
+        if (!panes[i] || !IsWindowVisible(panes[i]) || !IsWindowEnabled(panes[i])) continue;
+        if (panes[i] == preview) {
+            if (preview_focus()) return true;
+            continue;
         }
+        SetFocus(panes[i]);                    // (the address bar starts editing)
+        return true;
     }
     return false;
 }
@@ -422,6 +516,7 @@ static void on_command(WORD id) {
             SetFocus(g_search);
             SendMessageW(g_search, EM_SETSEL, 0, -1);
             break;
+        case IDM_FOCUS_LIST: SetFocus(g_list); break;
 
         case IDM_TABNEXT: tabmodel_next_tab(+1); break;
         case IDM_TABPREV: tabmodel_next_tab(-1); break;
@@ -443,6 +538,8 @@ static void on_command_ex(WPARAM wp, LPARAM) {
         else if (code == EN_CHANGE) search_text_changed();
         return;
     }
+    // (code 1: an accelerator, typed where the focus is; menus keep acting on the list)
+    if (code == 1 && GetFocus() == g_tree && tree_key_command(id)) return;
     on_command(id);
 }
 static void tree_context_menu(HWND hwnd, POINT pt) {
@@ -463,7 +560,7 @@ static void tree_context_menu(HWND hwnd, POINT pt) {
     if (!h) return;
     // highlight the node for the menu's lifetime without navigating to it
     TreeView_SelectDropTarget(g_tree, h);
-    PITEMID_CHILD p = tree_get_pidl_of_item(h);
+    PIDLIST_ABSOLUTE p = tree_get_pidl_of_item(h);
     if (p) { show_tree_context_menu(hwnd, pt, p); CoTaskMemFree(p); }
     TreeView_SelectDropTarget(g_tree, nullptr);
 }
@@ -487,7 +584,9 @@ static void save_window_state(HWND hwnd) {
         MONITORINFO mi{ sizeof(mi) };
         if (GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mi))
             OffsetRect(&r, mi.rcWork.left - mi.rcMonitor.left, mi.rcWork.top - mi.rcMonitor.top);
-        s.maximized = wpl.showCmd == SW_SHOWMAXIMIZED;
+        // (minimized from maximized: it comes back maximized)
+        s.maximized = wpl.showCmd == SW_SHOWMAXIMIZED ||
+                      (wpl.showCmd == SW_SHOWMINIMIZED && (wpl.flags & WPF_RESTORETOMAXIMIZED));
         s.x = (int)r.left;
         s.y = (int)r.top;
         s.winW = (int)(r.right - r.left);
@@ -495,7 +594,8 @@ static void save_window_state(HWND hwnd) {
     }
     settings_set_splitter(s);
     tabs_persist_now();
-    settings_save_all();
+    // a scanner or sync client can hold the file a moment: a few tries, not the session's changes lost
+    for (int attempt = 0; attempt < 5 && !settings_save_all(); ++attempt) Sleep(200);
 }
 
 static void on_theme_changed(HWND hwnd) {
@@ -605,10 +705,15 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == TIMER_WATCH_REFRESH) { watcher_on_timer(); return 0; }
             if (wp == TIMER_SEARCH) { search_on_timer(); return 0; }
             if (wp == TIMER_ENUM_STREAM) { enum_on_stream_timer(); return 0; }
+            if (wp == TIMER_TABS_PERSIST) { tabs_persist_now(); return 0; }
+            if (wp == TIMER_ENUM_HELD) { enum_on_held_timer(); return 0; }
             break;
         case WM_SETTINGCHANGE:
-            if (lp && lstrcmpW((LPCWSTR)lp, L"ImmersiveColorSet") == 0 && theme_reload())
+            if (((lp && lstrcmpW((LPCWSTR)lp, L"ImmersiveColorSet") == 0) || wp == SPI_SETHIGHCONTRAST) && theme_reload())
                 on_theme_changed(hwnd);
+            break;
+        case WM_SYSCOLORCHANGE:          // (High Contrast themes: the palette is these colours)
+            if (theme_reload()) on_theme_changed(hwnd);
             break;
         case WM_DWMCOLORIZATIONCOLORCHANGED:
             if (theme_reload()) on_theme_changed(hwnd);
@@ -626,12 +731,27 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
                 return TRUE;
             }
+            RECT sf = layout_search_frame();
+            if ((HWND)wp == hwnd && LOWORD(lp) == HTCLIENT && g_search && PtInRect(&sf, pt)) {
+                SetCursor(LoadCursorW(nullptr, IDC_IBEAM));
+                return TRUE;
+            }
             break;
         }
         case WM_LBUTTONDOWN: {
             POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             DragKind k = layout_splitter_kind(hwnd, pt);
             if (k != DragKind::None) { s_dragKind = k; SetCapture(hwnd); return 0; }
+            // the search box's frame (around the edit) is the box too
+            RECT sf = layout_search_frame();
+            if (g_search && PtInRect(&sf, pt)) {
+                if (GetFocus() != g_search) {
+                    SetFocus(g_search);
+                    int n = GetWindowTextLengthW(g_search);
+                    SendMessageW(g_search, EM_SETSEL, n, n);
+                }
+                return 0;
+            }
             break;
         }
         case WM_LBUTTONUP:
@@ -643,8 +763,7 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MOUSEMOVE:
             if (s_dragKind != DragKind::None) {
                 POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-                layout_splitter_drag(hwnd, pt, s_dragKind);
-                InvalidateRect(hwnd, nullptr, FALSE);
+                layout_splitter_drag(hwnd, pt, s_dragKind);     // (repaints the panes' row)
                 return 0;
             }
             break;
@@ -759,23 +878,17 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     if (sp.widthRight >= 140 && sp.widthRight <= 480) g_splitterRight = sp.widthRight;
     g_treeVisible = sp.treeVisible;
 
-    // explorer-plus.exe [--new-window] [folder]
-    std::wstring openPath;
-    bool newWindow = false;
+    // explorer-plus.exe [--new-window] [folder or file]
+    CommandLine cl = parse_command_line(GetCommandLineW());
+    std::wstring openPath = cl.path;
+    bool newWindow = cl.newWindow;
     {
-        int argc = 0;
-        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-        for (int i = 1; argv && i < argc; ++i) {
-            if (lstrcmpiW(argv[i], L"--new-window") == 0) newWindow = true;
-            else openPath += (openPath.empty() ? L"" : L" ") + std::wstring(argv[i]);   // an unquoted path with spaces
-        }
-        if (argv) LocalFree(argv);
         // "explorer-plus.exe ..\docs": relative to the working directory
         if (!openPath.empty() && PathIsRelativeW(openPath.c_str()) && openPath.find(L':') == std::wstring::npos &&
             openPath.rfind(L"\\\\", 0) != 0) {
             WCHAR full[MAX_PATH * 4]{};
             DWORD n = GetFullPathNameW(openPath.c_str(), ARRAYSIZE(full), full, nullptr);
-            if (n && n < ARRAYSIZE(full) && PathIsDirectoryW(full)) openPath = full;
+            if (n && n < ARRAYSIZE(full) && PathFileExistsW(full)) openPath = full;   // (a file: its folder)
         }
     }
     perf_event("settings");
@@ -794,10 +907,14 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     LoadIconMetric(hInst, MAKEINTRESOURCEW(IDI_APP), LIM_SMALL, &appIconSm);
     if (!appIcon) appIcon = LoadIconW(nullptr, IDI_APPLICATION);
     register_class(appIcon, appIconSm ? appIconSm : appIcon);
+    s_accel = make_accels();        // (before the window: a preview handler may ask for it)
 
     // restore window rect, clamped to the work area of the monitor nearest the saved rect
+    // (no saved rect: 1200 x 760 at 96 dpi, centered on the primary monitor and within it)
     int wx = CW_USEDEFAULT, wy = CW_USEDEFAULT;
-    int ww = 1200, wh = 760;
+    UINT sysDpi = GetDpiForSystem();
+    int defW = MulDiv(1200, (int)sysDpi, 96), defH = MulDiv(760, (int)sysDpi, 96);
+    int ww = defW, wh = defH;
     bool haveRect = (sp.winW > 500 && sp.winH > 350 && sp.x != INT_MIN && sp.y != INT_MIN);
     if (newWindow && haveRect) { sp.x += 32; sp.y += 32; }      // cascade
     if (haveRect) {
@@ -813,11 +930,20 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
             if (wx + ww > work.right)  ww = work.right - wx;
             if (wy + wh > work.bottom) wh = work.bottom - wy;
             if (ww < 500 || wh < 350) {  // fallback centered on that monitor
-                ww = min(1200, (int)(work.right - work.left));
-                wh = min(760,  (int)(work.bottom - work.top));
+                ww = min(defW, (int)(work.right - work.left));
+                wh = min(defH, (int)(work.bottom - work.top));
                 wx = work.left + (work.right - work.left - ww) / 2;
                 wy = work.top  + (work.bottom - work.top - wh) / 2;
             }
+        }
+    } else {
+        MONITORINFO mi{ sizeof(mi) };
+        if (GetMonitorInfoW(MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+            RECT work = mi.rcWork;
+            ww = min(defW, (int)(work.right - work.left));
+            wh = min(defH, (int)(work.bottom - work.top));
+            wx = work.left + (work.right - work.left - ww) / 2;
+            wy = work.top  + (work.bottom - work.top - wh) / 2;
         }
     }
     HWND wnd = CreateWindowExW(0, APP_CLASS, L"Explorer Plus",
@@ -830,12 +956,13 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     UpdateWindow(wnd);
     perf_event("window.shown");
 
-    HACCEL acc = make_accels();
+    HACCEL acc = s_accel;
     MSG m{};
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
+        bool key = m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN;
+        if (key && preview_translate_accelerator(&m)) continue;     // (an in-process handler's keys)
         if (cycle_focus(m)) continue;
-        if ((m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN) && !edit_owns_key(m) &&
-            TranslateAcceleratorW(g_main, acc, &m))
+        if (key && !edit_owns_key(m) && (text_size_key(m) || TranslateAcceleratorW(g_main, acc, &m)))
             continue;
         TranslateMessage(&m);
         if (!perf_on()) {

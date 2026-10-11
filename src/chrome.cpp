@@ -115,8 +115,8 @@ bool chrome_handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* result) {
         case WM_NCMOUSELEAVE:
             if (s_hover >= 0 || s_pressed >= 0) { s_hover = s_pressed = -1; invalidate_buttons(hwnd); }
             return false;
-        case WM_MOUSEMOVE:
-            if (s_hover >= 0) { s_hover = -1; invalidate_buttons(hwnd); }
+        case WM_MOUSEMOVE:      // (into the client area: a press on a button is let go there)
+            if (s_hover >= 0 || s_pressed >= 0) { s_hover = s_pressed = -1; invalidate_buttons(hwnd); }
             return false;
         case WM_NCLBUTTONDOWN:
         case WM_NCLBUTTONDBLCLK: {
@@ -129,10 +129,9 @@ bool chrome_handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* result) {
         }
         case WM_NCLBUTTONUP: {
             int b = ht_to_button(wp);
+            bool fire = b >= 0 && b == s_pressed;
+            if (s_pressed >= 0) { s_pressed = -1; invalidate_buttons(hwnd); }   // (let go anywhere)
             if (b < 0) return false;
-            bool fire = b == s_pressed;
-            s_pressed = -1;
-            invalidate_buttons(hwnd);
             if (fire) {
                 WPARAM sc = b == 0 ? SC_MINIMIZE : b == 2 ? SC_CLOSE : (IsZoomed(hwnd) ? SC_RESTORE : SC_MAXIMIZE);
                 s_hover = -1;

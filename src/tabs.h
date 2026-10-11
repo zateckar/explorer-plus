@@ -4,9 +4,9 @@
 // --- per-tab navigation state model (tabs.cpp owns it) ---
 struct TabState {
     int id = 0;                                   // stable identity across reorders
-    PITEMID_CHILD current = nullptr;              // absolute pidl (empty = Desktop)
-    std::vector<PITEMID_CHILD> back;
-    std::vector<PITEMID_CHILD> fwd;
+    PIDLIST_ABSOLUTE current = nullptr;           // absolute pidl (empty = Desktop)
+    std::vector<PIDLIST_ABSOLUTE> back;
+    std::vector<PIDLIST_ABSOLUTE> fwd;
     View view{ LV_VIEW_DETAILS, 0 };
     std::wstring name;                            // display name shown in the tab
     bool pinned = false;                          // pinned: no close button, no Ctrl+W, sorted first
@@ -28,7 +28,7 @@ int    tabmodel_move_tab(int from, int to);        // drag reorder; returns new 
 bool   tabmodel_is_pinned(int idx);
 
 // called by navigation when the active tab navigates
-void   tabmodel_on_navigate(PITEMID_CHILD newAbs /*adopted clone*/, bool pushHistory);
+void   tabmodel_on_navigate(PIDLIST_ABSOLUTE newAbs /*adopted clone*/, bool pushHistory);
 // info
 TabState* tabmodel_active();
 std::wstring  tabmodel_active_name();
@@ -43,8 +43,10 @@ bool tabmodel_go_forward();
 void tabs_serialize_lines(std::vector<std::wstring>& lines, int& outActive);
 void tabs_deserialize(const std::wstring& tabs, int active);
 
-// persist the tab set right now (called on pin / close / new / dup / reorder)
+// persist the tab set right now (at exit)
 void tabs_persist_now();
+// ... or a moment later, once (pin / close / new / dup / reorder / navigation)
+void tabs_persist_soon();
 
 // --- tab strip UI window ---
 HWND tabstrip_create(HWND parent);   // returns HWND with id IDC_TABSTRIP

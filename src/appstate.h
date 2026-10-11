@@ -72,7 +72,7 @@ extern std::mutex g_itemsMx;
 extern std::vector<Item*> g_items;          // UI thread owns; workers only read under g_itemsMx
 
 // current folder: absolute pidl, never nullptr after startup (empty pidl = Desktop)
-extern PITEMID_CHILD g_current;
+extern PIDLIST_ABSOLUTE g_current;
 
 // operation ids — ops carrying a stale id are dropped
 extern std::atomic<UINT> g_enumId;
@@ -112,6 +112,8 @@ enum : UINT_PTR {
     TIMER_WATCH_REFRESH = 1,        // debounced change-notify refresh
     TIMER_SEARCH = 2,               // search-as-you-type pause
     TIMER_ENUM_STREAM = 3,          // take the rows a listing has produced so far
+    TIMER_TABS_PERSIST = 4,         // save the tab set (debounced: tabs_persist_soon)
+    TIMER_ENUM_HELD = 5,            // listing results held while a rename box is open
 };
 
 // heap op passed via WM_ENUM_DONE
@@ -132,11 +134,12 @@ void drain_async();                 // WM_ASYNC_WAKE handler
 // --- helpers in appstate.cpp ---
 void  fix_font(HWND h);
 
-PITEMID_CHILD current_clone();
-void current_replace(PITEMID_CHILD newAbs);    // frees old, adopts new (nullptr -> Desktop)
+PIDLIST_ABSOLUTE current_clone();
+void current_replace(PIDLIST_ABSOLUTE newAbs);    // frees old, adopts new (nullptr -> Desktop)
 std::wstring current_display_path();           // what the address bar shows
 
 // status bar update (reads g_items + listview selection)
 void status_update();
 void search_update_cue();                     // "Search <folder>" placeholder
 void exit_app();
+HACCEL app_accelerators(UINT* count);         // the main window's shortcuts (count: entries; may be null)

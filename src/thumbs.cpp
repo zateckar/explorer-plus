@@ -1,6 +1,7 @@
 #include "thumbs.h"
 #include <thread>
 #include <condition_variable>
+#include <unordered_set>
 
 // Thumbnails for the Medium (48px), Large (96px) and Extra large (256px) icon views,
 // extracted by a small pool of worker threads. Requests are served newest-first so
@@ -15,7 +16,7 @@ struct ThumbReq {
     ULONGLONG sig = 0;
     int px = 96;
     int extra = 1;
-    PITEMID_CHILD abs = nullptr;   // owned
+    PIDLIST_ABSOLUTE abs = nullptr;   // owned
 };
 struct ThumbResult {
     UINT opId;
@@ -100,7 +101,14 @@ static void pool_worker() {
     }
 }
 
+// Scrolling through thousands of photos asks for every row that passes by; the oldest
+// requests are for rows long gone from the screen. Beyond this many waiting, they are
+// dropped and their rows ask again if they come back into view.
+static const size_t kMaxQueued = 512, kDropSlack = 256;
+
+// (UI thread, g_itemsMx held: from LVN_GETDISPINFO)
 static void enqueue(ThumbReq* r) {
+    std::vector<ThumbReq*> dropped;
     {
         std::lock_guard<std::mutex> lk(s_qMx);
         if (!s_poolStarted) {
@@ -109,8 +117,26 @@ static void enqueue(ThumbReq* r) {
             for (unsigned i = 0; i < n; ++i) std::thread(pool_worker).detach();
         }
         s_queue.push_back(r);
+        if (s_queue.size() > kMaxQueued + kDropSlack) {
+            while (s_queue.size() > kMaxQueued) {
+                dropped.push_back(s_queue.front());
+                s_queue.pop_front();
+            }
+        }
     }
     s_qCv.notify_one();
+    if (dropped.empty()) return;
+    std::unordered_set<ULONGLONG> sigs;
+    for (ThumbReq* d : dropped) {
+        if (d->opId == s_opId.load()) sigs.insert(d->sig);
+        CoTaskMemFree(d->abs);
+        delete d;
+    }
+    for (Item* it : g_items)             // not requested any more: asked again when shown
+        if (sigs.count(it->sig)) {
+            int queued = 1;
+            it->thumbReady.compare_exchange_strong(queued, 0);
+        }
 }
 
 static void drop_queued() {
@@ -166,7 +192,7 @@ void thumb_get_or_request(Item* it, int, int* outImageIndex) {
     r->sig = it->sig;
     r->px = thumb_px(extra);
     r->extra = extra;
-    r->abs = static_cast<PITEMID_CHILD>(ILCombine(g_current, it->pidl));
+    r->abs = ILCombine(g_current, it->pidl);
     if (!r->abs) { delete r; it->thumbReady.store(0); return; }
     enqueue(r);
 }

@@ -79,19 +79,68 @@ static bool drop_into_folder(PCIDLIST_ABSOLUTE folder, IDataObject* pdo, DWORD e
     return SUCCEEDED(dt->Drop(pdo, 0, pt, &eff));
 }
 
-void fileops_paste_into_current() {
+// after a cut was pasted: are its files all still where they were? (the user cancelled
+// the conflict dialog or skipped everything: the cut stays on the clipboard)
+static bool cut_files_still_there(IDataObject* pdo) {
+    FORMATETC fe{ CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+    STGMEDIUM sm{};
+    if (FAILED(pdo->GetData(&fe, &sm))) return false;     // (not files: can't tell)
+    bool all = false;
+    if (sm.tymed == TYMED_HGLOBAL && sm.hGlobal) {
+        HDROP drop = (HDROP)sm.hGlobal;
+        UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+        all = n > 0;
+        for (UINT i = 0; i < n && i < 64 && all; ++i) {     // (a sample is enough)
+            UINT len = DragQueryFileW(drop, i, nullptr, 0);
+            std::wstring p(len, L'\0');
+            DragQueryFileW(drop, i, p.data(), len + 1);
+            all = GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+        }
+    }
+    ReleaseStgMedium(&sm);
+    return all;
+}
+
+void fileops_paste_into_current() { fileops_paste_into(g_current); }
+
+void fileops_paste_into(PCIDLIST_ABSOLUTE folder) {
     com_ptr<IDataObject> pdo;
     if (FAILED(OleGetClipboard(pdo.put())) || !pdo) return;
     bool move = clipboard_prefers_move(pdo.get());
-    if (!drop_into_folder(g_current, pdo.get(), move ? DROPEFFECT_MOVE : DROPEFFECT_COPY)) {
+    if (!drop_into_folder(folder, pdo.get(), move ? DROPEFFECT_MOVE : DROPEFFECT_COPY)) {
         MessageBeep(MB_ICONASTERISK);
         return;
     }
-    if (move) {
+    if (move && !cut_files_still_there(pdo.get())) {
         OleSetClipboard(nullptr);    // a cut is consumed by the paste
         s_cutSigs.clear();
     }
-    navigation_refresh();
+    if (pidl_equal(folder, g_current)) navigation_refresh();
+}
+
+bool fileops_set_clipboard(IShellFolder* parent, const std::vector<PCITEMID_CHILD>& children, bool cut) {
+    if (!parent || children.empty()) return false;
+    com_ptr<IDataObject> pdo;
+    if (FAILED(dataobject_from_children(g_main, parent, children, pdo.put())) || !pdo) return false;
+    FORMATETC fe{ (CLIPFORMAT)RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT),
+                  nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+    STGMEDIUM sm{};
+    sm.tymed = TYMED_HGLOBAL;
+    sm.hGlobal = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, sizeof(DWORD));
+    if (sm.hGlobal) {
+        if (void* p = GlobalLock(sm.hGlobal)) {
+            *(DWORD*)p = cut ? DROPEFFECT_MOVE : DROPEFFECT_COPY;
+            GlobalUnlock(sm.hGlobal);
+        }
+        if (FAILED(pdo->SetData(&fe, &sm, TRUE))) GlobalFree(sm.hGlobal);
+    }
+    // (another program may hold the clipboard: then nothing is cut)
+    bool onClipboard = SUCCEEDED(OleSetClipboard(pdo.get()));
+    if (onClipboard) OleFlushClipboard();
+    else MessageBeep(MB_ICONASTERISK);
+    // the cut file is about to be moved by whoever pastes it: the preview lets go of it
+    if (onClipboard && cut) detailspane_release_files();
+    return onClipboard;
 }
 
 void fileops_delete_items(HWND hwnd, IShellFolder* parent,

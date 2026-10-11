@@ -108,7 +108,7 @@ static HRESULT make_condition(const std::wstring& query, ICondition** out) {
 
 struct SearchRec {
     ULONGLONG sig = 0;
-    PITEMID_CHILD scope = nullptr;
+    PIDLIST_ABSOLUTE scope = nullptr;
     std::wstring query;
 };
 static std::vector<SearchRec> s_searches;
@@ -127,7 +127,7 @@ PCIDLIST_ABSOLUTE search_scope_of(PCIDLIST_ABSOLUTE abs) {
     return r ? r->scope : nullptr;
 }
 
-PITEMID_CHILD search_real_location(PCIDLIST_ABSOLUTE resultItem) {
+PIDLIST_ABSOLUTE search_real_location(PCIDLIST_ABSOLUTE resultItem) {
     com_ptr<IShellItem> si;
     if (FAILED(SHCreateItemFromIDList(resultItem, IID_PPV_ARGS(si.put()))) || !si) return nullptr;
     PWSTR path = nullptr;
@@ -135,7 +135,7 @@ PITEMID_CHILD search_real_location(PCIDLIST_ABSOLUTE resultItem) {
     PIDLIST_ABSOLUTE real = nullptr;
     if (FAILED(SHParseDisplayName(path, nullptr, &real, 0, nullptr))) real = nullptr;
     CoTaskMemFree(path);
-    return reinterpret_cast<PITEMID_CHILD>(real);
+    return real;
 }
 
 static std::wstring box_text() {
@@ -148,7 +148,7 @@ static std::wstring box_text() {
 }
 
 // result folder for `query` under `scope` (nullptr on failure)
-static PITEMID_CHILD make_search(PCIDLIST_ABSOLUTE scope, const std::wstring& query) {
+static PIDLIST_ABSOLUTE make_search(PCIDLIST_ABSOLUTE scope, const std::wstring& query) {
     com_ptr<ICondition> cond;
     if (FAILED(make_condition(query, cond.put())) || !cond) return nullptr;
     com_ptr<ISearchFolderItemFactory> f;
@@ -163,7 +163,7 @@ static PITEMID_CHILD make_search(PCIDLIST_ABSOLUTE scope, const std::wstring& qu
     if (FAILED(f->SetScope(arr.get())) || FAILED(f->SetCondition(cond.get())) ||
         FAILED(f->SetDisplayName(name.c_str())) || FAILED(f->GetIDList(&out)))
         return nullptr;
-    return reinterpret_cast<PITEMID_CHILD>(out);
+    return out;
 }
 
 void search_submit() {
@@ -175,7 +175,7 @@ void search_submit() {
     if (cur && cur->query == q) return;                    // already showing it
     const bool refining = cur != nullptr;
     PCIDLIST_ABSOLUTE scope = refining ? cur->scope : g_current;
-    PITEMID_CHILD results = make_search(scope, q);
+    PIDLIST_ABSOLUTE results = make_search(scope, q);
     if (!results) { MessageBeep(MB_ICONASTERISK); return; }
     SearchRec r;
     r.sig = pidl_sig(results);

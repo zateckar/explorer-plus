@@ -4,9 +4,9 @@
 // Apply a tab state to the whole UI (tabs.cpp / tab switching uses this)
 struct TabState;
 void navigate_replace(TabState* t);
-void navigate_owned(PITEMID_CHILD pidl);    // adopts; nullptr = Desktop
+void navigate_owned(PIDLIST_ABSOLUTE pidl);    // adopts; nullptr = Desktop
 void navigate_to(PCIDLIST_ABSOLUTE pidl);   // clones; nullptr = Desktop
-void navigate_in_place(PITEMID_CHILD pidl); // adopts; replaces the current folder, no history entry
+void navigate_in_place(PIDLIST_ABSOLUTE pidl); // adopts; replaces the current folder, no history entry
 void navigate_path_text(const std::wstring& text);
 void navigation_open_abs(PCIDLIST_ABSOLUTE abs);   // folder -> navigate, file -> default verb
 void navigation_open_new_window(PCIDLIST_ABSOLUTE folder);   // Ctrl+N, "Open in new window"

@@ -23,7 +23,7 @@ static PITEMID_CHILD s_editPidl = nullptr;   // the item itself
 static std::wstring s_editName;              // as shown when the edit began
 static std::wstring s_editHiddenExt;         // the extension the shown name leaves out (ours or Windows')
 static bool s_editExtForced = false;
-static PITEMID_CHILD s_editFolder = nullptr;  // absolute pidl of the folder the renamed item is in
+static PIDLIST_ABSOLUTE s_editFolder = nullptr;  // absolute pidl of the folder the renamed item is in
 static bool s_selChangePosted = false;
 
 // ---------------------------------------------------------------
@@ -64,6 +64,9 @@ static void apply_image_lists(UINT v) {
     s_boxW = S(16);
     int key = (h << 16) ^ (cx << 8) ^ s_boxW;
     if (key != s_padKey || !s_padSmall) {
+        // off the control first: it would paint with freed lists until they're replaced
+        if (ListView_GetImageList(g_list, LVSIL_STATE) == s_padState) ListView_SetImageList(g_list, nullptr, LVSIL_STATE);
+        if (ListView_GetImageList(g_list, LVSIL_SMALL) == s_padSmall) ListView_SetImageList(g_list, nullptr, LVSIL_SMALL);
         if (s_padSmall) ImageList_Destroy(s_padSmall);     // (LVS_SHAREIMAGELISTS: ours to free)
         if (s_padState) ImageList_Destroy(s_padState);
         s_padSmall = ImageList_Create(cx, h, ILC_COLOR32, 0, 1);
@@ -150,6 +153,8 @@ static bool on_empty_space(POINT pt) {
 // a press on a group header's chevron toggles the group instead of selecting its items
 static LRESULT CALLBACK list_subclass(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
     static bool swallowUp = false;
+    static bool swallowSpace = false;     // the WM_CHAR of a Space that toggled a check box
+    static DWORD lastCharTime = 0;        // a character typed to find an item by name
     switch (msg) {
         case WM_PAINT:
             if (perf_on()) {
@@ -161,6 +166,7 @@ static LRESULT CALLBACK list_subclass(HWND h, UINT msg, WPARAM wp, LPARAM lp, UI
             break;
         case WM_LBUTTONDOWN:
         case WM_LBUTTONDBLCLK: {
+            swallowUp = false;
             POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             if (toggle_group_at(pt) || toggle_check_at(pt)) { swallowUp = true; return 0; }
             if (msg == WM_LBUTTONDBLCLK && on_empty_space(pt)) {
@@ -173,6 +179,37 @@ static LRESULT CALLBACK list_subclass(HWND h, UINT msg, WPARAM wp, LPARAM lp, UI
         }
         case WM_LBUTTONUP:
             if (swallowUp) { swallowUp = false; return 0; }   // (the up would select the group)
+            break;
+        case WM_MOUSEMOVE:
+            // the button went up outside the list: that up is not coming
+            if (!(wp & MK_LBUTTON)) swallowUp = false;
+            break;
+        case WM_CAPTURECHANGED:
+        case WM_KILLFOCUS:
+            swallowUp = false;
+            break;
+        case WM_KEYDOWN:
+            // check boxes: Space toggles the focused item's box, like a click on it (not
+            // while typing a name to find: a space can be part of it)
+            if (wp == VK_SPACE && g_checkBoxes && GetKeyState(VK_CONTROL) >= 0 && GetKeyState(VK_SHIFT) >= 0 &&
+                GetKeyState(VK_MENU) >= 0) {
+                // (the control's own typed string has no size query: LVM_GETISEARCHSTRING
+                // copies all of it; a letter typed lately means a name is being typed)
+                bool typing = lastCharTime && (DWORD)GetMessageTime() - lastCharTime < 2 * GetDoubleClickTime();
+                int i = ListView_GetNextItem(h, -1, LVNI_FOCUSED);
+                if (i >= 0 && !typing) {
+                    bool sel = ListView_GetItemState(h, i, LVIS_SELECTED) & LVIS_SELECTED;
+                    ListView_SetItemState(h, i, sel ? 0 : LVIS_SELECTED, LVIS_SELECTED);
+                    ListView_SetSelectionMark(h, i);
+                    swallowSpace = true;
+                    return 0;
+                }
+            }
+            break;
+        case WM_CHAR:
+            if (wp == L' ' && swallowSpace) { swallowSpace = false; return 0; }
+            swallowSpace = false;
+            lastCharTime = wp >= L' ' ? (DWORD)GetMessageTime() : 0;
             break;
         case WM_NOTIFY: {
             // the header reports to the list, not to the main window
@@ -244,13 +281,13 @@ std::vector<PCITEMID_CHILD> list_selected_pidls() {
 int list_first_selected() { return ListView_GetNextItem(g_list, -1, LVNI_SELECTED); }
 
 void navigation_open_selected() {
-    std::vector<PITEMID_CHILD> full;
+    std::vector<PIDLIST_ABSOLUTE> full;
     for (PCITEMID_CHILD c : list_selected_pidls())
-        if (PITEMID_CHILD f = static_cast<PITEMID_CHILD>(ILCombine(g_current, c))) full.push_back(f);
+        if (PIDLIST_ABSOLUTE f = ILCombine(g_current, c)) full.push_back(f);
     // a single folder (or folder shortcut) opens in place; multiple items each get
     // their default verb, folders among them navigate to the first one
-    PITEMID_CHILD navTarget = nullptr;
-    for (PITEMID_CHILD f : full) {
+    PIDLIST_ABSOLUTE navTarget = nullptr;
+    for (PIDLIST_ABSOLUTE f : full) {
         com_ptr<IShellItem> si;
         SFGAOF a = 0;
         if (SUCCEEDED(SHCreateItemFromIDList(f, IID_PPV_ARGS(si.put()))) && si)
@@ -262,11 +299,11 @@ void navigation_open_selected() {
     }
     if (navTarget) {
         // a folder found by a search opens at its real location, not inside the result set
-        PITEMID_CHILD real = search_is_results(g_current) ? search_real_location(navTarget) : nullptr;
+        PIDLIST_ABSOLUTE real = search_is_results(g_current) ? search_real_location(navTarget) : nullptr;
         if (real) navigate_owned(real);
         else navigate_to(navTarget);
     }
-    for (PITEMID_CHILD f : full) CoTaskMemFree(f);
+    for (PIDLIST_ABSOLUTE f : full) CoTaskMemFree(f);
 }
 
 // ---------------------------------------------------------------
@@ -277,24 +314,8 @@ void list_copy_selection(bool cut) {
     if (sel.empty()) return;
     com_ptr<IShellFolder> psf;
     if (FAILED(bind_list(g_current, IID_PPV_ARGS(psf.put()))) || !psf) return;
-    com_ptr<IDataObject> pdo;
-    if (FAILED(dataobject_from_children(g_main, psf.get(), sel, pdo.put())) || !pdo) return;
-    FORMATETC fe{ (CLIPFORMAT)RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT),
-                  nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
-    STGMEDIUM sm{};
-    sm.tymed = TYMED_HGLOBAL;
-    sm.hGlobal = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, sizeof(DWORD));
-    if (sm.hGlobal) {
-        if (void* p = GlobalLock(sm.hGlobal)) {
-            *(DWORD*)p = cut ? DROPEFFECT_MOVE : DROPEFFECT_COPY;
-            GlobalUnlock(sm.hGlobal);
-        }
-        if (FAILED(pdo->SetData(&fe, &sm, TRUE))) GlobalFree(sm.hGlobal);
-    }
-    // (another program may hold the clipboard: then nothing is cut, and no row is ghosted)
-    bool onClipboard = SUCCEEDED(OleSetClipboard(pdo.get()));
-    if (onClipboard) OleFlushClipboard();
-    else MessageBeep(MB_ICONASTERISK);
+    // (not on the clipboard: no row is ghosted)
+    bool onClipboard = fileops_set_clipboard(psf.get(), sel, cut);
     fileops_set_cut_items(cut && onClipboard ? sel : std::vector<PCITEMID_CHILD>{});
     InvalidateRect(g_list, nullptr, FALSE);
 }
@@ -695,7 +716,7 @@ static void edit_capture(int idx) {
     if (idx < 0 || idx >= (int)g_items.size() || !g_items[idx]->pidl) return;
     const Item* it = g_items[idx];
     s_editIndex = idx;
-    s_editPidl = pidl_clone(it->pidl);
+    s_editPidl = pidl_clone_child(it->pidl);
     s_editFolder = pidl_clone(g_current);       // the folder the item is in, whatever happens meanwhile
     s_editName = it->name;
     s_editHiddenExt = it->hiddenExt;
@@ -709,8 +730,10 @@ static void edit_capture(int idx) {
 }
 
 static void rename_commit(const std::wstring& newName) {
-    PITEMID_CHILD child = s_editPidl, folder = s_editFolder;
-    s_editPidl = s_editFolder = nullptr;
+    PITEMID_CHILD child = s_editPidl;
+    PIDLIST_ABSOLUTE folder = s_editFolder;
+    s_editPidl = nullptr;
+    s_editFolder = nullptr;
     bool unchanged = newName == s_editName;
     // the shown name may differ from Windows' own (File name extensions): rename to the
     // file name the user means — a hidden extension stays, a shown one is taken as typed

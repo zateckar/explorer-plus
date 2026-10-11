@@ -4,6 +4,9 @@
 #include <cwchar>
 #include <cstdlib>
 #include <exception>
+#include <string>
+#include <vector>
+#include <algorithm>
 
 namespace {
 
@@ -83,6 +86,25 @@ LONG WINAPI on_crash(EXCEPTION_POINTERS* ep) {
     std::abort();
 }
 
+// only the newest dumps stay: a shell extension that crashes at every start would
+// otherwise fill the folder (names sort by time: explorer-plus-YYYYMMDD-HHMMSS-pid.dmp)
+constexpr size_t kKeepDumps = 10;
+
+void prune_dumps() {
+    std::wstring dir = s_dir;
+    std::vector<std::wstring> names;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"\\explorer-plus-*.dmp").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) names.push_back(fd.cFileName);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    if (names.size() <= kKeepDumps) return;
+    std::sort(names.begin(), names.end());
+    for (size_t i = 0; i + kKeepDumps < names.size(); ++i) DeleteFileW((dir + L"\\" + names[i]).c_str());
+}
+
 }  // namespace
 
 void crash_init() {
@@ -99,6 +121,7 @@ void crash_init() {
         CreateDirectoryW(dir, nullptr);
         wcscat_s(dir, L"\\crashes");
         wcscpy_s(s_dir, dir);
+        prune_dumps();
     }
 
     // room for the filter to run after a stack overflow on the UI thread

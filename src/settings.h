@@ -15,7 +15,7 @@ int  view_to_int(const View& v);        // persisted form (settings + tab lines)
 View int_to_view(int x);
 
 void settings_load_all();
-void settings_save_all();
+bool settings_save_all();               // false: the file couldn't be written (changes kept for a retry)
 View settings_default_view();
 void settings_set_default_view(const View& v);
 const View* settings_view_for(const std::wstring& folderKey);

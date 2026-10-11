@@ -26,7 +26,8 @@ const UINT* columns_tile_lines(UINT* count);   // tile view: type + size sub-ite
 int  columns_sort_display_index();             // header column showing the sort arrow
 void columns_header_click(int subItem);        // sort by that column (toggles direction)
 void columns_sort_by(int subItem);             // Sort menu: that column, its default direction
-int  columns_compare_extra(const Item* a, const Item* b);   // g_sortColumn == COL_EXTRA
+int  columns_compare_extra(const Item* a, const Item* b);   // g_sortColumn == COL_EXTRA (values both there)
+int  columns_compare_extra_empty(const Item* a, const Item* b);   // items without a value go last
 void columns_prepare_sort();                   // resolve g_sortKey before a sort
 void columns_header_menu(POINT screen);        // header right-click: column chooser
 void columns_widths_changed();                 // the user resized a column

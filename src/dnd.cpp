@@ -102,7 +102,7 @@ private:
             HTREEITEM h = TreeView_HitTest(m_hwnd, &th);
             if (h != m_treeHover) { TreeView_SelectDropTarget(m_hwnd, h); m_treeHover = h; }
             if (!h || !(th.flags & TVHT_ONITEM)) return 0;
-            PITEMID_CHILD abs = tree_get_pidl_of_item(h);
+            PIDLIST_ABSOLUTE abs = tree_get_pidl_of_item(h);
             if (!abs) return 0;         // a separator (nullptr isn't the Desktop here)
             ULONGLONG key = pidl_sig(abs) | 1;
             if (key != m_targetKey) target_for_item(abs, out.put());
@@ -111,14 +111,14 @@ private:
         }
         LVHITTESTINFO ht{}; ht.pt = c;
         int idx = ListView_HitTest(m_hwnd, &ht);
-        PITEMID_CHILD abs = nullptr;
+        PIDLIST_ABSOLUTE abs = nullptr;
         // only rows that accept drops (folders, archives, programs) are targets, and
         // never the rows being dragged
         if (idx >= 0 && (ht.flags & LVHT_ONITEM) &&
             !(ListView_GetItemState(m_hwnd, idx, LVIS_SELECTED) & LVIS_SELECTED)) {
             std::lock_guard<std::mutex> lk(g_itemsMx);
             if (idx < (int)g_items.size() && (g_items[idx]->attrs & SFGAO_DROPTARGET))
-                abs = static_cast<PITEMID_CHILD>(ILCombine(g_current, g_items[idx]->pidl));
+                abs = ILCombine(g_current, g_items[idx]->pidl);
         }
         ULONGLONG key = abs ? (pidl_sig(abs) | 1) : 2;     // 2 = background
         if (key != m_targetKey) {

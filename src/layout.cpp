@@ -55,6 +55,9 @@ void layout_splitter_drag(HWND hwnd, POINT pt, DragKind kind) {
         g_splitterRight = MulDiv(nw, 96, theme_dpi());
     }
     layout_resize(hwnd, rc.right, rc.bottom);
+    // only the panes' row moved: its gaps repaint (the rows above don't change)
+    RECT band{ 0, s_list.top, rc.right, s_list.bottom };
+    InvalidateRect(hwnd, &band, FALSE);
 }
 
 void layout_relayout() {

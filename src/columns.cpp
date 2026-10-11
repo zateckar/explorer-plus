@@ -294,14 +294,19 @@ void columns_prepare_sort() {
         if (c.kind == COL_EXTRA && same_key(c.key, g_sortKey)) s_sortExtra = c.extra;
 }
 
-int columns_compare_extra(const Item* a, const Item* b) {
+static bool has_sort_value(const Item* it) {
     int i = s_sortExtra;
-    if (i < 0) return 0;
-    bool ha = i < (int)a->extraRaw.size() && a->extraRaw[i].vt != VT_EMPTY;
-    bool hb = i < (int)b->extraRaw.size() && b->extraRaw[i].vt != VT_EMPTY;
-    if (ha != hb) return ha ? -1 : 1;                 // empty values last
-    if (!ha) return 0;
-    return PropVariantCompareEx(a->extraRaw[i], b->extraRaw[i], PVCU_DEFAULT, PVCHF_DEFAULT);
+    return i >= 0 && i < (int)it->extraRaw.size() && it->extraRaw[i].vt != VT_EMPTY;
+}
+
+int columns_compare_extra_empty(const Item* a, const Item* b) {
+    bool ha = has_sort_value(a), hb = has_sort_value(b);
+    return ha == hb ? 0 : ha ? -1 : 1;
+}
+
+int columns_compare_extra(const Item* a, const Item* b) {
+    if (!has_sort_value(a) || !has_sort_value(b)) return 0;
+    return PropVariantCompareEx(a->extraRaw[s_sortExtra], b->extraRaw[s_sortExtra], PVCU_DEFAULT, PVCHF_DEFAULT);
 }
 
 // ------------------------------------------------------------------
@@ -401,7 +406,20 @@ void columns_header_menu(POINT screen) {
     if (id < 100 || id - 100 >= cands.size()) return;
     const Cand& pick = cands[id - 100];
     columns_widths_changed();                  // keep the widths the user has now
-    ColumnSet next = g_columns;
+    // the columns in the order the user dragged them to (the header is rebuilt in the
+    // set's order); Name stays first, the value slots (Column::extra) as they are
+    ColumnSet next;
+    {
+        int n = (int)g_columns.size();
+        std::vector<int> order(n);
+        if (!ListView_GetColumnOrderArray(g_list, n, order.data()))
+            for (int i = 0; i < n; ++i) order[i] = i;
+        for (int i : order)
+            if (i >= 0 && i < n) next.push_back(g_columns[i]);
+        if (next.size() != g_columns.size()) next = g_columns;
+        auto name = std::find_if(next.begin(), next.end(), [](const Column& c) { return c.kind == COL_NAME; });
+        if (name != next.end() && name != next.begin()) std::rotate(next.begin(), name, name + 1);
+    }
     bool fetch = false;
     if (pick.shown) {
         next.erase(std::remove_if(next.begin(), next.end(),
@@ -417,9 +435,19 @@ void columns_header_menu(POINT screen) {
         }
         next.push_back(c);
     }
+    // the column sorted by went: sort by Name (the list would go on sorting by something
+    // it doesn't show, with no arrow to say so)
+    bool resort = false;
+    if (pick.shown && kind_of(pick.key) != COL_NAME &&
+        (g_sortColumn == COL_EXTRA ? same_key(g_sortKey, pick.key) : g_sortColumn == kind_of(pick.key))) {
+        g_sortColumn = COL_NAME;
+        g_sortAsc = true;
+        resort = true;
+    }
     columns_apply(next);
     save_current();
     if (fetch) navigation_refresh();           // read the new column's values
     else if (!pick.shown && kind_of(pick.key) == COL_SIZE && enum_listing_complete())
         foldersizes_start(nullptr);            // the folders' sizes for the new Size column
+    if (resort && !fetch) enum_sort_items();
 }

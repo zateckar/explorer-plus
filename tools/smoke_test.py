@@ -3,19 +3,30 @@
 Builds a scratch folder under <workdir>, drives the app through window messages and
 checks results on disk / in the UI. Screenshots land in <workdir>/shots.
 """
-import os, sys, time, shutil, struct, subprocess, atexit, ctypes, ctypes.wintypes as W
+import os, sys, time, shutil, struct, subprocess, atexit, threading, ctypes, ctypes.wintypes as W
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import winauto
-from winauto import App, menu_items, u, children, cls, text, clipboard_text, WM_KEYDOWN, WM_SETTEXT
+from winauto import App, menu_items, u, children, cls, text, clipboard_text, send, WM_KEYDOWN, WM_SETTEXT
 
-IDM = dict(NEWFOLDER=40010, NEWTAB=40011, CLOSETAB=40012, COPY=40031, PASTE=40032, SELALL=40033, SELNONE=40034,
-           DELETE=40036, RENAME=40037, DETAILS=40050, TILES=40051, LARGE=40052, MEDIUM=40053,
-           LIST=40055, HIDDEN=40056, BACK=40070, FWD=40071, UP=40072, REFRESH=40073, INVERT=40035,
-           NEW_MENU=40130, COPY_PATH=40135, NEW_WINDOW=40137, FOCUS_ADDRESS=40096,
-           GROUP_NONE=40141, GROUP_TYPE=40144, XLARGE=40150, CHECKBOXES=40152, EXTENSIONS=40153,
-           PREVIEW=40154, COMPACT=40155, TOOLS_MENU=40156, CMDBAR=40157, FOLDERSIZES=40159, SORT_COL=40160,
-           VIEW_MENU=40132, MORE_MENU=40133, APPLY_ALL=40138, RESET_ALL=40139,
-           TEXT_LARGER=40100, TEXT_SMALLER=40101, TEXT_RESET=40102, TREE_DELETE=40103)
+# command IDs from the app's own resource.h (a renumbered command can't quietly become
+# another one here)
+R = winauto.RES
+GB_NONE, GB_TYPE = 1, 4                     # appstate.h: enum GroupBy
+IDM = dict(NEWFOLDER=R['IDM_FILE_NEWFOLDER'], NEWTAB=R['IDM_FILE_NEWTAB'], CLOSETAB=R['IDM_FILE_CLOSETAB'],
+           COPY=R['IDM_EDIT_COPY'], PASTE=R['IDM_EDIT_PASTE'], SELALL=R['IDM_EDIT_SELALL'],
+           SELNONE=R['IDM_EDIT_SELNONE'], DELETE=R['IDM_EDIT_DELETE'], RENAME=R['IDM_EDIT_RENAME'],
+           DETAILS=R['IDM_VIEW_DETAILS'], TILES=R['IDM_VIEW_TILES'], LARGE=R['IDM_VIEW_LARGE'],
+           MEDIUM=R['IDM_VIEW_MEDIUM'], LIST=R['IDM_VIEW_LIST'], HIDDEN=R['IDM_VIEW_HIDDEN'],
+           BACK=R['IDM_NAV_BACK'], FWD=R['IDM_NAV_FORWARD'], UP=R['IDM_NAV_UP'], REFRESH=R['IDM_NAV_REFRESH'],
+           INVERT=R['IDM_EDIT_INVERT'], NEW_MENU=R['IDM_NEW_MENU'], COPY_PATH=R['IDM_COPY_PATH'],
+           NEW_WINDOW=R['IDM_NEW_WINDOW'], FOCUS_ADDRESS=R['IDM_FOCUS_ADDRESS'],
+           GROUP_NONE=R['IDM_GROUP_BASE'] + GB_NONE, GROUP_TYPE=R['IDM_GROUP_BASE'] + GB_TYPE,
+           XLARGE=R['IDM_VIEW_XLARGE'], CHECKBOXES=R['IDM_VIEW_CHECKBOXES'], EXTENSIONS=R['IDM_VIEW_EXTENSIONS'],
+           PREVIEW=R['IDM_VIEW_PREVIEWPANE'], COMPACT=R['IDM_VIEW_COMPACT'], TOOLS_MENU=R['IDM_TOOLS_MENU'],
+           CMDBAR=R['IDM_VIEW_CMDBAR'], FOLDERSIZES=R['IDM_VIEW_FOLDERSIZES'], SORT_COL=R['IDM_SORT_COL_BASE'],
+           VIEW_MENU=R['IDM_VIEW_MENU'], MORE_MENU=R['IDM_MORE_MENU'], APPLY_ALL=R['IDM_VIEW_APPLY_ALL'],
+           RESET_ALL=R['IDM_VIEW_RESET_ALL'], TEXT_LARGER=R['IDM_TEXT_LARGER'], TEXT_SMALLER=R['IDM_TEXT_SMALLER'],
+           TEXT_RESET=R['IDM_TEXT_RESET'], TREE_DELETE=R['IDM_TREE_DELETE'])
 LV_VIEW_DETAILS, LV_VIEW_LIST, LV_VIEW_TILE = 1, 3, 4
 LVM_GETVIEW, TVM_GETITEMHEIGHT = 0x108F, 0x111C
 
@@ -65,6 +76,27 @@ results = []
 def check(name, ok, detail=''):
     results.append((name, bool(ok)))
     print(('PASS ' if ok else 'FAIL ') + name + (('  [' + str(detail) + ']') if detail else ''))
+
+# a check that couldn't run here (the desktop got in the way): a note locally, a failure
+# on CI (GitHub sets CI=true), where a check that never runs would pass unnoticed
+def skip(name, why):
+    if os.environ.get('CI'):
+        check(name, False, 'skipped: ' + why)
+    else:
+        print('SKIP ' + name + '  [' + why + ']')
+
+# the whole run has a deadline: a hung app (or a wait that never ends) fails the run with
+# a message, before the CI step's own timeout kills it without one
+deadline = int(os.environ.get('SMOKE_DEADLINE', '480'))
+def watchdog():
+    print('FAIL watchdog: the smoke test still ran after %d s; stopping it' % deadline, flush=True)
+    try:
+        cleanup()
+    finally:
+        os._exit(3)
+timer = threading.Timer(deadline, watchdog)
+timer.daemon = True
+timer.start()
 
 def wait_for(pred, timeout=5.0):
     end = time.time() + timeout
@@ -244,7 +276,7 @@ if (u.WindowFromPoint(pt) or 0) == app.list:
         u.mouse_event(0x0002, 0, 0, 0, 0); time.sleep(0.05)       # MOUSEEVENTF_LEFTDOWN
         u.mouse_event(0x0004, 0, 0, 0, 0)                          # MOUSEEVENTF_LEFTUP
     def picked():
-        return u.SendMessageW(app.list, 0x100C, -1, 0x0002)         # LVM_GETNEXTITEM, LVNI_SELECTED
+        return send(app.list, 0x100C, -1, 0x0002)         # LVM_GETNEXTITEM, LVNI_SELECTED
     check('one click beside the compact menu closes it and selects the file there',
           fly and wait_for(lambda: app.flyout() is None and app.selected_count() == 1 and picked() == ia, 3),
           (bool(fly), app.flyout(), app.selected_count(), picked(), ia))
@@ -264,7 +296,8 @@ if (u.WindowFromPoint(pt) or 0) == app.list:
         check('a selected row keeps its text when the pointer comes back over it', all(kept), kept)
     u.SetCursorPos(cursor.x, cursor.y)
 else:
-    print('  (skipped the click beside the menu: the list is covered at', (pt.x, pt.y), ')')
+    skip('one click beside the compact menu closes it and selects the file there',
+         'the list is covered at %s' % ((pt.x, pt.y),))
 # background flyout: View / Sort by / Group by / New, with our own submenus
 app.command(IDM['SELNONE'])
 fly = app.open_context_flyout()
@@ -287,13 +320,13 @@ if fly:
         time.sleep(0.25)
         menu = next((h for h in winauto.top_windows(app.proc.pid) if cls(h) == '#32768' and u.IsWindowVisible(h)), None)
         if menu: break
-    sub_items = menu_items(u.SendMessageW(menu, 0x01E1, 0, 0)) if menu else []
+    sub_items = menu_items(send(menu, 0x01E1, 0, 0)) if menu else []
     pick = next((i for i, s in enumerate(sub_items) if s.replace('&', '').startswith('List')), -1)
     if pick >= 0:
-        u.SendMessageW(menu, 0x01E5, pick, 0)      # MN_SELECTITEM
+        send(menu, 0x01E5, pick, 0)      # MN_SELECTITEM
         u.PostMessageW(menu, WM_KEYDOWN, 0x0D, 0)
 check('compact menu View submenu chooses a view',
-      wait_for(lambda: app.flyout() is None and u.SendMessageW(app.list, 0x108F, 0, 0) == 3, 4), sub_items)
+      wait_for(lambda: app.flyout() is None and send(app.list, 0x108F, 0, 0) == 3, 4), sub_items)
 app.close_menus()
 app.command(IDM['DETAILS'])
 check('no menu left open', app.flyout() is None)
@@ -320,12 +353,12 @@ def open_popup(cmd):
         time.sleep(0.25)
         menu = next((h for h in winauto.top_windows(app.proc.pid) if cls(h) == '#32768' and u.IsWindowVisible(h)), None)
         if menu:
-            return menu, menu_items(u.SendMessageW(menu, 0x01E1, 0, 0))
+            return menu, menu_items(send(menu, 0x01E1, 0, 0))
     return None, []
 def choose(menu, items, label):
     idx = next((i for i, s in enumerate(items) if s.replace('&', '').split('\t')[0] == label), -1)
     if menu and idx >= 0:
-        u.SendMessageW(menu, 0x01E5, idx, 0)                       # MN_SELECTITEM
+        send(menu, 0x01E5, idx, 0)                       # MN_SELECTITEM
         u.PostMessageW(menu, WM_KEYDOWN, 0x0D, 0)
     else:
         app.close_menus()
@@ -368,8 +401,8 @@ ed = label_edit()
 check('new folder enters rename mode', ed is not None)
 if ed:
     buf = ctypes.create_unicode_buffer('renamed dir')
-    u.SendMessageW(ed, WM_SETTEXT, 0, ctypes.addressof(buf))
-    u.SendMessageW(ed, WM_KEYDOWN, 0x0D, 0)
+    send(ed, WM_SETTEXT, 0, ctypes.addressof(buf))
+    send(ed, WM_KEYDOWN, 0x0D, 0)
     check('rename via label edit', wait_for(lambda: os.path.isdir(os.path.join(data, 'renamed dir')), 6),
           os.listdir(data))
 
@@ -381,8 +414,8 @@ ed = label_edit()
 check('F2 opens rename box', ed is not None)
 if ed:
     buf = ctypes.create_unicode_buffer('c.txt')
-    u.SendMessageW(ed, WM_SETTEXT, 0, ctypes.addressof(buf))
-    u.SendMessageW(ed, WM_KEYDOWN, 0x0D, 0)
+    send(ed, WM_SETTEXT, 0, ctypes.addressof(buf))
+    send(ed, WM_KEYDOWN, 0x0D, 0)
     check('file renamed b.txt -> c.txt',
           wait_for(lambda: os.path.isfile(os.path.join(data, 'c.txt')) and
                    not os.path.exists(os.path.join(data, 'b.txt')), 6), os.listdir(data))
@@ -402,7 +435,7 @@ for _ in range(20):
     menu = next((h for h in winauto.top_windows(app.proc.pid) if cls(h) == '#32768' and u.IsWindowVisible(h)), None)
     if menu:
         break
-new_items = menu_items(u.SendMessageW(menu, 0x01E1, 0, 0)) if menu else []
+new_items = menu_items(send(menu, 0x01E1, 0, 0)) if menu else []
 # the ShellNew types depend on the machine's registrations; Folder is always there
 check('New menu lists the shell New items', 'Folder' in new_items, new_items)
 pick = next((s for s in new_items if 'Text Document' in s), 'Folder')
@@ -419,7 +452,7 @@ if menu and idx >= 0:
     check('new item enters rename mode', wait_for(lambda: label_edit() is not None, 4))
     ed = label_edit()
     if ed:
-        u.SendMessageW(ed, WM_KEYDOWN, 0x1B, 0)                 # Esc: keep the name
+        send(ed, WM_KEYDOWN, 0x1B, 0)                 # Esc: keep the name
     time.sleep(0.5)
     for n in created():
         pth = os.path.join(data, n)
@@ -428,15 +461,14 @@ else:
     app.close_menus()
 # address bar: Ctrl+L switches the breadcrumb to an edit box with the path
 app.command(IDM['FOCUS_ADDRESS'])
-time.sleep(0.3)
 check('Ctrl+L shows the address edit with the path',
-      u.IsWindowVisible(app.addr_edit) and app.address_text() == data, app.address_text())
-u.SendMessageW(app.addr_edit, WM_KEYDOWN, 0x1B, 0)
-time.sleep(0.3)
-check('Esc returns to the breadcrumb', not u.IsWindowVisible(app.addr_edit))
+      wait_for(lambda: u.IsWindowVisible(app.addr_edit) and app.address_text() == data, 2), app.address_text())
+send(app.addr_edit, WM_KEYDOWN, 0x1B, 0)
+check('Esc returns to the breadcrumb', wait_for(lambda: not u.IsWindowVisible(app.addr_edit), 2))
 
-# F6 / Tab move the keyboard focus around the panes: address bar (editing), search box,
-# navigation pane, file list
+# F6 / Tab move the keyboard focus around the panes in screen order: tab strip, navigation
+# buttons, address bar (editing), search box, command bar (when shown), navigation pane,
+# file list
 class GUITHREADINFO(ctypes.Structure):
     _fields_ = [('cbSize', W.DWORD), ('flags', W.DWORD), ('hwndActive', W.HWND), ('hwndFocus', W.HWND),
                 ('hwndCapture', W.HWND), ('hwndMenuOwner', W.HWND), ('hwndMoveSize', W.HWND),
@@ -448,17 +480,26 @@ def focused():
 search = winauto.child_by_id(app.hwnd, App.IDC_SEARCH)
 if focused() and focused() == app.list:
     seen = []
-    for key, want in ((0x75, app.addr_edit), (0x75, search), (0x09, app.tree), (0x09, app.list)):   # F6 F6 Tab Tab
+    u.FindWindowExW.restype = W.HWND
+    strip = u.FindWindowExW(app.hwnd, None, 'ExplorerPlusTabStrip', None)
+    navbtns = u.FindWindowExW(app.hwnd, None, 'ExplorerPlusNavBar', None)
+    cmdbar = u.FindWindowExW(app.hwnd, None, 'ExplorerPlusCmdBar', None)
+    order = [(0x75, strip), (0x75, navbtns), (0x75, app.addr_edit), (0x75, search)]   # F6 x4
+    if cmdbar and u.IsWindowVisible(cmdbar):
+        order.append((0x09, cmdbar))
+    order += [(0x09, app.tree), (0x09, app.list)]                                      # Tab
+    for key, want in order:
         u.PostMessageW(focused(), WM_KEYDOWN, key, 0)
         wait_for(lambda: focused() == want, 2)
         seen.append(cls(focused()) if focused() else None)
         if focused() != want:
             break
-    check('F6 / Tab cycle the focus: address, search, navigation pane, list',
-          len(seen) == 4 and focused() == app.list, seen)
+    check('F6 / Tab cycle the focus: tabs, buttons, address, search, commands, navigation pane, list',
+          len(seen) == len(order) and focused() == app.list, seen)
     check('... and leaving the address bar ends its edit', not u.IsWindowVisible(app.addr_edit))
 else:
-    print('  (skipped the focus cycle: the list does not have the focus)', focused())
+    skip('F6 / Tab cycle the focus: tabs, buttons, address, search, commands, navigation pane, list',
+         'the list does not have the focus (%s)' % focused())
 
 # Ctrl+N opens a second window on the same folder (separate process)
 before = set(winauto.windows_of_class('ExplorerPlusMainWnd'))
@@ -477,23 +518,23 @@ def tree_rename_box():
     # the label edit shows the caret item's name: only rename when it is the scratch
     # 'sub' (the tree sync is deferred, the caret may still be on its parent; slow on CI)
     for _ in range(30):
-        sel = u.SendMessageW(app.tree, TVM_GETNEXTITEM, TVGN_CARET, 0)
+        sel = send(app.tree, TVM_GETNEXTITEM, TVGN_CARET, 0)
         if sel:
-            u.SendMessageW(app.tree, TVM_EDITLABELW, 0, sel)
+            send(app.tree, TVM_EDITLABELW, 0, sel)
             ed = next((c for c in children(app.tree) if cls(c) == 'Edit' and u.IsWindowVisible(c)), None)
             if ed and text(ed) == 'sub':
                 return ed
             print('  tree caret:', text(ed) if ed else None)
             if ed:
-                u.SendMessageW(app.tree, TVM_ENDEDITLABELNOW, 1, 0)   # cancel
+                send(app.tree, TVM_ENDEDITLABELNOW, 1, 0)   # cancel
         time.sleep(0.5)
     return None
 ed = tree_rename_box()
 check('tree selects the current folder and F2 opens a rename box', ed is not None)
 if ed:
     buf = ctypes.create_unicode_buffer('sub2')
-    u.SendMessageW(ed, WM_SETTEXT, 0, ctypes.addressof(buf))
-    u.SendMessageW(ed, WM_KEYDOWN, 0x0D, 0)
+    send(ed, WM_SETTEXT, 0, ctypes.addressof(buf))
+    send(ed, WM_KEYDOWN, 0x0D, 0)
     check('tree rename renames the folder on disk',
           wait_for(lambda: os.path.isdir(os.path.join(data, 'sub2')), 6), os.listdir(data))
     check('renaming the current folder follows it',
@@ -529,14 +570,14 @@ check('search finds a file in a subfolder',
       wait_for(lambda: app.title().startswith('Search Results in testdata') and app.item_count() == 1, 15),
       (app.title(), app.item_count()))
 app.screenshot(os.path.join(shots, '07_search.png'))
-hdr = u.SendMessageW(app.list, 0x101F, 0, 0)                     # LVM_GETHEADER
-ncols = u.SendMessageW(hdr, 0x1200, 0, 0)                         # HDM_GETITEMCOUNT
+hdr = send(app.list, 0x101F, 0, 0)                     # LVM_GETHEADER
+ncols = send(hdr, 0x1200, 0, 0)                         # HDM_GETITEMCOUNT
 check('results show where each item is (Folder column)',
       ncols == 5 and app.item_text(0, 4) == os.path.join(data, 'sub'), (ncols, app.item_text(0, 4)))
 txts = sum(1 for _, _, fs in os.walk(data) for n in fs if n.lower().endswith('.txt'))
 app.search('*.txt')
 check('wildcard search (refined in place)', wait_for(lambda: app.item_count() == txts, 15), (app.item_count(), txts))
-u.SendMessageW(app.search_box, WM_KEYDOWN, 0x1B, 0)
+send(app.search_box, WM_KEYDOWN, 0x1B, 0)
 check('Esc returns to the searched folder and clears the box',
       wait_for(lambda: app.title().startswith('testdata') and not text(app.search_box), 5),
       (app.title(), text(app.search_box)))
@@ -550,14 +591,16 @@ os.remove(needle)
 # navigation: up to the drive, This PC, Desktop and back
 app.go('C:\\')
 check('navigate C:\\', '(C:)' in app.title(), app.title())
-app.command(IDM['UP']); time.sleep(1.5)
+app.command(IDM['UP'])
+wait_for(lambda: 'This PC' in app.title() or 'Tento' in app.title(), 5)
 this_pc = app.title()
 check('Up from C:\\ -> This PC', 'This PC' in this_pc or 'Tento' in this_pc, this_pc)
+wait_for(lambda: send(app.list, 0x10AF, 0, 0), 3)                  # (LVM_ISGROUPVIEWENABLED: the tiles are in)
 LVM_GETVIEW, LVM_GETGROUPCOUNT, LVM_ISGROUPVIEWENABLED = 0x108F, 0x1098, 0x10AF
 check('This PC shows grouped drive tiles',
-      u.SendMessageW(app.list, LVM_GETVIEW, 0, 0) == 4 and u.SendMessageW(app.list, LVM_ISGROUPVIEWENABLED, 0, 0)
-      and u.SendMessageW(app.list, LVM_GETGROUPCOUNT, 0, 0) >= 1,
-      (u.SendMessageW(app.list, LVM_GETVIEW, 0, 0), u.SendMessageW(app.list, LVM_GETGROUPCOUNT, 0, 0)))
+      send(app.list, LVM_GETVIEW, 0, 0) == 4 and send(app.list, LVM_ISGROUPVIEWENABLED, 0, 0)
+      and send(app.list, LVM_GETGROUPCOUNT, 0, 0) >= 1,
+      (send(app.list, LVM_GETVIEW, 0, 0), send(app.list, LVM_GETGROUPCOUNT, 0, 0)))
 app.screenshot(os.path.join(shots, '04_thispc.png'))
 # a press on the first group's chevron collapses it without selecting its items
 LVM_GETGROUPSTATE = 0x105C
@@ -565,17 +608,17 @@ dpi = u.GetDpiForWindow(app.hwnd)
 pt = ((12 * dpi // 96) << 16) | (14 * dpi // 96)
 u.PostMessageW(app.list, 0x0201, 1, pt); u.PostMessageW(app.list, 0x0202, 0, pt)   # posted: no drag loop
 check('group chevron collapses the group',
-      wait_for(lambda: u.SendMessageW(app.list, LVM_GETGROUPSTATE, 0, 1) == 1, 2) and app.selected_count() == 0,
-      (u.SendMessageW(app.list, LVM_GETGROUPSTATE, 0, 1), app.selected_count()))
+      wait_for(lambda: send(app.list, LVM_GETGROUPSTATE, 0, 1) == 1, 2) and app.selected_count() == 0,
+      (send(app.list, LVM_GETGROUPSTATE, 0, 1), app.selected_count()))
 app.command(IDM['REFRESH']); time.sleep(1.5)
-check('a collapsed group stays collapsed across a refresh', u.SendMessageW(app.list, LVM_GETGROUPSTATE, 0, 1) == 1)
+check('a collapsed group stays collapsed across a refresh', send(app.list, LVM_GETGROUPSTATE, 0, 1) == 1)
 app.command(IDM['UP']); time.sleep(2)
 check('Up to Desktop lists items', wait_for(lambda: app.item_count() > 0, 5), (app.title(), app.item_count()))
 app.screenshot(os.path.join(shots, '05_desktop.png'))
-app.command(IDM['BACK']); time.sleep(1.5)
-check('Back returns to This PC', app.title() == this_pc, app.title())
-app.command(IDM['FWD']); time.sleep(1.5)
-check('Forward', app.title() != this_pc, app.title())
+app.command(IDM['BACK'])
+check('Back returns to This PC', wait_for(lambda: app.title() == this_pc, 5), app.title())
+app.command(IDM['FWD'])
+check('Forward', wait_for(lambda: app.title() != this_pc, 5), app.title())
 app.go('C:\\does\\not\\exist', 1.5, post=True)
 errs = [h for h in __import__('winauto').top_windows(app.proc.pid) if cls(h) == '#32770' and u.IsWindowVisible(h)]
 check('bad path shows an error instead of an empty folder', bool(errs))
@@ -611,30 +654,30 @@ app.command(IDM['GROUP_TYPE']); time.sleep(0.8)
 types = {'File folder'} | {os.path.splitext(n)[1].lower() for n in os.listdir(data)
                            if os.path.isfile(os.path.join(data, n))}
 check('Group by Type groups the listing',
-      u.SendMessageW(app.list, LVM_ISGROUPVIEWENABLED, 0, 0) and
-      u.SendMessageW(app.list, LVM_GETGROUPCOUNT, 0, 0) == len(types),
-      (u.SendMessageW(app.list, LVM_GETGROUPCOUNT, 0, 0), sorted(types)))
+      send(app.list, LVM_ISGROUPVIEWENABLED, 0, 0) and
+      send(app.list, LVM_GETGROUPCOUNT, 0, 0) == len(types),
+      (send(app.list, LVM_GETGROUPCOUNT, 0, 0), sorted(types)))
 app.go(os.path.join(data, 'sub2' if os.path.isdir(os.path.join(data, 'sub2')) else 'sub'))
-check('grouping is per folder', not u.SendMessageW(app.list, LVM_ISGROUPVIEWENABLED, 0, 0))
+check('grouping is per folder', not send(app.list, LVM_ISGROUPVIEWENABLED, 0, 0))
 app.go(data)
 
 # column chooser: header right-click > Date created adds a column, remembered per folder
 HDM_GETITEMCOUNT, LVM_GETHEADER = 0x1200, 0x101F
 def header_count():
-    return u.SendMessageW(u.SendMessageW(app.list, LVM_GETHEADER, 0, 0), HDM_GETITEMCOUNT, 0, 0)
+    return send(send(app.list, LVM_GETHEADER, 0, 0), HDM_GETITEMCOUNT, 0, 0)
 def choose_column(title):
-    hdr = u.SendMessageW(app.list, LVM_GETHEADER, 0, 0)
+    hdr = send(app.list, LVM_GETHEADER, 0, 0)
     u.PostMessageW(hdr, 0x0204, 2, (5 << 16) | 40); u.PostMessageW(hdr, 0x0205, 0, (5 << 16) | 40)
     menu = None
     for _ in range(20):
         time.sleep(0.25)
         menu = next((h for h in winauto.top_windows(app.proc.pid) if cls(h) == '#32768' and u.IsWindowVisible(h)), None)
         if menu: break
-    items = menu_items(u.SendMessageW(menu, 0x01E1, 0, 0)) if menu else []
+    items = menu_items(send(menu, 0x01E1, 0, 0)) if menu else []
     if title not in items:
         if menu: app.close_menus()
         return items
-    u.SendMessageW(menu, 0x01E5, items.index(title), 0)    # MN_SELECTITEM
+    send(menu, 0x01E5, items.index(title), 0)    # MN_SELECTITEM
     u.PostMessageW(menu, WM_KEYDOWN, 0x0D, 0)
     time.sleep(1.5)
     return items
@@ -649,29 +692,30 @@ check('exits cleanly', app.proc.returncode == 0, app.proc.returncode)
 
 app = App(exe, uni, settings=ini)
 app.wait_idle(1.5)
-check('per-folder view restored after restart (List)', u.SendMessageW(app.list, LVM_GETVIEW, 0, 0) == 3,
-      u.SendMessageW(app.list, LVM_GETVIEW, 0, 0))
+check('per-folder view restored after restart (List)', send(app.list, LVM_GETVIEW, 0, 0) == 3,
+      send(app.list, LVM_GETVIEW, 0, 0))
 app.go(data)
-check('Group by restored after restart', u.SendMessageW(app.list, LVM_ISGROUPVIEWENABLED, 0, 0))
+check('Group by restored after restart', send(app.list, LVM_ISGROUPVIEWENABLED, 0, 0))
 check('chosen columns restored after restart', header_count() == cols_before_restart,
       (header_count(), cols_before_restart))
 choose_column('Date created')
 check('unchecking a column removes it', header_count() == cols_before_restart - 1, header_count())
 app.go('shell:RecycleBinFolder')
-rb = [u.SendMessageW(u.SendMessageW(app.list, LVM_GETHEADER, 0, 0), HDM_GETITEMCOUNT, 0, 0)]
+rb = [send(send(app.list, LVM_GETHEADER, 0, 0), HDM_GETITEMCOUNT, 0, 0)]
 check('Recycle Bin shows its own columns', rb[0] >= 5, rb)
 app.go(data)
 app.command(IDM['GROUP_NONE']); time.sleep(0.8)
-check('Group by (None) ungroups', not u.SendMessageW(app.list, LVM_ISGROUPVIEWENABLED, 0, 0))
+check('Group by (None) ungroups', not send(app.list, LVM_ISGROUPVIEWENABLED, 0, 0))
 
 # Sort menu entries are the folder's columns: Size sorts largest first, Name back again
 def row_of(name):
     return next((i for i in range(app.item_count()) if app.item_text(i) == name), -1)
-app.command(IDM['SORT_COL'] + 3); time.sleep(0.8)                 # Name, Date modified, Type, Size
-check('Sort by Size (largest first)', row_of('photo.jpg') < row_of('external.txt'),
+app.command(IDM['SORT_COL'] + 3)                                   # Name, Date modified, Type, Size
+check('Sort by Size (largest first)', wait_for(lambda: 0 <= row_of('photo.jpg') < row_of('external.txt'), 3),
       (row_of('photo.jpg'), row_of('external.txt')))
-app.command(IDM['SORT_COL'] + 0); time.sleep(0.8)
-check('Sort by Name', row_of('external.txt') < row_of('photo.jpg'), (row_of('external.txt'), row_of('photo.jpg')))
+app.command(IDM['SORT_COL'] + 0)
+check('Sort by Name', wait_for(lambda: 0 <= row_of('external.txt') < row_of('photo.jpg'), 3),
+      (row_of('external.txt'), row_of('photo.jpg')))
 
 # folder sizes (on by default): a subfolder's Size is everything under it, every level
 sized = os.path.join(data, 'sized')
@@ -680,9 +724,9 @@ with open(os.path.join(sized, 'top.bin'), 'wb') as f:
     f.write(bytes(1000))
 with open(os.path.join(sized, 'deep', 'deeper', 'low.bin'), 'wb') as f:
     f.write(bytes(300000))
-def byte_size(n):                                                   # as the app formats it
+def byte_size(n):                                                   # as the app formats it: KB, like Explorer
     buf = ctypes.create_unicode_buffer(64)
-    ctypes.windll.shlwapi.StrFormatByteSizeEx(ctypes.c_ulonglong(n), 2, buf, 64)
+    ctypes.windll.shlwapi.StrFormatKBSizeW(ctypes.c_longlong(n), buf, 64)
     return buf.value
 def size_of(name):
     i = row_of(name)
@@ -700,13 +744,13 @@ check('removed folder leaves the list', wait_for(lambda: row_of('sized') < 0, 5)
 # view modes: Extra large / Medium icons are icon views
 app.command(IDM['XLARGE']); time.sleep(1.5)
 app.screenshot(os.path.join(shots, '08_xlarge.png'))
-check('Extra large icons', u.SendMessageW(app.list, LVM_GETVIEW, 0, 0) == 0)
+check('Extra large icons', send(app.list, LVM_GETVIEW, 0, 0) == 0)
 app.command(IDM['DETAILS']); time.sleep(0.5)
 
 # item check boxes: a press on an item's box adds just that item to the selection
 LVM_GETEXTENDEDLISTVIEWSTYLE, LVM_GETITEMRECT = 0x1037, 0x100E
 app.command(IDM['CHECKBOXES']); time.sleep(0.5)
-check('Item check boxes on', u.SendMessageW(app.list, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0) & 0x4)
+check('Item check boxes on', send(app.list, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0) & 0x4)
 app.select_name('photo.jpg')
 r = app.item_rect(row_of('external.txt'), 1)                       # LVIR_ICON
 box = (((r[1] + r[3]) // 2) << 16) | max(1, r[0] - 8)
@@ -723,7 +767,7 @@ def row_h():
     r = app.item_rect(0, 0)
     return r[3] - r[1]
 def tree_h():
-    return u.SendMessageW(app.tree, TVM_GETITEMHEIGHT, 0, 0)
+    return send(app.tree, TVM_GETITEMHEIGHT, 0, 0)
 first, tfirst = row_h(), tree_h()
 app.command(IDM['COMPACT']); time.sleep(0.5)
 second, tsecond = row_h(), tree_h()
@@ -746,20 +790,21 @@ check('a file without a preview handler drops the handler', wait_for(lambda: not
 app.command(IDM['PREVIEW']); time.sleep(0.5)
 
 # File name extensions off: "a.txt" lists as "a"; renaming keeps the hidden extension
-app.command(IDM['EXTENSIONS']); time.sleep(1.5)
-check('extensions hidden', row_of('a') >= 0 and row_of('a.txt') < 0, [app.item_text(i) for i in range(app.item_count())])
+app.command(IDM['EXTENSIONS'])
+check('extensions hidden', wait_for(lambda: row_of('a') >= 0 and row_of('a.txt') < 0, 5),
+      [app.item_text(i) for i in range(app.item_count())])
 app.select_name('a')
 app.command(IDM['RENAME'])
 wait_for(lambda: label_edit() is not None, 3)
 ed = label_edit()
 if ed:
     buf = ctypes.create_unicode_buffer('z')
-    u.SendMessageW(ed, WM_SETTEXT, 0, ctypes.addressof(buf))
-    u.SendMessageW(ed, WM_KEYDOWN, 0x0D, 0)
+    send(ed, WM_SETTEXT, 0, ctypes.addressof(buf))
+    send(ed, WM_KEYDOWN, 0x0D, 0)
 check('rename with the extension hidden keeps it', wait_for(lambda: os.path.isfile(os.path.join(data, 'z.txt')), 6),
       os.listdir(data))
-app.command(IDM['EXTENSIONS']); time.sleep(1.5)
-check('extensions shown again', row_of('z.txt') >= 0, [app.item_text(i) for i in range(app.item_count())])
+app.command(IDM['EXTENSIONS'])
+check('extensions shown again', wait_for(lambda: row_of('z.txt') >= 0, 5), [app.item_text(i) for i in range(app.item_count())])
 
 # Windows hides a shortcut's extension whatever the setting: a rename keeps it
 lnk = os.path.join(data, 'shortcut.lnk')
@@ -775,15 +820,15 @@ wait_for(lambda: label_edit() is not None, 3)
 ed = label_edit()
 if ed:
     buf = ctypes.create_unicode_buffer('link')
-    u.SendMessageW(ed, WM_SETTEXT, 0, ctypes.addressof(buf))
-    u.SendMessageW(ed, WM_KEYDOWN, 0x0D, 0)
+    send(ed, WM_SETTEXT, 0, ctypes.addressof(buf))
+    send(ed, WM_KEYDOWN, 0x0D, 0)
 check('renaming a shortcut keeps its hidden .lnk', wait_for(lambda: os.path.isfile(os.path.join(data, 'link.lnk')), 6),
       os.listdir(data))
 
 def dialogs():
     return [h for h in winauto.top_windows(app.proc.pid) if cls(h) == '#32770' and u.IsWindowVisible(h)]
 def view():
-    return u.SendMessageW(app.list, LVM_GETVIEW, 0, 0)
+    return send(app.list, LVM_GETVIEW, 0, 0)
 
 # View > Apply this view to all folders: a folder never opened before gets this
 # folder's view and columns; Reset all folders brings every folder back to Details
@@ -800,17 +845,17 @@ check('Apply to all folders: a new folder opens in that view', view() == LV_VIEW
 check('Apply to all folders: a new folder gets those columns', header_count() == applied_cols, (header_count(), applied_cols))
 app.go(os.path.join(data, 'sub'))
 check('Apply to all folders: folders with their own view follow too', view() == LV_VIEW_LIST, view())
-app.command(IDM['RESET_ALL']); time.sleep(1)
-check('Reset all folders: back to Details', view() == LV_VIEW_DETAILS, view())
+app.command(IDM['RESET_ALL'])
+check('Reset all folders: back to Details', wait_for(lambda: view() == LV_VIEW_DETAILS, 3), view())
 app.go(fresh)
 check('Reset all folders: default columns again', view() == LV_VIEW_DETAILS and header_count() == base_cols,
       (view(), header_count(), base_cols))
 app.go(data)
 
 # text size: list and tree rows grow, the menu limits hold, the size survives a restart
-rows0, tree0 = row_h(), u.SendMessageW(app.tree, TVM_GETITEMHEIGHT, 0, 0)
+rows0, tree0 = row_h(), send(app.tree, TVM_GETITEMHEIGHT, 0, 0)
 app.command(IDM['TEXT_LARGER']); app.command(IDM['TEXT_LARGER']); time.sleep(0.5)
-rows1, tree1 = row_h(), u.SendMessageW(app.tree, TVM_GETITEMHEIGHT, 0, 0)
+rows1, tree1 = row_h(), send(app.tree, TVM_GETITEMHEIGHT, 0, 0)
 check('Larger text grows list and tree rows', rows1 > rows0 and tree1 > tree0, (rows0, rows1, tree0, tree1))
 app.screenshot(os.path.join(shots, '11_text_larger.png'))
 app.command(IDM['TEXT_SMALLER']); time.sleep(0.3)

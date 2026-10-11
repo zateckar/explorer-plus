@@ -5,6 +5,7 @@
 #include "tabs.h"
 #include "layout.h"
 #include "preview.h"
+#include "workers.h"
 #include <wincodec.h>
 #include <thread>
 #include <mutex>
@@ -41,9 +42,8 @@ static std::wstring s_title;
 // through files never queues up work (and a slow drive never blocks the UI).
 struct PrevReq {
     unsigned gen;
-    PITEMID_CHILD abs = nullptr;   // owned; nullptr: no thumbnail
+    PIDLIST_ABSOLUTE abs = nullptr;   // owned; nullptr: no thumbnail
     int size = 220;
-    std::wstring spaceRoot;        // "C:\": report its free space
 };
 
 struct PrevResult {
@@ -52,7 +52,6 @@ struct PrevResult {
     int w = 0, h = 0;
     bool alpha = false;            // hbm is 32bpp with a real (premultiplied) alpha channel
     std::wstring dims;             // "1920 × 1080" for images
-    std::wstring space;            // "12.3 GB free of 476 GB"
 };
 
 static std::mutex s_reqMx;
@@ -75,7 +74,6 @@ static void apply_preview(void* payload) {
         r->hbm = nullptr;
         s_prevAlpha = r->alpha;
         if (s_mode == PANE_DETAILS && !r->dims.empty()) s_lines.push_back({ L"Dimensions", r->dims });
-        if (s_mode == PANE_DETAILS && !r->space.empty()) s_lines.push_back({ L"Space", r->space });
         if (s_mode == PANE_PREVIEW && !s_preview) s_message = L"No preview available.";
         if (s_pane) InvalidateRect(s_pane, nullptr, TRUE);
     }
@@ -118,16 +116,33 @@ static void prev_work(PrevReq* r) {
             res->dims = d;
         }
     }
-    if (!r->spaceRoot.empty()) {
-        ULARGE_INTEGER avail{}, total{}, totalfree{};
-        if (GetDiskFreeSpaceExW(r->spaceRoot.c_str(), &avail, &total, &totalfree)) {
-            WCHAR a[64]{}, b[64]{};
-            StrFormatByteSizeW(totalfree.QuadPart, a, 64);
-            StrFormatByteSizeW(total.QuadPart, b, 64);
-            res->space = std::wstring(a) + L" free of " + b;
-        }
-    }
     post_async(apply_preview, res);
+}
+
+// free space of a drive, for the folder's details
+struct SpaceResult {
+    unsigned gen;
+    std::wstring space;            // "12.3 GB free of 476 GB"
+};
+
+static void apply_space(void* payload) {
+    std::unique_ptr<SpaceResult> r(static_cast<SpaceResult*>(payload));
+    if (r->gen != s_gen.load() || s_mode != PANE_DETAILS || r->space.empty()) return;
+    s_lines.push_back({ L"Space", r->space });
+    if (s_pane) InvalidateRect(s_pane, nullptr, TRUE);
+}
+
+static void space_work(unsigned gen, const std::wstring& root) {
+    if (gen != s_gen.load()) return;            // the pane moved on while this waited
+    auto* res = new SpaceResult{ gen, {} };
+    ULARGE_INTEGER avail{}, total{}, totalfree{};
+    if (GetDiskFreeSpaceExW(root.c_str(), &avail, &total, &totalfree)) {
+        WCHAR a[64]{}, b[64]{};
+        StrFormatByteSizeW(totalfree.QuadPart, a, 64);
+        StrFormatByteSizeW(total.QuadPart, b, 64);
+        res->space = std::wstring(a) + L" free of " + b;
+    }
+    post_async(apply_space, res);
 }
 
 static void free_req(PrevReq* r) {
@@ -161,7 +176,7 @@ static void submit(PrevReq* r) {
     s_reqCv.notify_one();
 }
 
-static void request_thumbnail(PITEMID_CHILD abs /*adopted*/, int size) {
+static void request_thumbnail(PIDLIST_ABSOLUTE abs /*adopted*/, int size) {
     PrevReq* r = new PrevReq;
     r->gen = s_gen.load();
     r->abs = abs;
@@ -200,12 +215,12 @@ static void gather_for_selection() {
         std::wstring path = pidl_folder_path(g_current);
         if (path.rfind(L"::", 0) != 0) add_line(L"Path", path);   // virtual folders have no path
         add_line(L"Items", std::to_wstring(count));
-        // free space of the folder's drive (on the worker: a mapped drive can be offline)
+        // free space of the folder's drive (on the pool, not the thumbnail thread: a
+        // mapped drive can be offline, and the call then waits for the server)
         if (path.size() >= 3 && iswalpha(path[0]) && path[1] == L':' && path[2] == L'\\') {
-            PrevReq* r = new PrevReq;
-            r->gen = s_gen.load();
-            r->spaceRoot = path.substr(0, 3);
-            submit(r);
+            unsigned gen = s_gen.load();
+            std::wstring root = path.substr(0, 3);
+            worker_submit([gen, root] { space_work(gen, root); });
         }
         return;
     }
@@ -221,9 +236,9 @@ static void gather_for_selection() {
     add_line(L"Type", it->type);
     if (!it->size.empty()) add_line(L"Size", it->size);      // (a folder's once worked out)
     add_line(L"Date modified", it->date);
-    // queue preview thumbnail + image dimensions
-    if (PITEMID_CHILD full = static_cast<PITEMID_CHILD>(ILCombine(g_current, it->pidl)))
-        request_thumbnail(full, 220);
+    // queue preview thumbnail + image dimensions (as large as the pane draws it)
+    if (PIDLIST_ABSOLUTE full = ILCombine(g_current, it->pidl))
+        request_thumbnail(full, S(260));
 }
 
 // Preview mode: the one selected file through its preview handler, else its thumbnail
@@ -233,8 +248,8 @@ static void load_preview() {
     s_message.clear();
     preview_close();
     std::vector<Item*> sel = selected_items(nullptr);
-    PITEMID_CHILD full = sel.size() == 1 && !sel[0]->isFolder
-                       ? static_cast<PITEMID_CHILD>(ILCombine(g_current, sel[0]->pidl)) : nullptr;
+    PIDLIST_ABSOLUTE full = sel.size() == 1 && !sel[0]->isFolder
+                          ? ILCombine(g_current, sel[0]->pidl) : nullptr;
     if (!full) {
         s_message = L"Select a file to preview.";
     } else if (preview_open(s_hostWnd, full)) {

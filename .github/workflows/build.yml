@@ -3,11 +3,13 @@ name: Build and release
 # Every push / pull request: release build, smoke test, zips as a workflow artifact.
 # Every build of main (a push, or a manual run) that passes the smoke test is also
 # published as a GitHub release: the zip, the symbols zip (for crash dumps) and their
-# SHA-256. The version is the build date and the run number (2026.10.10.57, tag
+# SHA-256. The version is the commit's date and the run number (2026.10.10.57, tag
 # v2026.10.10.57); the notes are the commits since the previous release.
 #
 # Optional code signing of release builds: add the repository secrets
 # SIGNING_CERT_PFX_BASE64 (the .pfx, base64-encoded) and SIGNING_CERT_PASSWORD.
+#
+# Actions are pinned by commit (the release in the comment); Dependabot updates both.
 
 on:
   push:
@@ -18,8 +20,10 @@ on:
 permissions:
   contents: read
 
-# pull requests: a newer push cancels the running build. main: builds queue up, so a
-# release is never cancelled half-way (each one's notes reach back to the last release)
+# pull requests: a newer push cancels the running build. main: a running build is never
+# cancelled half-way; of the pushes made meanwhile only the newest waits (GitHub drops the
+# older pending runs), and its release notes reach back to the last release, so nothing
+# goes missing from them
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -35,11 +39,11 @@ jobs:
       label: ${{ steps.ver.outputs.label }}
       tag: ${{ steps.ver.outputs.tag }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: MinGW-w64 toolchain (MSYS2 UCRT64)
         id: msys2
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
         with:
           msystem: UCRT64
           update: false
@@ -49,8 +53,9 @@ jobs:
             mingw-w64-ucrt-x86_64-ninja
 
       # values from the event reach scripts through env:, never pasted into the script text
-      # version: the build date (UTC, no leading zeros: each part is a number in the exe's
-      # version resource) and the run number as the fourth part
+      # version: the date of the commit built (UTC, no leading zeros: each part is a number
+      # in the exe's version resource), so a re-run builds the same version, and the run
+      # number as the fourth part
       - name: Version
         id: ver
         shell: pwsh
@@ -58,7 +63,7 @@ jobs:
           SHA: ${{ github.sha }}
           RUN_NUMBER: ${{ github.run_number }}
         run: |
-          $d = (Get-Date).ToUniversalTime()
+          $d = [DateTimeOffset]::Parse((git show -s --format=%cI $env:SHA)).UtcDateTime
           $version = '{0}.{1}.{2}' -f $d.Year, $d.Month, $d.Day
           if ($env:RELEASE -eq 'true') {
             $label = "$version.$env:RUN_NUMBER"
@@ -92,7 +97,17 @@ jobs:
           RUN_NUMBER: ${{ github.run_number }}
         run: |
           $env:PATH = "$env:MSYS2_DIR\ucrt64\bin;" + $env:PATH
+          g++ --version | Select-Object -First 1      # (the toolchain in the log)
+          cmake --version | Select-Object -First 1
           ./tools/package.ps1 -Version $env:VERSION -Label $env:LABEL -Build $env:RUN_NUMBER
+
+      - name: Unit tests
+        shell: pwsh
+        env:
+          MSYS2_DIR: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          $env:PATH = "$env:MSYS2_DIR\ucrt64\bin;" + $env:PATH
+          ctest --test-dir build-release --output-on-failure
 
       - name: Remove signing certificate
         if: always() && env.SIGN_PFX != ''
@@ -110,13 +125,13 @@ jobs:
 
       - name: Smoke test screenshots
         if: always() && steps.smoke.outcome == 'failure'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: smoke-shots-${{ steps.ver.outputs.label }}
           path: build-smoke/shots
           if-no-files-found: ignore
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: explorer-plus-${{ steps.ver.outputs.label }}
           path: |
@@ -131,11 +146,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0              # the history and tags since the previous release
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: explorer-plus-${{ needs.build.outputs.label }}
           path: dist

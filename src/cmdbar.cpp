@@ -11,6 +11,7 @@ using std::min;
 #include "flyout.h"
 #include "navbar.h"
 #include "acc.h"
+#include "kbdrow.h"
 #include "foldersizes.h"
 #include <vector>
 
@@ -46,6 +47,7 @@ constexpr int kCount = (int)(sizeof(kItems) / sizeof(kItems[0]));
 static HWND s_bar = nullptr, s_tip = nullptr;
 static int s_hover = -1, s_pressed = -1;
 static std::vector<RECT> s_rects;
+static KbdRow s_kbd;                    // (indexes kItems)
 
 HWND cmdbar_hwnd() { return s_bar; }
 
@@ -125,6 +127,7 @@ static void paint(HWND hwnd) {
         bool en = enabled(it.cmd);
         if (en && (s_pressed == i || toggled(it.cmd))) fill_rrect(bp.dc, r, S(4), p.pressed);
         else if (en && s_hover == i) fill_rrect(bp.dc, r, S(4), p.hover);
+        if (s_kbd.focus == i) kbdrow_ring(bp.dc, r, S(4));
         COLORREF fg = en ? p.text : p.textDisabled;
         if (!it.label) {
             draw_glyph(bp.dc, it.glyph, r, fg, 16);
@@ -364,16 +367,38 @@ static const AccSource s_acc = [] {
         if (!enabled(it.cmd)) c.state |= STATE_SYSTEM_UNAVAILABLE;
         if (toggled(it.cmd)) c.state |= STATE_SYSTEM_CHECKED;
         if (s_hover == i) c.state |= STATE_SYSTEM_HOTTRACKED;
+        c.state |= STATE_SYSTEM_FOCUSABLE | (s_kbd.focus == i ? STATE_SYSTEM_FOCUSED : 0);
         return c;
+    };
+    a.focus = [] {
+        auto v = acc_buttons();
+        for (int n = 0; n < (int)v.size(); ++n) if (v[n] == s_kbd.focus) return n;
+        return -1;
     };
     // (posted: a menu opened from inside the screen reader's call would block it)
     a.action = [](int n) { PostMessageW(g_main, WM_COMMAND, MAKEWPARAM(kItems[acc_buttons()[n]].cmd, 0), 0); };
     return a;
 }();
 
+static bool is_menu(int i) { return kItems[i].dropdown || kItems[i].cmd == IDM_MORE_MENU; }
+
+// a button pressed from the keyboard (Enter / Space; Down Arrow opens a menu)
+static void press(int i) {
+    if (kItems[i].kind != Kind::Button || !enabled(kItems[i].cmd)) return;
+    if (is_menu(i)) cmdbar_show_menu(kItems[i].cmd);
+    else SendMessageW(g_main, WM_COMMAND, MAKEWPARAM(kItems[i].cmd, 0), 0);
+}
+
 static LRESULT CALLBACK bar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    LRESULT kr = 0;
+    if (s_kbd.handle(hwnd, msg, wp, &kr, kCount,
+                     [](int i) { return kItems[i].kind == Kind::Button && enabled(kItems[i].cmd); }, press))
+        return kr;
     switch (msg) {
         case WM_GETOBJECT: return acc_get_object(hwnd, wp, lp, &s_acc);
+        case WM_KEYDOWN:
+            if (wp == VK_DOWN && s_kbd.focus >= 0 && is_menu(s_kbd.focus)) press(s_kbd.focus);
+            return 0;
         case WM_SIZE: layout(hwnd); InvalidateRect(hwnd, nullptr, FALSE); return 0;
         case WM_SETFONT: layout(hwnd); return 0;
         case WM_ERASEBKGND: return 1;

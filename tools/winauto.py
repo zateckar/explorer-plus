@@ -21,6 +21,43 @@ u.GetMenuItemID.argtypes = [W.HMENU, ctypes.c_int]
 u.GetMenuItemID.restype = W.UINT
 EnumProc = ctypes.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
 
+# own handle: its prototypes and last-error stay out of the shared `u`
+_send_u = ctypes.WinDLL('user32', use_last_error=True)
+_send_u.SendMessageTimeoutW.restype = W.LPARAM
+_send_u.SendMessageTimeoutW.argtypes = [W.HWND, W.UINT, W.WPARAM, W.LPARAM, W.UINT, W.UINT,
+                                        ctypes.POINTER(ctypes.c_size_t)]
+
+
+class NoAnswer(RuntimeError):
+    """The app didn't answer a message in time (hung): the test fails instead of hanging."""
+
+
+def send(h, msg, wp=0, lp=0, timeout_ms=30000):
+    """SendMessage with a deadline (and none at all to a hung window)."""
+    res = ctypes.c_size_t()
+    if not _send_u.SendMessageTimeoutW(h, msg, wp, lp, 0x0002, timeout_ms, ctypes.byref(res)):   # SMTO_ABORTIFHUNG
+        if ctypes.get_last_error() == 1460:                                  # ERROR_TIMEOUT
+            raise NoAnswer('window %#x did not answer message %#x within %d ms' % (h or 0, msg, timeout_ms))
+        return 0                                                             # (a gone window: as SendMessage)
+    v = res.value
+    return v - (1 << 64) if v >= 1 << 63 else v                             # LRESULT is signed
+
+
+def resource_ids(path=None):
+    """The app's #define NAME number lines (src/resource.h): command and control IDs."""
+    import re
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'resource.h')
+    ids = {}
+    with open(path, encoding='utf-8', errors='replace') as f:
+        for line in f:
+            m = re.match(r'\s*#define\s+(\w+)\s+(\d+)\b', line)
+            if m:
+                ids[m.group(1)] = int(m.group(2))
+    return ids
+
+
+RES = resource_ids()
+
 
 def screen_pixels(x, y, w, h):
     """BGRX bytes (top-down) of a screen rectangle, as shown right now."""
@@ -59,9 +96,9 @@ LVM_GETITEMCOUNT, LVM_GETSELECTEDCOUNT = 0x1004, 0x1032
 
 
 def text(h):
-    n = u.SendMessageW(h, WM_GETTEXTLENGTH, 0, 0)
+    n = send(h, WM_GETTEXTLENGTH, 0, 0)
     buf = ctypes.create_unicode_buffer(n + 1)
-    u.SendMessageW(h, WM_GETTEXT, n + 1, ctypes.addressof(buf))
+    send(h, WM_GETTEXT, n + 1, ctypes.addressof(buf))
     return buf.value
 
 
@@ -167,7 +204,8 @@ started = []          # every App launched, for the test's cleanup
 
 
 class App:
-    IDC_TREE, IDC_LIST, IDC_ADDRESS, IDC_SEARCH, IDC_STATUS = 1001, 1002, 1003, 1004, 1006
+    IDC_TREE, IDC_LIST, IDC_ADDRESS, IDC_SEARCH, IDC_STATUS = (RES[n] for n in (
+        'IDC_TREE', 'IDC_LIST', 'IDC_ADDRESS', 'IDC_SEARCH', 'IDC_STATUS'))
 
     def __init__(self, exe, *args, settings=None):
         env = dict(os.environ)
@@ -211,20 +249,20 @@ class App:
         return text(self.addr_edit)
 
     def command(self, cid):
-        u.SendMessageW(self.hwnd, WM_COMMAND, cid, 0)
+        send(self.hwnd, WM_COMMAND, cid, 0)
 
     def go(self, path, t=1.5, post=False):
         buf = ctypes.create_unicode_buffer(path)
-        u.SendMessageW(self.addr_edit, WM_SETTEXT, 0, ctypes.addressof(buf))
+        send(self.addr_edit, WM_SETTEXT, 0, ctypes.addressof(buf))
         # post when the app may answer with a modal dialog (SendMessage would block)
-        (u.PostMessageW if post else u.SendMessageW)(self.addr_edit, WM_KEYDOWN, 0x0D, 0)
+        (u.PostMessageW if post else send)(self.addr_edit, WM_KEYDOWN, 0x0D, 0)
         self.wait_idle(t)
 
     def item_count(self):
-        return u.SendMessageW(self.list, LVM_GETITEMCOUNT, 0, 0)
+        return send(self.list, LVM_GETITEMCOUNT, 0, 0)
 
     def selected_count(self):
-        return u.SendMessageW(self.list, LVM_GETSELECTEDCOUNT, 0, 0)
+        return send(self.list, LVM_GETSELECTEDCOUNT, 0, 0)
 
     def status_texts(self):
         # SB_GETTEXTW needs a buffer in the target process: read the window text of
@@ -253,15 +291,15 @@ class App:
             # LVFINDINFOW (x64): flags, psz, lParam, pt, vkDirection -> 40 bytes; the string at +512
             write(512, name.encode('utf-16-le') + b'\0\0')
             write(0, struct.pack('<I4xQQqI4x', 0x0002, mem + 512, 0, 0, 0))     # LVFI_STRING
-            idx = u.SendMessageW(self.list, 0x1053, -1, mem)                     # LVM_FINDITEMW
+            idx = send(self.list, 0x1053, -1, mem)                     # LVM_FINDITEMW
             # LVITEMW: only state / stateMask matter for LVM_SETITEMSTATE
             def set_state(i, state, mask):
                 write(1024, struct.pack('<IiiII', 0, 0, 0, state, mask) + bytes(68))
-                u.SendMessageW(self.list, 0x102B, i, mem + 1024)                 # LVM_SETITEMSTATE
+                send(self.list, 0x102B, i, mem + 1024)                 # LVM_SETITEMSTATE
             set_state(-1, 0, 0x0003)                                             # clear all
             if idx >= 0:
                 set_state(idx, 0x0003, 0x0003)                                   # focused + selected
-                u.SendMessageW(self.list, 0x1013, idx, 0)                        # LVM_ENSUREVISIBLE
+                send(self.list, 0x1013, idx, 0)                        # LVM_ENSUREVISIBLE
         finally:
             k.VirtualFreeEx(hp, mem, 0, 0x8000)
             k.CloseHandle(hp)
@@ -277,7 +315,7 @@ class App:
             # LVITEMW: iSubItem at +8, pszText at +24, cchTextMax at +32; the text buffer at +1024
             item = struct.pack('<IiiII4xQi', 0, i, sub, 0, 0, mem + 1024, 1024) + bytes(52)
             k.WriteProcessMemory(hp, mem, item, len(item), None)
-            n = u.SendMessageW(self.list, 0x1073, i, mem)                        # LVM_GETITEMTEXTW
+            n = send(self.list, 0x1073, i, mem)                        # LVM_GETITEMTEXTW
             buf = ctypes.create_unicode_buffer(1024)
             k.ReadProcessMemory(hp, mem + 1024, buf, 2048, None)
             return buf.value[:max(n, 0)]
@@ -292,7 +330,7 @@ class App:
         hp, mem = self._remote(64)
         try:
             k.WriteProcessMemory(hp, mem, struct.pack('<iiii', code, 0, 0, 0), 16, None)
-            u.SendMessageW(self.list, 0x100E, i, mem)                           # LVM_GETITEMRECT
+            send(self.list, 0x100E, i, mem)                           # LVM_GETITEMRECT
             buf = ctypes.create_string_buffer(16)
             k.ReadProcessMemory(hp, mem, buf, 16, None)
             return struct.unpack('<iiii', buf.raw)
@@ -309,7 +347,7 @@ class App:
             # TVITEMW (x64): mask, hItem +8, pszText +24, cchTextMax +32, iImage +36; the text at +512
             item = struct.pack('<I4xQII', 0x0001 | 0x0002 | 0x0010, hitem, 0, 0) + struct.pack('<QiiiiQ', mem + 512, 256, 0, 0, 0, 0)
             k.WriteProcessMemory(hp, mem, item, len(item), None)
-            u.SendMessageW(self.tree, 0x113E, 0, mem)                          # TVM_GETITEMW
+            send(self.tree, 0x113E, 0, mem)                          # TVM_GETITEMW
             head = ctypes.create_string_buffer(56)
             k.ReadProcessMemory(hp, mem, head, 56, None)
             image = struct.unpack_from('<i', head.raw, 36)[0]
@@ -324,14 +362,14 @@ class App:
         """Every node the navigation pane shows (expanded branches), in display order."""
         TVM_GETNEXTITEM, TVGN_NEXTVISIBLE, TVGN_FIRSTVISIBLE, TVGN_ROOT = 0x110A, 0x0006, 0x0005, 0x0000
         out = []
-        h = u.SendMessageW(self.tree, TVM_GETNEXTITEM, TVGN_ROOT, 0)
+        h = send(self.tree, TVM_GETNEXTITEM, TVGN_ROOT, 0)
         while h:
             out.append(h)
-            h = u.SendMessageW(self.tree, TVM_GETNEXTITEM, TVGN_NEXTVISIBLE, h)
+            h = send(self.tree, TVM_GETNEXTITEM, TVGN_NEXTVISIBLE, h)
         return out
 
     def tree_caret(self):
-        return u.SendMessageW(self.tree, 0x110A, 0x0009, 0)                   # TVGN_CARET
+        return send(self.tree, 0x110A, 0x0009, 0)                   # TVGN_CARET
 
     def tile_columns(self, i):
         """The sub-items a tile shows under item i's name (LVM_GETITEMW with LVIF_COLUMNS)."""
@@ -345,7 +383,7 @@ class App:
             struct.pack_into('<I', item, 56, 4)
             struct.pack_into('<QQ', item, 64, mem + 512, mem + 576)
             k.WriteProcessMemory(hp, mem, bytes(item), len(item), None)
-            u.SendMessageW(self.list, 0x104B, 0, mem)                          # LVM_GETITEMW
+            send(self.list, 0x104B, 0, mem)                          # LVM_GETITEMW
             head = ctypes.create_string_buffer(88)
             k.ReadProcessMemory(hp, mem, head, 88, None)
             n = struct.unpack_from('<I', head.raw, 56)[0]
@@ -359,8 +397,8 @@ class App:
     def search(self, q):
         """Type into the search box and press Enter (a recursive search of the folder)."""
         buf = ctypes.create_unicode_buffer(q)
-        u.SendMessageW(self.search_box, WM_SETTEXT, 0, ctypes.addressof(buf))
-        u.SendMessageW(self.search_box, WM_KEYDOWN, 0x0D, 0)
+        send(self.search_box, WM_SETTEXT, 0, ctypes.addressof(buf))
+        send(self.search_box, WM_KEYDOWN, 0x0D, 0)
 
     def flyout(self):
         """The open Win11 compact context menu, or None."""
@@ -396,14 +434,14 @@ class App:
             time.sleep(0.25)
             for h in top_windows(self.proc.pid):
                 if cls(h) == '#32768' and u.IsWindowVisible(h):
-                    return h, u.SendMessageW(h, MN_GETHMENU, 0, 0)
+                    return h, send(h, MN_GETHMENU, 0, 0)
         return None, None
 
     def close_menus(self):
         fly = self.flyout()
         if fly:
             u.PostMessageW(fly, WM_KEYDOWN, 0x1B, 0)  # Esc
-        u.SendMessageW(self.hwnd, WM_CANCELMODE, 0, 0)
+        send(self.hwnd, WM_CANCELMODE, 0, 0)
         time.sleep(0.3)
 
     def screenshot(self, path):

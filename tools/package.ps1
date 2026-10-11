@@ -7,7 +7,8 @@
     # -> dist/explorer-plus-1.2.0-win-x64.zip and dist/SHA256SUMS.txt
 
 .NOTES
-    Needs MinGW-w64 g++ (with windres) and CMake on PATH, plus Ninja or GNU Make.
+    Needs MinGW-w64 g++ (with windres) and CMake on PATH, plus Ninja, GNU Make (make) or
+    MinGW's mingw32-make.
     Set SIGN_PFX / SIGN_PFX_PASSWORD to sign the exe (Windows SDK signtool).
 #>
 param(
@@ -16,14 +17,17 @@ param(
     [int]$Build = 0,                # fourth version number (CI run number)
     [string]$BuildDir = "build-release",
     [string]$OutDir = "dist",
-    [string]$Generator = ""         # default: Ninja if available, else Unix Makefiles
+    [string]$Generator = ""         # default: Ninja, else Unix Makefiles (make), else MinGW Makefiles
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Push-Location $root
 try {
     if (-not $Generator) {
-        $Generator = if (Get-Command ninja -ErrorAction SilentlyContinue) { "Ninja" } else { "Unix Makefiles" }
+        $Generator = if (Get-Command ninja -ErrorAction SilentlyContinue) { "Ninja" }
+                     elseif (Get-Command make -ErrorAction SilentlyContinue) { "Unix Makefiles" }
+                     elseif (Get-Command mingw32-make -ErrorAction SilentlyContinue) { "MinGW Makefiles" }
+                     else { throw "no build tool: install Ninja or a make" }
     }
     # every version setting is passed each time: CMake caches them across runs
     $cfg = @("-S", ".", "-B", $BuildDir, "-G", $Generator, "-DCMAKE_BUILD_TYPE=Release",
@@ -39,12 +43,16 @@ try {
 
     # optional Authenticode signing: SIGN_PFX (path to a .pfx) + SIGN_PFX_PASSWORD
     if ($env:SIGN_PFX) {
+        # the newest SDK by version (as text, 10.0.9xxx would sort after 10.0.22621)
         $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
-            Sort-Object FullName -Descending | Select-Object -First 1
+            Sort-Object { $v = $null; if ([version]::TryParse($_.Directory.Parent.Name, [ref]$v)) { $v } else { [version]"0.0" } } -Descending |
+            Select-Object -First 1
         if (-not $signtool) { throw "signtool.exe not found (Windows SDK)" }
         & $signtool.FullName sign /fd SHA256 /f $env:SIGN_PFX /p $env:SIGN_PFX_PASSWORD `
             /tr http://timestamp.digicert.com /td SHA256 /d "Explorer Plus" $exe
         if ($LASTEXITCODE) { throw "signing failed" }
+        & $signtool.FullName verify /pa /q $exe        # (a signature that doesn't validate fails here)
+        if ($LASTEXITCODE) { throw "the signature does not verify" }
     }
     $ver = (Get-Item $exe).VersionInfo.ProductVersion
     $name = "explorer-plus-$ver-win-x64"
@@ -74,7 +82,8 @@ try {
     $sums = foreach ($z in $zips) {
         "{0}  {1}" -f (Get-FileHash $z -Algorithm SHA256).Hash.ToLower(), (Split-Path -Leaf $z)
     }
-    Set-Content -Path (Join-Path $OutDir "SHA256SUMS.txt") -Value $sums -Encoding ascii
+    # LF line ends: `sha256sum -c` reads the file name with a trailing CR otherwise
+    [IO.File]::WriteAllText((Join-Path $OutDir "SHA256SUMS.txt"), (($sums -join "`n") + "`n"), [Text.Encoding]::ASCII)
     Write-Host "packaged $zip ($ver)"
     if ($env:GITHUB_OUTPUT) {
         "zip=$zip" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT

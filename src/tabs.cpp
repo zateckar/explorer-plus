@@ -3,6 +3,7 @@
 using std::max;
 using std::min;
 #include "navigation.h"
+#include "enumerate.h"
 #include "settings.h"
 #include "theme.h"
 #include "chrome.h"
@@ -12,6 +13,7 @@ using std::min;
 #include <memory>
 #include "workers.h"
 #include "acc.h"
+#include "kbdrow.h"
 #include <cwctype>
 
 // ------------------------------------------------------------------
@@ -36,7 +38,7 @@ static std::wstring name_of(PCIDLIST_ABSOLUTE p) {
     return n;
 }
 
-static TabState make_tab(PITEMID_CHILD adoptCurrent) {
+static TabState make_tab(PIDLIST_ABSOLUTE adoptCurrent) {
     TabState t;
     t.id = s_nextTabId++;
     t.current = adoptCurrent ? adoptCurrent : pidl_desktop();
@@ -44,7 +46,7 @@ static TabState make_tab(PITEMID_CHILD adoptCurrent) {
     return t;
 }
 
-static TabState make_tab_named(PITEMID_CHILD adoptCurrent, const std::wstring& name) {
+static TabState make_tab_named(PIDLIST_ABSOLUTE adoptCurrent, const std::wstring& name) {
     TabState t;
     t.id = s_nextTabId++;
     t.current = adoptCurrent ? adoptCurrent : pidl_desktop();
@@ -63,7 +65,7 @@ TabState* tabmodel_active() {
     return &s_tabs[g_activeTab];
 }
 
-void tabmodel_on_navigate(PITEMID_CHILD newAbs, bool pushHistory) {
+void tabmodel_on_navigate(PIDLIST_ABSOLUTE newAbs, bool pushHistory) {
     TabState* t = tabmodel_active();
     if (!t) { CoTaskMemFree(newAbs); return; }
     if (!newAbs) newAbs = pidl_desktop();
@@ -80,6 +82,7 @@ void tabmodel_on_navigate(PITEMID_CHILD newAbs, bool pushHistory) {
     }
     t->name = name_of(newAbs);
     if (t->back.size() > 200) { CoTaskMemFree(t->back.front()); t->back.erase(t->back.begin()); }
+    tabs_persist_soon();
 }
 
 bool tabmodel_can_back() { TabState* t = tabmodel_active(); return t && !t->back.empty(); }
@@ -92,6 +95,7 @@ bool tabmodel_go_back() {
     t->current = t->back.back();
     t->back.pop_back();
     t->name = name_of(t->current);
+    tabs_persist_soon();
     return true;
 }
 bool tabmodel_go_forward() {
@@ -101,6 +105,7 @@ bool tabmodel_go_forward() {
     t->current = t->fwd.back();
     t->fwd.pop_back();
     t->name = name_of(t->current);
+    tabs_persist_soon();
     return true;
 }
 
@@ -108,6 +113,7 @@ void tabmodel_switch_to(int idx) {
     if (idx < 0 || idx >= (int)s_tabs.size() || idx == g_activeTab) return;
     g_activeTab = idx;
     navigate_replace(tabmodel_active());
+    tabs_persist_soon();
 }
 
 void tabmodel_new_tab() {
@@ -116,7 +122,7 @@ void tabmodel_new_tab() {
     s_tabs.push_back(std::move(t));
     g_activeTab = (int)s_tabs.size() - 1;
     navigate_replace(tabmodel_active());
-    tabs_persist_now();
+    tabs_persist_soon();
     tabstrip_refresh();
 }
 
@@ -135,7 +141,7 @@ void tabmodel_close_tab(int idx) {
     if (idx < g_activeTab) --g_activeTab;        // keep the same tab active
     if (g_activeTab >= (int)s_tabs.size()) g_activeTab = (int)s_tabs.size() - 1;
     if (wasActive) navigate_replace(tabmodel_active());
-    tabs_persist_now();
+    tabs_persist_soon();
     tabstrip_refresh();
 }
 
@@ -152,7 +158,7 @@ void tabmodel_toggle_pin(int idx) {
     s_tabs[idx].pinned = !s_tabs[idx].pinned;
     sort_pinned_first();
     tabstrip_refresh();
-    tabs_persist_now();
+    tabs_persist_soon();
 }
 
 void tabmodel_duplicate_tab(int idx) {
@@ -162,7 +168,7 @@ void tabmodel_duplicate_tab(int idx) {
     s_tabs.insert(s_tabs.begin() + idx + 1, std::move(t));
     g_activeTab = idx + 1;
     navigate_replace(tabmodel_active());
-    tabs_persist_now();
+    tabs_persist_soon();
     tabstrip_refresh();
 }
 
@@ -179,7 +185,7 @@ void tabmodel_close_others(int idx) {
     int stillActive = index_of_id(activeId);
     g_activeTab = stillActive >= 0 ? stillActive : max(0, index_of_id(keepId));
     if (stillActive < 0) navigate_replace(tabmodel_active());
-    tabs_persist_now();
+    tabs_persist_soon();
     tabstrip_refresh();
 }
 
@@ -198,7 +204,7 @@ int tabmodel_move_tab(int from, int to) {
     if (to > from) --to;
     s_tabs.insert(s_tabs.begin() + to, std::move(t));
     g_activeTab = max(0, index_of_id(activeId));
-    tabs_persist_now();
+    tabs_persist_soon();
     tabstrip_refresh();
     return to;
 }
@@ -232,7 +238,14 @@ static std::wstring tab_persist_path(PCIDLIST_ABSOLUTE p) {
     return s;
 }
 
+// the tab set changed: saved a moment later, once (a tab dragged across the strip, a few
+// folders opened in a row), so it survives a crash without a write per step
+void tabs_persist_soon() {
+    if (g_main && s_persist) SetTimer(g_main, TIMER_TABS_PERSIST, 2000, nullptr);
+}
+
 void tabs_persist_now() {
+    if (g_main) KillTimer(g_main, TIMER_TABS_PERSIST);
     if (s_tabs.empty() || !s_persist) return;      // extra windows don't own the saved tab set
     std::vector<std::wstring> lines;
     int active = 0;
@@ -240,26 +253,16 @@ void tabs_persist_now() {
     settings_set_tabs(lines, active);        // writes the ini immediately
 }
 
-// a share or a mapped network drive: parsing it would wait for the server
-static bool is_network_path(const std::wstring& path) {
-    if (path.rfind(L"\\\\", 0) == 0) return path.rfind(L"\\\\?\\", 0) != 0;
-    if (path.size() >= 2 && iswalpha(path[0]) && path[1] == L':') {
-        WCHAR root[4] = { path[0], L':', L'\\', 0 };
-        return GetDriveTypeW(root) == DRIVE_REMOTE;
-    }
-    return false;
-}
-
-static PITEMID_CHILD parse_persisted(const std::wstring& path) {
+static PIDLIST_ABSOLUTE parse_persisted(const std::wstring& path) {
     if (path.empty() || path == L"::desktop") return pidl_desktop();
     // network tabs open without asking the server (it may be offline: startup would wait
     // for its timeout); the listing, on a worker, finds out whether it is there
-    if (is_network_path(path))
+    if (path_is_network(path))
         if (PIDLIST_ABSOLUTE simple = SHSimpleIDListFromPath(path.c_str()))
-            return reinterpret_cast<PITEMID_CHILD>(simple);
+            return simple;
     PIDLIST_ABSOLUTE p = nullptr;
     if (SUCCEEDED(SHParseDisplayName(path.c_str(), nullptr, &p, 0, nullptr)) && p)
-        return reinterpret_cast<PITEMID_CHILD>(p);
+        return p;
     // path no longer exists: walk to parent until it parses, else Desktop
     std::wstring fb = path;
     while (!fb.empty()) {
@@ -268,7 +271,7 @@ static PITEMID_CHILD parse_persisted(const std::wstring& path) {
         fb.erase(s1);
         if (!fb.empty() && fb.back() == L':') fb += L'\\';
         if (SUCCEEDED(SHParseDisplayName(fb.c_str(), nullptr, &p, 0, nullptr)) && p)
-            return reinterpret_cast<PITEMID_CHILD>(p);
+            return p;
     }
     return pidl_desktop();
 }
@@ -291,7 +294,7 @@ void tabs_deserialize(const std::wstring& tabs, int active) {
             p2 = s + 1;
         }
         while (f.size() < 4) f.push_back(L"");
-        TabState t = is_network_path(f[0]) && !f[1].empty()
+        TabState t = path_is_network(f[0]) && !f[1].empty()
                    ? make_tab_named(parse_persisted(f[0]), f[1])     // (its name needs no server either)
                    : make_tab(parse_persisted(f[0]));
         t.view = int_to_view(_wtoi(f[2].c_str()));
@@ -304,7 +307,7 @@ void tabs_deserialize(const std::wstring& tabs, int active) {
         if (FAILED(SHParseDisplayName(L"shell:::{f874310e-b6b7-47dc-bc84-b9e6b38f5903}", nullptr, &dp, 0, nullptr)) &&
             FAILED(SHGetKnownFolderIDList(FOLDERID_Profile, 0, nullptr, &dp)))
             dp = nullptr;
-        s_tabs.push_back(make_tab(reinterpret_cast<PITEMID_CHILD>(dp)));
+        s_tabs.push_back(make_tab(dp));
     }
     // `active` indexes the saved order: pick the tab first, then let the sort keep it active
     g_activeTab = max(0, min(active, (int)s_tabs.size() - 1));
@@ -332,11 +335,36 @@ void tabmodel_init(const std::wstring& openPath, bool restore) {
     if (openPath.empty()) return;
     // "explorer-plus.exe <folder>": open it in a new, active tab
     PIDLIST_ABSOLUTE p = nullptr;
-    if (openPath == L"::desktop") p = reinterpret_cast<PIDLIST_ABSOLUTE>(pidl_desktop());
-    else if (FAILED(parse_typed(openPath, &p))) p = nullptr;
+    std::wstring netName;                   // a share's tab name, known without the server
+    if (openPath == L"::desktop") {
+        p = pidl_desktop();
+    } else if (path_is_network(openPath)) {
+        // a share or mapped drive opens without asking the server: it may be offline, and
+        // the window would wait for its timeout before it even shows
+        std::wstring path = openPath;
+        while (path.size() > 3 && path.back() == L'\\') path.pop_back();
+        p = SHSimpleIDListFromPath(path.c_str());
+        netName = PathFindFileNameW(path.c_str());
+    } else if (FAILED(parse_typed(openPath, &p))) {
+        p = nullptr;
+    }
     if (!p) {
         if (s_tabs.empty()) tabs_deserialize(L"", 0);      // fresh window, bad path: Home
         return;
+    }
+    // a file: its folder, with the file selected (like "Open file location")
+    if (netName.empty() && !pidl_is_desktop(p)) {
+        com_ptr<IShellItem> si;
+        SFGAOF a = 0;
+        if (SUCCEEDED(SHCreateItemFromIDList(p, IID_PPV_ARGS(si.put()))) && si &&
+            SUCCEEDED(si->GetAttributes(SFGAO_FOLDER, &a)) && !(a & SFGAO_FOLDER)) {
+            PWSTR name = nullptr;
+            if (SUCCEEDED(si->GetDisplayName(SIGDN_PARENTRELATIVEPARSING, &name)) && name) {
+                ILRemoveLastID(p);
+                enum_select_on_arrival(name, p);
+                CoTaskMemFree(name);
+            }
+        }
     }
     for (size_t i = 0; i < s_tabs.size(); ++i) {           // already open: just activate it
         if (pidl_equal(s_tabs[i].current, p)) {
@@ -346,7 +374,8 @@ void tabmodel_init(const std::wstring& openPath, bool restore) {
             return;
         }
     }
-    TabState t = make_tab(reinterpret_cast<PITEMID_CHILD>(p));
+    TabState t = netName.empty() ? make_tab(p)
+                                 : make_tab_named(p, netName);
     t.view = view_for_folder(t.current);
     s_tabs.push_back(std::move(t));
     g_activeTab = (int)s_tabs.size() - 1;
@@ -358,6 +387,7 @@ void tabmodel_init(const std::wstring& openPath, bool restore) {
 
 static HWND s_strip = nullptr;
 static int s_hoverTab = -1;
+static KbdRow s_kbd;                     // keyboard focus: a tab, or "+" (index = tab count)
 static bool s_hoverClose = false;
 static bool s_hoverPlus = false;
 static int s_draggingTab = -1;   // index of tab being drag-reordered
@@ -369,7 +399,7 @@ struct TabUI { RECT rect; RECT close; };
 
 // A tab's icon is looked up on a worker (a share's icon can take the server's timeout);
 // the plain folder icon stands in until it is known.
-struct TabIconJob { ULONGLONG sig; PITEMID_CHILD abs; int icon; };
+struct TabIconJob { ULONGLONG sig; PIDLIST_ABSOLUTE abs; int icon; };
 static constexpr int kIconPending = -2;
 
 static void tab_icon_apply(void* payload) {
@@ -393,7 +423,7 @@ static int tab_icon(PCIDLIST_ABSOLUTE p) {
     auto it = s_iconCache.find(sig);
     if (it != s_iconCache.end()) return it->second == kIconPending ? sys_folder_icon_index(false) : it->second;
     if (s_iconCache.size() > 256) s_iconCache.clear();
-    if (PITEMID_CHILD abs = pidl_clone(p)) {
+    if (PIDLIST_ABSOLUTE abs = pidl_clone(p)) {
         s_iconCache[sig] = kIconPending;
         auto* job = new TabIconJob{ sig, abs, -1 };
         worker_submit([job] { tab_icon_worker(job); });
@@ -499,6 +529,10 @@ static void paint_strip(HWND hwnd) {
         SetTextColor(bp.dc, activeWnd ? p.text : p.textSecondary);
         DrawTextW(bp.dc, s_tabs[i].name.c_str(), -1, &tr,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        if (s_kbd.focus == (int)i) {
+            RECT fr{ u.rect.left + S(2), u.rect.top + S(2), u.rect.right - S(2), u.rect.bottom - S(4) };
+            kbdrow_ring(bp.dc, fr, S(6));
+        }
         if (!s_tabs[i].pinned) {
             if (hover && s_hoverClose) fill_rrect(bp.dc, u.close, S(4), blend(active ? p.layer : p.tabHover, p.text, 0.08));
             draw_glyph(bp.dc, L'\xE711', u.close, p.text, 10);
@@ -506,6 +540,7 @@ static void paint_strip(HWND hwnd) {
     }
     if (s_hoverPlus) fill_rrect(bp.dc, plus, S(4), blend(bg, p.text, 0.07));
     draw_glyph(bp.dc, L'\xE710', plus, p.text, 12);
+    if (s_kbd.focus == (int)uis.size()) kbdrow_ring(bp.dc, plus, S(4));
 }
 
 // screen readers: each tab (selected = the active one), its close button, then "New tab"
@@ -545,6 +580,13 @@ static const AccSource s_acc = [] {
         }
         return c;
     };
+    a.focus = [] {
+        auto v = acc_items();
+        for (int n = 0; n < (int)v.size(); ++n)
+            if ((v[n].plus && s_kbd.focus == (int)s_tabs.size()) || (!v[n].close && !v[n].plus && v[n].tab == s_kbd.focus))
+                return n;
+        return -1;
+    };
     a.action = [](int i) {
         AccTabsItem it = acc_items()[i];
         if (it.plus) tabmodel_new_tab();
@@ -554,8 +596,26 @@ static const AccSource s_acc = [] {
     return a;
 }();
 
+// keyboard: Left / Right through the tabs and "+", Enter / Space switches to the tab (or
+// opens one), Delete closes it
+static void strip_press(int i) {
+    if (i >= (int)s_tabs.size()) tabmodel_new_tab();
+    else if (i != g_activeTab) tabmodel_switch_to(i);
+}
+
 static LRESULT CALLBACK strip_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_SETFOCUS) s_kbd.last = g_activeTab;           // (the ring starts on the active tab)
+    LRESULT kr = 0;
+    if (s_kbd.handle(hwnd, msg, wp, &kr, (int)s_tabs.size() + 1, [](int) { return true; }, strip_press))
+        return kr;
     switch (msg) {
+        case WM_KEYDOWN:
+            if (wp == VK_DELETE && s_kbd.focus >= 0 && s_kbd.focus < (int)s_tabs.size()) {
+                tabmodel_close_tab(s_kbd.focus);                // (pinned: kept)
+                if (s_kbd.focus >= (int)s_tabs.size() + 1) s_kbd.focus = (int)s_tabs.size();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
         case WM_GETOBJECT: return acc_get_object(hwnd, wp, lp, &s_acc);
         case WM_NCHITTEST: {
             // empty strip area belongs to the title bar (drag, double-click, snap)

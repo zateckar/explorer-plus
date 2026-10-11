@@ -6,19 +6,41 @@
 #include <algorithm>
 #include <memory>
 #include <thread>
+#include <unordered_set>
 
 static HWND s_main = nullptr;
 static UINT s_changeMsg = 0;
 static ULONG s_regId = 0;
-static PITEMID_CHILD s_folder = nullptr;           // the watched folder
-static PITEMID_CHILD s_parent = nullptr;           // its parent, also watched (local folders)
+static PIDLIST_ABSOLUTE s_folder = nullptr;        // the watched folder
+static PIDLIST_ABSOLUTE s_parent = nullptr;        // its parent, also watched (local folders)
 static bool s_listChanged = false;                 // a change the list has to show
 // the list's changes item by item (full paths), unless a change needs a full re-listing
 static std::vector<std::wstring> s_changedPaths;
+static std::unordered_set<std::wstring> s_changedSet;  // the same, lowercased: each path once
 static bool s_fullRefresh = false;
-static const size_t kMaxItemChanges = 200;          // more: re-list the folder instead
+static const size_t kMaxItemChanges = 200;          // more files: re-list the folder instead
+
+// a file changed (a download growing reports itself many times: it counts once);
+// too many different files make it a full re-listing
+static void add_changed(const std::wstring& path) {
+    if (s_fullRefresh) return;
+    std::wstring k = path;
+    CharLowerBuffW(k.data(), (DWORD)k.size());
+    if (!s_changedSet.insert(std::move(k)).second) return;
+    s_changedPaths.push_back(path);
+    if (s_changedPaths.size() > kMaxItemChanges) {
+        s_fullRefresh = true;
+        s_changedPaths.clear();
+        s_changedSet.clear();
+    }
+}
+
+static void clear_changed() {
+    s_changedPaths.clear();
+    s_changedSet.clear();
+}
 static const UINT kBusyRetryMs = 300;               // the list is busy: apply the changes after this
-static std::vector<PITEMID_CHILD> s_treeParents;   // tree nodes whose children changed
+static std::vector<PIDLIST_ABSOLUTE> s_treeParents;   // tree nodes whose children changed
 
 static const UINT kDebounceMs = 200;    // coalesce bursts (copying 1000 files = 1 refresh)
 static const ULONGLONG kMaxWaitMs = 1000;   // ... but a steady stream (a download) still shows
@@ -29,7 +51,7 @@ static int s_hold = 0;                      // our own file operations running (
 // Direct directory watch (folders on fixed drives). For changes made outside the shell,
 // the shell's notifications mostly come as one "folder updated" (SHCNE_UPDATEDIR) with no
 // item: ReadDirectoryChangesW names each file, so the list can update just those.
-// (Not on removable drives: the open handle would stop "Safely remove"; not on shares.)
+// (Not on removable or USB disks: the open handle would stop "Safely remove"; not on shares.)
 
 struct DirWatch {
     HANDLE dir = INVALID_HANDLE_VALUE;
@@ -51,20 +73,24 @@ struct DirChanges {
     std::vector<std::wstring> paths;
     bool overflow = false;            // too many to name (or the folder went): re-list
     bool structure = false;           // a name came or went (the tree may care)
+    bool ended = false;               // the watch failed and its thread is gone
 };
 
 static void arm_refresh_timer();
+static void stop_dir_watch();
 
 static void dir_changes_apply(void* payload) {
     std::unique_ptr<DirChanges> c(static_cast<DirChanges*>(payload));
     if (c->gen != s_dirGen) return;
+    // a dead watch lets go of the folder (its handle would keep a deleted folder
+    // "delete pending"); the refresh below opens a new one if the folder is still there
+    if (c->ended) stop_dir_watch();
     s_listChanged = true;
     if (c->overflow) {
         s_fullRefresh = true;
-        s_changedPaths.clear();
-    } else if (!s_fullRefresh) {
-        s_changedPaths.insert(s_changedPaths.end(), c->paths.begin(), c->paths.end());
-        if (s_changedPaths.size() > kMaxItemChanges) { s_fullRefresh = true; s_changedPaths.clear(); }
+        clear_changed();
+    } else {
+        for (auto& p : c->paths) add_changed(p);
     }
     if (c->structure && s_folder) s_treeParents.push_back(pidl_clone(s_folder));   // its subfolders
     if (perf_on()) perf_event("watch.dir", -1, (long long)c->paths.size(), c->overflow ? L"overflow" : nullptr);
@@ -92,6 +118,7 @@ static void dir_watch_thread(std::shared_ptr<DirWatch> w) {
         }
         auto* c = new DirChanges;
         c->gen = w->gen;
+        c->ended = failed;
         if (failed || got == 0) {
             c->overflow = true;          // buffer overflow; or the folder went: the refresh finds out
         } else {
@@ -120,8 +147,7 @@ static void stop_dir_watch() {
 static void start_dir_watch(const std::wstring& path) {
     stop_dir_watch();
     if (path.size() < 3 || path[1] != L':' || path[2] != L'\\') return;
-    WCHAR root[4] = { path[0], L':', L'\\', 0 };
-    if (GetDriveTypeW(root) != DRIVE_FIXED) return;
+    if (!path_on_internal_drive(path)) return;     // (a USB disk reports itself as fixed)
     DWORD a = GetFileAttributesW(path.c_str());
     if (a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY)) return;   // (a zip is a file)
     auto w = std::make_shared<DirWatch>();
@@ -156,7 +182,7 @@ void deregister_current_watch() {
     // changes of the folder left behind no longer matter
     s_listChanged = false;
     s_fullRefresh = false;
-    s_changedPaths.clear();
+    clear_changed();
 }
 
 void watcher_register_for(PCIDLIST_ABSOLUTE folder) {
@@ -169,7 +195,7 @@ void watcher_register_for(PCIDLIST_ABSOLUTE folder) {
         return;
     }
     deregister_current_watch();
-    PITEMID_CHILD root = folder ? nullptr : pidl_desktop();
+    PIDLIST_ABSOLUTE root = folder ? nullptr : pidl_desktop();
     s_folder = pidl_clone(folder ? folder : root);
     SHChangeNotifyEntry ent[2]{};
     ent[0].pidl = s_folder;
@@ -202,7 +228,7 @@ void watcher_register_for(PCIDLIST_ABSOLUTE folder) {
 static bool touches_folder(PCIDLIST_ABSOLUTE item) {
     if (!s_parent || !item) return true;
     if (pidl_equal(item, s_folder)) return true;
-    PITEMID_CHILD up = pidl_clone(item);
+    PIDLIST_ABSOLUTE up = pidl_clone(item);
     bool inside = up && ILRemoveLastID(up) && pidl_equal(up, s_folder);
     if (up) CoTaskMemFree(up);
     return inside;
@@ -221,11 +247,11 @@ static void note_change(LONG event, PIDLIST_ABSOLUTE* pidls) {
     for (int i = 0; itemized && i < 2; ++i) {
         if (i == 1 && !(event & (SHCNE_RENAMEITEM | SHCNE_RENAMEFOLDER))) break;
         if (!pidls[i] || !SHGetPathFromIDListW(pidls[i], path)) itemized = false;   // (not a file)
-        else s_changedPaths.push_back(path);
+        else add_changed(path);
     }
-    if (!itemized || s_changedPaths.size() > kMaxItemChanges) {
+    if (!itemized) {
         s_fullRefresh = true;
-        s_changedPaths.clear();
+        clear_changed();
     }
     if (perf_on()) {
         WCHAR d[MAX_PATH + 40] = L"";
@@ -246,7 +272,7 @@ void watcher_on_message(WPARAM wp, LPARAM lp) {
     // folder-level changes also touch the tree: remember the parent node to re-list
     if ((event & (SHCNE_MKDIR | SHCNE_RMDIR | SHCNE_RENAMEFOLDER | SHCNE_DRIVEADD |
                   SHCNE_DRIVEREMOVED | SHCNE_MEDIAINSERTED | SHCNE_MEDIAREMOVED)) && pidls && pidls[0]) {
-        PITEMID_CHILD parent = pidl_clone(pidls[0]);
+        PIDLIST_ABSOLUTE parent = pidl_clone(pidls[0]);
         if (parent && ILRemoveLastID(parent)) s_treeParents.push_back(parent);
         else if (parent) CoTaskMemFree(parent);
     }
@@ -301,14 +327,14 @@ void watcher_on_timer() {
             if (r == ChangeApply::Unsupported) navigation_refresh();
             s_listChanged = false;
             s_fullRefresh = false;
-            s_changedPaths.clear();
+            clear_changed();
         }
     } else {
         s_listChanged = false;
         s_fullRefresh = false;
-        s_changedPaths.clear();
+        clear_changed();
     }
-    std::vector<PITEMID_CHILD> parents;
+    std::vector<PIDLIST_ABSOLUTE> parents;
     parents.swap(s_treeParents);
     for (size_t i = 0; i < parents.size(); ++i) {
         bool dup = false;

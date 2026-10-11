@@ -3,6 +3,7 @@
 #include "tabs.h"
 #include "theme.h"
 #include "acc.h"
+#include "kbdrow.h"
 
 // Segoe Fluent Icons / MDL2 share these code points
 // The last one, "...", holds the command bar's commands while that row is hidden.
@@ -16,6 +17,7 @@ static int count() { return g_cmdBarVisible ? kMax - 1 : kMax; }
 
 static HWND s_bar = nullptr, s_tip = nullptr;
 static int s_hover = -1, s_pressed = -1;
+static KbdRow s_kbd;
 
 static int btn_w() { return S(36); }
 int navbar_width() { return count() * btn_w() + (count() - 1) * S(4); }
@@ -87,14 +89,20 @@ static const AccSource s_acc = [] {
         if (!btn_enabled(i)) c.state |= STATE_SYSTEM_UNAVAILABLE;
         if (s_hover == i) c.state |= STATE_SYSTEM_HOTTRACKED;
         if (s_pressed == i) c.state |= STATE_SYSTEM_PRESSED;
+        c.state |= STATE_SYSTEM_FOCUSABLE | (s_kbd.focus == i ? STATE_SYSTEM_FOCUSED : 0);
         c.action = L"Press";
         return c;
     };
     a.action = [](int i) { PostMessageW(g_main, WM_COMMAND, MAKEWPARAM(kCmd[i], 0), 0); };
+    a.focus = [] { return s_kbd.focus; };
     return a;
 }();
 
 static LRESULT CALLBACK bar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    LRESULT kr = 0;
+    if (s_kbd.handle(hwnd, msg, wp, &kr, count(), btn_enabled,
+                     [](int i) { SendMessageW(g_main, WM_COMMAND, MAKEWPARAM(kCmd[i], 0), 0); }))
+        return kr;
     switch (msg) {
         case WM_GETOBJECT: return acc_get_object(hwnd, wp, lp, &s_acc);
         case WM_CREATE: add_tooltips(hwnd); return 0;
@@ -110,6 +118,7 @@ static LRESULT CALLBACK bar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (en && (s_hover == i || s_pressed == i))
                     fill_rrect(bp.dc, r, S(4), s_pressed == i ? p.pressed : p.hover);
                 draw_glyph(bp.dc, kGlyph[i], r, en ? p.text : p.textDisabled, 16);
+                if (s_kbd.focus == i) kbdrow_ring(bp.dc, r, S(4));
             }
             return 0;
         }

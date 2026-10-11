@@ -60,6 +60,7 @@
 // ---- focus / misc accelerators ----
 #define IDM_FOCUS_ADDRESS 40096
 #define IDM_FOCUS_SEARCH  40097
+#define IDM_FOCUS_LIST    40099     // (Tab / F6 out of the preview)
 
 // ---- command bar ----
 #define IDC_CMDBAR        1009

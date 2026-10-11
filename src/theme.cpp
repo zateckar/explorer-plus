@@ -43,8 +43,36 @@ static bool apps_dark() {
     return v == 0;
 }
 
+// High Contrast: the user's system colours, not ours
+static bool s_highContrast = false;
+
+static bool high_contrast_on() {
+    HIGHCONTRASTW hc{ sizeof(hc) };
+    return SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(hc), &hc, 0) && (hc.dwFlags & HCF_HIGHCONTRASTON);
+}
+
+static bool dark_now() {
+    if (!s_highContrast) return apps_dark();
+    COLORREF w = GetSysColor(COLOR_WINDOW);     // (a dark HC theme: dark scrollbars and menus)
+    return GetRValue(w) * 299 + GetGValue(w) * 587 + GetBValue(w) * 114 < 128 * 1000;
+}
+
 static void build_palette() {
     Palette& p = s_pal;
+    if (s_highContrast) {
+        COLORREF window = GetSysColor(COLOR_WINDOW), text = GetSysColor(COLOR_WINDOWTEXT);
+        COLORREF face = GetSysColor(COLOR_BTNFACE);
+        p.caption = p.captionInactive = p.layer = face;
+        p.content = p.boxFill = window;
+        p.text = p.textSecondary = text;
+        p.textDisabled = GetSysColor(COLOR_GRAYTEXT);
+        p.divider = p.boxBorder = p.boxBottom = text;
+        // (hover / pressed fills sit under p.text: a shade of the background, not Highlight)
+        p.hover = p.tabHover = blend(face, text, 0.15);
+        p.pressed = blend(face, text, 0.25);
+        p.accent = p.closeHover = GetSysColor(COLOR_HIGHLIGHT);
+        return;
+    }
     if (g_dark) {
         p.caption         = RGB(32, 32, 32);
         p.captionInactive = RGB(40, 40, 40);
@@ -100,14 +128,15 @@ static void load_dark_api() {
 }
 
 static void apply_app_mode() {
-    if (s_setAppMode) s_setAppMode(g_dark ? 2 /*ForceDark*/ : 3 /*ForceLight*/);
+    if (s_setAppMode) s_setAppMode(s_highContrast ? 0 /*Default*/ : g_dark ? 2 /*ForceDark*/ : 3 /*ForceLight*/);
     if (s_flushMenus) s_flushMenus();        // popup menus follow the theme
 }
 
 void theme_init() {
     Gdiplus::GdiplusStartupInput in;
     Gdiplus::GdiplusStartup(&s_gdipToken, &in, nullptr);
-    g_dark = apps_dark();
+    s_highContrast = high_contrast_on();
+    g_dark = dark_now();
     build_palette();
     load_dark_api();
     apply_app_mode();
@@ -131,14 +160,19 @@ void theme_shutdown() {
 }
 
 bool theme_reload() {
-    bool dark = apps_dark();
-    COLORREF oldAccent = s_pal.accent;
+    bool hc = high_contrast_on();
+    bool hcChanged = hc != s_highContrast;
+    s_highContrast = hc;
+    bool dark = dark_now();
+    Palette old = s_pal;
     bool changed = dark != g_dark;
     g_dark = dark;
     build_palette();
-    if (changed) apply_app_mode();
-    return changed || oldAccent != s_pal.accent;
+    if (changed || hcChanged) apply_app_mode();
+    return changed || hcChanged || memcmp(&old, &s_pal, sizeof(old)) != 0;
 }
+
+bool theme_high_contrast() { return s_highContrast; }
 
 int theme_dpi() { return s_dpi; }
 
@@ -368,8 +402,9 @@ void theme_apply_controls() {
     const Palette& p = pal();
     auto dark_win = [](HWND h, const wchar_t* darkTheme, const wchar_t* lightTheme) {
         if (!h) return;
-        if (s_allowDark) s_allowDark(h, g_dark);
-        SetWindowTheme(h, g_dark ? darkTheme : lightTheme, nullptr);
+        bool dark = g_dark && !s_highContrast;        // (High Contrast: the system's own look)
+        if (s_allowDark) s_allowDark(h, dark);
+        SetWindowTheme(h, dark ? darkTheme : lightTheme, nullptr);
         SendMessageW(h, WM_THEMECHANGED, 0, 0);
     };
     if (g_list) {

@@ -1,4 +1,5 @@
 #include "navigation.h"
+#include "cmdline.h"
 #include "tabs.h"
 #include "settings.h"
 #include "watcher.h"
@@ -91,7 +92,7 @@ void views_reset_all() {
 }
 
 // ordinary navigation within the active tab (pushes history)
-void navigate_owned(PITEMID_CHILD pidl) {
+void navigate_owned(PIDLIST_ABSOLUTE pidl) {
     if (!pidl) pidl = pidl_desktop();
     TabState* t = tabmodel_active();
     if (t && pidl_equal(t->current, pidl)) {        // same folder: just refresh
@@ -128,7 +129,7 @@ void navigation_open_abs(PCIDLIST_ABSOLUTE abs) {
                 if (SUCCEEDED(SHCreateItemFromIDList(target, IID_PPV_ARGS(ti.put()))) && ti)
                     ti->GetAttributes(SFGAO_FOLDER | SFGAO_STREAM, &ta);
                 if ((ta & SFGAO_FOLDER) && !(ta & SFGAO_STREAM)) {
-                    navigate_owned(reinterpret_cast<PITEMID_CHILD>(target));
+                    navigate_owned(target);
                     return;
                 }
                 CoTaskMemFree(target);
@@ -193,24 +194,9 @@ void navigate_path_text(const std::wstring& text) {
     auto* job = new TypedNav{ ++s_typedGen, text, {} };
     WCHAR fsDir[MAX_PATH]{};
     if (!pidl_is_desktop(g_current) &&
-        SHGetPathFromIDListW(const_cast<LPITEMIDLIST>((LPCITEMIDLIST)g_current), fsDir))
+        SHGetPathFromIDListW(g_current, fsDir))
         job->fsDir = fsDir;
     worker_submit([job] { typed_worker(job); });
-}
-
-// an argument for CommandLineToArgvW: quoted, with the backslashes before the closing
-// quote doubled ("C:\" would otherwise arrive as C:")
-static std::wstring quote_arg(const std::wstring& s) {
-    std::wstring q = L"\"";
-    size_t slashes = 0;
-    for (wchar_t c : s) {
-        if (c == L'\\') { ++slashes; q += c; continue; }
-        if (c == L'"') q.append(slashes + 1, L'\\');      // (not in paths; kept correct anyway)
-        slashes = 0;
-        q += c;
-    }
-    q.append(slashes, L'\\');
-    return q + L"\"";
 }
 
 // another window on `folder` (a separate process, as each window keeps its own
@@ -219,7 +205,7 @@ void navigation_open_new_window(PCIDLIST_ABSOLUTE folder) {
     WCHAR exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     std::wstring path = pidl_is_desktop(folder) ? L"::desktop" : pidl_folder_path(folder);
-    std::wstring cmd = quote_arg(exe) + L" --new-window " + quote_arg(path);
+    std::wstring cmd = quote_command_arg(exe) + L" --new-window " + quote_command_arg(path);
     STARTUPINFOW si{ sizeof(si) };
     PROCESS_INFORMATION pi{};
     if (CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
@@ -243,7 +229,7 @@ void navigation_go_forward() {
 }
 
 // replace the current folder without a history entry (it was deleted, renamed, ...)
-void navigate_in_place(PITEMID_CHILD pidl) {
+void navigate_in_place(PIDLIST_ABSOLUTE pidl) {
     tabmodel_on_navigate(pidl, false);  // adopts pidl
     TabState* t = tabmodel_active();
     if (!t) return;
@@ -254,7 +240,7 @@ bool navigation_can_up() { return !pidl_is_desktop(g_current); }
 void navigation_go_up() {
     if (!navigation_can_up()) return;
     if (PCIDLIST_ABSOLUTE scope = search_scope_of(g_current)) { navigate_to(scope); return; }   // results -> searched folder
-    PITEMID_CHILD parent = pidl_clone(g_current);
+    PIDLIST_ABSOLUTE parent = pidl_clone(g_current);
     if (!parent) return;
     ILRemoveLastID(parent);       // a top-level item leaves the empty (Desktop) pidl
     navigate_owned(parent);
@@ -265,7 +251,7 @@ void navigation_refresh() { start_enum_current(true); }
 // folder above it that still exists, in place (Back must not lead into the void).
 bool navigation_leave_if_gone() {
     if (search_is_results(g_current) || !fs_folder_missing(g_current)) return false;
-    PITEMID_CHILD up = pidl_clone(g_current);
+    PIDLIST_ABSOLUTE up = pidl_clone(g_current);
     while (up && !pidl_is_desktop(up) && fs_folder_missing(up)) ILRemoveLastID(up);
     if (!up) return false;
     if (perf_on()) perf_event("nav.leave_gone", -1, -1, pidl_folder_path(up).c_str());

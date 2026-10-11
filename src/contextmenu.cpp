@@ -10,6 +10,8 @@
 #include "settings.h"
 #include "theme.h"
 #include "perf.h"
+#include "detailspane.h"
+#include "searchbox.h"
 #include <algorithm>
 #include <map>
 
@@ -140,10 +142,10 @@ static bool key_down(int vk) { return (GetKeyState(vk) & 0x8000) != 0; }
 
 static void invoke_id(HWND hwnd, IContextMenu* cm, UINT id, POINT pt, PCIDLIST_ABSOLUTE folder,
                       bool async = true) {
-    std::wstring dir = pidl_folder_path(folder);
+    // a working directory only where the folder is one on disk (Home's "shell:::{...}" or
+    // a search's "search-ms:..." would make a launched program fail to start)
     WCHAR dirBuf[MAX_PATH]{};
-    bool haveDir = !dir.empty() && dir.size() < MAX_PATH && dir.find(L"::") != 0;
-    if (haveDir) wcscpy_s(dirBuf, dir.c_str());
+    bool haveDir = folder && SHGetPathFromIDListEx(folder, dirBuf, MAX_PATH, GPFIDL_DEFAULT) && dirBuf[0];
     char dirA[MAX_PATH]{};
     if (haveDir) WideCharToMultiByte(CP_ACP, 0, dirBuf, -1, dirA, MAX_PATH, nullptr, nullptr);
 
@@ -350,10 +352,14 @@ static UINT item_flyout(HWND hwnd, IContextMenu* cm, HMENU m, POINT pt, bool fol
     std::vector<HICON> icons;
     std::vector<const ShellEntry*> used;
     fly_promoted(list, items, icons, used);
+    // (an item the user promoted is listed up there only)
+    auto taken = [&](const ShellEntry* e) { return std::find(used.begin(), used.end(), e) != used.end(); };
     for (auto& e : items)
         if (e.isDefault && !e.sub) {
+            if (taken(&e)) break;
             list.push_back(fly_from(e, L'\xE8E5'));
             list.back().bold = true;
+            used.push_back(&e);
             break;
         }
     if (folder) {
@@ -362,7 +368,7 @@ static UINT item_flyout(HWND hwnd, IContextMenu* cm, HMENU m, POINT pt, bool fol
     }
     for (auto& e : items)
         if (e.sub && plain_text(lower(e.text)).rfind(L"open with", 0) == 0) {
-            list.push_back(fly_from(e, L'\xE7AC'));
+            if (!taken(&e)) { list.push_back(fly_from(e, L'\xE7AC')); used.push_back(&e); }
             break;
         }
     static const struct { const wchar_t* verb; wchar_t glyph; const wchar_t* accel; } kCore[] = {
@@ -372,7 +378,10 @@ static UINT item_flyout(HWND hwnd, IContextMenu* cm, HMENU m, POINT pt, bool fol
         { L"properties", L'\xE90F', L"Alt+Enter" },
     };
     for (auto& c : kCore)
-        if (auto e = find_verb(items, c.verb)) list.push_back(fly_from(*e, c.glyph, c.accel));
+        if (auto e = find_verb(items, c.verb); e && !taken(e)) {
+            list.push_back(fly_from(*e, c.glyph, c.accel));
+            used.push_back(e);
+        }
     fly_app_verbs(list, items, used);
     fly_finish(list);
     UINT id = flyout_track(hwnd, pt, row, list);
@@ -416,6 +425,17 @@ static bool is_plain_folder(IShellFolder* parent, PCUITEMID_CHILD child) {
 
 enum class MenuSource { List, Tree };
 
+// verbs that never touch the files themselves (the preview can stay)
+static bool verb_keeps_files(const std::wstring& verb) {
+    static const wchar_t* const kKeep[] = {
+        L"properties", L"copyaspath", L"pintohome", L"unpinfromhome", L"pintohomefile",
+        L"unpinfromhomefile", L"PinToStartScreen", L"Windows.ModernShare", L"Windows.Share",
+    };
+    for (auto k : kKeep)
+        if (lstrcmpiW(verb.c_str(), k) == 0) return true;
+    return false;
+}
+
 static void show_cm(HWND hwnd, POINT pt, IShellFolder* parent, PCIDLIST_ABSOLUTE folderAbs,
                     PCUITEMID_CHILD_ARRAY apidl, UINT cidl, MenuSource src) {
     com_ptr<IContextMenu> cm;
@@ -435,24 +455,30 @@ static void show_cm(HWND hwnd, POINT pt, IShellFolder* parent, PCIDLIST_ABSOLUTE
 
     bool single = cidl == 1;
     bool folder = single && is_plain_folder(parent, apidl[0]);
-    auto full = [&]() { return static_cast<PITEMID_CHILD>(ILCombine(folderAbs, apidl[0])); };
+    // the folder itself; one found by a search at its real location (as double-click does)
+    auto full = [&]() {
+        PIDLIST_ABSOLUTE f = ILCombine(folderAbs, apidl[0]);
+        if (f && search_is_results(folderAbs))
+            if (PIDLIST_ABSOLUTE real = search_real_location(f)) { CoTaskMemFree(f); f = real; }
+        return f;
+    };
     UINT id = track(hwnd, cm.get(), m, pt, [&] { return item_flyout(hwnd, cm.get(), m, pt, folder); });
     if (id == kFlyNewTab) {
-        PITEMID_CHILD f = full();
+        PIDLIST_ABSOLUTE f = full();
         tabmodel_new_tab();
         navigate_owned(f);
     } else if (id == kFlyNewWindow) {
-        PITEMID_CHILD f = full();
+        PIDLIST_ABSOLUTE f = full();
         navigation_open_new_window(f);
         CoTaskMemFree(f);
     } else if (id >= kIdFirst && id <= kIdLast) {
         std::wstring verb = verb_of(cm.get(), id);
         // verbs the app handles itself so they act inside this window
         if ((verb == L"open" || verb == L"explore") && folder) {
-            PITEMID_CHILD f = full();
+            PIDLIST_ABSOLUTE f = full();
             navigate_owned(f);
         } else if (verb == L"opennewtab" && folder) {
-            PITEMID_CHILD f = full();
+            PIDLIST_ABSOLUTE f = full();
             tabmodel_new_tab();
             navigate_owned(f);
         } else if (verb == L"rename") {
@@ -460,12 +486,17 @@ static void show_cm(HWND hwnd, POINT pt, IShellFolder* parent, PCIDLIST_ABSOLUTE
             else tree_rename_menu_node();
         } else if (verb == L"delete" && src == MenuSource::Tree) {
             tree_delete_menu_node(key_down(VK_SHIFT));     // moves on to the next folder
+        } else if (verb == L"delete") {
+            list_delete_selection(key_down(VK_SHIFT));     // as the Delete key (preview, watcher)
         } else if ((verb == L"cut" || verb == L"copy") && src == MenuSource::List) {
             list_copy_selection(verb == L"cut");
         } else {
+            // a verb may move, compress or open the file for writing: the preview handler
+            // lets go of it first (it comes back with the next selection change)
+            if (src == MenuSource::List && !verb_keeps_files(verb)) detailspane_release_files();
             invoke_id(hwnd, cm.get(), id, pt, folderAbs);
             // Pin to / Unpin from Quick access changes the navigation pane
-            if (verb == L"pintohome" || verb == L"unpinfromhome") tree_refresh_all_deferred();
+            if (verb == L"pintohome" || verb == L"unpinfromhome") tree_reread_pins();
         }
     }
     DestroyMenu(m);
@@ -481,8 +512,8 @@ void show_items_context_menu(HWND hwnd, POINT pt) {
     if (FAILED(bind_list(g_current, IID_PPV_ARGS(parent.put()))) || !parent) return;
     // clone: a refresh while the menu is up would free the rows' pidls
     std::vector<PITEMID_CHILD> own;
-    for (auto c : sel) own.push_back(pidl_clone(c));
-    PITEMID_CHILD folder = current_clone();
+    for (auto c : sel) own.push_back(pidl_clone_child(c));
+    PIDLIST_ABSOLUTE folder = current_clone();
     show_cm(hwnd, pt, parent.get(), folder,
             (PCUITEMID_CHILD_ARRAY)own.data(), (UINT)own.size(), MenuSource::List);
     for (auto c : own) CoTaskMemFree(c);
@@ -507,7 +538,7 @@ void show_tree_context_menu(HWND hwnd, POINT pt, PCIDLIST_ABSOLUTE abs) {
     com_ptr<IShellFolder> parent;
     PCUITEMID_CHILD child = nullptr;
     if (FAILED(bind_parent(abs, parent.put(), &child)) || !parent || !child) return;
-    PITEMID_CHILD parentAbs = pidl_clone(abs);
+    PIDLIST_ABSOLUTE parentAbs = pidl_clone(abs);
     ILRemoveLastID(parentAbs);
     show_cm(hwnd, pt, parent.get(), parentAbs, &child, 1, MenuSource::Tree);
     CoTaskMemFree(parentAbs);
@@ -574,7 +605,8 @@ static UINT bg_flyout(HWND hwnd, IContextMenu* cm, HMENU m, POINT pt, HMENU view
         sub(newSub, L"Ne&w", L'\xE710');
     }
     fly_separator(list);
-    if (auto e = find_verb(items, L"properties")) list.push_back(fly_from(*e, L'\xE90F', L"Alt+Enter"));
+    if (auto e = find_verb(items, L"properties"); e && std::find(used.begin(), used.end(), e) == used.end())
+        list.push_back(fly_from(*e, L'\xE90F', L"Alt+Enter"));
     fly_app_verbs(list, items, used);
     fly_finish(list);
     UINT id = flyout_track(hwnd, pt, row, list);
@@ -606,7 +638,8 @@ void show_bg_context_menu(HWND hwnd, POINT pt) {
     if (cm) {
         for (int i = (int)fixed; i < GetMenuItemCount(m); ++i) {
             if (verb_of(cm.get(), GetMenuItemID(m, i)) == L"paste") {
-                DeleteMenu(m, IDM_EDIT_PASTE, MF_BYCOMMAND);
+                // (ours sits right before the shell's items: they now start one earlier)
+                if (DeleteMenu(m, IDM_EDIT_PASTE, MF_BYCOMMAND)) --fixed;
                 break;
             }
         }
@@ -667,32 +700,41 @@ void show_new_menu(HWND hwnd, POINT pt, UINT tpmAlign) {
     if (id >= kIdFirst && id <= kIdLast) invoke_new_item(hwnd, cm.get(), id, pt);
     DestroyMenu(host);
 }
+static bool invoke_verb_with(HWND hwnd, IShellFolder* parent, PIDLIST_ABSOLUTE folderAbs /*adopted*/,
+                             std::vector<PITEMID_CHILD>& own /*adopted*/, const char* verb);
+
 // invoke a canonical verb ("properties", "Windows.ModernShare", ...) on the
 // selection, or on the current folder itself when nothing is selected
 bool contextmenu_invoke_verb(HWND hwnd, const char* verb) {
     auto sel = list_selected_pidls();
+    if (sel.empty()) return contextmenu_invoke_verb_on(hwnd, g_current, verb);
     com_ptr<IShellFolder> parent;
+    if (FAILED(bind_list(g_current, IID_PPV_ARGS(parent.put())))) return false;
     std::vector<PITEMID_CHILD> own;
-    PITEMID_CHILD folderAbs = nullptr;
-    if (!sel.empty()) {
-        if (FAILED(bind_list(g_current, IID_PPV_ARGS(parent.put())))) return false;
-        for (auto c : sel) own.push_back(pidl_clone(c));
-        folderAbs = current_clone();
-    } else {
-        PCUITEMID_CHILD child = nullptr;
-        if (FAILED(bind_parent(g_current, parent.put(), &child)) || !child) return false;
-        own.push_back(pidl_clone(child));
-        folderAbs = current_clone();
-        ILRemoveLastID(folderAbs);
-    }
+    for (auto c : sel) own.push_back(pidl_clone_child(c));
+    return invoke_verb_with(hwnd, parent.get(), current_clone(), own, verb);
+}
+
+bool contextmenu_invoke_verb_on(HWND hwnd, PCIDLIST_ABSOLUTE item, const char* verb) {
+    com_ptr<IShellFolder> parent;
+    PCUITEMID_CHILD child = nullptr;
+    if (FAILED(bind_parent(item, parent.put(), &child)) || !child) return false;
+    std::vector<PITEMID_CHILD> own{ pidl_clone_child(child) };
+    PIDLIST_ABSOLUTE folderAbs = pidl_clone(item);
+    ILRemoveLastID(folderAbs);
+    return invoke_verb_with(hwnd, parent.get(), folderAbs, own, verb);
+}
+
+static bool invoke_verb_with(HWND hwnd, IShellFolder* parent, PIDLIST_ABSOLUTE folderAbs,
+                             std::vector<PITEMID_CHILD>& own, const char* verb) {
     bool ok = false;
     com_ptr<IContextMenu> cm;
-    if (SUCCEEDED(item_menu(hwnd, parent.get(), folderAbs,
+    if (SUCCEEDED(item_menu(hwnd, parent, folderAbs,
                             (PCUITEMID_CHILD_ARRAY)own.data(), (UINT)own.size(), cm)) && cm) {
         HMENU m = CreatePopupMenu();
         HRESULT hr;
         {
-            MediaPropsOff fast(parent.get(), (PCUITEMID_CHILD_ARRAY)own.data(), (UINT)own.size());
+            MediaPropsOff fast(parent, (PCUITEMID_CHILD_ARRAY)own.data(), (UINT)own.size());
             hr = cm->QueryContextMenu(m, 0, kIdFirst, kIdLast, CMF_NORMAL);
         }
         if (SUCCEEDED(hr)) {
@@ -719,4 +761,9 @@ void contextmenu_properties(HWND hwnd) {
     // virtual roots without a parent item
     if (pidl_is_desktop(g_current) || list_selected_pidls().empty())
         SHObjectProperties(hwnd, SHOP_FILEPATH, pidl_folder_path(g_current).c_str(), nullptr);
+}
+
+void contextmenu_properties_of(HWND hwnd, PCIDLIST_ABSOLUTE item) {
+    if (!contextmenu_invoke_verb_on(hwnd, item, "properties"))
+        SHObjectProperties(hwnd, SHOP_FILEPATH, pidl_folder_path(item).c_str(), nullptr);
 }

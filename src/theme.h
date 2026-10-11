@@ -27,7 +27,8 @@ extern bool g_dark;                  // apps use the dark theme
 
 void theme_init();                   // read theme + accent, start GDI+
 void theme_shutdown();
-bool theme_reload();                 // WM_SETTINGCHANGE: true when light/dark or accent changed
+bool theme_reload();                 // WM_SETTINGCHANGE: true when light/dark, accent or system colours changed
+bool theme_high_contrast();          // High Contrast is on (the palette is the system colours)
 const Palette& pal();
 
 // --- DPI ---

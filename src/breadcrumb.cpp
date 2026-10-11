@@ -9,7 +9,7 @@ using std::min;
 #include <algorithm>
 
 struct Crumb {
-    PITEMID_CHILD abs = nullptr;    // owned
+    PIDLIST_ABSOLUTE abs = nullptr; // owned
     std::wstring name;
     RECT chevron{}, text{};         // layout (client coords); empty = hidden (overflow)
 };
@@ -34,7 +34,7 @@ static void free_crumbs() {
 
 static void rebuild_crumbs() {
     free_crumbs();
-    PITEMID_CHILD p = current_clone();
+    PIDLIST_ABSOLUTE p = current_clone();
     while (p && !pidl_is_desktop(p)) {
         Crumb c;
         c.abs = pidl_clone(p);
@@ -151,7 +151,7 @@ static void paint(HWND hwnd) {
 // ------------------------------------------------------------------
 // drop-down menus
 
-struct MenuEntry { PITEMID_CHILD abs; int icon; };
+struct MenuEntry { PIDLIST_ABSOLUTE abs; int icon; };
 static std::vector<MenuEntry> s_menuEntries;
 
 static void clear_menu_entries() {
@@ -159,7 +159,7 @@ static void clear_menu_entries() {
     s_menuEntries.clear();
 }
 
-static void append_entry(HMENU m, PITEMID_CHILD abs, const std::wstring& name, bool bold) {
+static void append_entry(HMENU m, PIDLIST_ABSOLUTE abs, const std::wstring& name, bool bold) {
     UINT id = (UINT)s_menuEntries.size() + 1;
     s_menuEntries.push_back({ abs, sys_icon_index(abs) });
     MENUITEMINFOW mi{ sizeof(mi) };
@@ -193,7 +193,7 @@ static void fill_children_menu(HMENU m, PCIDLIST_ABSOLUTE parent, PCIDLIST_ABSOL
         return (short)HRESULT_CODE(raw->CompareIDs(0, a, b)) < 0;
     });
     for (auto k : kids) {
-        PITEMID_CHILD abs = static_cast<PITEMID_CHILD>(ILCombine(parent, k));
+        PIDLIST_ABSOLUTE abs = ILCombine(parent, k);
         std::wstring name = child_name(raw, k, SHGDN_NORMAL);
         bool isCurrent = current && ILIsParent(abs, current, FALSE);
         append_entry(m, abs, name, isCurrent);
@@ -212,7 +212,7 @@ static void track_and_navigate(HMENU m, POINT screen) {
 static void show_chevron_menu(int crumb) {
     clear_menu_entries();
     HMENU m = CreatePopupMenu();
-    PITEMID_CHILD parent = crumb > 0 ? pidl_clone(s_crumbs[crumb - 1].abs) : pidl_desktop();
+    PIDLIST_ABSOLUTE parent = crumb > 0 ? pidl_clone(s_crumbs[crumb - 1].abs) : pidl_desktop();
     fill_children_menu(m, parent, g_current);
     CoTaskMemFree(parent);
     if (GetMenuItemCount(m) == 0) AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"(empty)");
@@ -435,6 +435,9 @@ static LRESULT CALLBACK box_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             s_hover = kHitNone;
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
+        case WM_CAPTURECHANGED:         // a crumb's press let go elsewhere (or taken away)
+            if (s_pressed != -100) { s_pressed = -100; InvalidateRect(hwnd, nullptr, FALSE); }
+            return 0;
         case WM_LBUTTONDOWN: {
             int h = hit({ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
             if (address_editing() && h != kHitHistory) return 0;
@@ -444,7 +447,7 @@ static LRESULT CALLBACK box_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (h == kHitOverflow) { show_overflow_menu(); }
             else if (h >= 0 && h % 2 == 0) { show_chevron_menu(h / 2); }
             else if (h == kHitNone) { s_pressed = -100; address_begin_edit(); return 0; }
-            else return 0;                 // crumb text: navigate on button-up
+            else { SetCapture(hwnd); return 0; }   // crumb text: navigate on button-up (wherever it is)
             s_pressed = -100;
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
@@ -453,6 +456,7 @@ static LRESULT CALLBACK box_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int h = hit({ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
             int pressed = s_pressed;
             s_pressed = -100;
+            if (GetCapture() == hwnd) ReleaseCapture();
             InvalidateRect(hwnd, nullptr, FALSE);
             if (h >= 0 && h % 2 == 1 && h == pressed) {
                 int i = h / 2;

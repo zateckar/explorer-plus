@@ -24,7 +24,7 @@ bool g_sortAsc = true;
 // items + current folder
 std::mutex g_itemsMx;
 std::vector<Item*> g_items;
-PITEMID_CHILD g_current = nullptr;
+PIDLIST_ABSOLUTE g_current = nullptr;
 
 std::atomic<UINT> g_enumId{ 0 };
 
@@ -94,9 +94,9 @@ void drain_async() {
 
 void fix_font(HWND h)  { if (g_font) SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE); }
 
-PITEMID_CHILD current_clone() { return pidl_clone(g_current); }
+PIDLIST_ABSOLUTE current_clone() { return pidl_clone(g_current); }
 
-void current_replace(PITEMID_CHILD newAbs) {
+void current_replace(PIDLIST_ABSOLUTE newAbs) {
     if (!newAbs) newAbs = pidl_desktop();
     if (g_current) CoTaskMemFree(g_current);
     g_current = newAbs;

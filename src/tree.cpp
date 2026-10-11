@@ -21,7 +21,7 @@ enum class NodeKind { Folder, Separator };
 
 // absolute pidl (empty pidl = Desktop root); `listed` once children were enumerated
 struct NodeData {
-    PITEMID_CHILD abs = nullptr;
+    PIDLIST_ABSOLUTE abs = nullptr;
     UINT serial = 0;               // unique per node: a freed node's address can be reused
     bool listed = false;
     bool listing = false;          // a worker is enumerating the children
@@ -54,7 +54,7 @@ static NodeData* node_data(HWND tree, HTREEITEM h) {
     return nullptr;
 }
 
-static int id_count(LPCITEMIDLIST p) {
+static int id_count(PCUIDLIST_RELATIVE p) {
     int n = 0;
     for (; p && !ILIsEmpty(p); p = ILNext(p)) ++n;
     return n;
@@ -62,11 +62,11 @@ static int id_count(LPCITEMIDLIST p) {
 
 // is `anc` a strict ancestor of `target`? compares the target's prefix canonically
 // (byte-wise prefix checks fail for fs pidls carrying different timestamps).
-static bool pidl_is_ancestor(LPCITEMIDLIST anc, LPCITEMIDLIST target) {
+static bool pidl_is_ancestor(PCIDLIST_ABSOLUTE anc, PCIDLIST_ABSOLUTE target) {
     int na = id_count(anc), nt = id_count(target);
     if (na >= nt) return false;
     if (na == 0) return true;               // Desktop contains everything
-    PITEMID_CHILD prefix = pidl_clone(target);
+    PIDLIST_ABSOLUTE prefix = pidl_clone(target);
     if (!prefix) return false;
     for (int i = nt; i > na; --i) ILRemoveLastID(prefix);
     bool r = pidl_equal(anc, prefix);
@@ -75,13 +75,13 @@ static bool pidl_is_ancestor(LPCITEMIDLIST anc, LPCITEMIDLIST target) {
 }
 
 struct NodeInfo {                  // everything needed to insert a node (worker-safe)
-    PITEMID_CHILD abs = nullptr;   // owned until inserted
+    PIDLIST_ABSOLUTE abs = nullptr;   // owned until inserted
     std::wstring name;
     int icon = -1, openIcon = -1;
     bool hasKids = false;
 };
 
-static NodeInfo describe(PITEMID_CHILD abs, bool hasKids) {
+static NodeInfo describe(PIDLIST_ABSOLUTE abs, bool hasKids) {
     NodeInfo n;
     n.abs = abs;
     n.name = pidl_abs_dispname(abs);
@@ -174,6 +174,7 @@ static bool list_children(PCIDLIST_ABSOLUTE parent, bool showHidden, std::vector
     // children of a plain directory are checked for subfolders directly
     std::wstring dir = pidl_folder_path(parent);
     bool fsParent = dir.size() >= 2 && (dir[1] == L':' || dir.rfind(L"\\\\", 0) == 0);
+    bool netParent = fsParent && path_is_network(dir);
     bool keepHidden = !showHidden && fsParent && keep.size() > dir.size() && path_within(dir, keep);
     com_ptr<IEnumIDList> e;
     SHCONTF flags = SHCONTF_FOLDERS | (showHidden || keepHidden ? SHCONTF_INCLUDEHIDDEN : 0);
@@ -205,7 +206,9 @@ static bool list_children(PCIDLIST_ABSOLUTE parent, bool showHidden, std::vector
         bool hasKids;
         if (fsParent && (attrs & SFGAO_FILESYSTEM) &&
             SUCCEEDED(SHGetDataFromIDListW(sf.get(), child, SHGDFIL_FINDDATA, &fd, sizeof(fd))) && fd.cFileName[0]) {
-            hasKids = (fd.dwFileAttributes & remote) ||
+            // on a share each look is a round trip to the server: the expander shows, and
+            // expanding finds out (as Explorer does)
+            hasKids = netParent || (fd.dwFileAttributes & remote) ||
                       fs_has_subfolder(dir + (dir.back() == L'\\' ? L"" : L"\\") + fd.cFileName, showHidden);
         } else {
             SFGAOF sub = SFGAO_HASSUBFOLDER;
@@ -226,7 +229,7 @@ static bool list_children(PCIDLIST_ABSOLUTE parent, bool showHidden, std::vector
     });
     double tSort = perf_on() ? perf_now() : 0;
     for (auto& k : kids) {
-        PITEMID_CHILD full = static_cast<PITEMID_CHILD>(ILCombine(parent, k.child));
+        PIDLIST_ABSOLUTE full = ILCombine(parent, k.child);
         CoTaskMemFree(k.child);
         if (full) out.push_back(describe(full, k.hasKids));
     }
@@ -269,7 +272,7 @@ struct ExpandJob {
     NodeData* node;
     UINT serial;
     HTREEITEM item;
-    PITEMID_CHILD abs;              // owned copy for the worker
+    PIDLIST_ABSOLUTE abs;           // owned copy for the worker
     bool showHidden;
     std::vector<NodeInfo> kids;
     bool ok = false;
@@ -349,7 +352,7 @@ static std::wstring prefetch_key(PCIDLIST_ABSOLUTE abs) {
     return k.empty() ? k : k + L'|' + std::to_wstring(id_count(abs));
 }
 
-static PITEMID_CHILD this_pc_route(LPCITEMIDLIST target, const std::wstring& path);
+static PIDLIST_ABSOLUTE this_pc_route(PCIDLIST_ABSOLUTE target, const std::wstring& path);
 
 // The ancestors of the folder a sync walks to are listed all at once, each on its own
 // worker: at startup before the window exists (tree_prefetch), later the ones below the
@@ -364,7 +367,7 @@ static int s_waitDepth = 0;         // id count of the node a sync waits for
 
 struct PrefetchJob {
     std::wstring key;
-    PITEMID_CHILD abs;              // owned
+    PIDLIST_ABSOLUTE abs;           // owned
     bool showHidden;
     UINT gen;
     std::wstring keep;
@@ -404,8 +407,8 @@ static void prefetch_worker(PrefetchJob* job) {
 }
 
 // list target's ancestors deeper than `depth` ids
-static void prefetch_ancestors(LPCITEMIDLIST target, int depth) {
-    PITEMID_CHILD prefix = pidl_clone(target);
+static void prefetch_ancestors(PCIDLIST_ABSOLUTE target, int depth) {
+    PIDLIST_ABSOLUTE prefix = pidl_clone(target);
     if (!prefix) return;
     for (int n = id_count(prefix) - 1; n > depth; --n) {
         ILRemoveLastID(prefix);
@@ -430,7 +433,7 @@ void tree_prefetch(PCIDLIST_ABSOLUTE folder) {
     std::wstring path = pidl_folder_path(folder);
     if (path.rfind(L"\\\\", 0) == 0) return;       // network: never walked
     // the walk goes under This PC: list that route's levels
-    PITEMID_CHILD pc = this_pc_route(folder, path);
+    PIDLIST_ABSOLUTE pc = this_pc_route(folder, path);
     prefetch_ancestors(pc ? pc : folder, 0);
     CoTaskMemFree(pc);
 }
@@ -454,16 +457,16 @@ static int use_prefetch(HWND tree, HTREEITEM h, NodeData* d) {
 // ------------------------------------------------------------------
 // roots
 
-static PITEMID_CHILD parse_shell(const wchar_t* path) {
+static PIDLIST_ABSOLUTE parse_shell(const wchar_t* path) {
     PIDLIST_ABSOLUTE p = nullptr;
     if (FAILED(SHParseDisplayName(path, nullptr, &p, 0, nullptr))) return nullptr;
-    return reinterpret_cast<PITEMID_CHILD>(p);
+    return p;
 }
 
-static PITEMID_CHILD known_folder(REFKNOWNFOLDERID id) {
+static PIDLIST_ABSOLUTE known_folder(REFKNOWNFOLDERID id) {
     PIDLIST_ABSOLUTE p = nullptr;
     if (FAILED(SHGetKnownFolderIDList(id, KF_FLAG_DONT_VERIFY, nullptr, &p))) return nullptr;
-    return reinterpret_cast<PITEMID_CHILD>(p);
+    return p;
 }
 
 static bool has_subfolders(PCIDLIST_ABSOLUTE abs, bool showHidden) {
@@ -477,9 +480,11 @@ static bool has_subfolders(PCIDLIST_ABSOLUTE abs, bool showHidden) {
 }
 
 // pinned folders of Quick access, in the user's order
-static std::vector<PITEMID_CHILD> pinned_folders() {
-    std::vector<PITEMID_CHILD> out;
-    PITEMID_CHILD qa = parse_shell(L"shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}");
+// *ok: Quick access was read to the end (else the pins shown stay as they are)
+static std::vector<PIDLIST_ABSOLUTE> pinned_folders(bool* ok) {
+    std::vector<PIDLIST_ABSOLUTE> out;
+    *ok = false;
+    PIDLIST_ABSOLUTE qa = parse_shell(L"shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}");
     if (!qa) return out;
     com_ptr<IShellFolder2> sf;
     PROPERTYKEY kPinned{};
@@ -488,7 +493,8 @@ static std::vector<PITEMID_CHILD> pinned_folders() {
         com_ptr<IEnumIDList> e;
         if (sf->EnumObjects(nullptr, SHCONTF_FOLDERS | SHCONTF_NONFOLDERS, e.put()) == S_OK && e) {
             PITEMID_CHILD c = nullptr;
-            while (e->Next(1, &c, nullptr) == S_OK) {
+            HRESULT next;
+            while ((next = e->Next(1, &c, nullptr)) == S_OK) {
                 SFGAOF a = SFGAO_FOLDER | SFGAO_STREAM;
                 VARIANT v; VariantInit(&v);
                 bool pinned = SUCCEEDED(sf->GetDetailsEx(c, &kPinned, &v)) && v.vt == VT_BOOL && v.boolVal;
@@ -503,13 +509,14 @@ static std::vector<PITEMID_CHILD> pinned_folders() {
                         SUCCEEDED(SHGetIDListFromObject(si.get(), &target)) && target) {
                         // re-parse the location ("D:\DEV", "::{645FF040-...}") so it is a normal namespace pidl
                         std::wstring path = pidl_folder_path(target);
-                        PITEMID_CHILD reparsed = path.empty() ? nullptr : parse_shell(path.c_str());
+                        PIDLIST_ABSOLUTE reparsed = path.empty() ? nullptr : parse_shell(path.c_str());
                         if (reparsed) { CoTaskMemFree(target); out.push_back(reparsed); }
-                        else out.push_back(reinterpret_cast<PITEMID_CHILD>(target));
+                        else out.push_back(target);
                     }
                 }
                 CoTaskMemFree(c);
             }
+            *ok = next == S_FALSE;
         }
     }
     CoTaskMemFree(qa);
@@ -547,14 +554,16 @@ struct PinsJob {
     UINT gen;
     std::vector<NodeInfo> pins;
     std::vector<std::wstring> keys;
+    bool ok = true;                      // (pins_worker: Quick access could be read)
 };
 
 static bool s_pinsCurrent = false;       // the worker's pins arrived (a later cache result is stale)
 
 static void pins_apply(void* payload) {
     std::unique_ptr<PinsJob> job(static_cast<PinsJob*>(payload));
-    if (g_tree && job->gen == s_treeGen) s_pinsCurrent = true;
-    if (!g_tree || job->gen != s_treeGen || job->keys == s_shownPins) {   // the cache was right
+    if (g_tree && job->gen == s_treeGen && job->ok) s_pinsCurrent = true;
+    // the cache was right, or Quick access couldn't be read (the pins shown stay)
+    if (!g_tree || job->gen != s_treeGen || !job->ok || job->keys == s_shownPins) {
         free_infos(job->pins);
         return;
     }
@@ -567,7 +576,7 @@ static void pins_apply(void* payload) {
 static void pins_worker(PinsJob* job) {
     ComInit ci;
     double t0 = perf_on() ? perf_now() : 0;
-    for (auto p : pinned_folders()) {
+    for (auto p : pinned_folders(&job->ok)) {
         job->pins.push_back(describe(p, has_subfolders(p, g_showHidden)));
         job->keys.push_back(pin_key(job->pins.back()));
     }
@@ -585,14 +594,20 @@ static void cached_pins_apply(void* payload) {
     tree_sync_to_current();             // a pin is the better match for itself
 }
 
+// the current pins from Quick access (shown when they differ from those shown)
+static void read_pins() {
+    auto* live = new PinsJob{ s_treeGen, {}, {} };
+    worker_submit([live] { pins_worker(live); });
+}
+
 static void cached_pins_worker(PinsJob* job) {
     ComInit ci;
     std::vector<std::wstring> keys;
     for (auto& key : job->keys) {
         if (key.size() < 3 || key[1] != L'|') continue;
         std::wstring path = key.substr(2);
-        if (path.rfind(L"\\\\", 0) == 0) continue;     // network pins: only from the Quick access read
-        if (PITEMID_CHILD abs = parse_shell(path.c_str())) {
+        if (path_is_network(path)) continue;           // network pins: only from the Quick access read
+        if (PIDLIST_ABSOLUTE abs = parse_shell(path.c_str())) {
             job->pins.push_back(describe(abs, key[0] == L'1'));
             keys.push_back(key);
         }
@@ -618,12 +633,12 @@ void initialize_tree(HWND tree) {
     // Home, Gallery, OneDrive
     for (const wchar_t* p : { L"shell:::{f874310e-b6b7-47dc-bc84-b9e6b38f5903}",      // Home
                               L"shell:::{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}" }) {  // Gallery
-        if (PITEMID_CHILD abs = parse_shell(p)) {
+        if (PIDLIST_ABSOLUTE abs = parse_shell(p)) {
             NodeInfo n = describe(abs, false);
             insert_node(tree, TVI_ROOT, n);
         }
     }
-    if (PITEMID_CHILD od = known_folder(FOLDERID_SkyDrive)) {
+    if (PIDLIST_ABSOLUTE od = known_folder(FOLDERID_SkyDrive)) {
         if (!pidl_folder_path(od).empty() && PathIsDirectoryW(pidl_folder_path(od).c_str())) {
             NodeInfo n = describe(od, true);
             insert_node(tree, TVI_ROOT, n);
@@ -640,17 +655,16 @@ void initialize_tree(HWND tree) {
     s_pinsCurrent = false;
     ++s_treeGen;
     auto* cached = new PinsJob{ s_treeGen, {}, settings_tree_pins() };
-    auto* live = new PinsJob{ s_treeGen, {}, {} };
     worker_submit([cached] { cached_pins_worker(cached); });
-    worker_submit([live] { pins_worker(live); });
+    read_pins();
     // This PC, Network
     insert_separator(tree);
     s_thisPC = nullptr;
-    if (PITEMID_CHILD pc = known_folder(FOLDERID_ComputerFolder)) {
+    if (PIDLIST_ABSOLUTE pc = known_folder(FOLDERID_ComputerFolder)) {
         NodeInfo n = describe(pc, true);
         s_thisPC = insert_node(tree, TVI_ROOT, n);
     }
-    if (PITEMID_CHILD net = known_folder(FOLDERID_NetworkFolder)) {
+    if (PIDLIST_ABSOLUTE net = known_folder(FOLDERID_NetworkFolder)) {
         NodeInfo n = describe(net, true);
         insert_node(tree, TVI_ROOT, n);
     }
@@ -662,7 +676,7 @@ void initialize_tree(HWND tree) {
 // find the node for target by walking down from h, expanding as needed. An ancestor
 // whose children are not listed yet gets listed on a worker: `*waiting` is set and the
 // walk stops there (expand_apply / prefetch_apply / refresh_apply resume it).
-static HTREEITEM locate_in(HWND tree, HTREEITEM h, LPCITEMIDLIST target, bool expand, int depth,
+static HTREEITEM locate_in(HWND tree, HTREEITEM h, PCIDLIST_ABSOLUTE target, bool expand, int depth,
                            bool* waiting = nullptr);
 static void start_refresh(HTREEITEM h, NodeData* d);
 
@@ -673,21 +687,21 @@ static std::unordered_set<UINT> s_relisted;      // node serials
 static ULONGLONG s_relistTarget = 0;
 
 // the walk one level down from the listed node h; *missing: h has no child on the way
-static HTREEITEM locate_below(HWND tree, HTREEITEM h, NodeData* d, LPCITEMIDLIST target, bool expand, int depth,
+static HTREEITEM locate_below(HWND tree, HTREEITEM h, NodeData* d, PCIDLIST_ABSOLUTE target, bool expand, int depth,
                               bool* waiting, bool* missing) {
     *missing = false;
     // fast path: the child whose ID is byte-equal to the target's next one (a shell
     // comparison binds every level: ~0.1 ms per child, 17 ms in a 98-folder directory)
-    if (PITEMID_CHILD next = pidl_clone(target)) {
+    if (PIDLIST_ABSOLUTE next = pidl_clone(target)) {
         int want = id_count(d->abs) + 1;
         for (int n = id_count(next); n > want; --n) ILRemoveLastID(next);
-        LPCITEMIDLIST nextId = ILFindLastID(next);
+        PCUITEMID_CHILD nextId = ILFindLastID(next);
         UINT cb = nextId->mkid.cb;
         HTREEITEM found = nullptr;
         for (HTREEITEM c = TreeView_GetChild(tree, h); c && !found; c = TreeView_GetNextSibling(tree, c)) {
             NodeData* cd = node_data(tree, c);
             if (!cd || cd->kind != NodeKind::Folder || ILIsEmpty(cd->abs)) continue;
-            LPCITEMIDLIST id = ILFindLastID(cd->abs);
+            PCUITEMID_CHILD id = ILFindLastID(cd->abs);
             if (id->mkid.cb == cb && memcmp(id, nextId, cb) == 0) found = c;
         }
         bool last = id_count(target) == want;
@@ -709,7 +723,7 @@ static HTREEITEM locate_below(HWND tree, HTREEITEM h, NodeData* d, LPCITEMIDLIST
     return nullptr;
 }
 
-static HTREEITEM locate_in(HWND tree, HTREEITEM h, LPCITEMIDLIST target, bool expand, int depth, bool* waiting) {
+static HTREEITEM locate_in(HWND tree, HTREEITEM h, PCIDLIST_ABSOLUTE target, bool expand, int depth, bool* waiting) {
     if (!h || depth > 64) return nullptr;
     NodeData* d = node_data(tree, h);
     if (!d || d->kind != NodeKind::Folder) return nullptr;
@@ -747,8 +761,8 @@ static HTREEITEM locate_in(HWND tree, HTREEITEM h, LPCITEMIDLIST target, bool ex
 // under any other root that contains it (OneDrive, Network, a pin)
 // `pcTarget`: the same folder by way of This PC (see this_pc_route); *walked: the pidl
 // the walk that is waiting followed
-static HTREEITEM locate(HWND tree, LPCITEMIDLIST target, LPCITEMIDLIST pcTarget, bool expand, bool* waiting,
-                        LPCITEMIDLIST* walked) {
+static HTREEITEM locate(HWND tree, PCIDLIST_ABSOLUTE target, PCIDLIST_ABSOLUTE pcTarget, bool expand, bool* waiting,
+                        PCIDLIST_ABSOLUTE* walked) {
     *walked = target;
     for (HTREEITEM r = TreeView_GetRoot(tree); r; r = TreeView_GetNextSibling(tree, r)) {
         NodeData* d = node_data(tree, r);
@@ -769,25 +783,27 @@ static HTREEITEM locate(HWND tree, LPCITEMIDLIST target, LPCITEMIDLIST pcTarget,
 // A folder in the user's profile (C:\Users\me\AppData\...) parses to a pidl by way of the
 // user's folder on the Desktop, not This PC > C: > Users: the walk under This PC wouldn't
 // find it. This PC parses the path into its own route. Null: the target is fine as it is.
-static PITEMID_CHILD this_pc_route(LPCITEMIDLIST target, const std::wstring& path) {
-    if (path.size() < 3 || path[1] != L':' || path[2] != L'\\') return nullptr;
-    PITEMID_CHILD pc = known_folder(FOLDERID_ComputerFolder);
+// (Not for a mapped network drive: parsing asks the server, on the UI thread. A folder
+// redirected there, Documents on H:, keeps its own route.)
+static PIDLIST_ABSOLUTE this_pc_route(PCIDLIST_ABSOLUTE target, const std::wstring& path) {
+    if (path.size() < 3 || path[1] != L':' || path[2] != L'\\' || path_is_network(path)) return nullptr;
+    PIDLIST_ABSOLUTE pc = known_folder(FOLDERID_ComputerFolder);
     if (!pc) return nullptr;
-    PITEMID_CHILD full = nullptr;
+    PIDLIST_ABSOLUTE full = nullptr;
     com_ptr<IShellFolder> sf;
     if (!pidl_is_ancestor(pc, target) &&
         SUCCEEDED(SHBindToObject(nullptr, pc, nullptr, IID_PPV_ARGS(sf.put()))) && sf) {
         PIDLIST_RELATIVE rel = nullptr;
         std::wstring p = path;
         if (SUCCEEDED(sf->ParseDisplayName(nullptr, nullptr, p.data(), nullptr, &rel, nullptr)) && rel) {
-            full = static_cast<PITEMID_CHILD>(ILCombine(pc, rel));
+            full = ILCombine(pc, rel);
             CoTaskMemFree(rel);
         }
     }
     CoTaskMemFree(pc);
     return full;
 }
-static PITEMID_CHILD s_pcRoute = nullptr;        // for s_relistTarget
+static PIDLIST_ABSOLUTE s_pcRoute = nullptr;     // for s_relistTarget
 
 void tree_sync_to_current_deferred() {
     // tree sync on the UI thread can hit the disk; post so navigation isn't blocked.
@@ -809,7 +825,7 @@ void tree_sync_to_current() {
         s_pcRoute = remote ? nullptr : this_pc_route(target, path);
     }
     bool waiting = false;
-    LPCITEMIDLIST walked = target;
+    PCIDLIST_ABSOLUTE walked = target;
     TreeNoRedraw nr(g_tree);                // one repaint for all the levels expanded
     HTREEITEM h = locate(g_tree, target, s_pcRoute, !remote, &waiting, &walked);
     s_syncPending = waiting;
@@ -836,11 +852,25 @@ void tree_refresh_all() {
     tree_sync_to_current();
 }
 
-static void refresh_all_cb(void*) { tree_refresh_all(); }
-void tree_refresh_all_deferred() { post_async(refresh_all_cb, nullptr); }
+void tree_reread_pins() { if (g_tree) read_pins(); }
 
 static void set_has_children(HTREEITEM h, bool has) {
     TVITEMW ti{}; ti.mask = TVIF_CHILDREN; ti.hItem = h; ti.cChildren = has ? 1 : 0;
+    TreeView_SetItem(g_tree, &ti);
+}
+
+static void update_text_and_icon(HTREEITEM h, const NodeInfo& k) {
+    WCHAR text[MAX_PATH]{};
+    TVITEMW ti{};
+    ti.mask = TVIF_TEXT | TVIF_IMAGE | TVIF_SELECTEDIMAGE;
+    ti.hItem = h;
+    ti.pszText = text;
+    ti.cchTextMax = ARRAYSIZE(text);
+    if (!TreeView_GetItem(g_tree, &ti)) return;
+    if (k.name == text && ti.iImage == k.icon && ti.iSelectedImage == k.openIcon) return;
+    ti.pszText = const_cast<LPWSTR>(k.name.c_str());
+    ti.iImage = k.icon;
+    ti.iSelectedImage = k.openIcon;
     TreeView_SetItem(g_tree, &ti);
 }
 
@@ -852,7 +882,7 @@ struct RefreshJob {
     NodeData* node;
     UINT serial;
     HTREEITEM item;
-    PITEMID_CHILD abs;              // owned copy for the worker
+    PIDLIST_ABSOLUTE abs;           // owned copy for the worker
     bool showHidden;
     bool listed;                    // the node was listed when the job started
     std::vector<NodeInfo> kids;
@@ -886,6 +916,7 @@ static void refresh_apply(void* payload) {
                 prev = it->second;
                 // a child not listed yet: its expander follows what it has now
                 if (NodeData* cd = node_data(g_tree, prev); cd && !cd->listed) set_has_children(prev, k.hasKids);
+                update_text_and_icon(prev, k);   // (a display name or icon that changed)
                 existing.erase(it);
                 CoTaskMemFree(k.abs);
                 k.abs = nullptr;
@@ -932,13 +963,13 @@ void tree_refresh_node(PCIDLIST_ABSOLUTE folder) {
         if (HTREEITEM h = locate_in(g_tree, r, folder, false, 0)) start_refresh(h, node_data(g_tree, h));
     // a profile folder's pidl doesn't lead under This PC: walk there by its This PC route
     std::wstring path = pidl_folder_path(folder);
-    if (PITEMID_CHILD pc = path.rfind(L"\\\\", 0) == 0 ? nullptr : this_pc_route(folder, path)) {
+    if (PIDLIST_ABSOLUTE pc = path.rfind(L"\\\\", 0) == 0 ? nullptr : this_pc_route(folder, path)) {
         if (HTREEITEM h = locate_in(g_tree, s_thisPC, pc, false, 0)) start_refresh(h, node_data(g_tree, h));
         CoTaskMemFree(pc);
     }
 }
 
-PITEMID_CHILD tree_get_pidl_of_item(HTREEITEM h) {
+PIDLIST_ABSOLUTE tree_get_pidl_of_item(HTREEITEM h) {
     NodeData* d = node_data(g_tree, h);
     if (!d || d->kind != NodeKind::Folder) return nullptr;
     return pidl_clone(d->abs);
@@ -984,15 +1015,15 @@ static void delete_node(HTREEITEM h, bool permanent) {
     if (FAILED(bind_parent(d->abs, parent.put(), &child)) || !parent || !child) return;
     SFGAOF a = SFGAO_CANDELETE;
     if (FAILED(parent->GetAttributesOf(1, &child, &a)) || !(a & SFGAO_CANDELETE)) { MessageBeep(MB_ICONASTERISK); return; }
-    PITEMID_CHILD abs = pidl_clone(d->abs);
-    PITEMID_CHILD parentAbs = pidl_clone(d->abs);
+    PIDLIST_ABSOLUTE abs = pidl_clone(d->abs);
+    PIDLIST_ABSOLUTE parentAbs = pidl_clone(d->abs);
     ILRemoveLastID(parentAbs);
     bool current = holds_current(abs);
-    PITEMID_CHILD next = nullptr;
+    PIDLIST_ABSOLUTE next = nullptr;
     if (HTREEITEM n = neighbor_folder(h)) next = tree_get_pidl_of_item(n);
     if (!next) next = pidl_clone(parentAbs);
 
-    PITEMID_CHILD own = pidl_clone(child);           // (the node may be gone after the delete)
+    PITEMID_CHILD own = pidl_clone_child(child);           // (the node may be gone after the delete)
     fileops_delete_items(g_main, parent.get(), { own }, permanent, false);
     CoTaskMemFree(own);
     bool gone = !pidl_exists(abs);
@@ -1125,7 +1156,7 @@ LRESULT tree_notify(HWND, WPARAM, LPARAM lp) {
             com_ptr<IShellFolder> parent;
             PCUITEMID_CHILD child = nullptr;
             if (FAILED(bind_parent(d->abs, parent.put(), &child)) || !parent) return FALSE;
-            PITEMID_CHILD parentAbs = pidl_clone(d->abs);
+            PIDLIST_ABSOLUTE parentAbs = pidl_clone(d->abs);
             ILRemoveLastID(parentAbs);
             // renaming the current folder or one of its ancestors: follow it (fs paths)
             std::wstring oldPath = pidl_folder_path(d->abs), cur = pidl_folder_path(g_current);
@@ -1138,13 +1169,18 @@ LRESULT tree_notify(HWND, WPARAM, LPARAM lp) {
                 bool found = slash != std::wstring::npos && PathIsDirectoryW(moved.c_str()) &&
                              SUCCEEDED(SHParseDisplayName(moved.c_str(), nullptr, &np, 0, nullptr)) && np;
                 if (perf_on()) perf_event("tree.rename.follow", -1, found ? 1 : 0, moved.c_str());
-                if (found) navigate_in_place(reinterpret_cast<PITEMID_CHILD>(np));
+                if (found) navigate_in_place(np);
             } else if (perf_on()) {
                 perf_event("tree.rename", -1, (follow ? 1 : 0) + (renamed ? 2 : 0), oldPath.c_str());
             }
-            tree_refresh_node(parentAbs);          // the node's pidl changed: re-list its parent
+            if (renamed) {
+                // the node's pidl changed: re-list its parent wherever it shows (under
+                // This PC, as a pin, ...); a pin of it follows from Quick access (the rest
+                // of the tree keeps what is expanded)
+                tree_refresh_node(parentAbs);
+                read_pins();
+            }
             CoTaskMemFree(parentAbs);
-            tree_refresh_all_deferred();           // pins / other copies of the folder
             return FALSE;
         }
         case TVN_DELETEITEMW: {

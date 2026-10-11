@@ -72,15 +72,16 @@ struct OleInit {
 // pidl helpers
 // The Desktop (namespace root) is represented by an EMPTY absolute pidl; nullptr is
 // accepted everywhere as a synonym, but g_current / tab state always hold a real pidl.
-bool pidl_is_desktop(LPCITEMIDLIST pidl);
-PITEMID_CHILD pidl_desktop();                               // newly allocated empty pidl
-std::wstring pidl_abs_dispname(LPCITEMIDLIST abs);          // display name of an absolute pidl ("Downloads")
-std::wstring pidl_parsingname(LPCITEMIDLIST abs);
-std::wstring pidl_editingname(LPCITEMIDLIST abs);           // what Explorer shows in the address edit
-PITEMID_CHILD pidl_clone(LPCITEMIDLIST pidl);
-bool pidl_equal(LPCITEMIDLIST a, LPCITEMIDLIST b);          // canonical shell comparison
-ULONGLONG pidl_sig(LPCITEMIDLIST pidl);    // stable content hash, works for relative pidls
-std::wstring pidl_folder_path(LPCITEMIDLIST abs);           // fs path if possible else parsing name
+bool pidl_is_desktop(PCUIDLIST_RELATIVE pidl);
+PIDLIST_ABSOLUTE pidl_desktop();                            // newly allocated empty pidl
+std::wstring pidl_abs_dispname(PCIDLIST_ABSOLUTE abs);      // display name of an absolute pidl ("Downloads")
+std::wstring pidl_parsingname(PCIDLIST_ABSOLUTE abs);
+std::wstring pidl_editingname(PCIDLIST_ABSOLUTE abs);       // what Explorer shows in the address edit
+PIDLIST_ABSOLUTE pidl_clone(PCIDLIST_ABSOLUTE pidl);
+PITEMID_CHILD pidl_clone_child(PCUITEMID_CHILD child);
+bool pidl_equal(PCIDLIST_ABSOLUTE a, PCIDLIST_ABSOLUTE b);  // canonical shell comparison
+ULONGLONG pidl_sig(PCUIDLIST_RELATIVE pidl);    // stable content hash, works for relative pidls
+std::wstring pidl_folder_path(PCIDLIST_ABSOLUTE abs);       // fs path if possible else parsing name
 std::wstring child_name(IShellFolder* psf, PCUITEMID_CHILD child, SHGDNF flags);
 
 // typed path parsing (address bar)
@@ -96,14 +97,22 @@ HRESULT create_item(IShellFolder* parent, PCITEMID_CHILD child, REFIID riid, voi
 HRESULT shell_item_for(PCIDLIST_ABSOLUTE abs, IShellItem** out);                       // nullptr = Desktop
 
 // formatting
-std::wstring fmt_size(ULONGLONG bytes);
+std::wstring fmt_size(ULONGLONG bytes);         // "1.5 MB": drives, totals, the status bar
+std::wstring fmt_size_kb(ULONGLONG bytes);      // "1 536 KB": a file's or folder's Size column
 std::wstring fmt_filetime(const FILETIME& ft);
 
-bool pidl_exists(LPCITEMIDLIST abs);          // the item is (still) there
-bool fs_folder_missing(LPCITEMIDLIST abs);    // a local file-system folder that is gone (never blocks on the network)
+// Where a path lives, asked without touching the path itself (never blocks):
+// a share or a mapped network drive (asking it anything waits for the server)
+bool path_is_network(const std::wstring& path);
+// a fixed disk inside the machine (not a share, not removable, not a USB / SD disk
+// that Windows reports as fixed): safe to walk and to hold open
+bool path_on_internal_drive(const std::wstring& path);
+
+bool pidl_exists(PCIDLIST_ABSOLUTE abs);          // the item is (still) there
+bool fs_folder_missing(PCIDLIST_ABSOLUTE abs);    // a local file-system folder that is gone (never blocks on the network)
 
 // system image list index for an absolute pidl (thread-safe); `fallback` if the shell has none
-int sys_icon_index(LPCITEMIDLIST abs, bool open = false, int fallback = 0);
+int sys_icon_index(PCIDLIST_ABSOLUTE abs, bool open = false, int fallback = 0);
 int sys_folder_icon_index(bool open);     // the stock folder icon
 HIMAGELIST sys_imagelist(int shil);       // SHIL_SMALL / SHIL_LARGE / SHIL_EXTRALARGE (shared, never destroy)
 void sys_imagelist_init();                // once, on the UI thread, before workers ask for icons
