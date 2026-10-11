@@ -23,7 +23,8 @@ File Explorer while starting in well under 100 ms.
   and columns the default (like Explorer's Folder Options), "Reset all folders" goes back.
   Double-click on empty space goes up a level.
 - **Folder sizes**: the Size column shows each subfolder's total (all levels, hidden files
-  included; junctions and symbolic links not followed), worked out in the background
+  included; junctions and symbolic links not followed, and show no size themselves;
+  folders you have no access to left out), worked out in the background
   after the listing and filled in as known; sorting by Size takes them into account.
   View ▸ Show ▸ Folder sizes turns it off.
 - **Text size**: View ▸ Text size, or Ctrl+Plus / Ctrl+Minus / Ctrl+0, scales the text of

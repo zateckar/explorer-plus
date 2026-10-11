@@ -917,6 +917,7 @@ void enum_apply_op(HeapEnumOp* op) {
             if (perf_on()) perf_event("enum.complete", -1, (long long)g_items.size());
             stream_stop();
             set_error(op->enumHr);
+            status_update();                     // (append_batch showed it before the outcome was known)
             detailspane_update();
             listing_complete(op->opId);
         }

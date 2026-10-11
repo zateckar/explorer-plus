@@ -643,6 +643,32 @@ app.command(IDM['NEWTAB']); time.sleep(1.5)
 app.screenshot(os.path.join(shots, '06_tabs.png'))
 app.command(IDM['CLOSETAB']); time.sleep(0.5)
 
+# another instance holding the settings lock: the tab save waits (never writes over it),
+# then a retry saves the tab set once the lock is free
+k32 = ctypes.windll.kernel32
+k32.CreateMutexW.restype = W.HANDLE
+def ini_bytes():
+    try:
+        with open(ini, 'rb') as f:
+            return f.read()
+    except OSError:                                                 # (being replaced this moment)
+        return None
+time.sleep(2.5)                                                     # (the tab save above done)
+ini_before = ini_bytes()
+lock = k32.CreateMutexW(None, False, 'Local\\ExplorerPlus.Settings')
+if ini_before and lock and k32.WaitForSingleObject(lock, 5000) == 0:
+    app.command(IDM['NEWTAB'])
+    time.sleep(6.5)                                                 # saved at +2 s, gives up at +5 s
+    check('settings locked by another instance: file untouched', ini_bytes() == ini_before)
+    k32.ReleaseMutex(lock)
+    check('lock released: the tab save is retried',
+          wait_for(lambda: ini_bytes() not in (None, ini_before), 8))
+    app.command(IDM['CLOSETAB']); time.sleep(0.5)
+else:
+    skip('settings locked by another instance: file untouched', 'mutex not acquired')
+if lock:
+    k32.CloseHandle(lock)
+
 # per-folder view memory survives a restart, even for a non-ASCII, INI-hostile name
 app.go(uni)
 check('non-ASCII folder opens', app.title().startswith('Stažené'), app.title())
@@ -738,6 +764,15 @@ app.command(IDM['FOLDERSIZES']); time.sleep(0.5)
 check('Folder sizes off: no folder size', size_of('sized') == '', size_of('sized'))
 app.command(IDM['FOLDERSIZES'])
 check('Folder sizes on again', wait_for(lambda: size_of('sized') == byte_size(301000), 5), size_of('sized'))
+# a junction is not followed, not even as the folder whose size is asked for
+sized_link = os.path.join(data, 'sized-link')
+if subprocess.run(['cmd', '/c', 'mklink', '/J', sized_link, sized], capture_output=True).returncode == 0:
+    wait_for(lambda: row_of('sized-link') >= 0, 5)
+    time.sleep(1.5)
+    check('junction: no folder size', size_of('sized-link') == '', size_of('sized-link'))
+    os.rmdir(sized_link)                                            # (the junction, not its target)
+else:
+    skip('junction: no folder size', 'mklink /J failed')
 shutil.rmtree(sized)
 check('removed folder leaves the list', wait_for(lambda: row_of('sized') < 0, 5))
 

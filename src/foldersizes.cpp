@@ -27,6 +27,7 @@ struct Result {
     std::wstring key;                     // Item::key
     std::wstring path;                    // the \\?\ path walked, lowercased (the cache's key)
     ULONGLONG bytes;
+    bool known;                           // false: no size (a size shown from before goes)
 };
 
 struct Walk {
@@ -77,11 +78,39 @@ struct BackgroundMode {
 
 enum class WalkEnd { Done, Cancelled, Unknown };
 
-// the bytes of every file under `root`. Unknown: the folder can't be read, or part of it
-// is in the cloud only (a size that leaves things out would be wrong, not just late)
+bool is_link(DWORD attrs, DWORD tag) {
+    return (attrs & FILE_ATTRIBUTE_REPARSE_POINT) && (tag == IO_REPARSE_TAG_MOUNT_POINT || tag == IO_REPARSE_TAG_SYMLINK);
+}
+
+// `root` may be walked: a real folder (not a junction or link itself, not in the cloud
+// only) that really is on an internal disk. Its path can go through a link higher up,
+// to a share or an external disk, which the drive letter doesn't tell.
+bool walkable_root(const std::wstring& root) {
+    HANDLE h = CreateFileW(root.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    FILE_ATTRIBUTE_TAG_INFO ti{};
+    bool ok = GetFileInformationByHandleEx(h, FileAttributeTagInfo, &ti, sizeof(ti)) &&
+              (ti.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(ti.FileAttributes & kCloudDir) &&
+              !is_link(ti.FileAttributes, ti.ReparseTag);
+    std::wstring real;
+    if (ok) {
+        DWORD n = GetFinalPathNameByHandleW(h, nullptr, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        real.resize(n);
+        n = n ? GetFinalPathNameByHandleW(h, real.data(), n, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS) : 0;
+        real.resize(n < real.size() ? n : 0);
+    }
+    CloseHandle(h);
+    // "\\?\C:\..." (a share: "\\?\UNC\...")
+    return ok && real.rfind(L"\\\\?\\", 0) == 0 && path_on_internal_drive(real.substr(4));
+}
+
+// the bytes of every file under `root`. Folders inside that can't be opened (no access)
+// are left out, as Explorer's Properties does. Unknown: the folder itself can't be
+// walked, a listing broke off part way, or part of it is in the cloud only (a size that
+// leaves things out would be wrong, not just late).
 WalkEnd folder_bytes(const Walk& w, const std::wstring& root, ULONGLONG* out) {
-    DWORD rootAttrs = GetFileAttributesW(root.c_str());
-    if (rootAttrs == INVALID_FILE_ATTRIBUTES || (rootAttrs & kCloudDir)) return WalkEnd::Unknown;
+    if (!walkable_root(root)) return WalkEnd::Unknown;
     ULONGLONG total = 0;
     std::vector<std::wstring> dirs{ root };
     bool first = true;
@@ -106,13 +135,13 @@ WalkEnd folder_bytes(const Walk& w, const std::wstring& root, ULONGLONG* out) {
             if (n[0] == L'.' && (!n[1] || (n[1] == L'.' && !n[2]))) continue;
             // junctions and links: what they point to is counted where it is (and can't
             // loop). Other reparse points (OneDrive folders) are real folders.
-            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
-                (fd.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT || fd.dwReserved0 == IO_REPARSE_TAG_SYMLINK))
-                continue;
+            if (is_link(fd.dwFileAttributes, fd.dwReserved0)) continue;
             if (fd.dwFileAttributes & kCloudDir) { FindClose(h); return WalkEnd::Unknown; }
             dirs.push_back(dir + L'\\' + n);
         } while (FindNextFileW(h, &fd));
+        DWORD e = GetLastError();
         FindClose(h);
+        if (e != ERROR_NO_MORE_FILES) return WalkEnd::Unknown;   // (the rest of it unread)
     }
     *out = total;
     return WalkEnd::Done;
@@ -138,9 +167,8 @@ void walker(const std::shared_ptr<Walk>& w) {
         ULONGLONG bytes = 0;
         WalkEnd end = folder_bytes(*w, w->folders[i].second, &bytes);
         if (end == WalkEnd::Cancelled) break;
-        if (end == WalkEnd::Unknown) continue;            // (no size shown)
         std::lock_guard<std::mutex> lk(w->mx);
-        w->done.push_back({ w->folders[i].first, lower(w->folders[i].second), bytes });
+        w->done.push_back({ w->folders[i].first, lower(w->folders[i].second), bytes, end == WalkEnd::Done });
         if (GetTickCount64() - w->lastPost >= kPostMs) post(*w, false);
     }
     if (--w->running == 0) {
@@ -150,6 +178,7 @@ void walker(const std::shared_ptr<Walk>& w) {
 }
 
 void remember(const Result& r, ULONGLONG now) {
+    if (!r.known) { s_cache.erase(r.path); return; }
     if (s_cache.size() >= kCacheMax) s_cache.clear();     // (rarely: start over)
     s_cache[r.path] = { r.bytes, now };
 }
@@ -161,17 +190,18 @@ void apply(void* payload) {
     if (b->opId != g_enumId.load() || b->gen != s_gen.load()) return;     // another listing by now
     bool selectedChanged = false;
     if (!b->results.empty()) {
-        std::unordered_map<std::wstring, ULONGLONG> sizes;
+        std::unordered_map<std::wstring, const Result*> sizes;
         sizes.reserve(b->results.size());
-        for (auto& r : b->results) sizes[r.key] = r.bytes;
+        for (auto& r : b->results) sizes[r.key] = &r;
         std::lock_guard<std::mutex> lk(g_itemsMx);
         for (int i = 0; i < (int)g_items.size(); ++i) {
             Item* it = g_items[i];
             if (!it->isFolder) continue;
             auto f = sizes.find(it->key);
             if (f == sizes.end()) continue;
-            it->bytes = f->second;
-            it->size = fmt_size_kb(f->second);
+            const Result& r = *f->second;
+            it->bytes = r.known ? r.bytes : 0;
+            it->size = r.known ? fmt_size_kb(r.bytes) : std::wstring();
             selectedChanged |= (ListView_GetItemState(g_list, i, LVIS_SELECTED) & LVIS_SELECTED) != 0;
         }
         InvalidateRect(g_list, nullptr, FALSE);

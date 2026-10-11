@@ -30,7 +30,7 @@ void settings_set_splitter(const SplitMode& s);
 
 // tabs persistence
 void settings_tabs(std::wstring& tabsOut, int& active);      // read
-void settings_set_tabs(const std::vector<std::wstring>& lines, int active);
+bool settings_set_tabs(const std::vector<std::wstring>& lines, int active);   // written at once; false: kept for settings_save_all
 bool settings_details_pane();
 void settings_set_details_pane(bool v);
 

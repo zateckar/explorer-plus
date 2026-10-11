@@ -255,7 +255,10 @@ static std::wstring tab_persist_path(PCIDLIST_ABSOLUTE p) {
 
 // the tab set changed: saved a moment later, once (a tab dragged across the strip, a few
 // folders opened in a row), so it survives a crash without a write per step
+static int s_persistRetries = 0;     // failed saves retried since the last change
+
 void tabs_persist_soon() {
+    s_persistRetries = 0;
     if (g_main && s_persist) SetTimer(g_main, TIMER_TABS_PERSIST, 2000, nullptr);
 }
 
@@ -265,7 +268,10 @@ void tabs_persist_now() {
     std::vector<std::wstring> lines;
     int active = 0;
     tabs_serialize_lines(lines, active);
-    settings_set_tabs(lines, active);        // writes the ini immediately
+    if (settings_set_tabs(lines, active)) { s_persistRetries = 0; return; }   // writes the ini immediately
+    // not written (another window holding the file, a scanner): again after 1, 2, 4 s; then
+    // the next change, or the settings saved at exit, write it
+    if (g_main && s_persistRetries < 3) SetTimer(g_main, TIMER_TABS_PERSIST, 1000u << s_persistRetries++, nullptr);
 }
 
 static PIDLIST_ABSOLUTE parse_persisted(const std::wstring& path) {

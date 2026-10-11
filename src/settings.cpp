@@ -98,22 +98,29 @@ static bool write_doc(const std::wstring& p, const IniDoc& d) {
     return false;
 }
 
-// read-modify-write of the file, one instance at a time
+// the mutex all instances write the file under; owned() only once acquired (released and
+// closed however the write ends)
+struct SettingsLock {
+    HANDLE mx = CreateMutexW(nullptr, FALSE, L"Local\\ExplorerPlus.Settings");
+    DWORD w = mx ? WaitForSingleObject(mx, 3000) : WAIT_FAILED;
+    bool owned() const { return w == WAIT_OBJECT_0 || w == WAIT_ABANDONED; }
+    ~SettingsLock() {
+        if (owned()) ReleaseMutex(mx);
+        if (mx) CloseHandle(mx);
+    }
+};
+
+// read-modify-write of the file, one instance at a time. False: not written (another
+// instance kept the lock, or the file couldn't be read or replaced)
 static bool update_file(const std::function<void(IniDoc&)>& change) {
     std::wstring p = ini_path();
     if (p.empty()) return false;
-    HANDLE mx = CreateMutexW(nullptr, FALSE, L"Local\\ExplorerPlus.Settings");
-    DWORD w = mx ? WaitForSingleObject(mx, 3000) : WAIT_FAILED;
-    bool owned = w == WAIT_OBJECT_0 || w == WAIT_ABANDONED;
+    SettingsLock lock;
+    if (!lock.owned()) return false;   // (writing anyway could undo another instance's save)
     IniDoc d;
-    bool ok = read_doc(p, d);          // (a file that couldn't be read isn't written over: all else in it would go)
-    if (ok) {
-        change(d);
-        ok = write_doc(p, d);
-    }
-    if (owned) ReleaseMutex(mx);
-    if (mx) CloseHandle(mx);
-    return ok;
+    if (!read_doc(p, d)) return false; // (a file that couldn't be read isn't written over: all else in it would go)
+    change(d);
+    return write_doc(p, d);
 }
 
 // ------------------------------------------------------------------
@@ -136,6 +143,7 @@ static std::map<std::wstring, View> s_byFolder;
 static std::map<std::wstring, std::wstring> s_columns;     // folder -> serialized column set
 static std::vector<std::wstring> s_tabLines;
 static int s_activeTab = 0;
+static bool s_tabsDirty = false;         // the tab set isn't in the file yet
 static std::map<std::wstring, int> s_prefs;
 
 // what this process changed since loading / its last save
@@ -230,6 +238,13 @@ static void prune(IniDoc& d, const wchar_t* sec, size_t cap) {
     }
 }
 
+// [tabs]: active=<index>, tab0..tabN
+static void put_tabs(IniDoc& d) {
+    KeyValues kv{ { L"active", std::to_wstring(s_activeTab) } };
+    for (size_t i = 0; i < s_tabLines.size(); ++i) kv.push_back({ L"tab" + std::to_wstring(i), s_tabLines[i] });
+    d.replace(L"tabs", kv);
+}
+
 bool settings_save_all() {
     MainValues now = main_now();
     const MainValues& was = s_mainLoaded;
@@ -270,8 +285,10 @@ bool settings_save_all() {
         }
         prune(d, L"views", kMaxViews);
         prune(d, L"columns", kMaxColumns);
+        if (s_tabsDirty) put_tabs(d);    // a tab set whose own save failed
     });
     if (!saved) return false;            // (not saved: still to do, the next save tries again)
+    s_tabsDirty = false;
     s_viewsDirty.clear();
     s_columnsDirty.clear();
     s_prefsDirty.clear();
@@ -374,12 +391,13 @@ void settings_tabs(std::wstring& out, int& active) {
     active = s_activeTab;
 }
 
-void settings_set_tabs(const std::vector<std::wstring>& lines, int active) {
+bool settings_set_tabs(const std::vector<std::wstring>& lines, int active) {
     s_tabLines = lines;
     s_activeTab = active;
-    KeyValues kv{ { L"active", std::to_wstring(active) } };
-    for (size_t i = 0; i < lines.size(); ++i) kv.push_back({ L"tab" + std::to_wstring(i), lines[i] });
-    update_file([&](IniDoc& d) { d.replace(L"tabs", kv); });    // written at once
+    s_tabsDirty = true;
+    if (!update_file(put_tabs)) return false;      // (still to do: a retry, or the next save, writes it)
+    s_tabsDirty = false;
+    return true;
 }
 
 bool settings_details_pane() { return s_detailsPane; }
