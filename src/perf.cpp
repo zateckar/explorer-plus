@@ -126,7 +126,10 @@ static void sampler(std::wstring out, double untilMs) {
                 char p[MAX_PATH] = "?";
                 if (m) GetModuleFileNameA(m, p, MAX_PATH);
                 const char* slash = strrchr(p, '\\');
-                it = names.emplace(m, m == exe ? std::string("exe") : std::string(slash ? slash + 1 : p)).first;
+                // (keys made in place: GCC 16's static libstdc++ has no std::string move
+                // constructor to link against when -Os keeps it out of line)
+                it = names.emplace(std::piecewise_construct, std::forward_as_tuple(m),
+                                   std::forward_as_tuple(m == exe ? "exe" : slash ? slash + 1 : p)).first;
             }
             unsigned long long off = s.pc[i] - (DWORD64)m + (m == exe ? 0x140000000ULL : 0);
             fprintf(f, " %s+%llx", it->second.c_str(), off);
@@ -193,7 +196,8 @@ unsigned long long perf_code_address(const void* code) {
 void perf_paint(const char* what, double ms) {
     if (!s_on) return;
     std::lock_guard<std::mutex> lk(s_mx);
-    s_paints[what].push_back(ms);
+    s_paints.emplace(std::piecewise_construct, std::forward_as_tuple(what), std::forward_as_tuple())
+        .first->second.push_back(ms);                   // (key made in place: see sampler)
 }
 
 void perf_flush() {
