@@ -259,6 +259,9 @@ struct TreeNoRedraw {
 };
 
 static void restore_children(HTREEITEM h);
+static bool apply_top();
+static bool keep_restored_top(PCIDLIST_ABSOLUTE target);
+static LRESULT CALLBACK tree_input_subclass(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR);
 
 static void insert_children(HWND tree, HTREEITEM parent, std::vector<NodeInfo>& kids) {
     TreeNoRedraw nr(tree);
@@ -268,7 +271,10 @@ static void insert_children(HWND tree, HTREEITEM parent, std::vector<NodeInfo>& 
         TreeView_SetItem(tree, &ti);
     }
     // a tab's state being put back: the new nodes get theirs (listed by expanding or by a sync)
-    if (tree == g_tree) restore_children(parent);
+    if (tree == g_tree) {
+        restore_children(parent);
+        apply_top();
+    }
 }
 
 // asynchronous listing: slow / network folders never block the UI. Expanding a node and
@@ -326,6 +332,7 @@ static void expand_apply(void* payload) {
         TreeNoRedraw nr(g_tree);
         insert_children(g_tree, job->item, job->kids);
         if (!job->kids.empty()) TreeView_Expand(g_tree, job->item, TVE_EXPAND);
+        apply_top();                          // (expanding scrolled its children into view)
     }
     resume_sync();
 }
@@ -553,6 +560,10 @@ static void show_pins(HWND tree, std::vector<NodeInfo>& pins, const std::vector<
     if (pins.empty()) return;
     HTREEITEM after = s_pinSep = insert_separator(tree, s_pinsAfter);
     for (auto& p : pins) after = insert_node(tree, TVI_ROOT, p, true, after);
+    if (tree == g_tree) {
+        restore_children(nullptr);           // (the pins: a tab's state being put back)
+        apply_top();
+    }
 }
 
 struct PinsJob {
@@ -630,6 +641,7 @@ void tree_apply_metrics() {
 }
 
 void initialize_tree(HWND tree) {
+    SetWindowSubclass(tree, tree_input_subclass, 1, 0);
     TreeView_SetImageList(tree, sys_imagelist(SHIL_SMALL), TVSIL_NORMAL);
     TreeView_SetExtendedStyle(tree, TVS_EX_DOUBLEBUFFER | TVS_EX_FADEINOUTEXPANDOS | TVS_EX_AUTOHSCROLL,
                               TVS_EX_DOUBLEBUFFER | TVS_EX_FADEINOUTEXPANDOS | TVS_EX_AUTOHSCROLL);
@@ -842,7 +854,7 @@ void tree_sync_to_current() {
     if (perf_on()) perf_event("tree.synced", -1, h ? 1 : 0);
     if (h) {
         TreeView_SelectItem(g_tree, h);     // programmatic: TVN_SELCHANGED ignores it
-        TreeView_EnsureVisible(g_tree, h);
+        if (!keep_restored_top(target)) TreeView_EnsureVisible(g_tree, h);
     } else {
         TreeView_SelectItem(g_tree, nullptr);
     }
@@ -921,8 +933,42 @@ static void restore_below(HTREEITEM first, ULONGLONG parentKey) {
     }
 }
 
+// h's children (null: the top level)
 static void restore_children(HTREEITEM h) {
-    if (s_restoreOn && h) restore_below(TreeView_GetChild(g_tree, h), key_of(h));
+    if (s_restoreOn) restore_below(h ? TreeView_GetChild(g_tree, h) : TreeView_GetRoot(g_tree), h ? key_of(h) : 0);
+}
+
+// The node at the top is put back when it is there: after a restart its branch is still
+// being listed, and the sync to the current folder would scroll to that instead. Until the
+// user scrolls or clicks the pane, opens another folder or tab, or a few seconds pass.
+static bool s_topPending = false;
+static ULONGLONG s_topUntil = 0;
+static ULONGLONG s_topTarget = 0;       // the folder the tree follows meanwhile (pidl_sig)
+
+static bool apply_top() {
+    if (!s_topPending || !g_tree) return false;
+    if (GetTickCount64() > s_topUntil) { s_topPending = false; return false; }
+    for (HTREEITEM h = TreeView_GetRoot(g_tree); h; h = TreeView_GetNextVisible(g_tree, h))
+        if (key_of(h) == s_restoring.top) { TreeView_Select(g_tree, h, TVGN_FIRSTVISIBLE); return true; }
+    return false;
+}
+
+// the sync to `target` keeps the restored top instead of scrolling to the folder
+static bool keep_restored_top(PCIDLIST_ABSOLUTE target) {
+    if (!s_topPending) return false;
+    ULONGLONG sig = pidl_sig(target);
+    if (!s_topTarget) s_topTarget = sig;
+    else if (sig != s_topTarget) { s_topPending = false; return false; }    // another folder
+    return apply_top();
+}
+
+static LRESULT CALLBACK tree_input_subclass(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    switch (msg) {
+        case WM_MOUSEWHEEL: case WM_VSCROLL: case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_KEYDOWN:
+            s_topPending = false;           // the user's own scrolling and clicks win
+            break;
+    }
+    return DefSubclassProc(h, msg, wp, lp);
 }
 
 void tree_capture_state(TreeState& s) {
@@ -936,26 +982,31 @@ void tree_capture_state(TreeState& s) {
     if (s_restoreOn)
         for (ULONGLONG k : s_restoring.expanded)
             if (!present.count(k)) s.expanded.insert(k);
-    if (HTREEITEM top = TreeView_GetFirstVisible(g_tree)) s.top = key_of(top);
+    if (s_restoreOn && s_topPending) s.top = s_restoring.top;     // (not put back yet)
+    else if (HTREEITEM top = TreeView_GetFirstVisible(g_tree)) s.top = key_of(top);
 }
 
 void tree_save_state(TreeState& s) {
     tree_capture_state(s);
     s_restoreOn = false;
+    s_topPending = false;
 }
 
 void tree_restore_state(const TreeState& s) {
     if (!g_tree) return;
     s_restoring = s;
     s_restoreOn = true;
+    s_topPending = false;
     TreeNoRedraw nr(g_tree);
     restore_below(TreeView_GetRoot(g_tree), 0);
     if (!s.saved || !s.top) {
         TreeView_Select(g_tree, TreeView_GetRoot(g_tree), TVGN_FIRSTVISIBLE);
         return;
     }
-    for (HTREEITEM h = TreeView_GetRoot(g_tree); h; h = TreeView_GetNextVisible(g_tree, h))
-        if (key_of(h) == s.top) { TreeView_Select(g_tree, h, TVGN_FIRSTVISIBLE); break; }
+    s_topPending = true;
+    s_topUntil = GetTickCount64() + 5000;
+    s_topTarget = 0;
+    apply_top();
 }
 
 static void set_has_children(HTREEITEM h, bool has) {

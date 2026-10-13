@@ -1062,6 +1062,15 @@ app.command(IDM['CLOSETAB']); time.sleep(1.0)
 check('the dual-pane tab shows both lists again', wait_for(lambda: u.IsWindowVisible(list2) and count2() > 0, 5)
       and count2() == len(os.listdir(dual)), count2())
 
+# the navigation pane scrolled away from the current folder: it comes back there after a restart
+def tree_top():
+    h = send(app.tree, 0x110A, 0x0005, 0)                            # TVGN_FIRSTVISIBLE
+    return app.tree_item(h)[0] if h else None
+for _ in range(6):
+    send(app.tree, 0x0115, 0, 0)                                       # WM_VSCROLL SB_LINEUP
+time.sleep(0.3)
+top_before_restart = tree_top()
+
 app.close()
 check('exits cleanly after the second run', app.proc.returncode == 0, app.proc.returncode)
 app = App(exe, data, settings=ini)
@@ -1077,6 +1086,8 @@ check('the dual-pane layout and its folders are remembered after restart',
       (u.IsWindowVisible(list2), count2()))
 check("the tab's navigation pane is remembered after restart (the folder open)",
       wait_for(lambda: tree_shows('sub'), 5))
+check('... and scrolled where it was', wait_for(lambda: tree_top() == top_before_restart, 5),
+      (tree_top(), top_before_restart))
 app.command(IDM['DUALPANE'])
 check('Dual pane off: one list again', wait_for(lambda: not u.IsWindowVisible(list2), 3))
 app.close()
