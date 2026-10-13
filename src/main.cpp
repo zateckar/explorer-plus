@@ -999,6 +999,23 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
                                wx, wy, ww, wh, nullptr, nullptr, g_hinst, nullptr);
     if (!wnd) return 2;
     perf_event("window.created");
+    // the folder's listing is usually done by now (or nearly): its rows go into the first
+    // paint, not into an empty list a moment after it. A slow folder isn't waited for long.
+    {
+        MSG em;
+        ULONGLONG until = GetTickCount64() + 30;
+        for (;;) {
+            if (PeekMessageW(&em, wnd, WM_ENUM_DONE, WM_ENUM_DONE, PM_REMOVE)) {
+                DispatchMessageW(&em);
+                if (!PeekMessageW(&em, wnd, WM_ENUM_DONE, WM_ENUM_DONE, PM_NOREMOVE)) break;   // (dual pane: both)
+                continue;
+            }
+            ULONGLONG now = GetTickCount64();
+            if (now >= until) break;
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, (DWORD)(until - now), QS_POSTMESSAGE);
+        }
+        perf_event("window.listing");
+    }
 
     ShowWindow(wnd, sp.maximized && !newWindow ? SW_SHOWMAXIMIZED : nCmdShow);
     UpdateWindow(wnd);

@@ -602,6 +602,11 @@ void enumerate_start(PCIDLIST_ABSOLUTE folderAbs, bool keepView) {
     job->ext.show = g_showExtensions.load() < 0 ? job->ext.windows : g_showExtensions.load() != 0;
     // a refresh keeps the shown columns; a new folder uses its remembered set or defaults
     job->columns = es().pendingKeepView ? g_pane->columns : columns_for_folder(job->folder);
+    // the header is the new folder's at once (the list is empty now): the last folder's, or
+    // at startup the template, would be rearranged when the listing comes, a horizontal
+    // scroll bar showing meanwhile if they are wider. (No set remembered: the listing finds
+    // the folder's defaults.)
+    if (!es().pendingKeepView) columns_apply(job->columns);
     stream_stop();
     if (!es().pendingKeepView) {
         es().stream = std::make_shared<StreamBuf>();
