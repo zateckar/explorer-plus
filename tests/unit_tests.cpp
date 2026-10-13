@@ -3,7 +3,9 @@
 #include "ini.h"
 #include "cmdline.h"
 #include "playlist.h"
+#include "mediadata.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -261,11 +263,89 @@ static void media_text() {
     CHECK(unpack_paths(nullptr, 5).empty());
 }
 
+// ------------------------------------------------------------------
+// now playing: the album cover, the spectrogram, formats, Opus in MP4
+
+static void cover_pick() {
+    CHECK(pick_cover({}) == -1);
+    CHECK(is_image_name(L"Cover.JPG") && is_image_name(L"a.webp") && !is_image_name(L"cover.txt") && !is_image_name(L"jpg"));
+    // the names first, in their order, whatever the sizes
+    CHECK(pick_cover({ { L"back.jpg", 900000 }, { L"Folder.jpg", 1000 }, { L"cover.png", 500 } }) == 2);
+    CHECK(pick_cover({ { L"back.jpg", 900000 }, { L"folder.jpg", 1000 } }) == 1);
+    CHECK(pick_cover({ { L"AlbumArtSmall.jpg", 10 }, { L"AlbumArt_{X}_Large.jpg", 20 }, { L"x.png", 99 } }) == 1);
+    CHECK(pick_cover({ { L"cover.jpg", 10 }, { L"Cover.png", 20 } }) == 1);       // two covers: the bigger
+    CHECK(pick_cover({ { L"covers.jpg", 10 }, { L"discover.jpg", 30 }, { L"scan.png", 20 } }) == 1);   // not names: the biggest
+    CHECK(pick_cover({ { L"notes.txt", 1 << 20 }, { L"a.gif", 5 } }) == 1);       // pictures only
+    CHECK(pick_cover({ { L"notes.txt", 1 } }) == -1);
+}
+
+static void spectrum_math() {
+    const int rate = 48000, n = 4096;
+    SpectrumMath m(n, rate, 160, 40, 18000);
+    CHECK(m.size() == n && m.bands() == 160);
+    CHECK(m.band_freq(0) > 39 && m.band_freq(0) < 45 && m.band_freq(159) > 16000 && m.band_freq(159) <= 18000);
+    for (int b = 1; b < 160; ++b) CHECK(m.band_freq(b) > m.band_freq(b - 1));
+    std::vector<float> s(n, 0.0f);
+    std::vector<uint8_t> col(160);
+    m.column(s.data(), col.data());
+    CHECK(*std::max_element(col.begin(), col.end()) == 0);           // silence: nothing
+    for (double hz : { 100.0, 1000.0, 10000.0 }) {
+        for (int i = 0; i < n; ++i) s[i] = 0.5f * (float)std::sin(2 * 3.14159265358979 * hz * i / rate);
+        m.column(s.data(), col.data());
+        int peak = (int)(std::max_element(col.begin(), col.end()) - col.begin());
+        CHECK(m.band_freq(peak) > hz / 1.1 && m.band_freq(peak) < hz * 1.1);
+        CHECK(col[peak] > 200);                                       // -6 dBFS: near the top
+        CHECK(col[0] < col[peak] / 2 && col[159] < col[peak] / 2);   // far from it: well below (a little leaks)
+    }
+}
+
+static void formats() {
+    CHECK_EQ(audio_format_name(0x55), L"MP3");
+    CHECK_EQ(audio_format_name(0x1610), L"AAC");
+    CHECK_EQ(audio_format_name(0xF1AC), L"FLAC");
+    CHECK_EQ(audio_format_name(0x704F), L"Opus");
+    CHECK_EQ(audio_format_name(0x4F707573), L"Opus");      // ('Opus' as the MP4 file gives it)
+    CHECK_EQ(audio_format_name(1), L"PCM");
+    CHECK_EQ(audio_format_name(0x12345678), L"");
+    CHECK_EQ(fmt_sample_rate(44100), L"44.1 kHz");
+    CHECK_EQ(fmt_sample_rate(48000), L"48 kHz");
+    CHECK_EQ(fmt_sample_rate(0), L"");
+    CHECK_EQ(fmt_channels(1), L"Mono");
+    CHECK_EQ(fmt_channels(2), L"Stereo");
+    CHECK_EQ(fmt_channels(6), L"5.1");
+    CHECK_EQ(fmt_channels(0), L"");
+    CHECK_EQ(fmt_bitrate(320000), L"320 kbps");
+    CHECK_EQ(fmt_bitrate(0), L"");
+    CHECK_EQ(fmt_file_size(512), L"512 bytes");
+    CHECK_EQ(fmt_file_size(4404019), L"4.2 MB");
+}
+
+static void opus_head() {
+    // an MP4 'Opus' sample entry's tail with its 'dOps' box (as in a real file): version 0,
+    // 2 channels, pre-skip 312, 48000 Hz, gain 0, mapping family 0
+    const uint8_t desc[] = { 0, 0, 0, 19, 'd', 'O', 'p', 's', 0, 2, 0x01, 0x38, 0, 0, 0xBB, 0x80, 0, 0, 0 };
+    uint8_t h[19]{};
+    CHECK(opus_head_from_dops(desc, sizeof(desc), h));
+    const uint8_t want[19] = { 'O', 'p', 'u', 's', 'H', 'e', 'a', 'd', 1, 2, 0x38, 0x01, 0x80, 0xBB, 0, 0, 0, 0, 0 };
+    CHECK(std::equal(h, h + 19, want));
+    CHECK(!opus_head_from_dops(desc, sizeof(desc) - 1, h));            // cut short
+    uint8_t surround[sizeof(desc)];
+    std::copy(desc, desc + sizeof(desc), surround);
+    surround[18] = 1;                                                   // mapping family 1: not converted
+    CHECK(!opus_head_from_dops(surround, sizeof(surround), h));
+    const uint8_t none[] = { 0, 0, 0, 8, 'e', 's', 'd', 's', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    CHECK(!opus_head_from_dops(none, sizeof(none), h));
+}
+
 int wmain() {
     queue_order();
     queue_remove();
     queue_shuffle();
     media_text();
+    cover_pick();
+    spectrum_math();
+    formats();
+    opus_head();
     ini_round_trip();
     ini_values();
     ini_set_erase();

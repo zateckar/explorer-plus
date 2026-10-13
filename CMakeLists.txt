@@ -59,6 +59,9 @@ add_executable(explorer-plus WIN32
     src/ini.cpp
     src/cmdline.cpp
     src/media.cpp
+    src/mediadata.cpp
+    src/mediainfo.cpp
+    src/spectrum.cpp
     src/playlist.cpp
     src/player.cpp
     res/resource.rc
@@ -68,7 +71,7 @@ add_executable(explorer-plus WIN32
 # version numbers from the generated version.h
 set_source_files_properties(res/resource.rc PROPERTIES
     INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/res;${CMAKE_CURRENT_SOURCE_DIR}/src;${CMAKE_CURRENT_BINARY_DIR}/generated"
-    OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/res/app.manifest;${CMAKE_CURRENT_SOURCE_DIR}/res/app.ico;${CMAKE_CURRENT_SOURCE_DIR}/src/resource.h;${CMAKE_CURRENT_BINARY_DIR}/generated/version.h")
+    OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/res/app.manifest;${CMAKE_CURRENT_SOURCE_DIR}/res/app.ico;${CMAKE_CURRENT_SOURCE_DIR}/res/player.ico;${CMAKE_CURRENT_SOURCE_DIR}/src/resource.h;${CMAKE_CURRENT_BINARY_DIR}/generated/version.h")
 
 target_compile_options(explorer-plus PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-cast-function-type)
 # STRICT_TYPED_ITEMIDS: absolute ID lists and child IDs are different types, so the compiler
@@ -108,7 +111,7 @@ target_link_libraries(explorer-plus PRIVATE
 option(EXPLORERPLUS_TESTS "Build the unit tests" ON)
 if(EXPLORERPLUS_TESTS)
     enable_testing()
-    add_executable(explorer-plus-tests tests/unit_tests.cpp src/ini.cpp src/cmdline.cpp src/playlist.cpp)
+    add_executable(explorer-plus-tests tests/unit_tests.cpp src/ini.cpp src/cmdline.cpp src/playlist.cpp src/mediadata.cpp)
     target_include_directories(explorer-plus-tests PRIVATE src)
     target_compile_options(explorer-plus-tests PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
     target_compile_definitions(explorer-plus-tests PRIVATE UNICODE _UNICODE)

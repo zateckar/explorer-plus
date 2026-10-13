@@ -1,7 +1,9 @@
 """Draw the app icon (the familiar yellow file folder with a green plus badge) at every
 size Windows asks for. The folder fills the canvas, so the icon reads at taskbar sizes.
+With --player: the media player's icon, the same folder with an orange play badge.
 
 Usage: python -I tools/make_icon.py res/app.ico [preview-dir]
+       python -I tools/make_icon.py --player res/player.ico [preview-dir]
 
 No dependencies: shapes are sampled 4x4 per pixel and every size is stored as a PNG
 entry in the .ico (supported since Windows Vista). With a preview dir, each size is
@@ -20,6 +22,8 @@ FRONT_A, FRONT_B = (255, 216, 102), (252, 186, 46)    # front panel, top -> bott
 FRONT_LIP = (255, 234, 166)                           # light top edge of the front panel
 BADGE_A, BADGE_B = (84, 200, 84), (16, 124, 16)        # top -> bottom (Windows' success green)
 PLUS = (255, 255, 255)
+PLAY_A, PLAY_B = (255, 146, 48), (214, 70, 0)         # the player's badge, top -> bottom
+PLAYER = False                                        # --player: a play badge instead of the plus
 
 
 def mix(a, b, t):
@@ -57,6 +61,10 @@ def shade(x, y, size):
     bx = by = 32.0 - br - (0.5 if small else 0.8) + (k / 2 if bar % 2 else 0.0)
     d2 = (x - bx) ** 2 + (y - by) ** 2
     if d2 <= br * br:
+        if PLAYER:                          # a play triangle, a little right of centre (optically centred)
+            if in_tri(x, y, (bx - br * 0.36, by - br * 0.52), (bx - br * 0.36, by + br * 0.52), (bx + br * 0.56, by)):
+                return PLUS
+            return mix(PLAY_A, PLAY_B, (y - by + br) / (2 * br))
         half, arm = bar * k / 2, snap(br * 0.74)
         if (abs(x - bx) <= half and abs(y - by) <= arm) or (abs(y - by) <= half and abs(x - bx) <= arm):
             return PLUS
@@ -109,8 +117,13 @@ def png(size, raw):
 
 
 def main():
-    out = sys.argv[1] if len(sys.argv) > 1 else 'res/app.ico'
-    preview = sys.argv[2] if len(sys.argv) > 2 else None
+    global PLAYER
+    args = sys.argv[1:]
+    if args[:1] == ['--player']:
+        PLAYER = True
+        args = args[1:]
+    out = args[0] if args else ('res/player.ico' if PLAYER else 'res/app.ico')
+    preview = args[1] if len(args) > 1 else None
     images = [render(s) for s in SIZES]
     header = struct.pack('<HHH', 0, 1, len(images))
     offset = 6 + 16 * len(images)

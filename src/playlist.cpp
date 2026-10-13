@@ -137,29 +137,33 @@ bool media_extension_excluded(const std::wstring& ext) {
     return false;
 }
 
-// (asked for every file of a folder walk, on any thread: the answer is kept per extension)
-bool media_file_playable(const std::wstring& path) {
+// 0: not media, 1: audio, 2: video, by the extension's perceived type (asked for every file
+// of a folder walk, on any thread: the answer is kept per extension)
+static int media_kind(const std::wstring& path) {
     const wchar_t* dot = PathFindExtensionW(path.c_str());
-    if (!*dot) return false;
+    if (!*dot) return 0;
     std::wstring ext = dot;
     for (auto& c : ext) c = (wchar_t)towlower(c);
     static std::mutex mx;
-    static std::map<std::wstring, bool> known;
+    static std::map<std::wstring, int> known;
     {
         std::lock_guard<std::mutex> lk(mx);
         if (auto it = known.find(ext); it != known.end()) return it->second;
     }
-    bool yes = false;
+    int kind = 0;
     if (!media_extension_excluded(ext)) {
         PERCEIVED type = PERCEIVED_TYPE_UNSPECIFIED;
         PERCEIVEDFLAG flags = 0;
-        yes = SUCCEEDED(AssocGetPerceivedType(ext.c_str(), &type, &flags, nullptr)) &&
-              (type == PERCEIVED_TYPE_AUDIO || type == PERCEIVED_TYPE_VIDEO);
+        if (SUCCEEDED(AssocGetPerceivedType(ext.c_str(), &type, &flags, nullptr)))
+            kind = type == PERCEIVED_TYPE_AUDIO ? 1 : type == PERCEIVED_TYPE_VIDEO ? 2 : 0;
     }
     std::lock_guard<std::mutex> lk(mx);
-    known[ext] = yes;
-    return yes;
+    known[ext] = kind;
+    return kind;
 }
+
+bool media_file_playable(const std::wstring& path) { return media_kind(path) != 0; }
+bool media_file_video(const std::wstring& path) { return media_kind(path) == 2; }
 
 std::wstring pack_paths(const std::vector<std::wstring>& paths) {
     std::wstring out;

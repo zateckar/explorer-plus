@@ -1,6 +1,7 @@
 #pragma once
 
 #define IDI_APP 1
+#define IDI_PLAYER 2        // the media player's window (res/player.ico, tools/make_icon.py --player)
 
 #define IDC_TREE      1001
 #define IDC_LIST      1002

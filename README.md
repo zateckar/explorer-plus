@@ -53,10 +53,14 @@ File Explorer while starting in well under 100 ms.
   complete in under 0.2 s.
 - **Media player**: "Play in Explorer Plus" / "Queue in Explorer Plus" in the compact menu
   of audio and video files (and of folders with some: their files by name, subfolders
-  after) open a player window — the video, or the title and artist of what plays; the
-  play queue (Enter plays, Delete removes, drop files on it); seek, volume, shuffle,
-  repeat, full screen. Windows' own Media Foundation plays (the formats and codecs
-  Windows has; Windows N needs the Media Feature Pack), nothing to install. Keys: Space
+  after) open a player window — the video, or for sound the album cover (cover.jpg,
+  folder.jpg, … in the track's folder, else its biggest picture, else the art in the
+  file), the tags (album, year, genre, track, …) with the format, bitrate and sample
+  rate, and a scrolling spectrogram; the play queue (Enter plays, Delete removes, drop
+  files on it); seek, volume, shuffle, repeat, full screen. Its own taskbar button, with
+  the track's progress and Previous / Play / Next in the thumbnail. Windows' own Media
+  Foundation plays (the formats and codecs Windows has, Opus in MP4 too; Windows N needs
+  the Media Feature Pack), nothing to install. Keys: Space
   play / pause, Left / Right ±5 s (Shift: 30 s), Ctrl+Left / Ctrl+Right previous / next,
   Up / Down volume, M mute, F or F11 full screen, Ctrl+H shuffle, Ctrl+T repeat; the
   media keys too. One player for all windows; it stays open after the main window closes.
@@ -174,6 +178,7 @@ src/contextmenu, flyout    classic + Win11 compact context menus
 src/fileops, dnd, watcher  file operations, drag and drop, change notifications
 src/detailspane, preview   details / preview pane
 src/player, media, playlist   media player window, Media Foundation playback, play queue
+src/mediainfo, mediadata, spectrum   player's cover and tags, their pure helpers, spectrogram
 src/settings, ini, theme, perf, crash   settings.ini, colours and fonts, profiling, crash dumps
 src/cmdline            command line and typed-path text
 tests/                 unit tests (ctest)

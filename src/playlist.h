@@ -62,6 +62,7 @@ std::wstring fmt_duration(long long hns);
 // playlists and MIDI (Media Foundation plays neither)
 bool media_extension_excluded(const std::wstring& ext);
 bool media_file_playable(const std::wstring& path);
+bool media_file_video(const std::wstring& path);     // its type is a video's (.mp4 too: may hold only sound)
 
 // WM_COPYDATA payload between processes: paths separated by NUL
 std::wstring pack_paths(const std::vector<std::wstring>& paths);

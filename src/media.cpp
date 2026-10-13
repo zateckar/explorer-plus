@@ -1,6 +1,8 @@
 #include "media.h"
+#include "mediadata.h"
 #include <mfapi.h>
 #include <mfidl.h>
+#include <mfreadwrite.h>
 #include <mferror.h>
 #include <evr.h>
 #include <mmdeviceapi.h>
@@ -9,6 +11,7 @@
 #include <shlwapi.h>
 #include <atomic>
 #include <cwchar>
+#include <mutex>
 
 // ------------------------------------------------------------------
 // Media Foundation, loaded on first use (mf.dll alone pulls in a dozen DLLs: none of
@@ -26,6 +29,7 @@ static struct {
     HRESULT (WINAPI* CreateMFByteStreamOnStream)(IStream*, IMFByteStream**);
     HRESULT (WINAPI* CreateMediaSession)(IMFAttributes*, IMFMediaSession**);
     HRESULT (WINAPI* CreateSourceResolver)(IMFSourceResolver**);
+    HRESULT (WINAPI* CreateMediaType)(IMFMediaType**);
     HRESULT (WINAPI* CreateTopology)(IMFTopology**);
     HRESULT (WINAPI* CreateTopologyNode)(MF_TOPOLOGY_TYPE, IMFTopologyNode**);
     HRESULT (WINAPI* CreateAudioRendererActivate)(IMFActivate**);
@@ -50,6 +54,7 @@ bool media_available(std::wstring* why) {
             !proc(plat, "MFPutWorkItem", s_mf.PutWorkItem) ||
             !proc(plat, "MFCreateMFByteStreamOnStream", s_mf.CreateMFByteStreamOnStream) ||
             !proc(plat, "MFCreateSourceResolver", s_mf.CreateSourceResolver) ||
+            !proc(plat, "MFCreateMediaType", s_mf.CreateMediaType) ||
             !proc(mf, "MFCreateMediaSession", s_mf.CreateMediaSession) ||
             !proc(mf, "MFCreateTopology", s_mf.CreateTopology) ||
             !proc(mf, "MFCreateTopologyNode", s_mf.CreateTopologyNode) ||
@@ -317,6 +322,7 @@ void MediaPlayer::close() {
     m_hasVideo = false;
     m_error = S_OK;
     m_title.clear(); m_artist.clear(); m_album.clear();
+    m_audio = {};
     if (d->video) InvalidateRect(d->video, nullptr, TRUE);
 }
 
@@ -351,6 +357,53 @@ bool MediaPlayer::open(const std::wstring& path, bool play, LONGLONG startAt) {
     return true;
 }
 
+// Opus in MP4: Windows' MP4 source labels the stream with the sample entry's box type
+// ('Opus', read big-endian) where Windows' own Opus decoder takes MFAudioFormat_Opus with
+// an OpusHead (as Matroska / WebM carry it). The stream is relabelled for the decoder:
+// the OpusHead is made from the sample description's 'dOps' box (opus_head_from_dops).
+// (The source accepts the type though IsMediaTypeSupported says otherwise.)
+static void fix_opus_type(IMFMediaTypeHandler* th) {
+    IMFMediaType* mt = nullptr;
+    if (FAILED(th->GetCurrentMediaType(&mt)) || !mt) return;
+    GUID sub = GUID_NULL;
+    mt->GetGUID(MF_MT_SUBTYPE, &sub);
+    UINT8* desc = nullptr;
+    UINT32 n = 0;
+    UINT8 head[19];
+    if ((sub.Data1 == 0x4F707573 || sub.Data1 == 0x7375704F) &&
+        SUCCEEDED(mt->GetAllocatedBlob(MF_MT_MPEG4_SAMPLE_DESCRIPTION, &desc, &n))) {
+        IMFMediaType* fixed = nullptr;
+        if (opus_head_from_dops(desc, n, head) && SUCCEEDED(s_mf.CreateMediaType(&fixed))) {
+            GUID opus = MFAudioFormat_Base;
+            opus.Data1 = 0x704F;                      // MFAudioFormat_Opus
+            if (SUCCEEDED(mt->CopyAllItems(fixed)) && SUCCEEDED(fixed->SetGUID(MF_MT_SUBTYPE, opus)) &&
+                SUCCEEDED(fixed->SetBlob(MF_MT_USER_DATA, head, sizeof(head))))
+                th->SetCurrentMediaType(fixed);
+            fixed->Release();
+        }
+        CoTaskMemFree(desc);
+    }
+    mt->Release();
+}
+
+// the first selected audio stream's format (after fix_opus_type)
+static AudioInfo audio_info_of(IMFMediaTypeHandler* th) {
+    AudioInfo a;
+    IMFMediaType* mt = nullptr;
+    // (some sources, WAV's among them, have no current type before playback: their first one)
+    if ((FAILED(th->GetCurrentMediaType(&mt)) || !mt) && (FAILED(th->GetMediaTypeByIndex(0, &mt)) || !mt)) return a;
+    GUID sub = GUID_NULL;
+    if (SUCCEEDED(mt->GetGUID(MF_MT_SUBTYPE, &sub))) a.format = sub.Data1;
+    UINT32 v = 0;
+    if (SUCCEEDED(mt->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &v))) a.rate = v;
+    if (SUCCEEDED(mt->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &v))) a.channels = v;
+    if (SUCCEEDED(mt->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, &v))) a.bits = v;
+    if (SUCCEEDED(mt->GetUINT32(MF_MT_AVG_BITRATE, &v))) a.bitrate = v;
+    else if (SUCCEEDED(mt->GetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, &v))) a.bitrate = v * 8;
+    mt->Release();
+    return a;
+}
+
 static bool audio_output_present() {
     IMMDeviceEnumerator* en = nullptr;
     if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&en))))
@@ -383,7 +436,14 @@ void MediaPlayer::source_ready(IUnknown* obj, HRESULT hr) {
         if (FAILED(pd->GetStreamDescriptorByIndex(i, &selected, &sd))) continue;
         GUID major = GUID_NULL;
         IMFMediaTypeHandler* th = nullptr;
-        if (SUCCEEDED(sd->GetMediaTypeHandler(&th))) { th->GetMajorType(&major); th->Release(); }
+        if (SUCCEEDED(sd->GetMediaTypeHandler(&th))) {
+            th->GetMajorType(&major);
+            if (selected && major == MFMediaType_Audio) {
+                fix_opus_type(th);
+                if (!m_audio.format) m_audio = audio_info_of(th);
+            }
+            th->Release();
+        }
         IMFActivate* sink = nullptr;
         if (major == MFMediaType_Video) audioOnly = false;
         // one audio and one video stream (the first ones the file selects); without an
@@ -592,4 +652,120 @@ MediaPlayer::Change MediaPlayer::handle(MediaNote* n) {
         default: break;
     }
     return m_state != was ? Change::State : Change::None;
+}
+
+// ------------------------------------------------------------------
+// decoding for analysis
+// ------------------------------------------------------------------
+static HRESULT (WINAPI* s_createReader)(IMFMediaSource*, IMFAttributes*, IMFSourceReader**) = nullptr;
+static std::once_flag s_readerOnce;
+
+AudioDecoder::~AudioDecoder() {
+    if (m_reader) m_reader->Release();
+    if (m_source) { m_source->Shutdown(); m_source->Release(); }
+}
+
+bool AudioDecoder::open(const std::wstring& path, LONGLONG from) {
+    if (s_loaded <= 0) return false;                     // (media_available said no, or wasn't asked)
+    std::call_once(s_readerOnce, [] {
+        if (HMODULE rw = LoadLibraryExW(L"mfreadwrite.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32))
+            proc(rw, "MFCreateSourceReaderFromMediaSource", s_createReader);
+    });
+    if (!s_createReader) return false;
+    // the source as playback makes it: the file shared for deleting, Opus in MP4 relabelled
+    IStream* file = nullptr;
+    IMFByteStream* bytes = nullptr;
+    IMFSourceResolver* resolver = nullptr;
+    IUnknown* obj = nullptr;
+    MF_OBJECT_TYPE type = MF_OBJECT_INVALID;
+    HRESULT hr = SHCreateStreamOnFileEx(path.c_str(), STGM_READ | STGM_SHARE_DENY_NONE, FILE_ATTRIBUTE_NORMAL, FALSE,
+                                        nullptr, &file);
+    if (SUCCEEDED(hr)) hr = s_mf.CreateMFByteStreamOnStream(file, &bytes);
+    if (SUCCEEDED(hr)) hr = s_mf.CreateSourceResolver(&resolver);
+    if (SUCCEEDED(hr))
+        hr = resolver->CreateObjectFromByteStream(bytes, path.c_str(),
+                                                  MF_RESOLUTION_MEDIASOURCE | MF_RESOLUTION_CONTENT_DOES_NOT_HAVE_TO_MATCH_EXTENSION_OR_MIME_TYPE,
+                                                  nullptr, &type, &obj);
+    if (SUCCEEDED(hr) && obj) hr = obj->QueryInterface(IID_PPV_ARGS(&m_source));
+    release(obj);
+    release(resolver);
+    release(bytes);
+    release(file);
+    if (FAILED(hr) || !m_source) return false;
+    IMFPresentationDescriptor* pd = nullptr;
+    if (SUCCEEDED(m_source->CreatePresentationDescriptor(&pd))) {
+        DWORD count = 0;
+        pd->GetStreamDescriptorCount(&count);
+        for (DWORD i = 0; i < count; ++i) {
+            BOOL selected = FALSE;
+            IMFStreamDescriptor* sd = nullptr;
+            if (FAILED(pd->GetStreamDescriptorByIndex(i, &selected, &sd))) continue;
+            IMFMediaTypeHandler* th = nullptr;
+            GUID major = GUID_NULL;
+            if (SUCCEEDED(sd->GetMediaTypeHandler(&th))) {
+                if (SUCCEEDED(th->GetMajorType(&major)) && major == MFMediaType_Audio) fix_opus_type(th);
+                th->Release();
+            }
+            sd->Release();
+        }
+        pd->Release();
+    }
+    if (FAILED(s_createReader(m_source, nullptr, &m_reader)) || !m_reader) return false;
+    const DWORD audio = (DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM;
+    m_reader->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);
+    if (FAILED(m_reader->SetStreamSelection(audio, TRUE))) return false;
+    IMFMediaType* want = nullptr;
+    if (FAILED(s_mf.CreateMediaType(&want))) return false;
+    want->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+    want->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_Float);
+    hr = m_reader->SetCurrentMediaType(audio, nullptr, want);
+    want->Release();
+    IMFMediaType* got = nullptr;
+    if (FAILED(hr) || FAILED(m_reader->GetCurrentMediaType(audio, &got)) || !got) return false;
+    UINT32 ch = 0, rate = 0, bits = 0;
+    got->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &ch);
+    got->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate);
+    got->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, &bits);
+    got->Release();
+    if (!ch || !rate || bits != 32) return false;
+    m_channels = ch;
+    m_rate = rate;
+    if (from > 0) {
+        PROPVARIANT v;
+        PropVariantInit(&v);
+        v.vt = VT_I8;
+        v.hVal.QuadPart = from;
+        m_reader->SetCurrentPosition(GUID_NULL, v);
+    }
+    return true;
+}
+
+bool AudioDecoder::read(std::vector<float>& out, LONGLONG* time) {
+    if (!m_reader) return false;
+    for (;;) {
+        DWORD flags = 0;
+        LONGLONG ts = 0;
+        IMFSample* s = nullptr;
+        HRESULT hr = m_reader->ReadSample((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, nullptr, &flags, &ts, &s);
+        if (FAILED(hr) || (flags & (MF_SOURCE_READERF_ENDOFSTREAM | MF_SOURCE_READERF_ERROR))) {
+            release(s);
+            return false;
+        }
+        if (!s) continue;                                  // (a gap, a format change)
+        IMFMediaBuffer* b = nullptr;
+        bool ok = false;
+        if (SUCCEEDED(s->ConvertToContiguousBuffer(&b)) && b) {
+            BYTE* p = nullptr;
+            DWORD len = 0;
+            if (SUCCEEDED(b->Lock(&p, nullptr, &len))) {
+                out.insert(out.end(), (const float*)p, (const float*)p + len / sizeof(float));
+                b->Unlock();
+                ok = true;
+            }
+            b->Release();
+        }
+        s->Release();
+        if (time) *time = ts;
+        return ok;
+    }
 }

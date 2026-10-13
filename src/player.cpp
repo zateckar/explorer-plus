@@ -1,16 +1,26 @@
-// Media player window: the video (or what is playing, for audio), the play queue on the
-// right, the controls bar at the bottom. Playback is media.cpp's (Media Foundation); the
-// queue's logic is playlist.cpp's.
+// Media player window: the video (or, for sound, the album cover, the tags and a
+// spectrogram), the play queue on the right, the controls bar at the bottom. Playback is
+// media.cpp's (Media Foundation); the queue's logic is playlist.cpp's.
 #include "player.h"
 #include "media.h"
+#include "mediadata.h"
+#include "mediainfo.h"
+#include "spectrum.h"
 #include "playlist.h"
 #include "theme.h"
 #include "settings.h"
 #include "acc.h"
+#include "resource.h"
+#include <algorithm>
+using std::max;
+using std::min;
+#include <gdiplus.h>
 #include <dwmapi.h>
 #include <propkey.h>
+#include <propvarutil.h>
+#include <shobjidl.h>
 #include <windowsx.h>
-#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cwctype>
 #include <deque>
@@ -22,8 +32,11 @@ namespace {
 const UINT WM_MEDIA_NOTE = WM_APP + 40;     // lParam: MediaNote* (media.cpp)
 const UINT WM_PLAYER_OPEN = WM_APP + 41;    // to the message window, lParam: OpenJob*
 const UINT WM_QUEUE_INFO = WM_APP + 42;     // to the message window: tags read (s_tagDone)
+const UINT WM_MEDIA_INFO = WM_APP + 43;     // lParam: MediaInfoNote* (mediainfo.cpp)
 const ULONG_PTR kCopyPlay = 0x45505031, kCopyEnqueue = 0x45505032;     // WM_COPYDATA: 'EPP1', 'EPP2'
-const UINT_PTR TIMER_POSITION = 1, TIMER_SKIP = 2, TIMER_HIDE_BAR = 3;
+const UINT_PTR TIMER_POSITION = 1, TIMER_SKIP = 2, TIMER_HIDE_BAR = 3, TIMER_SPECTRUM = 4;
+const wchar_t kAppId[] = L"RadimZatecka.ExplorerPlus.Player";   // its own taskbar button
+const UINT s_taskbarCreated = RegisterWindowMessageW(L"TaskbarButtonCreated");
 const size_t kMaxFiles = 10000;             // a folder walk stops there
 
 enum Cmd : UINT {
@@ -67,6 +80,24 @@ struct Player {
     int titleLeft = 0, titleRight = 0;
     int hot = -1, pressed = -1, drag = -1;
     LONGLONG dragPos = 0;
+    // now playing, for sound: the album cover, the tags, the spectrogram
+    unsigned infoFor = 0;           // the entry (QueueEntry::id) `info` is of; 0: none
+    MediaInfo info;
+    HBITMAP coverBmp = nullptr;     // the cover drawn at `coverSize` px (premultiplied alpha)
+    int coverSize = 0;
+    SpectrumFeed feed;
+    std::deque<std::array<uint8_t, SpectrumFeed::kBands>> spec;      // columns shown, newest last
+    HBITMAP specBmp = nullptr;      // the spectrogram as shown (newest column on the right)
+    uint32_t* specBits = nullptr;
+    int specW = 0, specH = 0;
+    LONGLONG specPos = -1;          // the playback position at the last frame
+    uint32_t specLut[256]{};
+    unsigned specLutTheme = 0;
+    // the taskbar button
+    ITaskbarList3* taskbar = nullptr;
+    int tbState = -1, tbPermille = -1;
+    wchar_t tbGlyph = 0;            // the thumbnail's play / pause button shows
+    HICON thumbIcons[3]{};          // previous, play / pause, next
 };
 Player* s_p = nullptr;
 HWND s_msg = nullptr;               // the module's message window (results of its threads)
@@ -207,7 +238,11 @@ void update_title(Player& p) {
     if (t != now) SetWindowTextW(p.wnd, t.c_str());
 }
 
-// the bar's text (what screen readers and the tests read), its paint, the position timer
+void update_taskbar(Player& p);
+bool now_playing(Player& p);
+
+// the bar's text (what screen readers and the tests read), its paint, the taskbar button,
+// the position timer and the spectrogram's frames
 void refresh_bar(Player& p) {
     std::wstring t = state_text(p);
     WCHAR now[512]{};
@@ -217,8 +252,12 @@ void refresh_bar(Player& p) {
         acc_notify(p.bar, EVENT_OBJECT_VALUECHANGE, -1);
     }
     InvalidateRect(p.bar, nullptr, FALSE);
-    if (p.mp->state() == State::Playing) SetTimer(p.wnd, TIMER_POSITION, 250, nullptr);
+    update_taskbar(p);
+    bool running = p.mp->state() == State::Playing;
+    if (running) SetTimer(p.wnd, TIMER_POSITION, 250, nullptr);
     else KillTimer(p.wnd, TIMER_POSITION);
+    if (running && p.feed.active() && now_playing(p)) SetTimer(p.wnd, TIMER_SPECTRUM, 30, nullptr);
+    else KillTimer(p.wnd, TIMER_SPECTRUM);
 }
 
 void refresh_all(Player& p) {
@@ -328,16 +367,21 @@ void tags_read(Player& p, int from);
 void tags_forget();
 
 void on_failed(Player& p);
+void spectrum_reset(Player& p);
 
 // opens entry i and plays it (or shows it stopped at the start)
 void play_index(Player& p, int i, bool play) {
     KillTimer(p.wnd, TIMER_SKIP);
     p.q.set_current(i);
     p.message.clear();
+    spectrum_reset(p);
     if (p.q.current() < 0) {
         p.mp->close();
     } else {
-        p.mp->open(p.q.at(i).path, play);
+        const QueueEntry& e = p.q.at(i);
+        // the cover and the tags (the panel keeps the album's cover meanwhile)
+        if (p.infoFor != e.id) media_info_request(p.wnd, WM_MEDIA_INFO, e.id, e.path, std::max(400, px(400)));
+        p.mp->open(e.path, play);
         if (p.mp->state() == State::Failed) on_failed(p);
         ListView_EnsureVisible(p.list, i, FALSE);
     }
@@ -441,7 +485,7 @@ void remove_selected(Player& p) {
     if (focus >= 0) ListView_SetItemState(p.list, focus, LVIS_FOCUSED | LVIS_SELECTED, LVIS_FOCUSED | LVIS_SELECTED);
     if (hit) {
         if (p.q.current() >= 0) play_index(p, p.q.current(), was);
-        else { KillTimer(p.wnd, TIMER_SKIP); p.mp->close(); p.message.clear(); }
+        else { KillTimer(p.wnd, TIMER_SKIP); p.mp->close(); p.message.clear(); spectrum_reset(p); }
     }
     refresh_all(p);
 }
@@ -452,6 +496,7 @@ void clear_queue(Player& p) {
     p.q.clear();
     p.mp->close();
     p.message.clear();
+    spectrum_reset(p);
     queue_changed(p);
     refresh_all(p);
 }
@@ -556,6 +601,9 @@ void on_note(Player& p, LPARAM lp) {
                 if (!p.mp->title().empty()) e.title = p.mp->title();
                 e.failed = false;
                 ListView_RedrawItems(p.list, i, i);
+                // sound: its spectrogram, from a decoding of its own
+                if (!p.mp->has_video())
+                    p.feed.start(e.path, p.mp->position(), std::max(30, MulDiv(60, p.dpi, 96)));
             }
             InvalidateRect(p.video, nullptr, FALSE);
             update_title(p);
@@ -931,10 +979,305 @@ void paint_bar(Player& p) {
     }
 }
 
-// the video area without a video: what is playing (or how to get something to play)
-void paint_art(Player& p, HDC dc, const RECT& rc) {
+// ------------------------------------------------------------------
+// now playing, for sound: the album cover, the title and tags, the spectrogram
+// ------------------------------------------------------------------
+// the video area shows the panel: an entry is current and it isn't (or isn't yet) a video
+bool now_playing(Player& p) {
+    int i = p.q.current();
+    if (i < 0 || p.mp->has_video()) return false;
+    // (a video file still opening: no panel flashing up before its picture)
+    return !(p.mp->state() == State::Opening && media_file_video(p.q.at(i).path));
+}
+
+std::wstring folder_of(const std::wstring& path) { return path.substr(0, path.find_last_of(L"\\/") + 1); }
+
+// the tags read for the current entry; null while they're on their way
+const MediaInfo* current_info(Player& p) {
+    int i = p.q.current();
+    return i >= 0 && p.infoFor == p.q.at(i).id ? &p.info : nullptr;
+}
+
+// the cover to show: the current entry's, or meanwhile the previous one's when it's a
+// picture of the same folder (the next track of an album)
+bool cover_shown(Player& p) {
+    int i = p.q.current();
+    if (i < 0 || !p.info.cover) return false;
+    if (current_info(p)) return true;
+    const std::wstring& from = p.info.coverFrom;
+    return !from.empty() && folder_of(from) == folder_of(p.q.at(i).path) && is_image_name(from);
+}
+
+// what the panel lists under the title: the tags, then the stream's format
+std::vector<std::pair<std::wstring, std::wstring>> now_details(Player& p) {
+    std::vector<std::pair<std::wstring, std::wstring>> out;
+    const MediaInfo* info = current_info(p);
+    if (info) out = info->tags;
+    const AudioInfo& a = p.mp->audio();
+    int i = p.q.current();
+    std::wstring fmt = audio_format_name(a.format);
+    if (fmt.empty() && i >= 0) {                        // (unknown: the file type)
+        const wchar_t* ext = PathFindExtensionW(p.q.at(i).path.c_str());
+        if (*ext) { fmt = ext + 1; for (auto& ch : fmt) ch = (wchar_t)towupper(ch); }
+    }
+    unsigned bitrate = info && info->bitrate ? info->bitrate : a.bitrate;
+    if (!bitrate && info && info->size && p.mp->duration() > 0)      // (the average: size / duration)
+        bitrate = (unsigned)(info->size * 8 * 10000000.0 / (double)p.mp->duration());
+    std::wstring b = fmt_bitrate(bitrate);
+    if (!fmt.empty()) out.push_back({ L"Format", b.empty() ? fmt : fmt + L", " + b });
+    std::wstring audio = fmt_sample_rate(a.rate);
+    std::wstring ch = fmt_channels(a.channels);
+    if (!ch.empty()) audio += (audio.empty() ? L"" : L", ") + ch;
+    bool lossless = a.format == 1 || a.format == 3 || a.format == 0xF1AC || a.format == 0x6C61 ||
+                    a.format == 0x63616C61 || a.format == 0x0163;
+    if (lossless && a.bits) audio += (audio.empty() ? L"" : L", ") + std::to_wstring(a.bits) + L"-bit";
+    if (!audio.empty()) out.push_back({ L"Audio", audio });
+    if (info && info->size) out.push_back({ L"Size", fmt_file_size(info->size) });
+    return out;
+}
+
+struct NowRects { RECT cover{}, text{}, spec{}; bool stacked = false; };
+
+NowRects now_rects(Player& p, const RECT& rc) {
+    NowRects r;
+    int w = rc.right - rc.left, h = rc.bottom - rc.top, pad = px(24);
+    int specH = h >= px(300) ? std::clamp(h * 30 / 100, px(80), px(220)) : 0;
+    if (specH) r.spec = { rc.left + pad, rc.bottom - pad - specH, rc.right - pad, rc.bottom - pad };
+    int top = rc.top + pad, bottom = (specH ? r.spec.top - px(8) : rc.bottom - pad);
+    int availH = bottom - top, availW = w - 2 * pad;
+    r.stacked = availW < px(460);
+    if (!r.stacked) {                       // the cover on the left, the text beside it
+        int s = std::min({ availH, availW * 45 / 100, px(320) });
+        if (s < px(64)) s = 0;
+        int y = top + (availH - s) / 2;
+        r.cover = { rc.left + pad, y, rc.left + pad + s, y + s };
+        r.text = { s ? r.cover.right + px(28) : rc.left + pad, top, rc.right - pad, bottom };
+    } else {                                // narrow: the cover above the text
+        int s = std::min({ availH - px(170), availW, px(220) });     // (room for the title and a few details)
+        if (s < px(64)) s = 0;
+        int x = rc.left + (w - s) / 2;
+        r.cover = { x, top, x + s, top + s };
+        r.text = { rc.left + pad, top + s + (s ? px(16) : 0), rc.right - pad, bottom };
+    }
+    return r;
+}
+
+// the cover scaled into a `size` square (aspect kept, centred, rounded corners), with alpha
+HBITMAP render_cover(const MediaInfo& info, int size, int radius) {
+    BITMAPINFO bi{};
+    bi.bmiHeader = { sizeof(BITMAPINFOHEADER), size, -size, 1, 32, BI_RGB };
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bmp) return nullptr;
+    Gdiplus::Bitmap src(info.coverW, info.coverH, info.coverW * 4, PixelFormat32bppPARGB,
+                        (BYTE*)const_cast<uint32_t*>(info.cover->data()));
+    double k = std::min((double)size / info.coverW, (double)size / info.coverH);
+    int fw = std::max(1, (int)(info.coverW * k + 0.5)), fh = std::max(1, (int)(info.coverH * k + 0.5));
+    Gdiplus::Bitmap scaled(fw, fh, PixelFormat32bppPARGB);
+    {
+        Gdiplus::Graphics g(&scaled);
+        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        Gdiplus::ImageAttributes clampEdges;        // (no blend with the far edge at the borders)
+        clampEdges.SetWrapMode(Gdiplus::WrapModeTileFlipXY);
+        g.DrawImage(&src, Gdiplus::Rect(0, 0, fw, fh), 0, 0, info.coverW, info.coverH, Gdiplus::UnitPixel, &clampEdges);
+    }
+    Gdiplus::Bitmap out(size, size, size * 4, PixelFormat32bppPARGB, (BYTE*)bits);
+    {
+        Gdiplus::Graphics g(&out);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        int x = (size - fw) / 2, y = (size - fh) / 2;
+        Gdiplus::TextureBrush brush(&scaled);
+        brush.TranslateTransform((float)x, (float)y);
+        Gdiplus::GraphicsPath path;
+        float d = (float)radius * 2;
+        path.AddArc((float)x, (float)y, d, d, 180, 90);
+        path.AddArc((float)(x + fw) - d, (float)y, d, d, 270, 90);
+        path.AddArc((float)(x + fw) - d, (float)(y + fh) - d, d, d, 0, 90);
+        path.AddArc((float)x, (float)(y + fh) - d, d, d, 90, 90);
+        path.CloseFigure();
+        g.FillPath(&brush, &path);
+    }
+    return bmp;
+}
+
+void draw_cover(Player& p, HDC dc, const RECT& r) {
     const Palette& c = pal();
-    fill_rect(dc, rc, c.content);
+    int size = r.right - r.left;
+    if (size <= 0) return;
+    if (cover_shown(p)) {
+        if (!p.coverBmp || p.coverSize != size) {
+            if (p.coverBmp) DeleteObject(p.coverBmp);
+            p.coverBmp = render_cover(p.info, size, px(8));
+            p.coverSize = size;
+        }
+        if (p.coverBmp) {
+            HDC mem = CreateCompatibleDC(dc);
+            HGDIOBJ old = SelectObject(mem, p.coverBmp);
+            BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+            AlphaBlend(dc, r.left, r.top, size, size, mem, 0, 0, size, size, bf);
+            SelectObject(mem, old);
+            DeleteDC(mem);
+            return;
+        }
+    }
+    // no cover: a tile with a note
+    fill_rrect(dc, r, px(8), blend(c.content, c.text, g_dark ? 0.08 : 0.05));
+    RECT g = r;
+    HFONT f = size >= px(160) ? p.glyphsArt : p.glyphsBig;
+    glyph_at(dc, L'\xE8D6', g, c.textDisabled, f);
+}
+
+// --- the spectrogram: one column per pixel, scrolling left as playback goes on ---
+void spectrum_lut(Player& p) {
+    if (p.specLutTheme == theme_generation()) return;
+    p.specLutTheme = theme_generation();
+    const Palette& c = pal();
+    // silence is a shade off the background; loud is the accent, then light (dark theme) or
+    // deep (light)
+    COLORREF quiet = blend(c.content, c.text, g_dark ? 0.05 : 0.035);
+    COLORREF stops[4] = { quiet, blend(quiet, c.accent, 0.45), c.accent,
+                          g_dark ? blend(c.accent, RGB(255, 255, 255), 0.8) : blend(c.accent, RGB(0, 0, 0), 0.6) };
+    const double at[4] = { 0.0, 0.35, 0.7, 1.0 };
+    for (int i = 0; i < 256; ++i) {
+        double t = i / 255.0;
+        int s = t < at[1] ? 0 : t < at[2] ? 1 : 2;
+        COLORREF col = blend(stops[s], stops[s + 1], (t - at[s]) / (at[s + 1] - at[s]));
+        p.specLut[i] = 0xFF000000u | (GetRValue(col) << 16) | (GetGValue(col) << 8) | GetBValue(col);
+    }
+}
+
+void spectrum_column(Player& p, int x, const uint8_t* bands) {
+    const int B = SpectrumFeed::kBands;
+    for (int y = 0; y < p.specH; ++y) {
+        double f = p.specH > 1 ? (double)(p.specH - 1 - y) * (B - 1) / (p.specH - 1) : 0;    // (low at the bottom)
+        int b = (int)f;
+        double t = f - b;
+        double v = b + 1 < B ? bands[b] * (1 - t) + bands[b + 1] * t : bands[b];
+        p.specBits[(size_t)y * p.specW + x] = p.specLut[(int)v];
+    }
+}
+
+// the bitmap at the area's size, drawn again from the columns kept
+void spectrum_fit(Player& p, int w, int h) {
+    spectrum_lut(p);
+    if (p.specBmp && p.specW == w && p.specH == h) return;
+    if (p.specBmp) DeleteObject(p.specBmp);
+    p.specBmp = nullptr;
+    p.specBits = nullptr;
+    p.specW = p.specH = 0;
+    if (w <= 0 || h <= 0) return;
+    BITMAPINFO bi{};
+    bi.bmiHeader = { sizeof(BITMAPINFOHEADER), w, -h, 1, 32, BI_RGB };
+    void* bits = nullptr;
+    p.specBmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!p.specBmp) return;
+    p.specBits = (uint32_t*)bits;
+    p.specW = w;
+    p.specH = h;
+    std::fill(p.specBits, p.specBits + (size_t)w * h, p.specLut[0]);
+    int n = (int)std::min<size_t>(p.spec.size(), (size_t)w);
+    for (int k = 0; k < n; ++k) spectrum_column(p, w - n + k, p.spec[p.spec.size() - n + k].data());
+}
+
+void spectrum_redraw(Player& p) {                  // (a new theme: new colours)
+    int w = p.specW, h = p.specH;
+    if (p.specBmp) DeleteObject(p.specBmp);
+    p.specBmp = nullptr;
+    p.specW = p.specH = 0;
+    spectrum_fit(p, w, h);
+}
+
+// a new track (or none): an empty spectrogram, no analysis
+void spectrum_reset(Player& p) {
+    p.feed.stop();
+    p.spec.clear();
+    p.specPos = -1;
+    KillTimer(p.wnd, TIMER_SPECTRUM);
+    if (p.specBits) std::fill(p.specBits, p.specBits + (size_t)p.specW * p.specH, p.specLut[0]);
+}
+
+// the spectrogram's picture within its area: right of the frequency scale
+RECT spectrum_image(const RECT& area) {
+    RECT r = area;
+    r.left = std::min(r.right, r.left + px(32));
+    return r;
+}
+
+RECT spectrum_rect(Player& p) {
+    RECT rc{};
+    GetClientRect(p.video, &rc);
+    RECT a = now_rects(p, rc).spec;
+    return IsRectEmpty(&a) ? a : spectrum_image(a);
+}
+
+// a frame: the columns playback has reached, scrolled in from the right
+void spectrum_tick(Player& p) {
+    if (!p.feed.active() || !now_playing(p)) return;
+    LONGLONG pos = p.mp->position();
+    // a seek (or a jump of the clock): the analysis starts again there
+    if (p.specPos >= 0 && (pos < p.specPos - 2000000 || pos > p.specPos + 15000000)) {
+        int i = p.q.current();
+        if (i >= 0) p.feed.start(p.q.at(i).path, pos, std::max(30, MulDiv(60, p.dpi, 96)));
+        p.spec.clear();
+        if (p.specBits) std::fill(p.specBits, p.specBits + (size_t)p.specW * p.specH, p.specLut[0]);
+    }
+    p.specPos = pos;
+    std::vector<uint8_t> cols;
+    int n = p.feed.take(pos, cols);
+    if (!n) return;
+    const int B = SpectrumFeed::kBands;
+    for (int k = 0; k < n; ++k) {
+        std::array<uint8_t, SpectrumFeed::kBands> a;
+        std::copy(cols.begin() + (size_t)k * B, cols.begin() + (size_t)(k + 1) * B, a.begin());
+        p.spec.push_back(a);
+    }
+    while (p.spec.size() > 4096) p.spec.pop_front();
+    RECT r = spectrum_rect(p);
+    if (IsRectEmpty(&r)) return;
+    spectrum_fit(p, r.right - r.left, r.bottom - r.top);
+    if (!p.specBits) return;
+    int w = p.specW, shift = std::min(n, w);
+    for (int y = 0; y < p.specH; ++y) {             // (scrolled left by the new columns)
+        uint32_t* row = p.specBits + (size_t)y * w;
+        memmove(row, row + shift, (size_t)(w - shift) * 4);
+    }
+    for (int k = 0; k < shift; ++k) spectrum_column(p, w - shift + k, cols.data() + (size_t)(n - shift + k) * B);
+    GdiFlush();
+    InvalidateRect(p.video, &r, FALSE);
+}
+
+void draw_spectrum(Player& p, HDC dc, const RECT& area) {
+    RECT r = spectrum_image(area);
+    int w = r.right - r.left, h = r.bottom - r.top;
+    spectrum_fit(p, w, h);
+    if (!p.specBmp) return;
+    HDC mem = CreateCompatibleDC(dc);
+    HGDIOBJ old = SelectObject(mem, p.specBmp);
+    BitBlt(dc, r.left, r.top, w, h, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, old);
+    DeleteDC(mem);
+    // the frequency scale: 100 Hz, 1 kHz, 10 kHz
+    const Palette& c = pal();
+    const int B = SpectrumFeed::kBands;
+    double f0 = p.feed.band_freq(0), f1 = p.feed.band_freq(B - 1);
+    if (f0 <= 0 || f1 <= f0) return;
+    for (int hz : { 100, 1000, 10000 }) {
+        if (hz <= f0 || hz >= f1) continue;
+        double band = std::log(hz / f0) / std::log(f1 / f0) * (B - 1);
+        int y = r.bottom - 1 - (int)(band / (B - 1) * (h - 1));
+        RECT tick{ r.left - px(5), y, r.left - px(1), y + 1 };
+        fill_rect(dc, tick, c.textSecondary);
+        RECT lr{ area.left, y - px(9), r.left - px(8), y + px(9) };
+        text_at(dc, hz >= 1000 ? std::to_wstring(hz / 1000) + L"k" : std::to_wstring(hz), lr, c.textSecondary,
+                p.fontSmall, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    }
+}
+
+// the video area with nothing playing yet: how to get something to play
+void paint_idle(Player& p, HDC dc, const RECT& rc) {
+    const Palette& c = pal();
     std::wstring title, detail;
     wchar_t g = L'\xE8D6';                     // (music note)
     if (p.q.empty()) {
@@ -946,7 +1289,7 @@ void paint_art(Player& p, HDC dc, const RECT& rc) {
     } else {
         title = current_title(p);
         detail = current_detail(p);
-        if (p.mp->has_video()) g = L'\xE714';      // (video)
+        g = L'\xE714';                         // (video)
     }
     int w = rc.right - rc.left, h = rc.bottom - rc.top;
     if (w < px(80) || h < px(80)) return;
@@ -963,6 +1306,192 @@ void paint_art(Player& p, HDC dc, const RECT& rc) {
         RECT mr{ tr.left, dr.bottom + px(8), tr.right, dr.bottom + px(56) };
         text_at(dc, p.message, mr, c.text, p.font, DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
     }
+}
+
+// the video area without a video
+void paint_art(Player& p, HDC dc, const RECT& rc) {
+    const Palette& c = pal();
+    fill_rect(dc, rc, c.content);
+    if (!now_playing(p)) { paint_idle(p, dc, rc); return; }
+    NowRects r = now_rects(p, rc);
+    if (!IsRectEmpty(&r.cover)) draw_cover(p, dc, r.cover);
+    // the text: title, artist, album; the message (can't play) or the details
+    std::wstring title = current_title(p), artist = p.mp->artist(), album = p.mp->album();
+    auto details = p.message.empty() ? now_details(p) : decltype(now_details(p)){};
+    int lineBig = px(40), line = px(26), row = px(22), gap = px(14);
+    int textH = r.text.bottom - r.text.top;
+    int fixed = lineBig + (artist.empty() ? 0 : line) + (album.empty() ? 0 : line);
+    int extra = !p.message.empty() ? gap + px(48) : details.empty() ? 0 : gap;
+    int rowsFit = std::max(0, (textH - fixed - extra) / row);
+    int rows = std::min((int)details.size(), rowsFit);
+    int total = fixed + extra + rows * row;
+    int y = r.text.top + (r.stacked ? 0 : std::max(0, (textH - total) / 2));
+    UINT align = r.stacked ? DT_CENTER : DT_LEFT;
+    auto line_at = [&](const std::wstring& s, int hgt, COLORREF col, HFONT f) {
+        RECT lr{ r.text.left, y, r.text.right, y + hgt };
+        text_at(dc, s, lr, col, f, align | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        y += hgt;
+    };
+    line_at(title, lineBig, c.text, p.fontBig);
+    if (!artist.empty()) line_at(artist, line, c.text, p.font);
+    if (!album.empty()) line_at(album, line, c.textSecondary, p.font);
+    if (!p.message.empty()) {
+        y += gap;
+        RECT mr{ r.text.left, y, r.text.right, y + px(48) };
+        text_at(dc, p.message, mr, c.text, p.font, align | DT_WORDBREAK | DT_END_ELLIPSIS);
+    } else if (rows) {
+        y += gap;
+        // labels in a column of their own (their widest), values beside them
+        HGDIOBJ of = SelectObject(dc, p.fontSmall);
+        int labelW = 0;
+        for (int k = 0; k < rows; ++k) labelW = std::max(labelW, text_width(dc, details[k].first.c_str()));
+        SelectObject(dc, of);
+        labelW += px(16);
+        int left = r.text.left;
+        if (r.stacked) {                                // (centred as a block)
+            int valueW = 0;
+            of = SelectObject(dc, p.fontSmall);
+            for (int k = 0; k < rows; ++k) valueW = std::max(valueW, text_width(dc, details[k].second.c_str()));
+            SelectObject(dc, of);
+            left = std::max(r.text.left, (r.text.left + r.text.right - labelW - valueW) / 2);
+        }
+        for (int k = 0; k < rows; ++k) {
+            RECT lr{ left, y, left + labelW, y + row };
+            RECT vr{ left + labelW, y, r.text.right, y + row };
+            text_at(dc, details[k].first, lr, c.textSecondary, p.fontSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            text_at(dc, details[k].second, vr, c.text, p.fontSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            y += row;
+        }
+    }
+    if (!IsRectEmpty(&r.spec)) draw_spectrum(p, dc, r.spec);
+}
+
+// ------------------------------------------------------------------
+// the taskbar button: its own (the player's icon), the track's progress, and Previous /
+// Play / Next in the thumbnail
+// ------------------------------------------------------------------
+void set_app_id(HWND hwnd, bool on) {
+    IPropertyStore* ps = nullptr;
+    if (FAILED(SHGetPropertyStoreForWindow(hwnd, IID_PPV_ARGS(&ps))) || !ps) return;
+    PROPVARIANT v;
+    // (PreventPinning before the ID, as documented; both cleared before the window goes)
+    if (on) InitPropVariantFromBoolean(TRUE, &v); else PropVariantInit(&v);
+    ps->SetValue(PKEY_AppUserModel_PreventPinning, v);
+    PropVariantClear(&v);
+    if (on) InitPropVariantFromString(kAppId, &v); else PropVariantInit(&v);
+    ps->SetValue(PKEY_AppUserModel_ID, v);
+    PropVariantClear(&v);
+    ps->Commit();
+    ps->Release();
+}
+
+// a Segoe Fluent glyph as a small icon (the thumbnail's buttons), for the taskbar's theme
+HICON glyph_icon(wchar_t glyph) {
+    int s = GetSystemMetrics(SM_CXSMICON);
+    DWORD light = 0, cb = sizeof(light);
+    RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                 L"SystemUsesLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &cb);
+    BITMAPINFO bi{};
+    bi.bmiHeader = { sizeof(BITMAPINFOHEADER), s, -s, 1, 32, BI_RGB };
+    void* bits = nullptr;
+    HBITMAP color = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!color) return nullptr;
+    HDC mem = CreateCompatibleDC(nullptr);
+    HGDIOBJ old = SelectObject(mem, color);
+    RECT r{ 0, 0, s, s };
+    FillRect(mem, &r, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    LOGFONTW lf{};
+    lf.lfHeight = -s * 3 / 4;
+    lf.lfQuality = ANTIALIASED_QUALITY;         // (grey levels: the coverage becomes the alpha)
+    lf.lfCharSet = DEFAULT_CHARSET;
+    wcscpy_s(lf.lfFaceName, theme_glyph_face());
+    HFONT f = CreateFontIndirectW(&lf);
+    HGDIOBJ of = SelectObject(mem, f);
+    SetBkMode(mem, TRANSPARENT);
+    SetTextColor(mem, RGB(255, 255, 255));
+    wchar_t t[2] = { glyph, 0 };
+    DrawTextW(mem, t, 1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(mem, of);
+    DeleteObject(f);
+    SelectObject(mem, old);
+    DeleteDC(mem);
+    GdiFlush();
+    uint8_t ink = light ? 0 : 255;
+    for (int i = 0; i < s * s; ++i) {
+        uint32_t& px32 = ((uint32_t*)bits)[i];
+        uint32_t a = px32 & 0xFF;                   // (white on black: any channel is the coverage)
+        uint32_t v = ink * a / 255;
+        px32 = (a << 24) | (v << 16) | (v << 8) | v;
+    }
+    HBITMAP mask = CreateBitmap(s, s, 1, 1, nullptr);
+    ICONINFO ii{ TRUE, 0, 0, mask, color };
+    HICON icon = CreateIconIndirect(&ii);
+    DeleteObject(mask);
+    DeleteObject(color);
+    return icon;
+}
+
+void free_thumb_icons(Player& p) {
+    for (HICON& i : p.thumbIcons) if (i) { DestroyIcon(i); i = nullptr; }
+}
+
+void thumb_buttons(Player& p, bool add) {
+    if (!p.taskbar) return;
+    wchar_t playGlyph = playing(p) ? L'\xE769' : L'\xE768';
+    if (!add && playGlyph == p.tbGlyph) return;
+    free_thumb_icons(p);
+    p.thumbIcons[0] = glyph_icon(L'\xE892');
+    p.thumbIcons[1] = glyph_icon(playGlyph);
+    p.thumbIcons[2] = glyph_icon(L'\xE893');
+    p.tbGlyph = playGlyph;
+    THUMBBUTTON b[3]{};
+    const UINT ids[3] = { CMD_PREV, CMD_PLAYPAUSE, CMD_NEXT };
+    const wchar_t* tips[3] = { L"Previous", playing(p) ? L"Pause" : L"Play", L"Next" };
+    for (int i = 0; i < 3; ++i) {
+        b[i].dwMask = THB_ICON | THB_TOOLTIP | THB_FLAGS;
+        b[i].iId = ids[i];
+        b[i].hIcon = p.thumbIcons[i];
+        wcscpy_s(b[i].szTip, tips[i]);
+        b[i].dwFlags = p.q.empty() ? THBF_DISABLED : THBF_ENABLED;
+    }
+    if (add) p.taskbar->ThumbBarAddButtons(p.wnd, 3, b);
+    else p.taskbar->ThumbBarUpdateButtons(p.wnd, 3, b);
+}
+
+// the taskbar made the button (again, after Explorer restarted)
+void taskbar_created(Player& p) {
+    if (!p.taskbar && SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&p.taskbar))) &&
+        FAILED(p.taskbar->HrInit())) {
+        p.taskbar->Release();
+        p.taskbar = nullptr;
+    }
+    p.tbState = p.tbPermille = -1;
+    thumb_buttons(p, true);
+    update_taskbar(p);
+}
+
+void update_taskbar(Player& p) {
+    if (!p.taskbar) return;
+    State s = p.mp->state();
+    int st = s == State::Failed ? TBPF_ERROR
+           : (s == State::Playing || s == State::Paused) && p.mp->duration() > 0 ? (playing(p) ? TBPF_NORMAL : TBPF_PAUSED)
+           : TBPF_NOPROGRESS;
+    if (st != p.tbState) {
+        p.taskbar->SetProgressState(p.wnd, (TBPFLAG)st);
+        p.tbState = st;
+        p.tbPermille = -1;
+    }
+    if (st == TBPF_NORMAL || st == TBPF_PAUSED) {
+        int v = (int)std::clamp(p.mp->position() * 1000 / std::max<LONGLONG>(1, p.mp->duration()), 0LL, 1000LL);
+        if (v != p.tbPermille) {
+            p.taskbar->SetProgressValue(p.wnd, (ULONGLONG)v, 1000);
+            p.tbPermille = v;
+        }
+    } else if (st == TBPF_ERROR && p.tbPermille != 1000) {
+        p.taskbar->SetProgressValue(p.wnd, 1000, 1000);
+        p.tbPermille = 1000;
+    }
+    thumb_buttons(p, false);
 }
 
 void paint_main(Player& p) {
@@ -1242,6 +1771,7 @@ void apply_theme(Player& p) {
     BOOL dark = g_dark;
     DwmSetWindowAttribute(p.wnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof(dark));
     theme_style_list(p.list);
+    if (p.specBmp) spectrum_redraw(p);
     RedrawWindow(p.wnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
 }
 
@@ -1296,8 +1826,9 @@ void register_classes() {
     if (done) return;
     done = true;
     HICON big = nullptr, small = nullptr;
-    LoadIconMetric(g_hinst, MAKEINTRESOURCEW(IDI_APP), LIM_LARGE, &big);
-    LoadIconMetric(g_hinst, MAKEINTRESOURCEW(IDI_APP), LIM_SMALL, &small);
+    // (the player's own icon: its taskbar button is apart from the file windows')
+    LoadIconMetric(g_hinst, MAKEINTRESOURCEW(IDI_PLAYER), LIM_LARGE, &big);
+    LoadIconMetric(g_hinst, MAKEINTRESOURCEW(IDI_PLAYER), LIM_SMALL, &small);
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.hInstance = g_hinst;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
@@ -1375,7 +1906,29 @@ void on_destroy(Player& p) {
     while (PeekMessageW(&m, p.wnd, WM_MEDIA_NOTE, WM_MEDIA_NOTE, PM_REMOVE)) p.mp->handle(reinterpret_cast<MediaNote*>(m.lParam));
     delete p.mp;
     p.mp = nullptr;
+    p.feed.stop();
+    KillTimer(p.wnd, TIMER_SPECTRUM);
+    while (PeekMessageW(&m, p.wnd, WM_MEDIA_INFO, WM_MEDIA_INFO, PM_REMOVE)) delete reinterpret_cast<MediaInfoNote*>(m.lParam);
+    if (p.coverBmp) DeleteObject(p.coverBmp);
+    if (p.specBmp) DeleteObject(p.specBmp);
+    p.coverBmp = p.specBmp = nullptr;
+    p.specBits = nullptr;
+    if (p.taskbar) { p.taskbar->Release(); p.taskbar = nullptr; }
+    free_thumb_icons(p);
+    set_app_id(p.wnd, false);
     delete_fonts(p);
+}
+
+void on_media_info(Player& p, MediaInfoNote* n) {
+    int i = p.q.current();
+    if (i >= 0 && p.q.at(i).id == n->id) {
+        p.info = std::move(n->info);
+        p.infoFor = n->id;
+        if (p.coverBmp) DeleteObject(p.coverBmp);
+        p.coverBmp = nullptr;
+        InvalidateRect(p.video, nullptr, FALSE);
+    }
+    delete n;
 }
 
 LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1383,14 +1936,20 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_CREATE && pp) { on_create(*pp, hwnd); return 0; }
     if (!pp || pp->wnd != hwnd || !pp->mp) return DefWindowProcW(hwnd, msg, wp, lp);
     Player& p = *pp;
+    if (msg == s_taskbarCreated && s_taskbarCreated) { taskbar_created(p); return 0; }
     switch (msg) {
         case WM_MEDIA_NOTE: on_note(p, lp); return 0;
-        case WM_COMMAND: if (HIWORD(wp) == 0 && LOWORD(wp) >= CMD_PLAYPAUSE) command(p, LOWORD(wp)); return 0;
+        case WM_MEDIA_INFO: on_media_info(p, reinterpret_cast<MediaInfoNote*>(lp)); return 0;
+        case WM_COMMAND:
+            // (menus and accelerators; the taskbar thumbnail's buttons)
+            if ((HIWORD(wp) == 0 || HIWORD(wp) == THBN_CLICKED) && LOWORD(wp) >= CMD_PLAYPAUSE) command(p, LOWORD(wp));
+            return 0;
         case WM_APPCOMMAND:
             if (media_command(p, GET_APPCOMMAND_LPARAM(lp))) return TRUE;
             break;
         case WM_TIMER:
             if (wp == TIMER_POSITION) refresh_bar(p);
+            else if (wp == TIMER_SPECTRUM) spectrum_tick(p);
             else if (wp == TIMER_SKIP) { KillTimer(hwnd, TIMER_SKIP); next(p); }
             else if (wp == TIMER_HIDE_BAR) {
                 POINT c{};
@@ -1514,6 +2073,8 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // (the main window may have read the change first: the generation tells)
             theme_reload();
             if (p.themeSeen != theme_generation()) apply_theme(p);
+            // (the thumbnail's glyphs follow the taskbar's light or dark)
+            if (msg == WM_SETTINGCHANGE && p.taskbar) { p.tbGlyph = 0; thumb_buttons(p, false); }
             break;
         case WM_DPICHANGED: {
             p.dpi = HIWORD(wp);
@@ -1567,6 +2128,7 @@ bool create_player(bool activate) {
         s_p = nullptr;
         return false;
     }
+    set_app_id(w, true);                    // (before it's shown: the button is made then)
     ShowWindow(w, maximized ? SW_SHOWMAXIMIZED : activate ? SW_SHOWNORMAL : SW_SHOWNOACTIVATE);
     if (activate) SetForegroundWindow(w);
     return true;

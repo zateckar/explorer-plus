@@ -135,10 +135,10 @@ check('lists folder', wait_for(lambda: app.item_count() == expected), (app.item_
 app.screenshot(os.path.join(shots, '01_details.png'))
 
 # the window (and so the taskbar button) carries the exe's own icon, not a folder
-def class_icon():
+def class_icon(hwnd=None):
     u.GetClassLongPtrW.restype = ctypes.c_void_p
     u.GetClassLongPtrW.argtypes = [W.HWND, ctypes.c_int]
-    return u.GetClassLongPtrW(app.hwnd, -14)                         # GCLP_HICON
+    return u.GetClassLongPtrW(hwnd or app.hwnd, -14)                 # GCLP_HICON
 def icon_size(hicon):
     # the window's icon has the DPI's size (LoadIconMetric): compare at that size, so
     # neither image is scaled
@@ -151,14 +151,14 @@ def icon_size(hicon):
     for h in (color, mask):
         if h: ctypes.windll.gdi32.DeleteObject(ctypes.c_void_p(h))
     return struct.unpack_from('<i', bm, 4)[0] or 32
-def exe_icon(size):
+def exe_icon(size, res=1):                                           # 1: IDI_APP, 2: IDI_PLAYER
     k = ctypes.windll.kernel32
     k.LoadLibraryExW.restype = ctypes.c_void_p
     k.LoadLibraryExW.argtypes = [W.LPCWSTR, W.HANDLE, W.DWORD]
     u.LoadImageW.restype = ctypes.c_void_p
     u.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, W.UINT, ctypes.c_int, ctypes.c_int, W.UINT]
     mod = k.LoadLibraryExW(exe, None, 0x20 | 0x2)                    # AS_IMAGE_RESOURCE | AS_DATAFILE
-    return u.LoadImageW(mod, 1, 1, size, size, 0) if mod else None   # IDI_APP
+    return u.LoadImageW(mod, res, 1, size, size, 0) if mod else None
 def folder_icon():
     info = ctypes.create_string_buffer(544)                          # SHSTOCKICONINFO
     struct.pack_into('<I', info, 0, 544)
@@ -1146,6 +1146,17 @@ check('the compact menu of a sound file offers Play / Queue in Explorer Plus',
       PLAY in entries and QUEUE in entries, entries)
 check('Play opens the player with the file in its queue', wait_for(lambda: queue_rows() == 1, 5), queue_rows())
 print('     player: %s' % player_state())
+# its taskbar button tells it's the player: the player's icon, not the file windows' one
+p = player()
+pi = class_icon(p) if p else None
+psz = icon_size(pi)
+if pi:
+    ppx = winauto.icon_pixels(pi, psz)
+    d_player = winauto.pixel_distance(ppx, winauto.icon_pixels(exe_icon(psz, 2), psz))
+    d_app = winauto.pixel_distance(ppx, winauto.icon_pixels(exe_icon(psz, 1), psz))
+    check('the player\'s window has the player icon', d_player < 8 and d_player < d_app, (round(d_player, 1), round(d_app, 1)))
+else:
+    check('the player\'s window has the player icon', False, pi)
 media_entry('two.wav', QUEUE)
 check('Queue appends to it', wait_for(lambda: queue_rows() == 2, 5), queue_rows())
 app.go(data)

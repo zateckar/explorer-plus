@@ -1,5 +1,6 @@
 #pragma once
 #include "shell_utils.h"
+#include <vector>
 
 // Media Foundation playback of one file at a time (Media Session, the enhanced video
 // renderer into a window, the streaming audio renderer). Used on the UI thread; Media
@@ -13,6 +14,12 @@
 bool media_available(std::wstring* why = nullptr);
 
 struct MediaNote;
+
+// the audio stream that plays (as the file has it, before decoding)
+struct AudioInfo {
+    unsigned long format = 0;       // subtype's first field: WAVE_FORMAT_* / FOURCC (audio_format_name)
+    unsigned rate = 0, channels = 0, bits = 0, bitrate = 0;     // 0: not known
+};
 
 class MediaPlayer {
 public:
@@ -48,6 +55,7 @@ public:
     const std::wstring& title() const { return m_title; }
     const std::wstring& artist() const { return m_artist; }
     const std::wstring& album() const { return m_album; }
+    const AudioInfo& audio() const { return m_audio; }      // once Opened
 
     void set_volume(float amplitude);   // 0..1 (0 also for muted)
     void video_resized();               // the video window changed size
@@ -64,6 +72,7 @@ private:
     bool m_closing = false;
     HRESULT m_error = S_OK;
     std::wstring m_title, m_artist, m_album;
+    AudioInfo m_audio;
     void start_at(LONGLONG hns, bool keepPosition);
     void topology_ready();
     void source_ready(struct IUnknown* obj, HRESULT hr);
@@ -72,3 +81,23 @@ private:
 
 // a sentence for a Media Foundation error ("This file type can't be played", ...)
 std::wstring media_error_text(HRESULT hr);
+
+// A file's audio decoded to float PCM, apart from playback (the spectrogram's): used on a
+// thread of its own (COM initialised there), after media_available() said yes.
+class AudioDecoder {
+public:
+    AudioDecoder() = default;
+    ~AudioDecoder();
+    AudioDecoder(const AudioDecoder&) = delete;
+    AudioDecoder& operator=(const AudioDecoder&) = delete;
+    bool open(const std::wstring& path, LONGLONG from);     // false: no audio it can decode
+    unsigned channels() const { return m_channels; }
+    unsigned rate() const { return m_rate; }
+    // the next block, interleaved, appended to `out`; `time`: its start (100-ns units).
+    // false: the end, or an error
+    bool read(std::vector<float>& out, LONGLONG* time);
+private:
+    struct IMFSourceReader* m_reader = nullptr;
+    struct IMFMediaSource* m_source = nullptr;
+    unsigned m_channels = 0, m_rate = 0;
+};
