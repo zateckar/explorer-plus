@@ -12,6 +12,7 @@
 #include "perf.h"
 #include "detailspane.h"
 #include "searchbox.h"
+#include "player.h"
 #include <algorithm>
 #include <map>
 
@@ -169,6 +170,7 @@ static void invoke_id(HWND hwnd, IContextMenu* cm, UINT id, POINT pt, PCIDLIST_A
 // entries use ids above kIdLast and below the IDM_* range.
 // ------------------------------------------------------------------
 static const UINT kFlyMore = 0x8001, kFlyNewTab = 0x8002, kFlyNewWindow = 0x8003;
+static const UINT kFlyPlay = 0x8004, kFlyEnqueue = 0x8005;
 
 struct ShellEntry {
     UINT id = 0;
@@ -337,7 +339,7 @@ static void fly_app_verbs(std::vector<FlyEntry>& list, const std::vector<ShellEn
             list.push_back(fly_from(e, L'\xE7EF'));
 }
 
-static UINT item_flyout(HWND hwnd, IContextMenu* cm, HMENU m, POINT pt, bool folder) {
+static UINT item_flyout(HWND hwnd, IContextMenu* cm, HMENU m, POINT pt, bool folder, bool media) {
     auto items = menu_entries(cm, m);
     std::vector<FlyButton> row;
     static const struct { const wchar_t* verb; wchar_t glyph; const wchar_t* tip; } kRow[] = {
@@ -365,6 +367,10 @@ static UINT item_flyout(HWND hwnd, IContextMenu* cm, HMENU m, POINT pt, bool fol
     if (folder) {
         list.push_back(fly_item(kFlyNewTab, L"Open in new tab", L'\xE7C3'));
         list.push_back(fly_item(kFlyNewWindow, L"Open in new window", L'\xE8A7'));
+    }
+    if (media) {        // (named apart from a media app's own Play / Add to play queue verbs)
+        list.push_back(fly_item(kFlyPlay, L"Play in Explorer Plus", L'\xE768'));
+        list.push_back(fly_item(kFlyEnqueue, L"Queue in Explorer Plus", L'\xE710'));
     }
     for (auto& e : items)
         if (e.sub && plain_text(lower(e.text)).rfind(L"open with", 0) == 0) {
@@ -462,8 +468,29 @@ static void show_cm(HWND hwnd, POINT pt, IShellFolder* parent, PCIDLIST_ABSOLUTE
             if (PIDLIST_ABSOLUTE real = search_real_location(f)) { CoTaskMemFree(f); f = real; }
         return f;
     };
-    UINT id = track(hwnd, cm.get(), m, pt, [&] { return item_flyout(hwnd, cm.get(), m, pt, folder); });
-    if (id == kFlyNewTab) {
+    // files (and folders) the media player plays: Play / Add to play queue
+    std::vector<MediaItem> media;
+    if (src == MenuSource::List && cidl <= 1000) {
+        for (UINT i = 0; i < cidl; ++i) {
+            SFGAOF a = SFGAO_FOLDER | SFGAO_STREAM | SFGAO_FILESYSTEM;
+            if (FAILED(parent->GetAttributesOf(1, &apidl[i], &a)) || !(a & SFGAO_FILESYSTEM)) continue;
+            bool dir = (a & SFGAO_FOLDER) && !(a & SFGAO_STREAM);
+            PIDLIST_ABSOLUTE f = ILCombine(folderAbs, apidl[i]);
+            if (f && search_is_results(folderAbs))
+                if (PIDLIST_ABSOLUTE real = search_real_location(f)) { CoTaskMemFree(f); f = real; }
+            PWSTR path = nullptr;
+            if (f && SUCCEEDED(SHGetNameFromIDList(f, SIGDN_FILESYSPATH, &path)) && path) {
+                media.push_back({ path, dir });
+                CoTaskMemFree(path);
+            }
+            CoTaskMemFree(f);
+        }
+        if (!player_offer(media)) media.clear();
+    }
+    UINT id = track(hwnd, cm.get(), m, pt, [&] { return item_flyout(hwnd, cm.get(), m, pt, folder, !media.empty()); });
+    if (id == kFlyPlay || id == kFlyEnqueue) {
+        player_open(media, id == kFlyEnqueue);
+    } else if (id == kFlyNewTab) {
         PIDLIST_ABSOLUTE f = full();
         tabmodel_new_tab();
         navigate_owned(f);

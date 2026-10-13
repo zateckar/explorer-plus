@@ -58,6 +58,9 @@ add_executable(explorer-plus WIN32
     src/foldersizes.cpp
     src/ini.cpp
     src/cmdline.cpp
+    src/media.cpp
+    src/playlist.cpp
+    src/player.cpp
     res/resource.rc
 )
 
@@ -96,18 +99,20 @@ else()
 endif()
 
 target_link_libraries(explorer-plus PRIVATE
-    comctl32 shell32 ole32 oleaut32 shlwapi uuid uxtheme comdlg32 gdi32 user32 propsys windowscodecs gdiplus dwmapi msimg32 oleacc)
+    comctl32 shell32 ole32 oleaut32 shlwapi uuid uxtheme comdlg32 gdi32 user32 propsys windowscodecs gdiplus dwmapi msimg32 oleacc
+    # Media Foundation's GUIDs (static); mf.dll / mfplat.dll themselves load on first use
+    mfuuid)
 
 # unit tests of the pure text handling (settings INI, command line, typed paths):
 # ctest --test-dir build --output-on-failure
 option(EXPLORERPLUS_TESTS "Build the unit tests" ON)
 if(EXPLORERPLUS_TESTS)
     enable_testing()
-    add_executable(explorer-plus-tests tests/unit_tests.cpp src/ini.cpp src/cmdline.cpp)
+    add_executable(explorer-plus-tests tests/unit_tests.cpp src/ini.cpp src/cmdline.cpp src/playlist.cpp)
     target_include_directories(explorer-plus-tests PRIVATE src)
     target_compile_options(explorer-plus-tests PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
     target_compile_definitions(explorer-plus-tests PRIVATE UNICODE _UNICODE)
     target_link_options(explorer-plus-tests PRIVATE -municode -static -static-libgcc -static-libstdc++)
-    target_link_libraries(explorer-plus-tests PRIVATE shell32)
+    target_link_libraries(explorer-plus-tests PRIVATE shell32 shlwapi)
     add_test(NAME unit COMMAND explorer-plus-tests)
 endif()

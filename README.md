@@ -51,6 +51,15 @@ File Explorer while starting in well under 100 ms.
   removed by another program sends the view to its parent.
 - **Large folders**: listings stream in; 30,000 files are on screen in ~60 ms and
   complete in under 0.2 s.
+- **Media player**: "Play in Explorer Plus" / "Queue in Explorer Plus" in the compact menu
+  of audio and video files (and of folders with some: their files by name, subfolders
+  after) open a player window — the video, or the title and artist of what plays; the
+  play queue (Enter plays, Delete removes, drop files on it); seek, volume, shuffle,
+  repeat, full screen. Windows' own Media Foundation plays (the formats and codecs
+  Windows has; Windows N needs the Media Feature Pack), nothing to install. Keys: Space
+  play / pause, Left / Right ±5 s (Shift: 30 s), Ctrl+Left / Ctrl+Right previous / next,
+  Up / Down volume, M mute, F or F11 full screen, Ctrl+H shuffle, Ctrl+T repeat; the
+  media keys too. One player for all windows; it stays open after the main window closes.
 
 ## Requirements
 
@@ -126,7 +135,7 @@ pwsh tools/package.ps1 -Version 1.2.0     # -> dist/explorer-plus-1.2.0-win-x64.
 ## Tests and profiling
 
 ```powershell
-ctest --test-dir build --output-on-failure                          # unit tests (INI, command line)
+ctest --test-dir build --output-on-failure                          # unit tests (INI, command line, play queue)
 python -I tools/smoke_test.py build\explorer-plus.exe build\smoke   # GUI smoke test
 python -I tools/perf.py build\explorer-plus.exe build\perf 5         # startup / 30k files / scroll / sort / views / resize
 ```
@@ -164,6 +173,7 @@ src/listview, enumerate, columns, groups, thumbs, foldersizes   content view and
 src/contextmenu, flyout    classic + Win11 compact context menus
 src/fileops, dnd, watcher  file operations, drag and drop, change notifications
 src/detailspane, preview   details / preview pane
+src/player, media, playlist   media player window, Media Foundation playback, play queue
 src/settings, ini, theme, perf, crash   settings.ini, colours and fonts, profiling, crash dumps
 src/cmdline            command line and typed-path text
 tests/                 unit tests (ctest)

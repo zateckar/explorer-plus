@@ -33,6 +33,7 @@ using std::min;
 #include "breadcrumb.h"
 #include "foldersizes.h"
 #include "preview.h"
+#include "player.h"
 #include <uxtheme.h>
 #include <oleacc.h>
 
@@ -588,7 +589,11 @@ static void save_window_state(HWND hwnd) {
     for (int attempt = 0; attempt < 5 && !settings_save_all(); ++attempt) Sleep(200);
 }
 
+// the theme this window shows (the media player's window may read a change first)
+static unsigned s_themeSeen = 1;
+
 static void on_theme_changed(HWND hwnd) {
+    s_themeSeen = theme_generation();
     theme_apply_controls();
     for_each_pane([] {
         groups_theme_changed();
@@ -725,14 +730,12 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         }
         case WM_SETTINGCHANGE:
-            if (((lp && lstrcmpW((LPCWSTR)lp, L"ImmersiveColorSet") == 0) || wp == SPI_SETHIGHCONTRAST) && theme_reload())
-                on_theme_changed(hwnd);
-            break;
+            if (!((lp && lstrcmpW((LPCWSTR)lp, L"ImmersiveColorSet") == 0) || wp == SPI_SETHIGHCONTRAST)) break;
+            [[fallthrough]];
         case WM_SYSCOLORCHANGE:          // (High Contrast themes: the palette is these colours)
-            if (theme_reload()) on_theme_changed(hwnd);
-            break;
         case WM_DWMCOLORIZATIONCOLORCHANGED:
-            if (theme_reload()) on_theme_changed(hwnd);
+            theme_reload();
+            if (s_themeSeen != theme_generation()) on_theme_changed(hwnd);
             break;
 
         case WM_SETCURSOR: {
@@ -799,6 +802,7 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case APPCOMMAND_BROWSER_FORWARD:  navigation_go_forward(); return TRUE;
                 case APPCOMMAND_BROWSER_REFRESH:  navigation_refresh(); return TRUE;
             }
+            if (player_app_command(GET_APPCOMMAND_LPARAM(lp))) return TRUE;   // media keys: the player's
             break;
 
         case WM_NOTIFY: {
@@ -857,7 +861,8 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             dnd_unregister_all();
             for_each_pane(deregister_current_watch);
             if (s_searchBrush) { DeleteObject(s_searchBrush); s_searchBrush = nullptr; }
-            PostQuitMessage(0);
+            // (a media player still open keeps the process: it ends when that closes)
+            if (!player_main_closed()) PostQuitMessage(0);
             return 0;
         }
     }
@@ -999,6 +1004,12 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     MSG m{};
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
         bool key = m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN;
+        if (player_owns(m.hwnd)) {          // the media player's window: its keys, not the main window's
+            if (key && player_translate(&m)) continue;
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+            continue;
+        }
         if (key && preview_translate_accelerator(&m)) continue;     // (an in-process handler's keys)
         if (cycle_focus(m)) continue;
         if (key && !edit_owns_key(m) && (text_size_key(m) || TranslateAcceleratorW(g_main, acc, &m)))

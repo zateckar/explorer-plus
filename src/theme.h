@@ -28,6 +28,9 @@ extern bool g_dark;                  // apps use the dark theme
 void theme_init();                   // read theme + accent, start GDI+
 void theme_shutdown();
 bool theme_reload();                 // WM_SETTINGCHANGE: true when light/dark, accent or system colours changed
+// counts the changes theme_reload found: a window that compares it with the one it last
+// applied catches a change another window's theme_reload saw first
+unsigned theme_generation();
 bool theme_high_contrast();          // High Contrast is on (the palette is the system colours)
 const Palette& pal();
 
@@ -38,6 +41,9 @@ inline int S(int px) { return MulDiv(px, theme_dpi(), 96); }
 
 HFONT glyph_font(int px96);          // Segoe Fluent Icons (MDL2 fallback) at a 96-dpi pixel size
 HFONT ui_font_bold();                // semibold UI font (headings)
+// for a window with a DPI of its own (the media player): the caller owns the font
+HFONT theme_create_font(int dpi, int weight, int pct = 100);   // the UI font at `pct` %
+const wchar_t* theme_glyph_face();   // Segoe Fluent Icons, or Segoe MDL2 Assets (Windows 10)
 
 // --- text size of the content (navigation pane, list, details pane) ---
 // a percentage of the UI font; the chrome (tabs, address, command bar) keeps its size
@@ -70,3 +76,4 @@ struct BufferedPaint {
 
 // apply light/dark to the standard controls (list, tree, header, scrollbars)
 void theme_apply_controls();
+void theme_style_list(HWND list);    // one list view: dark scrollbars, the palette's colours

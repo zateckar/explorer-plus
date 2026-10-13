@@ -159,6 +159,8 @@ void theme_shutdown() {
     if (s_gdipToken) Gdiplus::GdiplusShutdown(s_gdipToken);
 }
 
+static unsigned s_generation = 1;
+
 bool theme_reload() {
     bool hc = high_contrast_on();
     bool hcChanged = hc != s_highContrast;
@@ -169,8 +171,12 @@ bool theme_reload() {
     g_dark = dark;
     build_palette();
     if (changed || hcChanged) apply_app_mode();
-    return changed || hcChanged || memcmp(&old, &s_pal, sizeof(old)) != 0;
+    bool any = changed || hcChanged || memcmp(&old, &s_pal, sizeof(old)) != 0;
+    if (any) ++s_generation;
+    return any;
 }
+
+unsigned theme_generation() { return s_generation; }
 
 bool theme_high_contrast() { return s_highContrast; }
 
@@ -198,6 +204,10 @@ static HFONT make_ui_font(int dpi, int weight, int pct = 100) {
     lf.lfFaceName[0] = 0;
     return CreateFontIndirectW(&lf);
 }
+
+HFONT theme_create_font(int dpi, int weight, int pct) { return make_ui_font(dpi, weight, pct); }
+
+const wchar_t* theme_glyph_face() { return s_fluent ? L"Segoe Fluent Icons" : L"Segoe MDL2 Assets"; }
 
 static HFONT make_icon_font(const wchar_t* face, int pt, int dpi) {
     LOGFONTW lf{};
@@ -399,24 +409,28 @@ BufferedPaint::~BufferedPaint() {
 // ------------------------------------------------------------------
 // standard controls
 
+static void dark_win(HWND h, const wchar_t* darkTheme, const wchar_t* lightTheme) {
+    if (!h) return;
+    bool dark = g_dark && !s_highContrast;        // (High Contrast: the system's own look)
+    if (s_allowDark) s_allowDark(h, dark);
+    SetWindowTheme(h, dark ? darkTheme : lightTheme, nullptr);
+    SendMessageW(h, WM_THEMECHANGED, 0, 0);
+}
+
+void theme_style_list(HWND list) {
+    const Palette& p = pal();
+    dark_win(list, L"DarkMode_Explorer", L"Explorer");      // dark scrollbars
+    if (HWND hdr = ListView_GetHeader(list)) dark_win(hdr, L"DarkMode_ItemsView", L"Explorer");
+    ListView_SetBkColor(list, p.content);
+    ListView_SetTextBkColor(list, p.content);
+    ListView_SetTextColor(list, p.text);
+    InvalidateRect(list, nullptr, TRUE);
+}
+
 void theme_apply_controls() {
     const Palette& p = pal();
-    auto dark_win = [](HWND h, const wchar_t* darkTheme, const wchar_t* lightTheme) {
-        if (!h) return;
-        bool dark = g_dark && !s_highContrast;        // (High Contrast: the system's own look)
-        if (s_allowDark) s_allowDark(h, dark);
-        SetWindowTheme(h, dark ? darkTheme : lightTheme, nullptr);
-        SendMessageW(h, WM_THEMECHANGED, 0, 0);
-    };
-    for (Pane& pn : g_panes) {
-        if (!pn.list) continue;
-        dark_win(pn.list, L"DarkMode_Explorer", L"Explorer");      // dark scrollbars
-        if (HWND hdr = ListView_GetHeader(pn.list)) dark_win(hdr, L"DarkMode_ItemsView", L"Explorer");
-        ListView_SetBkColor(pn.list, p.content);
-        ListView_SetTextBkColor(pn.list, p.content);
-        ListView_SetTextColor(pn.list, p.text);
-        InvalidateRect(pn.list, nullptr, TRUE);
-    }
+    for (Pane& pn : g_panes)
+        if (pn.list) theme_style_list(pn.list);
     if (g_tree) {
         dark_win(g_tree, L"DarkMode_Explorer", L"Explorer");
         TreeView_SetBkColor(g_tree, p.content);

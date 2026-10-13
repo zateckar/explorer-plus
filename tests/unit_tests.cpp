@@ -2,6 +2,8 @@
 // line / typed path parsing. Run: ctest --test-dir build (or build\explorer-plus-tests.exe)
 #include "ini.h"
 #include "cmdline.h"
+#include "playlist.h"
+#include <algorithm>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -158,7 +160,112 @@ static void typed_text() {
     CHECK_EQ(typed_text_clean(L"%NO_SUCH_VARIABLE_EP%\\x"), L"%NO_SUCH_VARIABLE_EP%\\x");
 }
 
+// ------------------------------------------------------------------
+// media player queue
+
+static std::vector<std::wstring> names(int n, int from = 0) {
+    std::vector<std::wstring> v;
+    for (int i = 0; i < n; ++i) v.push_back(L"f" + std::to_wstring(from + i));
+    return v;
+}
+
+static void queue_order() {
+    PlayQueue q;
+    CHECK(q.current() == -1 && q.next(false) == -1 && q.previous() == -1);
+    q.replace(names(3));
+    CHECK(q.current() == 0 && q.next(false) == 1 && q.previous() == -1);
+    q.set_current(2);
+    CHECK(q.next(true) == -1);                             // the end: done
+    q.repeat = Repeat::All;
+    CHECK(q.next(true) == 0);                              // wraps
+    q.set_current(0);
+    CHECK(q.previous() == 2);
+    q.repeat = Repeat::One;
+    CHECK(q.next(true) == 0);                              // ended by itself: again
+    CHECK(q.next(false) == 1);                             // Next: the next one
+    CHECK(q.append(names(2, 3)) == 3 && q.size() == 5 && q.current() == 0);
+    q.set_current(7);
+    CHECK(q.current() == -1);
+    CHECK(q.next(false) == 0);                             // nothing current: the first
+}
+
+static void queue_remove() {
+    PlayQueue q;
+    q.replace(names(5));
+    q.set_current(2);
+    CHECK(!q.remove({ 0 }));                               // before the current one
+    CHECK(q.current() == 1 && q.entries()[1].path == L"f2");
+    CHECK(q.remove({ 1, 2 }));                             // the current one and the next
+    CHECK(q.size() == 2 && q.current() == 1 && q.entries()[1].path == L"f4");
+    CHECK(q.remove({ 1 }));                                // the last: none current
+    CHECK(q.current() == -1 && q.size() == 1);
+    CHECK(!q.remove({ 9, -1 }));                           // out of range: nothing
+    q.clear();
+    CHECK(q.empty() && q.current() == -1);
+}
+
+static void queue_shuffle() {
+    PlayQueue q;
+    q.seed(7);
+    q.replace(names(20));
+    q.set_current(5);
+    q.set_shuffle(true);
+    CHECK(q.current() == 5 && q.previous() == -1);         // the current one leads
+    // every entry exactly once, following Next from the current one
+    std::vector<bool> seen(20, false);
+    int n = 0;
+    for (int i = q.current(); i >= 0 && n < 25; i = q.next(false), ++n) {
+        CHECK(!seen[(size_t)i]);
+        seen[(size_t)i] = true;
+        q.set_current(i);
+    }
+    CHECK(n == 20);
+    // added while shuffled: still each one once, all after the current one
+    q.set_current(5);
+    q.append(names(5, 20));
+    std::fill(seen.begin(), seen.end(), false);
+    seen.resize(25, false);
+    n = 0;
+    for (int i = q.current(); i >= 0 && n < 30; i = q.next(false), ++n) {
+        CHECK(!seen[(size_t)i]);
+        seen[(size_t)i] = true;
+        q.set_current(i);
+    }
+    CHECK(n == 25);
+    q.set_current(3);
+    q.set_shuffle(false);
+    CHECK(q.current() == 3 && q.next(false) == 4 && q.previous() == 2);
+    q.set_shuffle(true);
+    q.remove({ 0, 1, 2 });                                 // removal keeps the order consistent
+    CHECK(q.current() == 0);
+    n = 0;
+    for (int i = q.current(); i >= 0 && n < 30; i = q.next(false), ++n) q.set_current(i);
+    CHECK(n == 22);
+}
+
+static void media_text() {
+    CHECK_EQ(fmt_duration(-1), L"");
+    CHECK_EQ(fmt_duration(0), L"0:00");
+    CHECK_EQ(fmt_duration(1870000000LL), L"3:07");
+    CHECK_EQ(fmt_duration(37230000000LL), L"1:02:03");
+    CHECK(media_extension_excluded(L".M3U") && media_extension_excluded(L".mid"));
+    CHECK(!media_extension_excluded(L".mp3"));
+    CHECK(!media_file_playable(L"C:\\x\\notes.txt"));
+    CHECK(!media_file_playable(L"C:\\x\\list.m3u"));
+    CHECK(!media_file_playable(L"C:\\x\\noextension"));
+    std::vector<std::wstring> paths = { L"C:\\a.mp3", L"\\\\srv\\share\\b c.mkv", L"D:\\Sta\x17E" L"en\xE9\\x.wav" };
+    std::wstring packed = pack_paths(paths);
+    auto back = unpack_paths(packed.data(), packed.size());
+    CHECK(back == paths);
+    CHECK(unpack_paths(L"C:\\a\0\0C:\\b", 10).size() == 2);   // empty parts dropped, no final NUL
+    CHECK(unpack_paths(nullptr, 5).empty());
+}
+
 int wmain() {
+    queue_order();
+    queue_remove();
+    queue_shuffle();
+    media_text();
     ini_round_trip();
     ini_values();
     ini_set_erase();

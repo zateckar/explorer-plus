@@ -1098,6 +1098,72 @@ app.command(IDM['DUALPANE'])
 check('Dual pane off: one list again', wait_for(lambda: not u.IsWindowVisible(list2), 3))
 app.close()
 
+# the media player: Play / Queue in Explorer Plus in the compact menu, the player window and its
+# queue. Whether anything is heard isn't checked (a runner may have no audio device, or no
+# Media Foundation at all): the state is printed only. Settings of its own.
+import wave
+media = os.path.join(data, 'media')
+os.makedirs(media)
+for n, secs in (('one.wav', 2), ('two.wav', 1)):
+    with wave.open(os.path.join(media, n), 'wb') as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(8000)
+        w.writeframes(bytes(2 * 8000 * secs))
+with open(os.path.join(media, 'notes.txt'), 'w') as f:
+    f.write('not media')
+ini_player = ini + '.player'
+if os.path.exists(ini_player):
+    os.remove(ini_player)
+app = App(exe, media, settings=ini_player)
+app.wait_idle(2)
+def player():
+    return next((h for h in winauto.top_windows(app.proc.pid) if cls(h).startswith('ExplorerPlusPlayer')
+                 and u.IsWindowVisible(h)), None)
+def queue_rows():
+    p = player()
+    q = next((c for c in children(p) if cls(c) == 'SysListView32'), None) if p else None
+    return send(q, 0x1004, 0, 0) if q else -1                         # LVM_GETITEMCOUNT
+def player_state():
+    p = player()
+    b = next((c for c in children(p) if cls(c) == 'ExplorerPlusPlayerBar'), None) if p else None
+    return text(b) if b else None
+def media_entry(name, entry):
+    """Choose `entry` in the compact menu of `name` by keyboard; the menu's entries."""
+    app.select_name(name)
+    fly = app.open_context_flyout()
+    stops = [s for s in app.flyout_entries(fly) if s != '-'] if fly else []
+    if entry and entry in stops:
+        for _ in range(stops.index(entry) + 1):
+            u.PostMessageW(fly, WM_KEYDOWN, 0x28, 0)                    # Down
+        u.PostMessageW(fly, WM_KEYDOWN, 0x0D, 0)                        # Enter
+    else:
+        app.close_menus()
+    return stops
+PLAY, QUEUE = 'Play in Explorer Plus', 'Queue in Explorer Plus'   # (never a media app's own "Play")
+entries = media_entry('notes.txt', None)
+check('no Play for a file that isn\'t media', entries and PLAY not in entries, entries)
+entries = media_entry('one.wav', PLAY)
+check('the compact menu of a sound file offers Play / Queue in Explorer Plus',
+      PLAY in entries and QUEUE in entries, entries)
+check('Play opens the player with the file in its queue', wait_for(lambda: queue_rows() == 1, 5), queue_rows())
+print('     player: %s' % player_state())
+media_entry('two.wav', QUEUE)
+check('Queue appends to it', wait_for(lambda: queue_rows() == 2, 5), queue_rows())
+app.go(data)
+entries = media_entry('sub', None)
+check('a folder without media offers no Play', entries and PLAY not in entries, entries)
+entries = media_entry('media', QUEUE)
+check('a folder with media offers Queue: its files join the queue',
+      QUEUE in entries and wait_for(lambda: queue_rows() == 4, 5), (entries, queue_rows()))
+p = player()
+if p:
+    u.PostMessageW(p, 0x0010, 0, 0)                                      # WM_CLOSE
+check('the player closes, the app stays', wait_for(lambda: player() is None, 5) and app.proc.poll() is None)
+app.close()
+check('exits cleanly after the player', app.proc.returncode == 0, app.proc.returncode)
+raw = open(ini_player, 'rb').read() if os.path.exists(ini_player) else b''
+check('the player\'s place is saved',
+      'playerW=' in (raw.decode('utf-16', 'replace') if raw[:2] == b'\xff\xfe' else raw.decode('utf-8', 'replace')))
+
 failed = [n for n, ok in results if not ok]
 if failed and os.path.exists(events):
     keys = ('process.start', 'nav.', 'tree.delete', 'tree.rename', 'tree.select', 'watch.full', 'watch.dir', 'enum.start')
