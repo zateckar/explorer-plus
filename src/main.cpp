@@ -150,26 +150,6 @@ void search_update_cue() {
 // ------------------------------------------------------------------
 // commands that need a little glue
 
-// paths, quoted, one per line -> clipboard text
-static void copy_paths_to_clipboard(const std::vector<PCIDLIST_ABSOLUTE>& items) {
-    std::wstring text;
-    for (PCIDLIST_ABSOLUTE abs : items) {
-        std::wstring s = pidl_folder_path(abs);
-        if (s.empty()) continue;
-        if (!text.empty()) text += L"\r\n";
-        text += L"\"" + s + L"\"";
-    }
-    if (text.empty() || !OpenClipboard(g_main)) return;
-    EmptyClipboard();
-    size_t bytes = (text.size() + 1) * sizeof(WCHAR);
-    if (HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
-        memcpy(GlobalLock(hg), text.c_str(), bytes);
-        GlobalUnlock(hg);
-        if (!SetClipboardData(CF_UNICODETEXT, hg)) GlobalFree(hg);
-    }
-    CloseClipboard();
-}
-
 // selected items' paths, or the folder's
 static void copy_path_to_clipboard() {
     std::vector<PIDLIST_ABSOLUTE> own;
@@ -177,7 +157,7 @@ static void copy_path_to_clipboard() {
         if (PIDLIST_ABSOLUTE abs = ILCombine(g_pane->current, c)) own.push_back(abs);
     std::vector<PCIDLIST_ABSOLUTE> items(own.begin(), own.end());
     if (items.empty()) items.push_back(g_pane->current);
-    copy_paths_to_clipboard(items);
+    fileops_copy_paths(items);
     for (auto p : own) CoTaskMemFree(p);
 }
 
@@ -207,7 +187,7 @@ static bool tree_key_command(WORD id) {
         }
         case IDM_EDIT_PASTE:      fileops_paste_into(abs); break;
         case IDM_FILE_PROPERTIES: contextmenu_properties_of(g_main, abs); break;
-        case IDM_COPY_PATH:       copy_paths_to_clipboard({ abs }); break;
+        case IDM_COPY_PATH:       fileops_copy_paths({ abs }); break;
     }
     CoTaskMemFree(abs);
     return true;

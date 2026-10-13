@@ -250,13 +250,19 @@ if fly:
     app.screenshot(os.path.join(shots, '04_flyout.png'))
     u.PostMessageW(fly, WM_KEYDOWN, 0x1B, 0)      # Esc
 check('Esc closes the compact menu', wait_for(lambda: app.flyout() is None, 3))
-# access key: "Copy &as path" puts the quoted path on the clipboard
-app.select_name('a.txt')
-fly = app.open_context_flyout()
-if fly:
-    u.PostMessageW(fly, 0x0102, ord('a'), 0)       # WM_CHAR
-check('compact menu access key runs the verb',
-      wait_for(lambda: clipboard_text() == '"%s"' % os.path.join(data, 'a.txt'), 5), clipboard_text())
+# access key: "Copy &as path" puts the quoted path on the clipboard. (The menu closes when
+# another program takes the foreground, as menus do: someone using the desktop meanwhile
+# gets the try repeated.)
+want_path = '"%s"' % os.path.join(data, 'a.txt')
+def copy_as_path_by_key():
+    app.select_name('a.txt')
+    fly = app.open_context_flyout()
+    if fly:
+        u.PostMessageW(fly, 0x0102, ord('a'), 0)   # WM_CHAR
+    ok = wait_for(lambda: clipboard_text() == want_path, 5 if fly else 0)
+    app.close_menus()
+    return ok
+check('compact menu access key runs the verb', any(copy_as_path_by_key() for _ in range(3)), clipboard_text())
 app.close_menus()
 # a real click on another file while the compact menu is open closes the menu and
 # selects that file: one click, not one to close the menu and another to select

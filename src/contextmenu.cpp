@@ -490,6 +490,17 @@ static void show_cm(HWND hwnd, POINT pt, IShellFolder* parent, PCIDLIST_ABSOLUTE
             list_delete_selection(key_down(VK_SHIFT));     // as the Delete key (preview, watcher)
         } else if ((verb == L"cut" || verb == L"copy") && src == MenuSource::List) {
             list_copy_selection(verb == L"cut");
+        } else if (verb == L"copyaspath") {
+            // (Windows' own gives up when the clipboard is busy for a moment: this asks again)
+            std::vector<PIDLIST_ABSOLUTE> own;
+            for (UINT i = 0; i < cidl; ++i) {
+                PIDLIST_ABSOLUTE f = ILCombine(folderAbs, apidl[i]);
+                if (f && search_is_results(folderAbs))
+                    if (PIDLIST_ABSOLUTE real = search_real_location(f)) { CoTaskMemFree(f); f = real; }
+                if (f) own.push_back(f);
+            }
+            fileops_copy_paths(std::vector<PCIDLIST_ABSOLUTE>(own.begin(), own.end()));
+            for (auto p : own) CoTaskMemFree(p);
         } else {
             // a verb may move, compress or open the file for writing: the preview handler
             // lets go of it first (it comes back with the next selection change)

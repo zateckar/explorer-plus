@@ -3,6 +3,7 @@
 #include "enumerate.h"
 #include "detailspane.h"
 #include "watcher.h"
+#include "perf.h"
 #include <unordered_set>
 
 // the watcher waits while an operation runs (they pump messages); deletes and renames
@@ -16,6 +17,60 @@ struct WatchHold {
 
 // ---------------------------------------------------------------
 // clipboard helpers
+
+// Whoever watches the clipboard (clipboard history, a clipboard manager, a remote desktop
+// session) opens it for a moment after every change: a copy right after another one finds
+// it held. Ask again for up to half a second rather than fail.
+static void log_clipboard_busy(int tries) {
+    if (!perf_on()) return;
+    std::wstring holder;
+    DWORD pid = 0;
+    if (HWND w = GetOpenClipboardWindow()) GetWindowThreadProcessId(w, &pid);
+    if (HANDLE p = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : nullptr) {
+        WCHAR path[MAX_PATH]; DWORD n = MAX_PATH;
+        if (QueryFullProcessImageNameW(p, 0, path, &n)) holder = PathFindFileNameW(path);
+        CloseHandle(p);
+    }
+    perf_event("clipboard.busy", -1, tries, holder.c_str());
+}
+
+template <class F> static bool with_clipboard_retry(F attempt) {
+    for (int tries = 0; tries < 20; ++tries) {
+        if (attempt()) {
+            if (tries) log_clipboard_busy(tries);
+            return true;
+        }
+        Sleep(25);
+    }
+    log_clipboard_busy(20);
+    return false;
+}
+
+bool fileops_copy_paths(const std::vector<PCIDLIST_ABSOLUTE>& items) {
+    std::wstring text;
+    for (PCIDLIST_ABSOLUTE abs : items) {
+        std::wstring s = pidl_folder_path(abs);
+        if (s.empty()) continue;
+        if (!text.empty()) text += L"\r\n";
+        text += L"\"" + s + L"\"";
+    }
+    if (text.empty()) return false;
+    if (!with_clipboard_retry([] { return OpenClipboard(g_main) != FALSE; })) {
+        MessageBeep(MB_ICONASTERISK);
+        return false;
+    }
+    EmptyClipboard();
+    bool ok = false;
+    size_t bytes = (text.size() + 1) * sizeof(WCHAR);
+    if (HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+        memcpy(GlobalLock(hg), text.c_str(), bytes);
+        GlobalUnlock(hg);
+        ok = SetClipboardData(CF_UNICODETEXT, hg) != nullptr;
+        if (!ok) GlobalFree(hg);
+    }
+    CloseClipboard();
+    return ok;
+}
 
 bool clipboard_has_files() {
     UINT cf = RegisterClipboardFormatW(CFSTR_SHELLIDLIST);
@@ -134,8 +189,10 @@ bool fileops_set_clipboard(IShellFolder* parent, const std::vector<PCITEMID_CHIL
         }
         if (FAILED(pdo->SetData(&fe, &sm, TRUE))) GlobalFree(sm.hGlobal);
     }
-    // (another program may hold the clipboard: then nothing is cut)
-    bool onClipboard = SUCCEEDED(OleSetClipboard(pdo.get()));
+    // (another program may hold the clipboard past the retries: then nothing is cut)
+    HRESULT hr = E_FAIL;
+    with_clipboard_retry([&] { hr = OleSetClipboard(pdo.get()); return hr != CLIPBRD_E_CANT_OPEN; });
+    bool onClipboard = SUCCEEDED(hr);
     if (onClipboard) OleFlushClipboard();
     else MessageBeep(MB_ICONASTERISK);
     // the cut file is about to be moved by whoever pastes it: the preview lets go of it
