@@ -533,6 +533,10 @@ static bool s_hoverPlus = false;
 static int s_draggingTab = -1;   // index of tab being drag-reordered
 static bool s_dragMoved = false;
 static POINT s_dragDownPt{};
+// a button acts on release over what was pressed: a tab's close button (left) or the tab
+// itself (middle), or "+"
+static int s_pressClose = -1, s_pressMiddle = -1;
+static bool s_pressPlus = false;
 static std::unordered_map<ULONGLONG, int> s_iconCache;   // pidl signature -> system icon
 
 struct TabUI { RECT rect; RECT close; };
@@ -810,9 +814,13 @@ static LRESULT CALLBACK strip_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             bool oc = false, op = false;
             int t = hit_tab(pt, &oc, &op);
-            if (op) { tabmodel_new_tab(); return 0; }
+            if (op || (t >= 0 && oc)) {
+                s_pressPlus = op;
+                s_pressClose = op ? -1 : t;
+                SetCapture(hwnd);
+                return 0;
+            }
             if (t >= 0) {
-                if (oc) { tabmodel_close_tab(t); return 0; }
                 if (t != g_activeTab) tabmodel_switch_to(t);
                 s_draggingTab = t;         // potential drag-reorder; released on LBUTTONUP without move
                 s_dragMoved = false;
@@ -821,14 +829,27 @@ static LRESULT CALLBACK strip_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
-        case WM_LBUTTONUP:
+        case WM_LBUTTONUP: {
             if (s_draggingTab >= 0) {
                 s_draggingTab = -1;
                 ReleaseCapture();
+                return 0;
             }
+            int pc = s_pressClose;
+            bool pp = s_pressPlus;
+            if (pc < 0 && !pp) return 0;
+            ReleaseCapture();                                   // (clears the press)
+            POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            bool oc = false, op = false;
+            int t = hit_tab(pt, &oc, &op);
+            if (pp && op) tabmodel_new_tab();
+            else if (pc >= 0 && oc && t == pc) tabmodel_close_tab(t);
             return 0;
+        }
         case WM_CAPTURECHANGED:
             s_draggingTab = -1;
+            s_pressClose = s_pressMiddle = -1;
+            s_pressPlus = false;
             return 0;
         case WM_RBUTTONUP: {
             POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
@@ -854,11 +875,24 @@ static LRESULT CALLBACK strip_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
-        case WM_MBUTTONUP: {
+        case WM_MBUTTONDOWN: {
             POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             bool oc = false;
             int t = hit_tab(pt, &oc, nullptr);
-            if (t >= 0) tabmodel_close_tab(t);   // close_tab itself ignores pinned
+            if (t >= 0 && s_draggingTab < 0 && s_pressClose < 0 && !s_pressPlus) {
+                s_pressMiddle = t;
+                SetCapture(hwnd);
+            }
+            return 0;
+        }
+        case WM_MBUTTONUP: {
+            int pm = s_pressMiddle;
+            if (pm < 0) return 0;
+            ReleaseCapture();
+            POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            bool oc = false;
+            int t = hit_tab(pt, &oc, nullptr);
+            if (t == pm) tabmodel_close_tab(t);   // close_tab itself ignores pinned
             return 0;
         }
     }
