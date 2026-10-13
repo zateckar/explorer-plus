@@ -11,6 +11,7 @@
 class SpectrumFeed {
 public:
     static const int kBands = 160;          // per column, low frequencies first, 0..255
+    static constexpr double kMinHz = 40, kMaxHz = 18000;    // the bands' span (log spaced)
 
     SpectrumFeed() = default;
     ~SpectrumFeed() { stop(); }

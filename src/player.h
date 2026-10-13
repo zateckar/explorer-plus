@@ -2,17 +2,21 @@
 #include "appstate.h"
 
 // The media player: a window of its own (video, or the title of what is playing; the
-// play queue; transport controls) playing files with Media Foundation. One per desktop
-// session: a process without one hands the files to the process that has it.
+// play queue; transport controls) playing files with Media Foundation, and showing
+// pictures (a slide show when played). One per desktop session: a process without one
+// hands the files to the process that has it.
 
 struct MediaItem {
     std::wstring path;
     bool folder = false;            // its media files are played (sorted by name, subfolders after)
 };
 
-// the file list's context menu offers Play / Add to play queue for these
-bool player_offer(const std::vector<MediaItem>& items);
-// Play (the queue becomes these) or Add to play queue (appended; plays when nothing does)
+// the file list's context menu offers Play / Queue in Explorer Plus for these (View /
+// Queue for pictures only)
+enum class PlayerOffer { None, Play, View };
+PlayerOffer player_offer(const std::vector<MediaItem>& items);
+// Play (the queue becomes these; one picture: its folder's pictures, from it) or Queue
+// (appended; plays when nothing does)
 void player_open(const std::vector<MediaItem>& items, bool enqueue);
 
 HWND player_window();                       // this process's player, or nullptr

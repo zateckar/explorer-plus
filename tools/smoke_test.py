@@ -1101,7 +1101,7 @@ app.close()
 # the media player: Play / Queue in Explorer Plus in the compact menu, the player window and its
 # queue. Whether anything is heard isn't checked (a runner may have no audio device, or no
 # Media Foundation at all): the state is printed only. Settings of its own.
-import wave
+import wave, zlib
 media = os.path.join(data, 'media')
 os.makedirs(media)
 for n, secs in (('one.wav', 2), ('two.wav', 1)):
@@ -1165,6 +1165,33 @@ check('a folder without media offers no Play', entries and PLAY not in entries, 
 entries = media_entry('media', QUEUE)
 check('a folder with media offers Queue: its files join the queue',
       QUEUE in entries and wait_for(lambda: queue_rows() == 4, 5), (entries, queue_rows()))
+# pictures: View in Explorer Plus shows the folder's pictures from the one chosen; Right: the next
+pics = os.path.join(data, 'pics')
+os.makedirs(pics)
+def tiny_png(path, rgb):
+    raw = b''.join(b'\0' + bytes(rgb) * 8 for _ in range(8))
+    def chunk(tag, d):
+        return struct.pack('>I', len(d)) + tag + d + struct.pack('>I', zlib.crc32(tag + d) & 0xFFFFFFFF)
+    with open(path, 'wb') as f:
+        f.write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 8, 8, 8, 2, 0, 0, 0))
+                + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+for n, rgb in (('a.png', (200, 0, 0)), ('b.png', (0, 200, 0)), ('c.png', (0, 0, 200))):
+    tiny_png(os.path.join(pics, n), rgb)
+with open(os.path.join(pics, 'readme.txt'), 'w') as f:
+    f.write('not a picture')
+app.go(pics)
+app.wait_idle(2)
+VIEW = 'View in Explorer Plus'
+entries = media_entry('b.png', VIEW)
+check('the compact menu of a picture offers View / Queue in Explorer Plus', VIEW in entries and QUEUE in entries, entries)
+check('View shows the folder\'s pictures from the one chosen',
+      wait_for(lambda: queue_rows() == 3 and (player_state() or '').startswith('Picture') and '2 of 3' in player_state(), 5),
+      (queue_rows(), player_state()))
+p = player()
+if p:
+    u.PostMessageW(p, WM_KEYDOWN, 0x27, 0)                                 # Right
+    u.PostMessageW(p, 0x0101, 0x27, 0xC0000000)
+check('Right shows the next picture', wait_for(lambda: '3 of 3' in (player_state() or ''), 5), player_state())
 p = player()
 if p:
     u.PostMessageW(p, 0x0010, 0, 0)                                      # WM_CLOSE

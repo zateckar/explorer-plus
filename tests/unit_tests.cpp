@@ -299,6 +299,62 @@ static void spectrum_math() {
     }
 }
 
+static void loudness() {
+    // BS.1770's reference: a 1 kHz sine of amplitude A in one channel reads 20 log A - 3.01 LUFS
+    const unsigned rate = 44100;
+    auto sine = [&](double amp, unsigned ch, double secs) {
+        std::vector<float> v((size_t)(rate * secs) * ch);
+        for (size_t i = 0; i < v.size() / ch; ++i)
+            for (unsigned c = 0; c < ch; ++c) v[i * ch + c] = (float)(amp * std::sin(2 * 3.14159265358979 * 1000 * i / rate));
+        return v;
+    };
+    auto about = [](double a, double b) { return std::fabs(a - b) < 0.2; };
+    {
+        LoudnessMeter m(rate, 1);
+        auto s = sine(0.1, 1, 3);
+        m.add(s.data(), s.size());
+        CHECK(about(m.lufs(), -23.01));
+    }
+    {
+        LoudnessMeter m(48000, 2);                         // two channels: their sum (+3 dB)
+        std::vector<float> s(48000 * 2 * 3);
+        for (size_t i = 0; i < s.size() / 2; ++i)
+            s[2 * i] = s[2 * i + 1] = (float)(0.1 * std::sin(2 * 3.14159265358979 * 1000 * i / 48000));
+        m.add(s.data(), s.size() / 2);
+        CHECK(about(m.lufs(), -20.0));
+    }
+    {
+        // silence between: gated out (the blocks partly over the tone count: -23.35)
+        LoudnessMeter m(rate, 1);
+        auto s = sine(0.1, 1, 2);
+        std::vector<float> quiet(rate * 5, 0.0f);
+        m.add(s.data(), s.size());
+        m.add(quiet.data(), quiet.size());
+        m.add(s.data(), s.size());
+        CHECK(about(m.lufs(), -23.35));
+    }
+    {
+        LoudnessMeter m(rate, 1);                          // excerpts (cut between): the same
+        auto loud = sine(0.1, 1, 1), soft = sine(0.05, 1, 1);
+        m.add(loud.data(), loud.size());
+        m.cut();
+        m.add(soft.data(), soft.size());
+        double l = m.lufs();
+        CHECK(l > -29.1 && l < -23.0);                     // (between the two; the softer one isn't 10 LU under)
+        LoudnessMeter none(rate, 1);
+        CHECK(!std::isfinite(none.lufs()));
+        std::vector<float> zero(rate * 2, 0.0f);
+        none.add(zero.data(), zero.size());
+        CHECK(!std::isfinite(none.lufs()));
+        none.add(loud.data(), 1000);                       // (under 400 ms: no block)
+        CHECK(!std::isfinite(none.lufs()));
+    }
+    CHECK(about(loudness_gain_db(-9.0), -5.0));
+    CHECK(about(loudness_gain_db(-60.0), 12.0));            // (a boost has its limit)
+    CHECK(about(loudness_gain_db(-HUGE_VAL), 0.0));
+    CHECK(about(loudness_gain_db(NAN), 0.0));
+}
+
 static void formats() {
     CHECK_EQ(audio_format_name(0x55), L"MP3");
     CHECK_EQ(audio_format_name(0x1610), L"AAC");
@@ -344,6 +400,7 @@ int wmain() {
     media_text();
     cover_pick();
     spectrum_math();
+    loudness();
     formats();
     opus_head();
     ini_round_trip();

@@ -57,7 +57,12 @@ File Explorer while starting in well under 100 ms.
   folder.jpg, … in the track's folder, else its biggest picture, else the art in the
   file), the tags (album, year, genre, track, …) with the format, bitrate and sample
   rate, and a scrolling spectrogram; the play queue (Enter plays, Delete removes, drop
-  files on it); seek, volume, shuffle, repeat, full screen. Its own taskbar button, with
+  files on it); seek, volume, shuffle, repeat, full screen. Tracks are evened out in
+  loudness (each measured as it comes up, the next one ahead; right-click the player to
+  turn it off). "View in Explorer Plus" on a picture shows its folder's pictures in the
+  player: Left / Right or the mouse wheel step through them, Play runs a slide show (its
+  interval in the right-click menu), full screen as for video; photos are turned upright
+  as the camera recorded. Its own taskbar button, with
   the track's progress and Previous / Play / Next in the thumbnail. Windows' own Media
   Foundation plays (the formats and codecs Windows has, Opus in MP4 too; Windows N needs
   the Media Feature Pack), nothing to install. Keys: Space
@@ -179,6 +184,7 @@ src/fileops, dnd, watcher  file operations, drag and drop, change notifications
 src/detailspane, preview   details / preview pane
 src/player, media, playlist   media player window, Media Foundation playback, play queue
 src/mediainfo, mediadata, spectrum   player's cover and tags, their pure helpers, spectrogram
+src/imageview, loudness   player's pictures (WIC), loudness levelling
 src/settings, ini, theme, perf, crash   settings.ini, colours and fonts, profiling, crash dumps
 src/cmdline            command line and typed-path text
 tests/                 unit tests (ctest)

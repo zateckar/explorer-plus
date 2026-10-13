@@ -339,7 +339,7 @@ static void fly_app_verbs(std::vector<FlyEntry>& list, const std::vector<ShellEn
             list.push_back(fly_from(e, L'\xE7EF'));
 }
 
-static UINT item_flyout(HWND hwnd, IContextMenu* cm, HMENU m, POINT pt, bool folder, bool media) {
+static UINT item_flyout(HWND hwnd, IContextMenu* cm, HMENU m, POINT pt, bool folder, PlayerOffer media) {
     auto items = menu_entries(cm, m);
     std::vector<FlyButton> row;
     static const struct { const wchar_t* verb; wchar_t glyph; const wchar_t* tip; } kRow[] = {
@@ -368,8 +368,9 @@ static UINT item_flyout(HWND hwnd, IContextMenu* cm, HMENU m, POINT pt, bool fol
         list.push_back(fly_item(kFlyNewTab, L"Open in new tab", L'\xE7C3'));
         list.push_back(fly_item(kFlyNewWindow, L"Open in new window", L'\xE8A7'));
     }
-    if (media) {        // (named apart from a media app's own Play / Add to play queue verbs)
-        list.push_back(fly_item(kFlyPlay, L"Play in Explorer Plus", L'\xE768'));
+    if (media != PlayerOffer::None) {      // (named apart from a media app's own Play / Add to play queue verbs)
+        if (media == PlayerOffer::View) list.push_back(fly_item(kFlyPlay, L"View in Explorer Plus", L'\xE8B9'));
+        else list.push_back(fly_item(kFlyPlay, L"Play in Explorer Plus", L'\xE768'));
         list.push_back(fly_item(kFlyEnqueue, L"Queue in Explorer Plus", L'\xE710'));
     }
     for (auto& e : items)
@@ -470,6 +471,7 @@ static void show_cm(HWND hwnd, POINT pt, IShellFolder* parent, PCIDLIST_ABSOLUTE
     };
     // files (and folders) the media player plays: Play / Add to play queue
     std::vector<MediaItem> media;
+    PlayerOffer offer = PlayerOffer::None;
     if (src == MenuSource::List && cidl <= 1000) {
         for (UINT i = 0; i < cidl; ++i) {
             SFGAOF a = SFGAO_FOLDER | SFGAO_STREAM | SFGAO_FILESYSTEM;
@@ -485,9 +487,10 @@ static void show_cm(HWND hwnd, POINT pt, IShellFolder* parent, PCIDLIST_ABSOLUTE
             }
             CoTaskMemFree(f);
         }
-        if (!player_offer(media)) media.clear();
+        offer = player_offer(media);
+        if (offer == PlayerOffer::None) media.clear();
     }
-    UINT id = track(hwnd, cm.get(), m, pt, [&] { return item_flyout(hwnd, cm.get(), m, pt, folder, !media.empty()); });
+    UINT id = track(hwnd, cm.get(), m, pt, [&] { return item_flyout(hwnd, cm.get(), m, pt, folder, offer); });
     if (id == kFlyPlay || id == kFlyEnqueue) {
         player_open(media, id == kFlyEnqueue);
     } else if (id == kFlyNewTab) {

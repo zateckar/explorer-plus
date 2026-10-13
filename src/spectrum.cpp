@@ -25,7 +25,7 @@ static void run(std::shared_ptr<SpectrumFeed::Shared> s, std::wstring path, LONG
         if (dec.open(path, from)) {
             const unsigned ch = dec.channels(), rate = dec.rate();
             const int n = rate > 32000 ? 4096 : 2048;
-            SpectrumMath math(n, (int)rate, SpectrumFeed::kBands, 40, 18000);
+            SpectrumMath math(n, (int)rate, SpectrumFeed::kBands, SpectrumFeed::kMinHz, SpectrumFeed::kMaxHz);
             {
                 std::lock_guard<std::mutex> lk(s->mx);
                 for (int b = 0; b < SpectrumFeed::kBands; ++b) s->freqs.push_back(math.band_freq(b));

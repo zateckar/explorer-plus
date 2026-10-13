@@ -61,6 +61,8 @@ add_executable(explorer-plus WIN32
     src/media.cpp
     src/mediadata.cpp
     src/mediainfo.cpp
+    src/imageview.cpp
+    src/loudness.cpp
     src/spectrum.cpp
     src/playlist.cpp
     src/player.cpp

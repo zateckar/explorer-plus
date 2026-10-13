@@ -694,6 +694,8 @@ bool AudioDecoder::open(const std::wstring& path, LONGLONG from) {
     if (FAILED(hr) || !m_source) return false;
     IMFPresentationDescriptor* pd = nullptr;
     if (SUCCEEDED(m_source->CreatePresentationDescriptor(&pd))) {
+        UINT64 dur = 0;
+        if (SUCCEEDED(pd->GetUINT64(MF_PD_DURATION, &dur))) m_duration = (LONGLONG)dur;
         DWORD count = 0;
         pd->GetStreamDescriptorCount(&count);
         for (DWORD i = 0; i < count; ++i) {
@@ -730,14 +732,17 @@ bool AudioDecoder::open(const std::wstring& path, LONGLONG from) {
     if (!ch || !rate || bits != 32) return false;
     m_channels = ch;
     m_rate = rate;
-    if (from > 0) {
-        PROPVARIANT v;
-        PropVariantInit(&v);
-        v.vt = VT_I8;
-        v.hVal.QuadPart = from;
-        m_reader->SetCurrentPosition(GUID_NULL, v);
-    }
+    if (from > 0) seek(from);
     return true;
+}
+
+bool AudioDecoder::seek(LONGLONG to) {
+    if (!m_reader) return false;
+    PROPVARIANT v;
+    PropVariantInit(&v);
+    v.vt = VT_I8;
+    v.hVal.QuadPart = to;
+    return SUCCEEDED(m_reader->SetCurrentPosition(GUID_NULL, v));
 }
 
 bool AudioDecoder::read(std::vector<float>& out, LONGLONG* time) {

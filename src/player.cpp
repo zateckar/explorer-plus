@@ -1,10 +1,13 @@
 // Media player window: the video (or, for sound, the album cover, the tags and a
-// spectrogram), the play queue on the right, the controls bar at the bottom. Playback is
-// media.cpp's (Media Foundation); the queue's logic is playlist.cpp's.
+// spectrogram; or a picture), the play queue on the right, the controls bar at the
+// bottom. Playback is media.cpp's (Media Foundation); the queue's logic is playlist.cpp's;
+// pictures are decoded by imageview.cpp, tracks' loudness measured by loudness.cpp.
 #include "player.h"
 #include "media.h"
 #include "mediadata.h"
 #include "mediainfo.h"
+#include "imageview.h"
+#include "loudness.h"
 #include "spectrum.h"
 #include "playlist.h"
 #include "theme.h"
@@ -24,6 +27,7 @@ using std::min;
 #include <cmath>
 #include <cwctype>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <thread>
 
@@ -33,16 +37,21 @@ const UINT WM_MEDIA_NOTE = WM_APP + 40;     // lParam: MediaNote* (media.cpp)
 const UINT WM_PLAYER_OPEN = WM_APP + 41;    // to the message window, lParam: OpenJob*
 const UINT WM_QUEUE_INFO = WM_APP + 42;     // to the message window: tags read (s_tagDone)
 const UINT WM_MEDIA_INFO = WM_APP + 43;     // lParam: MediaInfoNote* (mediainfo.cpp)
-const ULONG_PTR kCopyPlay = 0x45505031, kCopyEnqueue = 0x45505032;     // WM_COPYDATA: 'EPP1', 'EPP2'
-const UINT_PTR TIMER_POSITION = 1, TIMER_SKIP = 2, TIMER_HIDE_BAR = 3, TIMER_SPECTRUM = 4;
+const UINT WM_IMAGE = WM_APP + 44;          // lParam: ImageNote* (imageview.cpp)
+const UINT WM_LOUDNESS = WM_APP + 45;       // lParam: LoudnessNote* (loudness.cpp)
+// WM_COPYDATA: 'EPP1' play, 'EPP2' queue, 'EPP3' view (the first path: the picture to show)
+const ULONG_PTR kCopyPlay = 0x45505031, kCopyEnqueue = 0x45505032, kCopyView = 0x45505033;
+const UINT_PTR TIMER_POSITION = 1, TIMER_SKIP = 2, TIMER_HIDE_BAR = 3, TIMER_SPECTRUM = 4, TIMER_LEVEL = 5;
 const wchar_t kAppId[] = L"RadimZatecka.ExplorerPlus.Player";   // its own taskbar button
 const UINT s_taskbarCreated = RegisterWindowMessageW(L"TaskbarButtonCreated");
 const size_t kMaxFiles = 10000;             // a folder walk stops there
 
 enum Cmd : UINT {
     CMD_PLAYPAUSE = 100, CMD_PREV, CMD_NEXT, CMD_SHUFFLE, CMD_REPEAT, CMD_MUTE, CMD_QUEUE, CMD_FULL,
-    CMD_CLEAR, CMD_PLAY_SELECTED, CMD_REMOVE_SELECTED,
+    CMD_CLEAR, CMD_PLAY_SELECTED, CMD_REMOVE_SELECTED, CMD_LEVEL,
+    CMD_SLIDE = 200,                // + seconds: the slide show's interval
 };
+const int kSlideSecs[] = { 2, 3, 5, 10, 20, 30 };
 // the controls bar's parts (also its accessible children, in this order)
 enum Part { P_SEEK, P_SHUFFLE, P_PREV, P_PLAY, P_NEXT, P_REPEAT, P_MUTE, P_VOLUME, P_QUEUE, P_FULL, P_COUNT };
 const UINT kPartCmd[P_COUNT] = { 0, CMD_SHUFFLE, CMD_PREV, CMD_PLAYPAUSE, CMD_NEXT, CMD_REPEAT, CMD_MUTE, 0, CMD_QUEUE, CMD_FULL };
@@ -98,6 +107,20 @@ struct Player {
     int tbState = -1, tbPermille = -1;
     wchar_t tbGlyph = 0;            // the thumbnail's play / pause button shows
     HICON thumbIcons[3]{};          // previous, play / pause, next
+    // pictures: the one shown (kept on screen while the next one decodes), the slide show
+    ImageNote img;                  // img.id: the entry it's of
+    HBITMAP imgBmp = nullptr;       // drawn at the size shown
+    int imgBmpW = 0, imgBmpH = 0;
+    const void* imgBmpOf = nullptr; // (the pixels it was drawn from)
+    bool slideshow = false;         // "playing" a picture: on to the next after `slideSecs`
+    int slideSecs = 5;
+    ULONGLONG slideStart = 0;       // when the picture came on screen (0: not yet)
+    ULONGLONG slideDone = 0;        // ms of it shown before a pause
+    // loudness levelling: tracks brought to about the same loudness
+    bool level = true;
+    double gainDb = 0;              // the current track's
+    unsigned levelWait = 0;         // the entry whose start waits for its loudness (not loud, then soft)
+    std::map<std::wstring, double> loud;    // measured: path -> LUFS (not finite: couldn't)
 };
 Player* s_p = nullptr;
 HWND s_msg = nullptr;               // the module's message window (results of its threads)
@@ -196,14 +219,26 @@ std::wstring file_title(const std::wstring& path) {
 
 std::wstring entry_name(const QueueEntry& e) { return e.title.empty() ? file_title(e.path) : e.title; }
 
+// files the player takes: sound, video, pictures
+bool player_file(const std::wstring& path) { return media_file_playable(path) || image_file(path); }
+
+bool image_entry(Player& p, int i) { return i >= 0 && i < p.q.size() && image_file(p.q.at(i).path); }
+bool image_current(Player& p) { return image_entry(p, p.q.current()); }
+
 std::wstring current_title(Player& p) {
     int i = p.q.current();
     if (i < 0) return {};
-    if (!p.mp->title().empty()) return p.mp->title();
+    if (!image_current(p) && !p.mp->title().empty()) return p.mp->title();
     return entry_name(p.q.at(i));
 }
 
 std::wstring current_detail(Player& p) {
+    if (image_current(p)) {                 // "4032 × 3024 · 3 of 120"
+        std::wstring s;
+        if (p.img.id == p.q.at(p.q.current()).id && p.img.fullW > 0)
+            s = std::to_wstring(p.img.fullW) + L" \x00D7 " + std::to_wstring(p.img.fullH) + L" \x00B7 ";
+        return s + std::to_wstring(p.q.current() + 1) + L" of " + std::to_wstring(p.q.size());
+    }
     std::wstring a = p.mp->artist(), b = p.mp->album();
     if (!a.empty() && !b.empty()) return a + L" \x2014 " + b;
     return a.empty() ? b : a;
@@ -214,11 +249,19 @@ bool seekable(Player& p) {
     return p.mp->duration() > 0 && (s == State::Playing || s == State::Paused || s == State::Stopped || s == State::Ended);
 }
 
-bool playing(Player& p) { return p.mp->will_play(); }
+// playing (or about to: its loudness measured first), or (a picture) in a slide show
+bool playing(Player& p) { return image_current(p) ? p.slideshow : p.levelWait || p.mp->will_play(); }
 
 std::wstring state_text(Player& p) {
     std::wstring s;
-    switch (p.mp->state()) {
+    if (image_current(p)) {
+        if (!p.message.empty()) return L"Can't show: " + p.message;
+        return std::wstring(p.slideshow ? L"Slide show" : L"Picture") + L" \x00B7 " + std::to_wstring(p.q.current() + 1) +
+               L" of " + std::to_wstring(p.q.size());
+    }
+    State st = p.mp->state();
+    if (p.levelWait && st != State::Failed) st = State::Opening;    // (its loudness measured first)
+    switch (st) {
         case State::Playing: s = p.mp->will_play() ? L"Playing" : L"Paused"; break;
         case State::Paused:  s = L"Paused"; break;
         case State::Opening: s = L"Opening"; break;
@@ -253,7 +296,7 @@ void refresh_bar(Player& p) {
     }
     InvalidateRect(p.bar, nullptr, FALSE);
     update_taskbar(p);
-    bool running = p.mp->state() == State::Playing;
+    bool running = p.mp->state() == State::Playing || (image_current(p) && p.slideshow);
     if (running) SetTimer(p.wnd, TIMER_POSITION, 250, nullptr);
     else KillTimer(p.wnd, TIMER_POSITION);
     if (running && p.feed.active() && now_playing(p)) SetTimer(p.wnd, TIMER_SPECTRUM, 30, nullptr);
@@ -351,7 +394,51 @@ void layout(Player& p) {
 // ------------------------------------------------------------------
 void apply_volume(Player& p) {
     double v = p.muted ? 0.0 : p.volume / 100.0;
-    p.mp->set_volume((float)(v * v));       // (closer to how loud it sounds than a straight line)
+    v *= v;                                 // (closer to how loud it sounds than a straight line)
+    // levelled: the track's gain on top (a boost only as far as full volume)
+    if (p.level) v *= std::pow(10.0, p.gainDb / 20);
+    p.mp->set_volume((float)std::min(1.0, v));
+}
+
+// the measured loudness of `path`, or nullptr
+const double* loudness_of(Player& p, const std::wstring& path) {
+    auto it = p.loud.find(path);
+    return it == p.loud.end() ? nullptr : &it->second;
+}
+
+// levelling: the gain of the track about to play (until it's measured: the previous
+// track's, likely the same album's), and the next track measured ahead
+void level_track(Player& p, int i) {
+    if (!p.level || image_entry(p, i)) return;
+    const std::wstring& path = p.q.at(i).path;
+    if (const double* l = loudness_of(p, path)) p.gainDb = loudness_gain_db(*l);
+    else loudness_request(p.wnd, WM_LOUDNESS, path, true);
+    int n = p.q.next(false);
+    if (n >= 0 && n != i && !image_entry(p, n) && !loudness_of(p, p.q.at(n).path))
+        loudness_request(p.wnd, WM_LOUDNESS, p.q.at(n).path, false);
+}
+
+// the start held back for the track's loudness: now (it's known, or took too long)
+void level_start(Player& p) {
+    if (!p.levelWait) return;
+    p.levelWait = 0;
+    KillTimer(p.wnd, TIMER_LEVEL);
+    State s = p.mp->state();
+    if (s == State::Opening || s == State::Stopped || s == State::Paused) p.mp->play();
+    refresh_bar(p);
+}
+
+void on_loudness(Player& p, LoudnessNote* n) {
+    if (p.loud.size() > 5000) p.loud.clear();
+    p.loud[n->path] = n->lufs;
+    int i = p.q.current();
+    if (p.level && i >= 0 && !image_current(p) && p.q.at(i).path == n->path) {
+        p.gainDb = loudness_gain_db(n->lufs);
+        apply_volume(p);
+        InvalidateRect(p.video, nullptr, FALSE);
+        if (p.levelWait == p.q.at(i).id) level_start(p);
+    }
+    delete n;
 }
 
 void set_volume(Player& p, int v) {
@@ -369,19 +456,71 @@ void tags_forget();
 void on_failed(Player& p);
 void spectrum_reset(Player& p);
 
+void image_forget(Player& p) {
+    p.img = {};
+    if (p.imgBmp) DeleteObject(p.imgBmp);
+    p.imgBmp = nullptr;
+    p.imgBmpOf = nullptr;
+}
+
+// the box a picture is decoded to: the monitor the window is on
+void image_box(Player& p, int& w, int& h) {
+    MONITORINFO mi{ sizeof(mi) };
+    GetMonitorInfoW(MonitorFromWindow(p.wnd, MONITOR_DEFAULTTONEAREST), &mi);
+    w = std::max(320, (int)(mi.rcMonitor.right - mi.rcMonitor.left));
+    h = std::max(240, (int)(mi.rcMonitor.bottom - mi.rcMonitor.top));
+}
+
+// a picture: shown (decoded on a thread; the one before stays meanwhile), the next one
+// decoded ahead; `play`: a slide show
+void show_image(Player& p, int i, bool play) {
+    p.mp->close();
+    const QueueEntry& e = p.q.at(i);
+    p.slideshow = play;
+    p.slideDone = 0;
+    p.slideStart = p.img.id == e.id && p.img.pixels ? GetTickCount64() : 0;
+    if (p.img.id != e.id) {
+        int n = p.q.next(false);
+        int w = 0, h = 0;
+        image_box(p, w, h);
+        image_request(p.wnd, WM_IMAGE, e.id, e.path, w, h, image_entry(p, n) && n != i ? p.q.at(n).path : std::wstring());
+    }
+    InvalidateRect(p.video, nullptr, FALSE);
+}
+
 // opens entry i and plays it (or shows it stopped at the start)
 void play_index(Player& p, int i, bool play) {
     KillTimer(p.wnd, TIMER_SKIP);
+    KillTimer(p.wnd, TIMER_LEVEL);
+    p.levelWait = 0;
     p.q.set_current(i);
     p.message.clear();
     spectrum_reset(p);
     if (p.q.current() < 0) {
         p.mp->close();
+        p.slideshow = false;
+        image_forget(p);
+    } else if (image_entry(p, i)) {
+        show_image(p, i, play);
+        ListView_EnsureVisible(p.list, i, FALSE);
     } else {
+        p.slideshow = false;
+        image_forget(p);
         const QueueEntry& e = p.q.at(i);
         // the cover and the tags (the panel keeps the album's cover meanwhile)
         if (p.infoFor != e.id) media_info_request(p.wnd, WM_MEDIA_INFO, e.id, e.path, std::max(400, px(400)));
-        p.mp->open(e.path, play);
+        // not measured yet (the first track, one jumped to): its start waits for that a
+        // moment, rather than its volume changing once it's playing
+        bool wait = play && p.level && !loudness_of(p, e.path);
+        p.mp->open(e.path, play && !wait);
+        // (after the open: Media Foundation is loaded then, the measuring needs it; the
+        // volume takes effect as the playback starts)
+        level_track(p, i);
+        apply_volume(p);
+        if (wait && p.mp->state() != State::Failed) {
+            p.levelWait = e.id;
+            SetTimer(p.wnd, TIMER_LEVEL, 1500, nullptr);
+        }
         if (p.mp->state() == State::Failed) on_failed(p);
         ListView_EnsureVisible(p.list, i, FALSE);
     }
@@ -391,6 +530,8 @@ void play_index(Player& p, int i, bool play) {
 void on_failed(Player& p) {
     int i = p.q.current();
     if (i < 0) return;
+    p.levelWait = 0;
+    KillTimer(p.wnd, TIMER_LEVEL);
     p.q.at(i).failed = true;
     p.message = media_error_text(p.mp->error());
     ++p.failsInRow;
@@ -406,8 +547,23 @@ void track_ended(Player& p) {
     else play_index(p, p.q.first(), false);         // the end of the queue: back to its start
 }
 
+// the slide show on or off (the picture's time shown so far kept)
+void set_slideshow(Player& p, bool on) {
+    if (on == p.slideshow) return;
+    ULONGLONG now = GetTickCount64();
+    if (!on && p.slideStart) p.slideDone = now - p.slideStart;
+    if (on && p.slideStart) p.slideStart = now - p.slideDone;
+    p.slideshow = on;
+}
+
 void play_pause(Player& p) {
     if (p.q.empty()) return;
+    if (image_current(p)) { set_slideshow(p, !p.slideshow); return; }
+    if (p.levelWait) {                      // (about to start: it doesn't)
+        p.levelWait = 0;
+        KillTimer(p.wnd, TIMER_LEVEL);
+        return;
+    }
     switch (p.mp->state()) {
         case State::Playing: case State::Opening:
             if (p.mp->will_play()) p.mp->pause(); else p.mp->play();
@@ -427,14 +583,48 @@ void previous(Player& p) {
     int i = p.q.previous();
     // 3 s into the track, or nothing before it: from its start
     if (loaded && (p.mp->position() > 30000000 || i < 0)) { p.mp->seek(0); return; }
-    play_index(p, i >= 0 ? i : p.q.first(), true);
+    // (from a picture: a slide show goes on, a picture looked at stays looked at)
+    play_index(p, i >= 0 ? i : p.q.first(), !image_current(p) || p.slideshow);
 }
 
 void next(Player& p) {
     if (p.q.empty()) return;
     int i = p.q.next(false);
-    if (i >= 0) play_index(p, i, true);
+    if (i >= 0) play_index(p, i, !image_current(p) || p.slideshow);
     else play_index(p, p.q.first(), false);           // past the end: its start, stopped
+}
+
+// the slide show's picture has been shown long enough
+void slide_tick(Player& p) {
+    int i = p.q.current();
+    if (!image_current(p) || !p.slideshow || !p.slideStart || p.img.id != p.q.at(i).id) return;
+    if (GetTickCount64() - p.slideStart < (ULONGLONG)p.slideSecs * 1000) return;
+    int n = p.q.next(true);
+    if (n >= 0) play_index(p, n, true);
+    else set_slideshow(p, false);                     // the last one: it stays
+}
+
+void on_image(Player& p, ImageNote* n) {
+    int i = p.q.current();
+    if (i >= 0 && image_current(p) && p.q.at(i).id == n->id) {
+        QueueEntry& e = p.q.at(i);
+        if (n->pixels) {
+            p.img = std::move(*n);
+            p.message.clear();
+            e.failed = false;
+            p.slideStart = GetTickCount64();
+            p.slideDone = 0;
+        } else {
+            image_forget(p);
+            p.img.id = e.id;
+            e.failed = true;
+            p.message = L"This picture can't be opened: its file type isn't supported, or the file is damaged.";
+            if (p.slideshow && p.q.next(false) >= 0) SetTimer(p.wnd, TIMER_SKIP, 1500, nullptr);
+        }
+        ListView_RedrawItems(p.list, i, i);
+        refresh_all(p);
+    }
+    delete n;
 }
 
 void queue_changed(Player& p) {
@@ -445,17 +635,22 @@ void queue_changed(Player& p) {
     InvalidateRect(p.wnd, &head, FALSE);
 }
 
-void add(Player& p, const std::vector<std::wstring>& paths, bool enqueue) {
+// `start`: the entry to begin with (a picture viewed: its folder's pictures from it)
+void add(Player& p, const std::vector<std::wstring>& paths, bool enqueue, const std::wstring& start = {}) {
     if (paths.empty()) return;
     State s = p.mp->state();
-    bool idle = !(s == State::Playing || s == State::Paused || s == State::Opening);
+    bool idle = !(s == State::Playing || s == State::Paused || s == State::Opening || image_current(p));
     if (!enqueue) {
         tags_forget();
         p.q.replace(paths);
+        if (!start.empty())
+            for (int i = 0; i < p.q.size(); ++i)
+                if (p.q.at(i).path == start) { p.q.set_current(i); break; }
         p.failsInRow = 0;
         queue_changed(p);
         tags_read(p, 0);
-        play_index(p, p.q.current(), true);
+        // (a picture is shown, not run as a slide show: Play starts that)
+        play_index(p, p.q.current(), !image_current(p));
         return;
     }
     int first = p.q.append(paths);
@@ -463,7 +658,7 @@ void add(Player& p, const std::vector<std::wstring>& paths, bool enqueue) {
     tags_read(p, first);
     if (idle) {
         p.failsInRow = 0;
-        play_index(p, first, true);
+        play_index(p, first, !image_entry(p, first));
     }
     refresh_bar(p);
 }
@@ -485,18 +680,15 @@ void remove_selected(Player& p) {
     if (focus >= 0) ListView_SetItemState(p.list, focus, LVIS_FOCUSED | LVIS_SELECTED, LVIS_FOCUSED | LVIS_SELECTED);
     if (hit) {
         if (p.q.current() >= 0) play_index(p, p.q.current(), was);
-        else { KillTimer(p.wnd, TIMER_SKIP); p.mp->close(); p.message.clear(); spectrum_reset(p); }
+        else play_index(p, -1, false);
     }
     refresh_all(p);
 }
 
 void clear_queue(Player& p) {
     tags_forget();
-    KillTimer(p.wnd, TIMER_SKIP);
     p.q.clear();
-    p.mp->close();
-    p.message.clear();
-    spectrum_reset(p);
+    play_index(p, -1, false);
     queue_changed(p);
     refresh_all(p);
 }
@@ -571,6 +763,19 @@ void command(Player& p, UINT cmd) {
             break;
         }
         case CMD_REMOVE_SELECTED: remove_selected(p); break;
+        case CMD_LEVEL:
+            p.level = !p.level;
+            settings_set_pref(L"playerLevel", p.level);
+            if (p.level && p.q.current() >= 0) level_track(p, p.q.current());
+            apply_volume(p);
+            InvalidateRect(p.video, nullptr, FALSE);
+            break;
+        default:
+            if (cmd > CMD_SLIDE && cmd <= CMD_SLIDE + 60) {
+                p.slideSecs = (int)(cmd - CMD_SLIDE);
+                settings_set_pref(L"playerSlideSeconds", p.slideSecs);
+            }
+            break;
     }
     refresh_bar(p);
     acc_notify(p.bar, EVENT_OBJECT_STATECHANGE, -1);
@@ -581,7 +786,11 @@ bool media_command(Player& p, int app) {
         case APPCOMMAND_MEDIA_PLAY_PAUSE: command(p, CMD_PLAYPAUSE); return true;
         case APPCOMMAND_MEDIA_PLAY: if (!playing(p)) command(p, CMD_PLAYPAUSE); return true;
         case APPCOMMAND_MEDIA_PAUSE: if (playing(p)) command(p, CMD_PLAYPAUSE); return true;
-        case APPCOMMAND_MEDIA_STOP: p.mp->stop(); refresh_bar(p); return true;
+        case APPCOMMAND_MEDIA_STOP:
+            if (image_current(p)) set_slideshow(p, false);
+            else p.mp->stop();
+            refresh_bar(p);
+            return true;
         case APPCOMMAND_MEDIA_NEXTTRACK: command(p, CMD_NEXT); return true;
         case APPCOMMAND_MEDIA_PREVIOUSTRACK: command(p, CMD_PREV); return true;
     }
@@ -592,6 +801,7 @@ void on_note(Player& p, LPARAM lp) {
     using Change = MediaPlayer::Change;
     Change c = p.mp->handle(reinterpret_cast<MediaNote*>(lp));
     int i = p.q.current();
+    if (image_current(p)) return;          // (the playback closed for a picture: late news of it)
     switch (c) {
         case Change::None: return;
         case Change::Opened:
@@ -661,7 +871,8 @@ void tag_thread() {
 
 void tags_read(Player& p, int from) {
     std::lock_guard<std::mutex> lk(s_tagMx);
-    for (int i = from; i < p.q.size(); ++i) s_tagJobs.push_back({ p.q.at(i).id, p.q.at(i).path });
+    for (int i = from; i < p.q.size(); ++i)
+        if (!image_entry(p, i)) s_tagJobs.push_back({ p.q.at(i).id, p.q.at(i).path });     // (pictures: no tags read)
     if (!s_tagBusy && !s_tagJobs.empty()) {
         s_tagBusy = true;
         std::thread(tag_thread).detach();
@@ -731,9 +942,34 @@ std::vector<std::wstring> expand(const std::vector<MediaItem>& items) {
         if (out.size() >= kMaxFiles) break;
         DWORD a = GetFileAttributesW(it.path.c_str());
         if (a == INVALID_FILE_ATTRIBUTES) continue;
-        if (a & FILE_ATTRIBUTE_DIRECTORY) walk(it.path, 0, out);
-        else if (media_file_playable(it.path)) out.push_back(it.path);
+        if (a & FILE_ATTRIBUTE_DIRECTORY) walk(it.path, 0, out);     // (a folder: its sound and video only)
+        else if (player_file(it.path)) out.push_back(it.path);
     }
+    return out;
+}
+
+// the pictures of `file`'s folder, sorted by name as Explorer does (`file` among them)
+std::vector<std::wstring> folder_pictures(const std::wstring& file) {
+    std::wstring base = file.substr(0, file.find_last_of(L"\\/") + 1);
+    std::vector<std::wstring> names;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileExW((base + L"*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr,
+                                FIND_FIRST_EX_LARGE_FETCH);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
+            if (image_file(fd.cFileName)) names.push_back(fd.cFileName);
+        } while (names.size() < kMaxFiles && FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    std::sort(names.begin(), names.end(), [](const std::wstring& a, const std::wstring& b) { return StrCmpLogicalW(a.c_str(), b.c_str()) < 0; });
+    std::vector<std::wstring> out;
+    bool found = false;
+    for (auto& n : names) {
+        out.push_back(base + n);
+        if (lstrcmpiW(out.back().c_str(), file.c_str()) == 0) { out.back() = file; found = true; }
+    }
+    if (!found) out.insert(out.begin(), file);          // (a hidden one, say)
     return out;
 }
 
@@ -775,18 +1011,23 @@ bool folder_has_media(const std::wstring& dir) {
 // ------------------------------------------------------------------
 // handing over: to this process's player, or another process's
 // ------------------------------------------------------------------
-struct OpenJob { std::vector<std::wstring> paths; bool enqueue = false; };
+struct OpenJob { std::vector<std::wstring> paths; bool enqueue = false; std::wstring start; };
 
 bool create_player(bool activate);
 
-bool hand_over(const std::vector<std::wstring>& paths, bool enqueue) {
+bool hand_over(const std::vector<std::wstring>& paths, bool enqueue, const std::wstring& start) {
     HWND other = FindWindowW(player_class().c_str(), nullptr);
     if (!other) return false;
     DWORD pid = 0;
     GetWindowThreadProcessId(other, &pid);
     if (pid == GetCurrentProcessId()) return false;
-    std::wstring data = pack_paths(paths);
-    COPYDATASTRUCT cd{ enqueue ? kCopyEnqueue : kCopyPlay, (DWORD)(data.size() * sizeof(wchar_t)), (void*)data.data() };
+    bool view = !enqueue && !start.empty();
+    std::vector<std::wstring> all;
+    if (view) all.push_back(start);
+    all.insert(all.end(), paths.begin(), paths.end());
+    std::wstring data = pack_paths(all);
+    COPYDATASTRUCT cd{ view ? kCopyView : enqueue ? kCopyEnqueue : kCopyPlay, (DWORD)(data.size() * sizeof(wchar_t)),
+                       (void*)data.data() };
     DWORD_PTR ok = 0;
     if (!SendMessageTimeoutW(other, WM_COPYDATA, 0, (LPARAM)&cd, SMTO_ABORTIFHUNG | SMTO_BLOCK, 3000, &ok) || !ok)
         return false;
@@ -797,22 +1038,22 @@ bool hand_over(const std::vector<std::wstring>& paths, bool enqueue) {
     return true;
 }
 
-void deliver(const std::vector<std::wstring>& paths, bool enqueue) {
+void deliver(const std::vector<std::wstring>& paths, bool enqueue, const std::wstring& start = {}) {
     if (paths.empty()) { MessageBeep(MB_ICONASTERISK); return; }
     if (!s_p) {
-        if (hand_over(paths, enqueue)) return;
+        if (hand_over(paths, enqueue, start)) return;
         if (!create_player(!enqueue)) return;
     } else if (!enqueue) {
         if (IsIconic(s_p->wnd)) ShowWindow(s_p->wnd, SW_RESTORE);
         SetForegroundWindow(s_p->wnd);
     }
-    add(*s_p, paths, enqueue);
+    add(*s_p, paths, enqueue, start);
 }
 
 LRESULT CALLBACK msg_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_PLAYER_OPEN) {
         auto* job = reinterpret_cast<OpenJob*>(lp);
-        deliver(job->paths, job->enqueue);
+        deliver(job->paths, job->enqueue, job->start);
         delete job;
         return 0;
     }
@@ -839,12 +1080,21 @@ void open_items(const std::vector<MediaItem>& items, bool enqueue, bool maybeFol
     if (!maybeFolders) {
         std::vector<std::wstring> paths;
         for (auto& it : items)
-            if (media_file_playable(it.path)) paths.push_back(it.path);
+            if (player_file(it.path)) paths.push_back(it.path);
         deliver(paths, enqueue);
         return;
     }
     std::thread([items, enqueue, target] {
         auto* job = new OpenJob{ expand(items), enqueue };
+        if (!PostMessageW(target, WM_PLAYER_OPEN, 0, (LPARAM)job)) delete job;
+    }).detach();
+}
+
+// one picture viewed: its folder's pictures, from it (listed on a thread: a big folder)
+void open_pictures(const std::wstring& file) {
+    HWND target = msg_window();
+    std::thread([file, target] {
+        auto* job = new OpenJob{ folder_pictures(file), false, file };
         if (!PostMessageW(target, WM_PLAYER_OPEN, 0, (LPARAM)job)) delete job;
     }).detach();
 }
@@ -907,9 +1157,12 @@ std::wstring part_name(Player& p, int part, std::wstring* key = nullptr) {
     switch (part) {
         case P_SEEK:    n = L"Position"; k = L"Left, Right"; break;
         case P_SHUFFLE: n = p.q.shuffle() ? L"Shuffle: on" : L"Shuffle: off"; k = L"Ctrl+H"; break;
-        case P_PREV:    n = L"Previous"; k = L"Ctrl+Left"; break;
-        case P_PLAY:    n = playing(p) ? L"Pause" : L"Play"; k = L"Space"; break;
-        case P_NEXT:    n = L"Next"; k = L"Ctrl+Right"; break;
+        case P_PREV:    n = L"Previous"; k = image_current(p) ? L"Left" : L"Ctrl+Left"; break;
+        case P_PLAY:
+            n = image_current(p) ? (p.slideshow ? L"Stop slide show" : L"Slide show") : playing(p) ? L"Pause" : L"Play";
+            k = L"Space";
+            break;
+        case P_NEXT:    n = L"Next"; k = image_current(p) ? L"Right" : L"Ctrl+Right"; break;
         case P_REPEAT:
             n = p.q.repeat == Repeat::One ? L"Repeat: one" : p.q.repeat == Repeat::All ? L"Repeat: all" : L"Repeat: off";
             k = L"Ctrl+T";
@@ -938,9 +1191,24 @@ void paint_bar(Player& p) {
     RECT tl{ px(12), seekY - px(10), p.seekRail.left - px(12), seekY + px(10) };
     RECT tr{ p.seekRail.right + px(12), seekY - px(10), bp.rc.right - px(12), seekY + px(10) };
     COLORREF timeColor = canSeek ? c.textSecondary : c.textDisabled;
-    text_at(dc, canSeek ? fmt_duration(pos) : L"0:00", tl, timeColor, p.fontSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    text_at(dc, dur > 0 ? fmt_duration(dur) : L"0:00", tr, timeColor, p.fontSmall, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-    slider(dc, p, p.seekRail, dur > 0 ? (double)pos / (double)dur : 0.0, canSeek, p.hot == P_SEEK || p.drag == P_SEEK);
+    if (image_current(p)) {
+        // a picture: which one of how many; the slide show's time to the next one
+        text_at(dc, std::to_wstring(p.q.current() + 1) + L" / " + std::to_wstring(p.q.size()), tl, c.textSecondary,
+                p.fontSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        text_at(dc, std::to_wstring(p.slideSecs) + L" s", tr, p.slideshow ? c.textSecondary : c.textDisabled,
+                p.fontSmall, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        fill_rrect(dc, p.seekRail, px(2), blend(c.layer, c.text, 0.2));
+        if (p.slideshow && p.slideStart) {
+            double f = std::min(1.0, (double)(GetTickCount64() - p.slideStart) / (p.slideSecs * 1000.0));
+            RECT done = p.seekRail;
+            done.right = done.left + (int)((done.right - done.left) * f);
+            if (done.right > done.left) fill_rrect(dc, done, px(2), c.accent);
+        }
+    } else {
+        text_at(dc, canSeek ? fmt_duration(pos) : L"0:00", tl, timeColor, p.fontSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        text_at(dc, dur > 0 ? fmt_duration(dur) : L"0:00", tr, timeColor, p.fontSmall, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        slider(dc, p, p.seekRail, dur > 0 ? (double)pos / (double)dur : 0.0, canSeek, p.hot == P_SEEK || p.drag == P_SEEK);
+    }
     // buttons
     for (int part : { P_SHUFFLE, P_PREV, P_PLAY, P_NEXT, P_REPEAT, P_MUTE, P_QUEUE, P_FULL }) {
         RECT r = p.parts[part];
@@ -985,7 +1253,7 @@ void paint_bar(Player& p) {
 // the video area shows the panel: an entry is current and it isn't (or isn't yet) a video
 bool now_playing(Player& p) {
     int i = p.q.current();
-    if (i < 0 || p.mp->has_video()) return false;
+    if (i < 0 || p.mp->has_video() || image_current(p)) return false;
     // (a video file still opening: no panel flashing up before its picture)
     return !(p.mp->state() == State::Opening && media_file_video(p.q.at(i).path));
 }
@@ -1032,6 +1300,17 @@ std::vector<std::pair<std::wstring, std::wstring>> now_details(Player& p) {
                     a.format == 0x63616C61 || a.format == 0x0163;
     if (lossless && a.bits) audio += (audio.empty() ? L"" : L", ") + std::to_wstring(a.bits) + L"-bit";
     if (!audio.empty()) out.push_back({ L"Audio", audio });
+    // its loudness; levelled: by how much
+    if (const double* l = i >= 0 ? loudness_of(p, p.q.at(i).path) : nullptr; l && std::isfinite(*l)) {
+        wchar_t b[96];
+        double g = loudness_gain_db(*l);
+        if (p.level) swprintf_s(b, L"%.1f LUFS, levelled %s%.1f dB", *l, g >= 0 ? L"+" : L"\x2212", std::fabs(g));
+        else swprintf_s(b, L"%.1f LUFS", *l);
+        std::wstring s = b;
+        size_t m = s.find(L'-');
+        if (m != std::wstring::npos) s[m] = L'\x2212';
+        out.push_back({ L"Loudness", s });
+    }
     if (info && info->size) out.push_back({ L"Size", fmt_file_size(info->size) });
     return out;
 }
@@ -1134,9 +1413,9 @@ void spectrum_lut(Player& p) {
     if (p.specLutTheme == theme_generation()) return;
     p.specLutTheme = theme_generation();
     const Palette& c = pal();
-    // silence is a shade off the background; loud is the accent, then light (dark theme) or
-    // deep (light)
-    COLORREF quiet = blend(c.content, c.text, g_dark ? 0.05 : 0.035);
+    // silence is the window's background (the spectrogram blends in); loud is the accent,
+    // then light (dark theme) or deep (light)
+    COLORREF quiet = c.content;
     COLORREF stops[4] = { quiet, blend(quiet, c.accent, 0.45), c.accent,
                           g_dark ? blend(c.accent, RGB(255, 255, 255), 0.8) : blend(c.accent, RGB(0, 0, 0), 0.6) };
     const double at[4] = { 0.0, 0.35, 0.7, 1.0 };
@@ -1205,10 +1484,15 @@ RECT spectrum_image(const RECT& area) {
     return r;
 }
 
-RECT spectrum_rect(Player& p) {
+// the spectrogram's area, its frequency scale included
+RECT spectrum_area(Player& p) {
     RECT rc{};
     GetClientRect(p.video, &rc);
-    RECT a = now_rects(p, rc).spec;
+    return now_rects(p, rc).spec;
+}
+
+RECT spectrum_rect(Player& p) {
+    RECT a = spectrum_area(p);
     return IsRectEmpty(&a) ? a : spectrum_image(a);
 }
 
@@ -1245,7 +1529,8 @@ void spectrum_tick(Player& p) {
     }
     for (int k = 0; k < shift; ++k) spectrum_column(p, w - shift + k, cols.data() + (size_t)(n - shift + k) * B);
     GdiFlush();
-    InvalidateRect(p.video, &r, FALSE);
+    RECT area = spectrum_area(p);           // (the scale too: whatever painted over it meanwhile)
+    InvalidateRect(p.video, &area, FALSE);
 }
 
 void draw_spectrum(Player& p, HDC dc, const RECT& area) {
@@ -1262,7 +1547,10 @@ void draw_spectrum(Player& p, HDC dc, const RECT& area) {
     const Palette& c = pal();
     const int B = SpectrumFeed::kBands;
     double f0 = p.feed.band_freq(0), f1 = p.feed.band_freq(B - 1);
-    if (f0 <= 0 || f1 <= f0) return;
+    if (f0 <= 0 || f1 <= f0) {             // (not started yet: the bands it will have, near enough)
+        f0 = SpectrumFeed::kMinHz * std::pow(SpectrumFeed::kMaxHz / SpectrumFeed::kMinHz, 0.5 / B);
+        f1 = SpectrumFeed::kMinHz * std::pow(SpectrumFeed::kMaxHz / SpectrumFeed::kMinHz, (B - 0.5) / B);
+    }
     for (int hz : { 100, 1000, 10000 }) {
         if (hz <= f0 || hz >= f1) continue;
         double band = std::log(hz / f0) / std::log(f1 / f0) * (B - 1);
@@ -1282,7 +1570,7 @@ void paint_idle(Player& p, HDC dc, const RECT& rc) {
     wchar_t g = L'\xE8D6';                     // (music note)
     if (p.q.empty()) {
         title = L"Nothing to play";
-        detail = L"Choose Play or Queue in Explorer Plus in a file's menu, or drop files here.";
+        detail = L"Choose Play, View or Queue in Explorer Plus in a file's menu, or drop files here.";
     } else if (p.q.current() < 0) {
         title = L"Play queue";
         detail = std::to_wstring(p.q.size()) + (p.q.size() == 1 ? L" item" : L" items");
@@ -1308,9 +1596,61 @@ void paint_idle(Player& p, HDC dc, const RECT& rc) {
     }
 }
 
+// a picture: fitted to the area, centred; black around it in full screen
+void paint_image(Player& p, HDC dc, const RECT& rc) {
+    const Palette& c = pal();
+    fill_rect(dc, rc, p.full ? RGB(0, 0, 0) : c.content);
+    int aw = rc.right - rc.left, ah = rc.bottom - rc.top;
+    if (!p.message.empty()) {               // (can't be opened)
+        RECT ga{ rc.left, rc.top + ah / 2 - px(80), rc.right, rc.top + ah / 2 };
+        glyph_at(dc, L'\xE91B', ga, c.textDisabled, p.glyphsArt);
+        RECT tr{ rc.left + px(24), ga.bottom + px(12), rc.right - px(24), ga.bottom + px(44) };
+        text_at(dc, current_title(p), tr, p.full ? RGB(255, 255, 255) : c.text, p.fontBig,
+                DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER);
+        RECT mr{ tr.left, tr.bottom + px(8), tr.right, tr.bottom + px(56) };
+        text_at(dc, p.message, mr, p.full ? RGB(200, 200, 200) : c.textSecondary, p.font, DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
+        return;
+    }
+    const ImageNote& im = p.img;             // (the one before while the next decodes)
+    if (!im.pixels || aw <= 0 || ah <= 0) return;
+    int fw = im.fullW > 0 ? im.fullW : im.w, fh = im.fullH > 0 ? im.fullH : im.h;
+    // (full screen: filling it, a small picture enlarged up to 3x; in a window: as big as it is at most)
+    double k = std::min({ p.full ? 3.0 : 1.0, (double)aw / fw, (double)ah / fh });
+    int dw = std::max(1, (int)(fw * k + 0.5)), dh = std::max(1, (int)(fh * k + 0.5));
+    if (!p.imgBmp || p.imgBmpW != dw || p.imgBmpH != dh || p.imgBmpOf != im.pixels.get()) {
+        if (p.imgBmp) DeleteObject(p.imgBmp);
+        p.imgBmp = nullptr;
+        BITMAPINFO bi{};
+        bi.bmiHeader = { sizeof(BITMAPINFOHEADER), dw, -dh, 1, 32, BI_RGB };
+        void* bits = nullptr;
+        p.imgBmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (!p.imgBmp) return;
+        Gdiplus::Bitmap src(im.w, im.h, im.w * 4, PixelFormat32bppPARGB, (BYTE*)const_cast<uint32_t*>(im.pixels->data()));
+        Gdiplus::Bitmap out(dw, dh, dw * 4, PixelFormat32bppPARGB, (BYTE*)bits);
+        Gdiplus::Graphics g(&out);
+        g.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
+        g.SetInterpolationMode(dw == im.w && dh == im.h ? Gdiplus::InterpolationModeNearestNeighbor
+                                                        : Gdiplus::InterpolationModeHighQualityBicubic);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        Gdiplus::ImageAttributes clampEdges;
+        clampEdges.SetWrapMode(Gdiplus::WrapModeTileFlipXY);
+        g.DrawImage(&src, Gdiplus::Rect(0, 0, dw, dh), 0, 0, im.w, im.h, Gdiplus::UnitPixel, &clampEdges);
+        p.imgBmpW = dw;
+        p.imgBmpH = dh;
+        p.imgBmpOf = im.pixels.get();
+    }
+    HDC mem = CreateCompatibleDC(dc);
+    HGDIOBJ old = SelectObject(mem, p.imgBmp);
+    BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };      // (transparent PNGs: on the background)
+    AlphaBlend(dc, rc.left + (aw - dw) / 2, rc.top + (ah - dh) / 2, dw, dh, mem, 0, 0, dw, dh, bf);
+    SelectObject(mem, old);
+    DeleteDC(mem);
+}
+
 // the video area without a video
 void paint_art(Player& p, HDC dc, const RECT& rc) {
     const Palette& c = pal();
+    if (image_current(p)) { paint_image(p, dc, rc); return; }
     fill_rect(dc, rc, c.content);
     if (!now_playing(p)) { paint_idle(p, dc, rc); return; }
     NowRects r = now_rects(p, rc);
@@ -1632,6 +1972,39 @@ LRESULT CALLBACK bar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// the video area's menu: levelling, the slide show's interval, full screen
+void view_menu(Player& p, POINT pt) {
+    if (pt.x == -1 && pt.y == -1) {             // (keyboard: the area's middle)
+        RECT r{};
+        GetClientRect(p.video, &r);
+        pt = { r.right / 2, r.bottom / 2 };
+        ClientToScreen(p.video, &pt);
+    }
+    HMENU m = CreatePopupMenu();
+    HMENU slides = CreatePopupMenu();
+    for (int s : kSlideSecs)
+        AppendMenuW(slides, MF_STRING | (s == p.slideSecs ? MF_CHECKED : 0), CMD_SLIDE + s, (std::to_wstring(s) + L" seconds").c_str());
+    AppendMenuW(m, MF_STRING | (p.level ? MF_CHECKED : 0), CMD_LEVEL, L"Even out loudness between tracks");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)slides, L"Slide show interval");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, CMD_FULL, p.full ? L"Exit full screen\tEsc" : L"Full screen\tF");
+    UINT id = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, p.wnd, nullptr);
+    DestroyMenu(m);                             // (and its submenu)
+    if (id) command(p, id);
+}
+
+// the wheel over a picture: the previous / next one
+bool image_wheel(Player& p, WPARAM wp) {
+    if (!image_current(p)) return false;
+    POINT c{};
+    GetCursorPos(&c);
+    RECT r{};
+    GetWindowRect(p.video, &r);
+    if (!PtInRect(&r, c)) return false;
+    command(p, GET_WHEEL_DELTA_WPARAM(wp) > 0 ? CMD_PREV : CMD_NEXT);
+    return true;
+}
+
 LRESULT CALLBACK video_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     Player* pp = s_p;
     if (!pp || !pp->mp) return DefWindowProcW(hwnd, msg, wp, lp);
@@ -1658,6 +2031,10 @@ LRESULT CALLBACK video_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONDOWN: SetFocus(p.wnd); return 0;
         case WM_LBUTTONDBLCLK: command(p, CMD_FULL); return 0;
         case WM_MOUSEMOVE: full_show_bar(p); return 0;
+        case WM_CONTEXTMENU: view_menu(p, { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }); return 0;
+        case WM_MOUSEWHEEL:
+            if (image_wheel(p, wp)) return 0;
+            break;
         case WM_SETCURSOR:
             if (p.full && !p.barInFull) { SetCursor(nullptr); return TRUE; }
             break;
@@ -1909,6 +2286,9 @@ void on_destroy(Player& p) {
     p.feed.stop();
     KillTimer(p.wnd, TIMER_SPECTRUM);
     while (PeekMessageW(&m, p.wnd, WM_MEDIA_INFO, WM_MEDIA_INFO, PM_REMOVE)) delete reinterpret_cast<MediaInfoNote*>(m.lParam);
+    while (PeekMessageW(&m, p.wnd, WM_IMAGE, WM_IMAGE, PM_REMOVE)) delete reinterpret_cast<ImageNote*>(m.lParam);
+    while (PeekMessageW(&m, p.wnd, WM_LOUDNESS, WM_LOUDNESS, PM_REMOVE)) delete reinterpret_cast<LoudnessNote*>(m.lParam);
+    image_forget(p);
     if (p.coverBmp) DeleteObject(p.coverBmp);
     if (p.specBmp) DeleteObject(p.specBmp);
     p.coverBmp = p.specBmp = nullptr;
@@ -1940,6 +2320,8 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_MEDIA_NOTE: on_note(p, lp); return 0;
         case WM_MEDIA_INFO: on_media_info(p, reinterpret_cast<MediaInfoNote*>(lp)); return 0;
+        case WM_IMAGE: on_image(p, reinterpret_cast<ImageNote*>(lp)); return 0;
+        case WM_LOUDNESS: on_loudness(p, reinterpret_cast<LoudnessNote*>(lp)); return 0;
         case WM_COMMAND:
             // (menus and accelerators; the taskbar thumbnail's buttons)
             if ((HIWORD(wp) == 0 || HIWORD(wp) == THBN_CLICKED) && LOWORD(wp) >= CMD_PLAYPAUSE) command(p, LOWORD(wp));
@@ -1948,8 +2330,9 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (media_command(p, GET_APPCOMMAND_LPARAM(lp))) return TRUE;
             break;
         case WM_TIMER:
-            if (wp == TIMER_POSITION) refresh_bar(p);
+            if (wp == TIMER_POSITION) { slide_tick(p); refresh_bar(p); }
             else if (wp == TIMER_SPECTRUM) spectrum_tick(p);
+            else if (wp == TIMER_LEVEL) level_start(p);
             else if (wp == TIMER_SKIP) { KillTimer(hwnd, TIMER_SKIP); next(p); }
             else if (wp == TIMER_HIDE_BAR) {
                 POINT c{};
@@ -1968,15 +2351,20 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_CONTEXTMENU:
             if ((HWND)wp == p.list) { queue_menu(p, { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }); return 0; }
+            if ((HWND)wp == hwnd || (HWND)wp == p.video) { view_menu(p, { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }); return 0; }
+            break;
+        case WM_MOUSEWHEEL:
+            if (image_wheel(p, wp)) return 0;
             break;
         case WM_COPYDATA: {
             // another Explorer Plus process hands over its files
             auto* cd = (COPYDATASTRUCT*)lp;
-            if (!cd || (cd->dwData != kCopyPlay && cd->dwData != kCopyEnqueue) || cd->cbData % sizeof(wchar_t) ||
-                cd->cbData > (64u << 20))
+            if (!cd || (cd->dwData != kCopyPlay && cd->dwData != kCopyEnqueue && cd->dwData != kCopyView) ||
+                cd->cbData % sizeof(wchar_t) || cd->cbData > (64u << 20))
                 return FALSE;
             auto* job = new OpenJob;
             job->enqueue = cd->dwData == kCopyEnqueue;
+            bool view = cd->dwData == kCopyView;    // (the first path: the picture to begin with)
             // (one path at a time, up to the cap: a huge payload isn't all materialised)
             const wchar_t* c = (const wchar_t*)cd->lpData;
             const wchar_t* end = c + cd->cbData / sizeof(wchar_t);
@@ -1984,7 +2372,10 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 const wchar_t* z = std::find(c, end, L'\0');
                 if (z - c > 0 && z - c < 32768) {
                     std::wstring s(c, z);
-                    if (!PathIsRelativeW(s.c_str()) && media_file_playable(s)) job->paths.push_back(std::move(s));
+                    if (!PathIsRelativeW(s.c_str()) && player_file(s)) {
+                        if (view && job->start.empty()) job->start = std::move(s);
+                        else job->paths.push_back(std::move(s));
+                    }
                 }
                 c = z + (z < end ? 1 : 0);
             }
@@ -2118,6 +2509,8 @@ bool create_player(bool activate) {
     p.q.set_shuffle(settings_pref(L"playerShuffle", 0) != 0);
     p.queueShown = settings_pref(L"playerQueue", 1) != 0;
     p.queueW96 = std::clamp(settings_pref(L"playerQueueWidth", 300), 160, 900);
+    p.level = settings_pref(L"playerLevel", 1) != 0;
+    p.slideSecs = std::clamp(settings_pref(L"playerSlideSeconds", 5), 1, 60);
     bool maximized = false;
     RECT r = initial_rect(maximized);
     HWND w = CreateWindowExW(0, player_class().c_str(), L"Player", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
@@ -2139,20 +2532,26 @@ bool create_player(bool activate) {
 // ------------------------------------------------------------------
 // public
 // ------------------------------------------------------------------
-bool player_offer(const std::vector<MediaItem>& items) {
+PlayerOffer player_offer(const std::vector<MediaItem>& items) {
     int folders = 0;
+    bool pictures = false;
     for (auto& it : items) {
         if (!it.folder) {
-            if (media_file_playable(it.path)) return true;
+            if (media_file_playable(it.path)) return PlayerOffer::Play;
+            if (image_file(it.path)) pictures = true;
             continue;
         }
         if (++folders > 4) continue;           // (a few folders looked into, no more)
-        if (folder_has_media(it.path)) return true;
+        if (folder_has_media(it.path)) return PlayerOffer::Play;
     }
-    return false;
+    return pictures ? PlayerOffer::View : PlayerOffer::None;
 }
 
 void player_open(const std::vector<MediaItem>& items, bool enqueue) {
+    if (!enqueue && items.size() == 1 && !items[0].folder && image_file(items[0].path)) {
+        open_pictures(items[0].path);
+        return;
+    }
     bool folders = std::any_of(items.begin(), items.end(), [](const MediaItem& it) { return it.folder; });
     open_items(items, enqueue, folders);
 }
@@ -2187,6 +2586,7 @@ bool player_translate(MSG* m) {
         case VK_LEFT: case VK_RIGHT:
             if (ctrl) { command(p, vk == VK_LEFT ? CMD_PREV : CMD_NEXT); return true; }
             if (inList) return false;
+            if (image_current(p)) { command(p, vk == VK_LEFT ? CMD_PREV : CMD_NEXT); return true; }     // (a picture: the one before / after)
             if (seekable(p)) {
                 LONGLONG step = (shift ? 30 : 5) * 10000000LL;
                 p.mp->seek(p.mp->position() + (vk == VK_LEFT ? -step : step));

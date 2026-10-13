@@ -116,6 +116,84 @@ void SpectrumMath::column(const float* samples, uint8_t* out) {
 }
 
 // ------------------------------------------------------------------
+// loudness
+// ------------------------------------------------------------------
+LoudnessMeter::LoudnessMeter(unsigned rate, unsigned channels) : m_channels(channels ? channels : 1) {
+    const double pi = 3.14159265358979323846;
+    double fs = rate ? rate : 48000;
+    // BS.1770's two filters, designed for this rate (the standard lists 48 kHz only)
+    {   // the head's high shelf, +4 dB above ~1.7 kHz
+        double f0 = 1681.974450955533, G = 3.999843853973347, Q = 0.7071752369554196;
+        double K = std::tan(pi * f0 / fs), Vh = std::pow(10.0, G / 20), Vb = std::pow(Vh, 0.4996667741545416);
+        double a0 = 1 + K / Q + K * K;
+        m_shelf = { (Vh + Vb * K / Q + K * K) / a0, 2 * (K * K - Vh) / a0, (Vh - Vb * K / Q + K * K) / a0,
+                    2 * (K * K - 1) / a0, (1 - K / Q + K * K) / a0 };
+    }
+    {   // the RLB high pass at ~38 Hz
+        double f0 = 38.13547087602444, Q = 0.5003270373238773;
+        double K = std::tan(pi * f0 / fs), a0 = 1 + K / Q + K * K;
+        m_highpass = { 1, -2, 1, 2 * (K * K - 1) / a0, (1 - K / Q + K * K) / a0 };
+    }
+    m_state.assign((size_t)m_channels * 4, 0.0);
+    m_subLen = std::max<size_t>(1, (size_t)(fs / 10));
+}
+
+void LoudnessMeter::cut() {
+    std::fill(m_state.begin(), m_state.end(), 0.0);
+    m_subFill = 0;
+    m_subSum = 0;
+    m_recent.clear();
+}
+
+void LoudnessMeter::add(const float* x, size_t frames) {
+    for (size_t f = 0; f < frames; ++f) {
+        double sum = 0;
+        for (unsigned c = 0; c < m_channels; ++c) {
+            double* s = &m_state[(size_t)c * 4];
+            double in = x[f * m_channels + c];
+            // (transposed direct form II, one filter after the other)
+            double y = m_shelf.b0 * in + s[0];
+            s[0] = m_shelf.b1 * in - m_shelf.a1 * y + s[1];
+            s[1] = m_shelf.b2 * in - m_shelf.a2 * y;
+            double z = m_highpass.b0 * y + s[2];
+            s[2] = m_highpass.b1 * y - m_highpass.a1 * z + s[3];
+            s[3] = m_highpass.b2 * y - m_highpass.a2 * z;
+            sum += z * z;
+        }
+        m_subSum += sum;
+        if (++m_subFill < m_subLen) continue;
+        double sub = m_subSum / (double)m_subLen;
+        m_subFill = 0;
+        m_subSum = 0;
+        if (m_recent.size() == 3) {            // a full 400 ms: these three and this one
+            m_blocks.push_back((m_recent[0] + m_recent[1] + m_recent[2] + sub) / 4);
+            m_recent.erase(m_recent.begin());
+        }
+        m_recent.push_back(sub);
+    }
+}
+
+double LoudnessMeter::lufs() const {
+    auto level = [](double ms) { return -0.691 + 10 * std::log10(ms); };
+    double sum = 0;
+    size_t n = 0;
+    for (double b : m_blocks)
+        if (b > 0 && level(b) > -70) { sum += b; ++n; }
+    if (!n) return -HUGE_VAL;
+    double gate = level(sum / (double)n) - 10;
+    sum = 0;
+    n = 0;
+    for (double b : m_blocks)
+        if (b > 0 && level(b) > -70 && level(b) > gate) { sum += b; ++n; }
+    return n ? level(sum / (double)n) : -HUGE_VAL;
+}
+
+double loudness_gain_db(double lufs, double target) {
+    if (!std::isfinite(lufs)) return 0;
+    return std::clamp(target - lufs, -20.0, 12.0);
+}
+
+// ------------------------------------------------------------------
 // formats
 // ------------------------------------------------------------------
 std::wstring audio_format_name(unsigned long subtype) {

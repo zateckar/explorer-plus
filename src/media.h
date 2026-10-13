@@ -93,6 +93,8 @@ public:
     bool open(const std::wstring& path, LONGLONG from);     // false: no audio it can decode
     unsigned channels() const { return m_channels; }
     unsigned rate() const { return m_rate; }
+    LONGLONG duration() const { return m_duration; }        // 100-ns units, 0: not known
+    bool seek(LONGLONG to);
     // the next block, interleaved, appended to `out`; `time`: its start (100-ns units).
     // false: the end, or an error
     bool read(std::vector<float>& out, LONGLONG* time);
@@ -100,4 +102,5 @@ private:
     struct IMFSourceReader* m_reader = nullptr;
     struct IMFMediaSource* m_source = nullptr;
     unsigned m_channels = 0, m_rate = 0;
+    LONGLONG m_duration = 0;
 };

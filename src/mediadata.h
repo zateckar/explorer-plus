@@ -37,6 +37,30 @@ private:
     std::vector<double> m_lo, m_hi;                     // each band's edges, in FFT bins
 };
 
+// --- loudness ---
+// A track's loudness (LUFS, ITU-R BS.1770: K-weighting, 400 ms blocks every 100 ms,
+// gated at -70 LUFS and 10 LU under the mean), from all of it or from excerpts: `cut()`
+// between two (no block spans the jump). Channels weigh the same (no surround weights).
+class LoudnessMeter {
+public:
+    LoudnessMeter(unsigned rate, unsigned channels);
+    void add(const float* interleaved, size_t frames);
+    void cut();
+    double lufs() const;                             // -HUGE_VAL: nothing above the gates
+private:
+    struct Biquad { double b0, b1, b2, a1, a2; };
+    Biquad m_shelf{}, m_highpass{};
+    std::vector<double> m_state;                    // per channel: 2 filters x 2 delays
+    unsigned m_channels;
+    size_t m_subLen;                                // frames per 100 ms
+    size_t m_subFill = 0;
+    double m_subSum = 0;                            // of the 100 ms being filled
+    std::vector<double> m_recent;                   // the last (up to 3) sub-blocks since a cut
+    std::vector<double> m_blocks;                   // mean squares of the 400 ms blocks
+};
+// the gain (dB) bringing a track of `lufs` to `target`, within [-20, +12]; 0: not known
+double loudness_gain_db(double lufs, double target = -14.0);
+
 // --- formats ---
 // an audio stream's format by its Media Foundation subtype's first field (WAVE_FORMAT_* or
 // FOURCC): "MP3", "AAC", "FLAC", "Opus", ...; empty when not known
