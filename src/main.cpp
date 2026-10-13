@@ -36,6 +36,7 @@ using std::min;
 #include "preview.h"
 #include "player.h"
 #include <uxtheme.h>
+#include <dwmapi.h>
 #include <oleacc.h>
 
 static WNDPROC s_searchProc = nullptr;
@@ -1024,8 +1025,14 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     }
     perf_event("window.listing");
 
+    // shown cloaked until it is all painted: DWM would now and then put up a frame of the
+    // controls before their first paint, white over the dark theme
+    BOOL cloak = TRUE;
+    DwmSetWindowAttribute(wnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
     ShowWindow(wnd, sp.maximized && !newWindow ? SW_SHOWMAXIMIZED : nCmdShow);
-    UpdateWindow(wnd);
+    RedrawWindow(wnd, nullptr, nullptr, RDW_UPDATENOW | RDW_ALLCHILDREN);
+    cloak = FALSE;
+    DwmSetWindowAttribute(wnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
     perf_event("window.shown");
     dnd_register_sources();         // (~4 ms: once the window is on screen)
 
