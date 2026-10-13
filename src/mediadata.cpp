@@ -116,6 +116,72 @@ void SpectrumMath::column(const float* samples, uint8_t* out) {
 }
 
 // ------------------------------------------------------------------
+// visualizations
+// ------------------------------------------------------------------
+void SampleRing::reset(size_t capacity) {
+    m_buf.assign(capacity, 0.0f);
+    m_end = 0;
+    m_held = 0;
+}
+
+void SampleRing::put(long long first, const float* s, size_t n) {
+    const size_t cap = m_buf.size();
+    if (!cap || !n) return;
+    long long last = first + (long long)n;
+    if (last <= m_end - (long long)m_held) return;          // (older than all held)
+    if (first < m_end - (long long)m_held || first > m_end + (long long)cap) {
+        m_end = first;                                      // (a jump: from here on)
+        m_held = 0;
+    }
+    while (m_end < first) {                                 // a gap: silence
+        m_buf[(size_t)(m_end % (long long)cap)] = 0.0f;
+        ++m_end;
+        m_held = std::min(cap, m_held + 1);
+    }
+    for (long long i = std::max(first, m_end - (long long)m_held); i < last; ++i)
+        m_buf[(size_t)(i % (long long)cap)] = s[i - first];
+    if (last > m_end) {
+        m_held = std::min(cap, m_held + (size_t)(last - m_end));
+        m_end = last;
+    }
+}
+
+size_t SampleRing::get(long long end, float* out, size_t n) const {
+    const long long cap = (long long)m_buf.size(), oldest = m_end - (long long)m_held;
+    size_t got = 0;
+    for (size_t k = 0; k < n; ++k) {
+        long long i = end - (long long)n + (long long)k;
+        if (i >= oldest && i < m_end && i >= 0) { out[k] = m_buf[(size_t)(i % cap)]; ++got; }
+        else out[k] = 0.0f;
+    }
+    return got;
+}
+
+float vis_level(float v255) {
+    double db = v255 / 255.0 * 80 - 80;
+    return (float)std::clamp((db + 62) / 50, 0.0, 1.0);
+}
+
+void vis_bars(const float* bands, int from, int to, float* bars, int n) {
+    if (n <= 0) return;
+    double span = (double)(to - from) / n;
+    for (int k = 0; k < n; ++k) {
+        double lo = from + span * k, hi = lo + span;
+        float v = 0;
+        if (span < 1.0) {                                   // (narrower than a band: between two)
+            double c = (lo + hi) / 2 - 0.5;
+            int i = std::clamp((int)std::floor(c), from, to - 1);
+            int j = std::min(i + 1, to - 1);
+            double f = std::clamp(c - i, 0.0, 1.0);
+            v = (float)(bands[i] * (1 - f) + bands[j] * f);
+        } else {
+            for (int i = (int)lo; i < std::min(to, (int)std::ceil(hi)); ++i) v = std::max(v, bands[i]);
+        }
+        bars[k] = v;
+    }
+}
+
+// ------------------------------------------------------------------
 // loudness
 // ------------------------------------------------------------------
 LoudnessMeter::LoudnessMeter(unsigned rate, unsigned channels) : m_channels(channels ? channels : 1) {

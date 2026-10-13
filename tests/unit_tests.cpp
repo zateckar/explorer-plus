@@ -355,6 +355,45 @@ static void loudness() {
     CHECK(about(loudness_gain_db(NAN), 0.0));
 }
 
+static void visuals() {
+    auto about = [](double a, double b) { return std::fabs(a - b) < 1e-4; };
+    // the samples ring: the newest kept, a gap and what isn't held read as silence
+    SampleRing ring(8);
+    const float a[5] = { 1, 2, 3, 4, 5 };
+    ring.put(100, a, 5);                               // samples 100..104
+    float out[6];
+    CHECK(ring.get(105, out, 3) == 3 && out[0] == 3 && out[2] == 5);
+    CHECK(ring.get(106, out, 3) == 2 && out[0] == 4 && out[2] == 0);     // (past the end: 0)
+    CHECK(ring.get(101, out, 3) == 1 && out[0] == 0 && out[2] == 1);     // (before the start: 0)
+    ring.put(107, a, 2);                               // a gap (105, 106), then 107..108
+    CHECK(ring.end() == 109);
+    CHECK(ring.get(109, out, 4) == 4 && out[0] == 0 && out[1] == 0 && out[2] == 1 && out[3] == 2);
+    CHECK(ring.get(109, out, 6) == 6 && out[0] == 4 && out[1] == 5);    // (8 held: 101..108)
+    CHECK(ring.get(101, out, 1) == 0);                 // (overwritten)
+    ring.put(102, a, 3);                               // older than kept: written over in place
+    CHECK(ring.end() == 109);
+    ring.put(5000, a, 2);                              // a jump (a seek): from there on
+    CHECK(ring.end() == 5002 && ring.get(5002, out, 3) == 2 && out[0] == 0 && out[1] == 1);
+    const float many[20] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 };
+    SampleRing small(4);
+    small.put(0, many, 20);                            // more than it holds: the last 4
+    CHECK(small.get(20, out, 4) == 4 && out[0] == 16 && out[3] == 19);
+    // a band's intensity to a level: -62 dB and less nothing, -12 dB and more all
+    CHECK(vis_level(0) == 0.0f);
+    CHECK(vis_level(255) == 1.0f);
+    CHECK(about(vis_level(255 * (80 - 37) / 80.0f), 0.5));           // (-37 dB: half)
+    // bars from bands: the loudest of each share; more bars than bands: between two
+    const float bands[8] = { 0.1f, 0.9f, 0.2f, 0.3f, 0.4f, 0.0f, 0.5f, 0.6f };
+    float bars[4];
+    vis_bars(bands, 0, 8, bars, 4);
+    CHECK(bars[0] == 0.9f && bars[1] == 0.3f && bars[2] == 0.4f && bars[3] == 0.6f);
+    vis_bars(bands, 2, 6, bars, 2);                    // (only bands 2..5)
+    CHECK(bars[0] == 0.3f && bars[1] == 0.4f);
+    float fine[8];
+    vis_bars(bands, 0, 2, fine, 4);                    // 2 bands, 4 bars: 0.1 .. 0.9 in steps
+    CHECK(about(fine[0], 0.1) && about(fine[1], 0.3) && about(fine[2], 0.7) && about(fine[3], 0.9));
+}
+
 static void formats() {
     CHECK_EQ(audio_format_name(0x55), L"MP3");
     CHECK_EQ(audio_format_name(0x1610), L"AAC");
@@ -401,6 +440,7 @@ int wmain() {
     cover_pick();
     spectrum_math();
     loudness();
+    visuals();
     formats();
     opus_head();
     ini_round_trip();

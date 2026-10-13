@@ -64,6 +64,7 @@ def screen_pixels(x, y, w, h):
     # own handles on the DLLs: the prototypes set here stay out of the shared u / g
     g, u = ctypes.WinDLL('gdi32'), ctypes.WinDLL('user32')
     g.CreateCompatibleDC.restype = W.HDC
+    g.CreateCompatibleDC.argtypes = [W.HDC]                     # (a handle may not fit an int)
     g.CreateCompatibleBitmap.restype = W.HBITMAP
     g.CreateCompatibleBitmap.argtypes = [W.HDC, ctypes.c_int, ctypes.c_int]
     g.SelectObject.argtypes = [W.HDC, W.HGDIOBJ]

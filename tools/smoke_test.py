@@ -1165,6 +1165,17 @@ check('a folder without media offers no Play', entries and PLAY not in entries, 
 entries = media_entry('media', QUEUE)
 check('a folder with media offers Queue: its files join the queue',
       QUEUE in entries and wait_for(lambda: queue_rows() == 4, 5), (entries, queue_rows()))
+# visualizations: V the next one after the spectrogram, in a window of its own over the sound's
+# panel (drawn on the GPU; without one Windows' software renderer); the choice remembered
+def vis_shown():
+    p = player()
+    v = next((c for c in children(p) if cls(c) == 'ExplorerPlusVisual'), None) if p else None
+    return bool(v and u.IsWindowVisible(v))
+p = player()
+if p:
+    u.PostMessageW(p, WM_KEYDOWN, 0x56, 0)                                 # V
+    u.PostMessageW(p, 0x0101, 0x56, 0xC0000000)
+check('V shows a visualization over the sound\'s panel', wait_for(vis_shown, 5), player_state())
 # pictures: View in Explorer Plus shows the folder's pictures from the one chosen; Right: the next
 pics = os.path.join(data, 'pics')
 os.makedirs(pics)
@@ -1187,6 +1198,7 @@ check('the compact menu of a picture offers View / Queue in Explorer Plus', VIEW
 check('View shows the folder\'s pictures from the one chosen',
       wait_for(lambda: queue_rows() == 3 and (player_state() or '').startswith('Picture') and '2 of 3' in player_state(), 5),
       (queue_rows(), player_state()))
+check('a picture hides the visualization', wait_for(lambda: not vis_shown(), 5))
 p = player()
 if p:
     u.PostMessageW(p, WM_KEYDOWN, 0x27, 0)                                 # Right
@@ -1199,8 +1211,9 @@ check('the player closes, the app stays', wait_for(lambda: player() is None, 5) 
 app.close()
 check('exits cleanly after the player', app.proc.returncode == 0, app.proc.returncode)
 raw = open(ini_player, 'rb').read() if os.path.exists(ini_player) else b''
-check('the player\'s place is saved',
-      'playerW=' in (raw.decode('utf-16', 'replace') if raw[:2] == b'\xff\xfe' else raw.decode('utf-8', 'replace')))
+saved = raw.decode('utf-16', 'replace') if raw[:2] == b'\xff\xfe' else raw.decode('utf-8', 'replace')
+check('the player\'s place is saved', 'playerW=' in saved)
+check('the visualization chosen is remembered', 'playerVisual=1' in saved)
 
 failed = [n for n, ok in results if not ok]
 if failed and os.path.exists(events):

@@ -64,6 +64,7 @@ add_executable(explorer-plus WIN32
     src/imageview.cpp
     src/loudness.cpp
     src/spectrum.cpp
+    src/visual.cpp
     src/playlist.cpp
     src/player.cpp
     res/resource.rc

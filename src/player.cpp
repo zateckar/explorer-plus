@@ -9,6 +9,7 @@
 #include "imageview.h"
 #include "loudness.h"
 #include "spectrum.h"
+#include "visual.h"
 #include "playlist.h"
 #include "theme.h"
 #include "settings.h"
@@ -39,6 +40,7 @@ const UINT WM_QUEUE_INFO = WM_APP + 42;     // to the message window: tags read 
 const UINT WM_MEDIA_INFO = WM_APP + 43;     // lParam: MediaInfoNote* (mediainfo.cpp)
 const UINT WM_IMAGE = WM_APP + 44;          // lParam: ImageNote* (imageview.cpp)
 const UINT WM_LOUDNESS = WM_APP + 45;       // lParam: LoudnessNote* (loudness.cpp)
+const UINT WM_VIS_FAILED = WM_APP + 46;     // the visualizations can't be drawn (visual.cpp)
 // WM_COPYDATA: 'EPP1' play, 'EPP2' queue, 'EPP3' view (the first path: the picture to show)
 const ULONG_PTR kCopyPlay = 0x45505031, kCopyEnqueue = 0x45505032, kCopyView = 0x45505033;
 const UINT_PTR TIMER_POSITION = 1, TIMER_SKIP = 2, TIMER_HIDE_BAR = 3, TIMER_SPECTRUM = 4, TIMER_LEVEL = 5;
@@ -48,8 +50,9 @@ const size_t kMaxFiles = 10000;             // a folder walk stops there
 
 enum Cmd : UINT {
     CMD_PLAYPAUSE = 100, CMD_PREV, CMD_NEXT, CMD_SHUFFLE, CMD_REPEAT, CMD_MUTE, CMD_QUEUE, CMD_FULL,
-    CMD_CLEAR, CMD_PLAY_SELECTED, CMD_REMOVE_SELECTED, CMD_LEVEL,
+    CMD_CLEAR, CMD_PLAY_SELECTED, CMD_REMOVE_SELECTED, CMD_LEVEL, CMD_VIS_NEXT, CMD_VIS_PREV,
     CMD_SLIDE = 200,                // + seconds: the slide show's interval
+    CMD_VIS = 300,                  // + VisStyle: the visualization
 };
 const int kSlideSecs[] = { 2, 3, 5, 10, 20, 30 };
 // the controls bar's parts (also its accessible children, in this order)
@@ -121,11 +124,18 @@ struct Player {
     double gainDb = 0;              // the current track's
     unsigned levelWait = 0;         // the entry whose start waits for its loudness (not loud, then soft)
     std::map<std::wstring, double> loud;    // measured: path -> LUFS (not finite: couldn't)
+    // the visualization (sound): the spectrogram (drawn here) or one of visual.cpp's
+    int visStyle = VIS_SPECTROGRAM;
+    Visualizer vis;
+    std::wstring visCaption;        // (what the caption was last made of)
 };
 Player* s_p = nullptr;
 HWND s_msg = nullptr;               // the module's message window (results of its threads)
 
 int px(int v) { return MulDiv(v, s_p ? s_p->dpi : 96, 96); }
+
+// a visualization of visual.cpp's is chosen (and can be drawn): not the spectrogram
+bool vis_on(Player& p) { return p.visStyle != VIS_SPECTROGRAM && !p.vis.failed(); }
 
 // The player's window class. Tests run with a settings file of their own: their player
 // has a class of its own too, so a test never reaches the user's real player.
@@ -283,9 +293,10 @@ void update_title(Player& p) {
 
 void update_taskbar(Player& p);
 bool now_playing(Player& p);
+void vis_update(Player& p);
 
 // the bar's text (what screen readers and the tests read), its paint, the taskbar button,
-// the position timer and the spectrogram's frames
+// the position timer, the spectrogram's frames and the visualization
 void refresh_bar(Player& p) {
     std::wstring t = state_text(p);
     WCHAR now[512]{};
@@ -301,6 +312,7 @@ void refresh_bar(Player& p) {
     else KillTimer(p.wnd, TIMER_POSITION);
     if (running && p.feed.active() && now_playing(p)) SetTimer(p.wnd, TIMER_SPECTRUM, 30, nullptr);
     else KillTimer(p.wnd, TIMER_SPECTRUM);
+    vis_update(p);
 }
 
 void refresh_all(Player& p) {
@@ -387,6 +399,7 @@ void layout(Player& p) {
     set_tool_rect(p.headTip, p.wnd, 1, p.clearBtn);
     if (queue) fit_columns(p);
     InvalidateRect(p.wnd, nullptr, FALSE);
+    vis_update(p);
 }
 
 // ------------------------------------------------------------------
@@ -455,6 +468,7 @@ void tags_forget();
 
 void on_failed(Player& p);
 void spectrum_reset(Player& p);
+void set_vis(Player& p, int style);
 
 void image_forget(Player& p) {
     p.img = {};
@@ -770,7 +784,14 @@ void command(Player& p, UINT cmd) {
             apply_volume(p);
             InvalidateRect(p.video, nullptr, FALSE);
             break;
+        case CMD_VIS_NEXT: case CMD_VIS_PREV: {
+            // (the spectrogram and the others in turn; only it when they can't be drawn)
+            int n = p.vis.failed() ? 1 : VIS_COUNT;
+            set_vis(p, ((p.visStyle % n) + (cmd == CMD_VIS_NEXT ? 1 : n - 1)) % n);
+            break;
+        }
         default:
+            if (cmd >= CMD_VIS && cmd < CMD_VIS + (UINT)VIS_COUNT) set_vis(p, (int)(cmd - CMD_VIS));
             if (cmd > CMD_SLIDE && cmd <= CMD_SLIDE + 60) {
                 p.slideSecs = (int)(cmd - CMD_SLIDE);
                 settings_set_pref(L"playerSlideSeconds", p.slideSecs);
@@ -812,8 +833,10 @@ void on_note(Player& p, LPARAM lp) {
                 e.failed = false;
                 ListView_RedrawItems(p.list, i, i);
                 // sound: its spectrogram, from a decoding of its own
-                if (!p.mp->has_video())
+                if (!p.mp->has_video()) {
                     p.feed.start(e.path, p.mp->position(), std::max(30, MulDiv(60, p.dpi, 96)));
+                    p.vis.set_source(p.feed.tap());
+                }
             }
             InvalidateRect(p.video, nullptr, FALSE);
             update_title(p);
@@ -1320,7 +1343,8 @@ struct NowRects { RECT cover{}, text{}, spec{}; bool stacked = false; };
 NowRects now_rects(Player& p, const RECT& rc) {
     NowRects r;
     int w = rc.right - rc.left, h = rc.bottom - rc.top, pad = px(24);
-    int specH = h >= px(300) ? std::clamp(h * 30 / 100, px(80), px(220)) : 0;
+    // (a visualization: a little more room than the spectrogram)
+    int specH = h < px(300) ? 0 : vis_on(p) ? std::clamp(h * 36 / 100, px(100), px(300)) : std::clamp(h * 30 / 100, px(80), px(220));
     if (specH) r.spec = { rc.left + pad, rc.bottom - pad - specH, rc.right - pad, rc.bottom - pad };
     int top = rc.top + pad, bottom = (specH ? r.spec.top - px(8) : rc.bottom - pad);
     int availH = bottom - top, availW = w - 2 * pad;
@@ -1471,6 +1495,7 @@ void spectrum_redraw(Player& p) {                  // (a new theme: new colours)
 // a new track (or none): an empty spectrogram, no analysis
 void spectrum_reset(Player& p) {
     p.feed.stop();
+    p.vis.set_source({});
     p.spec.clear();
     p.specPos = -1;
     KillTimer(p.wnd, TIMER_SPECTRUM);
@@ -1504,10 +1529,12 @@ void spectrum_tick(Player& p) {
     if (p.specPos >= 0 && (pos < p.specPos - 2000000 || pos > p.specPos + 15000000)) {
         int i = p.q.current();
         if (i >= 0) p.feed.start(p.q.at(i).path, pos, std::max(30, MulDiv(60, p.dpi, 96)));
+        p.vis.set_source(p.feed.tap());
         p.spec.clear();
         if (p.specBits) std::fill(p.specBits, p.specBits + (size_t)p.specW * p.specH, p.specLut[0]);
     }
     p.specPos = pos;
+    p.vis.set_clock(pos, true);
     std::vector<uint8_t> cols;
     int n = p.feed.take(pos, cols);
     if (!n) return;
@@ -1518,6 +1545,7 @@ void spectrum_tick(Player& p) {
         p.spec.push_back(a);
     }
     while (p.spec.size() > 4096) p.spec.pop_front();
+    if (vis_on(p)) return;                  // (kept for the spectrogram, not drawn)
     RECT r = spectrum_rect(p);
     if (IsRectEmpty(&r)) return;
     spectrum_fit(p, r.right - r.left, r.bottom - r.top);
@@ -1561,6 +1589,60 @@ void draw_spectrum(Player& p, HDC dc, const RECT& area) {
         text_at(dc, hz >= 1000 ? std::to_wstring(hz / 1000) + L"k" : std::to_wstring(hz), lr, c.textSecondary,
                 p.fontSmall, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
+}
+
+// --- the visualizations (visual.cpp's window, over the video area) ---
+// full screen, sound playing: the visualization is all there is to see
+bool vis_fills(Player& p) { return vis_on(p) && p.full && now_playing(p) && p.message.empty(); }
+
+// where it goes in the video area: all of it (full screen), else the spectrogram's place
+RECT vis_rect(Player& p) {
+    RECT rc{};
+    GetClientRect(p.video, &rc);
+    if (!vis_on(p) || !now_playing(p)) return {};
+    return vis_fills(p) ? rc : now_rects(p, rc).spec;
+}
+
+// shown or hidden, placed, its colours, the playback clock, the full-screen caption
+void vis_update(Player& p) {
+    RECT r = vis_rect(p);
+    if (IsRectEmpty(&r)) { p.vis.place(nullptr); return; }
+    if (!p.vis.hwnd() && !p.vis.create(p.video, p.wnd, WM_VIS_FAILED)) return;
+    const Palette& c = pal();
+    VisLook look;
+    look.style = p.visStyle;
+    look.full = vis_fills(p);
+    look.bg = c.content;
+    look.text = c.text;
+    look.dark = g_dark != 0;
+    look.dpi = p.dpi;
+    p.vis.set_look(look);
+    p.vis.set_clock(p.mp->position(), p.mp->state() == State::Playing && p.mp->will_play());
+    // (the caption made again when what it shows changes: the next track, its tags read)
+    std::wstring title = current_title(p), detail = current_detail(p);
+    const void* cover = cover_shown(p) ? p.info.cover.get() : nullptr;
+    std::wstring key = title + L'\n' + detail + L'\n' + std::to_wstring((uintptr_t)cover);
+    if (key != p.visCaption) {
+        p.visCaption = key;
+        VisCaption vc;
+        vc.title = title;
+        vc.detail = detail;
+        if (cover) { vc.cover = p.info.cover; vc.coverW = p.info.coverW; vc.coverH = p.info.coverH; }
+        p.vis.set_caption(vc);
+    }
+    p.vis.show_caption(p.barInFull);
+    p.vis.place(&r);
+}
+
+void set_vis(Player& p, int style) {
+    style = std::clamp(style, 0, VIS_COUNT - 1);
+    if (style == p.visStyle) { if (vis_on(p)) p.vis.announce(); return; }
+    p.visStyle = style;
+    settings_set_pref(L"playerVisual", style);
+    if (!vis_on(p)) spectrum_redraw(p);         // (its columns kept meanwhile, not drawn)
+    vis_update(p);
+    if (vis_on(p)) p.vis.announce();
+    InvalidateRect(p.video, nullptr, FALSE);
 }
 
 // the video area with nothing playing yet: how to get something to play
@@ -1651,6 +1733,7 @@ void paint_image(Player& p, HDC dc, const RECT& rc) {
 void paint_art(Player& p, HDC dc, const RECT& rc) {
     const Palette& c = pal();
     if (image_current(p)) { paint_image(p, dc, rc); return; }
+    if (vis_fills(p)) { fill_rect(dc, rc, RGB(0, 0, 0)); return; }     // (under the visualization)
     fill_rect(dc, rc, c.content);
     if (!now_playing(p)) { paint_idle(p, dc, rc); return; }
     NowRects r = now_rects(p, rc);
@@ -1703,7 +1786,7 @@ void paint_art(Player& p, HDC dc, const RECT& rc) {
             y += row;
         }
     }
-    if (!IsRectEmpty(&r.spec)) draw_spectrum(p, dc, r.spec);
+    if (!IsRectEmpty(&r.spec) && !vis_on(p)) draw_spectrum(p, dc, r.spec);
 }
 
 // ------------------------------------------------------------------
@@ -1972,7 +2055,7 @@ LRESULT CALLBACK bar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// the video area's menu: levelling, the slide show's interval, full screen
+// the video area's menu: the visualization, levelling, the slide show's interval, full screen
 void view_menu(Player& p, POINT pt) {
     if (pt.x == -1 && pt.y == -1) {             // (keyboard: the area's middle)
         RECT r{};
@@ -1981,15 +2064,22 @@ void view_menu(Player& p, POINT pt) {
         ClientToScreen(p.video, &pt);
     }
     HMENU m = CreatePopupMenu();
+    HMENU vis = CreatePopupMenu();
+    for (int s = 0; s < VIS_COUNT; ++s)
+        AppendMenuW(vis, MF_STRING | (s && p.vis.failed() ? MF_GRAYED : 0), CMD_VIS + s, vis_name(s));
+    CheckMenuRadioItem(vis, CMD_VIS, CMD_VIS + (UINT)VIS_COUNT - 1, CMD_VIS + p.visStyle, MF_BYCOMMAND);
+    AppendMenuW(vis, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(vis, MF_STRING, CMD_VIS_NEXT, L"Next visualization\tV");
     HMENU slides = CreatePopupMenu();
     for (int s : kSlideSecs)
         AppendMenuW(slides, MF_STRING | (s == p.slideSecs ? MF_CHECKED : 0), CMD_SLIDE + s, (std::to_wstring(s) + L" seconds").c_str());
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)vis, L"Visualization");
     AppendMenuW(m, MF_STRING | (p.level ? MF_CHECKED : 0), CMD_LEVEL, L"Even out loudness between tracks");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)slides, L"Slide show interval");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, CMD_FULL, p.full ? L"Exit full screen\tEsc" : L"Full screen\tF");
     UINT id = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, p.wnd, nullptr);
-    DestroyMenu(m);                             // (and its submenu)
+    DestroyMenu(m);                             // (and its submenus)
     if (id) command(p, id);
 }
 
@@ -2149,6 +2239,7 @@ void apply_theme(Player& p) {
     DwmSetWindowAttribute(p.wnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof(dark));
     theme_style_list(p.list);
     if (p.specBmp) spectrum_redraw(p);
+    vis_update(p);
     RedrawWindow(p.wnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
 }
 
@@ -2243,7 +2334,7 @@ void add_tool(HWND tip, HWND owner, UINT_PTR id, const wchar_t* text) {
 void on_create(Player& p, HWND hwnd) {
     p.wnd = hwnd;
     p.dpi = (int)GetDpiForWindow(hwnd);
-    p.video = CreateWindowExW(0, L"ExplorerPlusVideo", L"Video", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+    p.video = CreateWindowExW(0, L"ExplorerPlusVideo", L"Video", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
                               0, 0, 0, 0, hwnd, nullptr, g_hinst, nullptr);
     p.list = CreateWindowExW(0, WC_LISTVIEWW, L"Play queue",
                              WS_CHILD | WS_TABSTOP | WS_CLIPSIBLINGS | LVS_REPORT | LVS_OWNERDATA | LVS_NOCOLUMNHEADER |
@@ -2272,6 +2363,7 @@ void on_create(Player& p, HWND hwnd) {
 }
 
 void on_destroy(Player& p) {
+    p.vis.destroy();
     KillTimer(p.wnd, TIMER_POSITION);
     KillTimer(p.wnd, TIMER_SKIP);
     KillTimer(p.wnd, TIMER_HIDE_BAR);
@@ -2322,6 +2414,10 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MEDIA_INFO: on_media_info(p, reinterpret_cast<MediaInfoNote*>(lp)); return 0;
         case WM_IMAGE: on_image(p, reinterpret_cast<ImageNote*>(lp)); return 0;
         case WM_LOUDNESS: on_loudness(p, reinterpret_cast<LoudnessNote*>(lp)); return 0;
+        case WM_VIS_FAILED:                         // (the spectrogram instead: drawn again, not kept up meanwhile)
+            spectrum_redraw(p);
+            refresh_all(p);
+            return 0;
         case WM_COMMAND:
             // (menus and accelerators; the taskbar thumbnail's buttons)
             if ((HIWORD(wp) == 0 || HIWORD(wp) == THBN_CLICKED) && LOWORD(wp) >= CMD_PLAYPAUSE) command(p, LOWORD(wp));
@@ -2511,6 +2607,7 @@ bool create_player(bool activate) {
     p.queueW96 = std::clamp(settings_pref(L"playerQueueWidth", 300), 160, 900);
     p.level = settings_pref(L"playerLevel", 1) != 0;
     p.slideSecs = std::clamp(settings_pref(L"playerSlideSeconds", 5), 1, 60);
+    p.visStyle = std::clamp(settings_pref(L"playerVisual", VIS_SPECTROGRAM), 0, VIS_COUNT - 1);
     bool maximized = false;
     RECT r = initial_rect(maximized);
     HWND w = CreateWindowExW(0, player_class().c_str(), L"Player", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
@@ -2608,6 +2705,10 @@ bool player_translate(MSG* m) {
         case 'M':
             if (ctrl) return false;
             if (!held) command(p, CMD_MUTE);
+            return true;
+        case 'V':
+            if (ctrl || inList) return false;       // (the queue: type-ahead)
+            if (!held) command(p, shift ? CMD_VIS_PREV : CMD_VIS_NEXT);
             return true;
         case 'H': case 'T':
             if (!ctrl) return false;

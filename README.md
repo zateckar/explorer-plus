@@ -56,8 +56,11 @@ File Explorer while starting in well under 100 ms.
   after) open a player window — the video, or for sound the album cover (cover.jpg,
   folder.jpg, … in the track's folder, else its biggest picture, else the art in the
   file), the tags (album, year, genre, track, …) with the format, bitrate and sample
-  rate, and a scrolling spectrogram; the play queue (Enter plays, Delete removes, drop
-  files on it); seek, volume, shuffle, repeat, full screen. Tracks are evened out in
+  rate, and a scrolling spectrogram or a visualization (mirrored bars, waveform, circle,
+  particles, ribbons, a synthwave horizon, a tunnel: right-click the player ▸ Visualization,
+  or V; drawn on the GPU at the display's refresh rate; in full screen it fills the screen);
+  the play queue (Enter plays, Delete removes, drop files on it); seek, volume, shuffle,
+  repeat, full screen. Tracks are evened out in
   loudness (each measured as it comes up, the next one ahead; right-click the player to
   turn it off). "View in Explorer Plus" on a picture shows its folder's pictures in the
   player: Left / Right or the mouse wheel step through them, Play runs a slide show (its
@@ -67,8 +70,8 @@ File Explorer while starting in well under 100 ms.
   Foundation plays (the formats and codecs Windows has, Opus in MP4 too; Windows N needs
   the Media Feature Pack), nothing to install. Keys: Space
   play / pause, Left / Right ±5 s (Shift: 30 s), Ctrl+Left / Ctrl+Right previous / next,
-  Up / Down volume, M mute, F or F11 full screen, Ctrl+H shuffle, Ctrl+T repeat; the
-  media keys too. One player for all windows; it stays open after the main window closes.
+  Up / Down volume, M mute, V / Shift+V next / previous visualization, F or F11 full
+  screen, Ctrl+H shuffle, Ctrl+T repeat; the media keys too. One player for all windows; it stays open after the main window closes.
 
 ## Requirements
 
@@ -184,6 +187,7 @@ src/fileops, dnd, watcher  file operations, drag and drop, change notifications
 src/detailspane, preview   details / preview pane
 src/player, media, playlist   media player window, Media Foundation playback, play queue
 src/mediainfo, mediadata, spectrum   player's cover and tags, their pure helpers, spectrogram
+src/visual             player's visualizations (Direct2D on Direct3D 11, a thread of their own)
 src/imageview, loudness   player's pictures (WIC), loudness levelling
 src/settings, ini, theme, perf, crash   settings.ini, colours and fonts, profiling, crash dumps
 src/cmdline            command line and typed-path text

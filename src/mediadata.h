@@ -37,6 +37,29 @@ private:
     std::vector<double> m_lo, m_hi;                     // each band's edges, in FFT bins
 };
 
+// --- visualizations ---
+// The newest samples of a stream by their number (at the stream's rate), for the waveform
+// visualizations; samples not held (a gap, before the start, past the end) read as silence
+class SampleRing {
+public:
+    explicit SampleRing(size_t capacity = 0) { reset(capacity); }
+    void reset(size_t capacity);
+    void put(long long first, const float* s, size_t n);    // samples first .. first + n - 1
+    // the n samples before `end` (end - n .. end - 1) into `out`; how many of them were held
+    size_t get(long long end, float* out, size_t n) const;
+    long long end() const { return m_end; }
+private:
+    std::vector<float> m_buf;
+    long long m_end = 0;                            // one past the newest sample
+    size_t m_held = 0;                              // how many before m_end are held
+};
+// a band's intensity (0..255 as SpectrumMath makes it, -80..0 dB) as a visualization's
+// level, 0..1: -62 dB and less nothing, -12 dB and more all
+float vis_level(float v255);
+// `n` bars from bands `from` .. `to` - 1 (log-spaced, low first), spread evenly over them:
+// each the loudest band of its share, or (more bars than bands) between two in proportion
+void vis_bars(const float* bands, int from, int to, float* bars, int n);
+
 // --- loudness ---
 // A track's loudness (LUFS, ITU-R BS.1770: K-weighting, 400 ms blocks every 100 ms,
 // gated at -70 LUFS and 10 LU under the mean), from all of it or from excerpts: `cut()`
