@@ -12,6 +12,8 @@ double perf_now();                        // ms since the process was created
 void   perf_event(const char* name, double dur = -1, long long n = -1, const wchar_t* detail = nullptr);
 void   perf_paint(const char* what, double ms);   // accumulated: count / total / max / p95
 void   perf_flush();                      // paint summaries (exit)
+// a function's address as linked, for the log: addr2line -f -C -e explorer-plus.debug 0x<it>
+unsigned long long perf_code_address(const void* code);
 
 struct PerfScope {                        // logs its duration when it ends
     const char* name;

@@ -15,6 +15,7 @@ using std::min;
 #include "workers.h"
 #include "acc.h"
 #include "kbdrow.h"
+#include "perf.h"
 #include <cwctype>
 
 // ------------------------------------------------------------------
@@ -300,6 +301,7 @@ void tabs_persist_soon() {
 void tabs_persist_now() {
     if (g_main) KillTimer(g_main, TIMER_TABS_PERSIST);
     if (s_tabs.empty() || !s_persist) return;      // extra windows don't own the saved tab set
+    PerfScope ps("tabs.persist");
     std::vector<std::wstring> lines;
     int active = 0;
     tabs_serialize_lines(lines, active);

@@ -8,11 +8,14 @@
 #include "settings.h"
 #include <propsys.h>
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include "workers.h"
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 // ------------------------------------------------------------------
 // node data
@@ -55,6 +58,17 @@ static NodeData* node_data(HWND tree, HTREEITEM h) {
     return nullptr;
 }
 
+// the node's data and whether it is expanded, in one message (walks over the whole tree)
+static NodeData* node_and_state(HTREEITEM h, bool* expanded) {
+    TVITEMW ti{};
+    ti.mask = TVIF_PARAM | TVIF_STATE;
+    ti.stateMask = TVIS_EXPANDED;
+    ti.hItem = h;
+    if (!TreeView_GetItem(g_tree, &ti)) return nullptr;
+    *expanded = (ti.state & TVIS_EXPANDED) != 0;
+    return (NodeData*)ti.lParam;
+}
+
 static int id_count(PCUIDLIST_RELATIVE p) {
     int n = 0;
     for (; p && !ILIsEmpty(p); p = ILNext(p)) ++n;
@@ -80,7 +94,19 @@ struct NodeInfo {                  // everything needed to insert a node (worker
     std::wstring name;
     int icon = -1, openIcon = -1;
     bool hasKids = false;
+    ULONGLONG id = 0;                 // (see node_id)
 };
+
+// a folder's ID for the tabs' saved tree state: its parsing name's hash. (Asking the shell
+// for the name costs ~8 us: the workers listing the nodes do it, not the UI thread.)
+static ULONGLONG parsing_id(PCIDLIST_ABSOLUTE abs) {
+    std::wstring name = pidl_parsingname(abs);
+    if (name.empty()) return pidl_sig(abs) | 1;
+    CharLowerBuffW(name.data(), (DWORD)name.size());
+    ULONGLONG h = 1469598103934665603ULL;          // FNV-1a
+    for (wchar_t c : name) { h ^= (ULONGLONG)c; h *= 1099511628211ULL; }
+    return h | 1;
+}
 
 static NodeInfo describe(PIDLIST_ABSOLUTE abs, bool hasKids) {
     NodeInfo n;
@@ -91,15 +117,18 @@ static NodeInfo describe(PIDLIST_ABSOLUTE abs, bool hasKids) {
     n.icon = sys_icon_index(abs, false, sys_folder_icon_index(false));
     n.openIcon = sys_icon_index(abs, true, sys_folder_icon_index(true));
     n.hasKids = hasKids;
+    n.id = parsing_id(abs);
     return n;
 }
 
 // insert folder node; ownership of `info.abs` moves to the node
 static HTREEITEM insert_node(HWND tree, HTREEITEM parent, NodeInfo& info, bool pinned = false,
-                             HTREEITEM after = TVI_LAST) {
+                             HTREEITEM after = TVI_LAST, NodeData** node = nullptr) {
     NodeData* d = new NodeData{ info.abs };
+    if (node) *node = d;
     d->serial = ++s_nodeSerial;
     d->pinned = pinned;
+    d->id = info.id;
     info.abs = nullptr;
     s_live.insert(d);
     TVINSERTSTRUCTW ins{};
@@ -154,6 +183,31 @@ static bool fs_has_subfolder(const std::wstring& dir, bool showHidden) {
     return found;
 }
 
+// fn(0) .. fn(n - 1); a big folder's on a few threads (each with COM): looking into 17,500
+// subfolders and describing them takes 0.8 s on one. fn touches only its own index.
+template <class F> static void for_each_parallel(size_t n, F fn) {
+    const size_t chunk = 64;
+    unsigned threads = n < 4 * chunk ? 1 : std::min(4u, std::thread::hardware_concurrency());
+    if (threads <= 1) {
+        for (size_t i = 0; i < n; ++i) fn(i);
+        return;
+    }
+    std::atomic<size_t> next{ 0 };
+    auto run = [&] {
+        ComInit ci;
+        try {                       // (a throw on a std::thread would end the process)
+            for (size_t i; (i = next.fetch_add(chunk)) < n;)
+                for (size_t j = i; j < std::min(n, i + chunk); ++j) fn(j);
+        } catch (...) {}
+    };
+    std::vector<std::thread> helpers;
+    try {
+        for (unsigned t = 1; t < threads; ++t) helpers.emplace_back(run);
+    } catch (...) {}                // (no more threads now: fewer do it)
+    run();
+    for (auto& t : helpers) t.join();
+}
+
 // is `folder` the file-system path `path` or one of its ancestors? (case-insensitive)
 static bool path_within(const std::wstring& folder, const std::wstring& path) {
     size_t n = folder.size();
@@ -182,7 +236,7 @@ static bool list_children(PCIDLIST_ABSOLUTE parent, bool showHidden, std::vector
     HRESULT hrEnum = sf->EnumObjects(nullptr, flags, e.put());
     if (hrEnum == S_FALSE) return true;             // nothing to list
     if (hrEnum != S_OK || !e) return false;
-    struct Kid { PITEMID_CHILD child; bool hasKids; };
+    struct Kid { PITEMID_CHILD child; bool hasKids; std::wstring look; };   // look: the folder to check
     std::vector<Kid> kids;
     double t0 = perf_on() ? perf_now() : 0, tEnum = 0, tAttr = 0;
     PITEMID_CHILD child = nullptr; ULONG fetched = 0;
@@ -204,21 +258,26 @@ static bool list_children(PCIDLIST_ABSOLUTE parent, bool showHidden, std::vector
         // cloud placeholders are not opened (listing one would download it): assume children
         const DWORD remote = FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
         WIN32_FIND_DATAW fd{};
-        bool hasKids;
+        Kid k{ child, false, {} };
         if (fsParent && (attrs & SFGAO_FILESYSTEM) &&
             SUCCEEDED(SHGetDataFromIDListW(sf.get(), child, SHGDFIL_FINDDATA, &fd, sizeof(fd))) && fd.cFileName[0]) {
             // on a share each look is a round trip to the server: the expander shows, and
             // expanding finds out (as Explorer does)
-            hasKids = netParent || (fd.dwFileAttributes & remote) ||
-                      fs_has_subfolder(dir + (dir.back() == L'\\' ? L"" : L"\\") + fd.cFileName, showHidden);
+            k.hasKids = netParent || (fd.dwFileAttributes & remote);
+            if (!k.hasKids) k.look = dir + (dir.back() == L'\\' ? L"" : L"\\") + fd.cFileName;   // (below)
         } else {
             SFGAOF sub = SFGAO_HASSUBFOLDER;
             sf->GetAttributesOf(1, (PCUITEMID_CHILD*)&child, &sub);
-            hasKids = (sub & SFGAO_HASSUBFOLDER) != 0;
+            k.hasKids = (sub & SFGAO_HASSUBFOLDER) != 0;
         }
         if (perf_on()) tAttr += perf_now() - b;
-        kids.push_back({ child, hasKids });
+        kids.push_back(std::move(k));
     }
+    double tLook = perf_on() ? perf_now() : 0;
+    for_each_parallel(kids.size(), [&](size_t i) {
+        if (!kids[i].look.empty()) kids[i].hasKids = fs_has_subfolder(kids[i].look, showHidden);
+    });
+    if (perf_on()) tAttr += perf_now() - tLook;
     // the folder's own order; a comparison that fails falls back to the names. (stable_sort:
     // std::sort can read out of bounds when a namespace extension's order is inconsistent)
     IShellFolder* raw = sf.get();
@@ -229,11 +288,12 @@ static bool list_children(PCIDLIST_ABSOLUTE parent, bool showHidden, std::vector
                               child_name(raw, b.child, SHGDN_INFOLDER).c_str()) < 0;
     });
     double tSort = perf_on() ? perf_now() : 0;
-    for (auto& k : kids) {
-        PIDLIST_ABSOLUTE full = ILCombine(parent, k.child);
-        CoTaskMemFree(k.child);
-        if (full) out.push_back(describe(full, k.hasKids));
-    }
+    out.resize(kids.size());
+    for_each_parallel(kids.size(), [&](size_t i) {
+        if (PIDLIST_ABSOLUTE full = ILCombine(parent, kids[i].child)) out[i] = describe(full, kids[i].hasKids);
+        CoTaskMemFree(kids[i].child);
+    });
+    out.erase(std::remove_if(out.begin(), out.end(), [](const NodeInfo& n) { return !n.abs; }), out.end());
     if (perf_on()) {
         WCHAR d[400];
         swprintf_s(d, L"enum=%.1f attrs=%.1f describe=%.1f %ls", tEnum, tAttr, perf_now() - tSort,
@@ -258,21 +318,28 @@ struct TreeNoRedraw {
     TreeNoRedraw& operator=(const TreeNoRedraw&) = delete;
 };
 
-static void restore_children(HTREEITEM h);
+static void restore_new(HTREEITEM parent, const std::vector<std::pair<HTREEITEM, NodeData*>>& kids);
 static bool apply_top();
 static bool keep_restored_top(PCIDLIST_ABSOLUTE target);
 static LRESULT CALLBACK tree_input_subclass(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR);
 
 static void insert_children(HWND tree, HTREEITEM parent, std::vector<NodeInfo>& kids) {
     TreeNoRedraw nr(tree);
-    for (auto& k : kids) insert_node(tree, parent, k);
+    // last to first, each in front: inserting after a node (TVI_LAST too) walks the siblings
+    // before it (17,500 folders: 0.7 s; this way 27 ms)
+    std::vector<std::pair<HTREEITEM, NodeData*>> added;
+    added.reserve(kids.size());
+    for (size_t i = kids.size(); i-- > 0;) {
+        NodeData* d = nullptr;
+        if (HTREEITEM h = insert_node(tree, parent, kids[i], false, TVI_FIRST, &d)) added.push_back({ h, d });
+    }
     if (kids.empty()) {
         TVITEMW ti{}; ti.mask = TVIF_CHILDREN; ti.hItem = parent; ti.cChildren = 0;
         TreeView_SetItem(tree, &ti);
     }
     // a tab's state being put back: the new nodes get theirs (listed by expanding or by a sync)
     if (tree == g_tree) {
-        restore_children(parent);
+        restore_new(parent, added);
         apply_top();
     }
 }
@@ -385,14 +452,43 @@ struct PrefetchJob {
     std::wstring keep;
 };
 
-static void clear_prefetch() {
-    std::lock_guard<std::mutex> lk(s_prefetchMx);
-    for (auto& [key, p] : s_prefetch) free_infos(p.kids);
-    s_prefetch.clear();
-    ++s_prefetchGen;                // workers still running belong to the old entries
+static int use_prefetch(HWND tree, HTREEITEM h, NodeData* d);
+
+// Nodes expanded (a tab's state being put back) while a prefetch of their children was on
+// the way: they take it when it comes instead of listing the folder a second time
+struct PrefetchWaiter { HTREEITEM item; NodeData* node; UINT serial; };
+static std::vector<PrefetchWaiter> s_prefetchWaiters;
+
+// the waiters whose prefetch came (or failed, or was dropped: `dropped`) — listed and expanded
+static void serve_waiters(bool dropped) {
+    if (s_prefetchWaiters.empty()) return;
+    std::vector<PrefetchWaiter> waiting;
+    for (const PrefetchWaiter& w : std::exchange(s_prefetchWaiters, {})) {
+        if (!g_tree || !node_alive(w.node, w.serial) || node_data(g_tree, w.item) != w.node) continue;
+        NodeData* d = w.node;
+        int p = d->listed ? 1 : dropped ? -1 : use_prefetch(g_tree, w.item, d);
+        if (p == 0) { waiting.push_back(w); continue; }
+        d->listing = false;
+        if (p < 0) start_listing(w.item, d);
+        else if (TreeView_GetChild(g_tree, w.item)) TreeView_Expand(g_tree, w.item, TVE_EXPAND);
+    }
+    s_prefetchWaiters.insert(s_prefetchWaiters.end(), waiting.begin(), waiting.end());
 }
 
-static void prefetch_ready(void*) { resume_sync(); }   // the walk may be waiting for this one
+static void clear_prefetch() {
+    {
+        std::lock_guard<std::mutex> lk(s_prefetchMx);
+        for (auto& [key, p] : s_prefetch) free_infos(p.kids);
+        s_prefetch.clear();
+        ++s_prefetchGen;            // workers still running belong to the old entries
+    }
+    serve_waiters(true);            // (theirs won't come now: listed by themselves)
+}
+
+static void prefetch_ready(void*) {
+    serve_waiters(false);
+    resume_sync();                  // the walk may be waiting for this one
+}
 
 static void prefetch_worker(PrefetchJob* job) {
     std::unique_ptr<PrefetchJob> own(job);
@@ -559,9 +655,14 @@ static void show_pins(HWND tree, std::vector<NodeInfo>& pins, const std::vector<
     s_shownPins = keys;
     if (pins.empty()) return;
     HTREEITEM after = s_pinSep = insert_separator(tree, s_pinsAfter);
-    for (auto& p : pins) after = insert_node(tree, TVI_ROOT, p, true, after);
+    std::vector<std::pair<HTREEITEM, NodeData*>> added;
+    for (auto& p : pins) {
+        NodeData* d = nullptr;
+        after = insert_node(tree, TVI_ROOT, p, true, after, &d);
+        if (after) added.push_back({ after, d });
+    }
     if (tree == g_tree) {
-        restore_children(nullptr);           // (the pins: a tab's state being put back)
+        restore_new(nullptr, added);         // (the pins: a tab's state being put back)
         apply_top();
     }
 }
@@ -863,6 +964,7 @@ void tree_sync_to_current() {
 void tree_refresh_all() {
     if (!g_tree) return;
     TreeNoRedraw nr(g_tree);
+    s_prefetchWaiters.clear();                // (their nodes go)
     clear_prefetch();                         // (may be stale: e.g. hidden files toggled)
     TreeView_DeleteAllItems(g_tree);          // TVN_DELETEITEM frees every node's data
     initialize_tree(g_tree);
@@ -878,17 +980,7 @@ void tree_reread_pins() { if (g_tree) read_pins(); }
 // pidl bytes (a file system pidl carries its folder's timestamps).
 
 static ULONGLONG node_id(NodeData* d) {
-    if (!d->id) {
-        std::wstring name = pidl_parsingname(d->abs);
-        if (name.empty()) {
-            d->id = pidl_sig(d->abs) | 1;
-        } else {
-            CharLowerBuffW(name.data(), (DWORD)name.size());
-            ULONGLONG h = 1469598103934665603ULL;          // FNV-1a
-            for (wchar_t c : name) { h ^= (ULONGLONG)c; h *= 1099511628211ULL; }
-            d->id = h | 1;
-        }
-    }
+    if (!d->id) d->id = parsing_id(d->abs);         // (nodes are given theirs when listed)
     return d->id;
 }
 
@@ -905,14 +997,15 @@ static ULONGLONG key_of(HTREEITEM h) {
 
 // (every level: a folder open inside a closed one is open again when that one opens)
 static void save_below(HTREEITEM first, ULONGLONG parentKey, TreeState& s,
-                       std::unordered_set<ULONGLONG>& present) {
+                       std::unordered_set<ULONGLONG>* present) {
     for (HTREEITEM h = first; h; h = TreeView_GetNextSibling(g_tree, h)) {
-        NodeData* d = node_data(g_tree, h);
+        bool open = false;
+        NodeData* d = node_and_state(h, &open);
         if (!d || d->kind != NodeKind::Folder) continue;
         ULONGLONG k = state_key(parentKey, d);
-        present.insert(k);
-        if (TreeView_GetItemState(g_tree, h, TVIS_EXPANDED) & TVIS_EXPANDED) s.expanded.insert(k);
-        save_below(TreeView_GetChild(g_tree, h), k, s, present);
+        if (present) present->insert(k);
+        if (open) s.expanded.insert(k);
+        if (d->listed) save_below(TreeView_GetChild(g_tree, h), k, s, present);   // (else no children)
     }
 }
 
@@ -922,20 +1015,25 @@ static bool s_restoreOn = false;
 // (every level, collapsed ones too: their children keep their own state for when they open)
 static void restore_below(HTREEITEM first, ULONGLONG parentKey) {
     for (HTREEITEM h = first; h; h = TreeView_GetNextSibling(g_tree, h)) {
-        NodeData* d = node_data(g_tree, h);
+        bool open = false;
+        NodeData* d = node_and_state(h, &open);
         if (!d || d->kind != NodeKind::Folder) continue;
         ULONGLONG k = state_key(parentKey, d);
         bool want = s_restoring.expanded.count(k) > 0;
-        bool open = (TreeView_GetItemState(g_tree, h, TVIS_EXPANDED) & TVIS_EXPANDED) != 0;
         if (want && !open) TreeView_Expand(g_tree, h, TVE_EXPAND);   // (not listed yet: when it is)
         else if (!want && open) TreeView_Expand(g_tree, h, TVE_COLLAPSE);
-        restore_below(TreeView_GetChild(g_tree, h), k);
+        if (d->listed) restore_below(TreeView_GetChild(g_tree, h), k);
     }
 }
 
-// h's children (null: the top level)
-static void restore_children(HTREEITEM h) {
-    if (s_restoreOn) restore_below(h ? TreeView_GetChild(g_tree, h) : TreeView_GetRoot(g_tree), h ? key_of(h) : 0);
+// nodes just inserted under `parent` (null: the top level): collapsed and without children
+// of their own, so only the ones the state wants open are touched (restore_below asks the
+// tree about each)
+static void restore_new(HTREEITEM parent, const std::vector<std::pair<HTREEITEM, NodeData*>>& kids) {
+    if (!s_restoreOn || s_restoring.expanded.empty() || kids.empty()) return;
+    ULONGLONG parentKey = parent ? key_of(parent) : 0;
+    for (auto& [h, d] : kids)
+        if (s_restoring.expanded.count(state_key(parentKey, d))) TreeView_Expand(g_tree, h, TVE_EXPAND);
 }
 
 // The node at the top is put back when it is there: after a restart its branch is still
@@ -945,12 +1043,42 @@ static bool s_topPending = false;
 static ULONGLONG s_topUntil = 0;
 static ULONGLONG s_topTarget = 0;       // the folder the tree follows meanwhile (pidl_sig)
 
+// the visible node with the state key `key`, from `first` and its siblings down (each
+// key from its parent's on the way, not from the root up for every node)
+static HTREEITEM find_visible(HTREEITEM first, ULONGLONG parentKey, ULONGLONG key) {
+    for (HTREEITEM h = first; h; h = TreeView_GetNextSibling(g_tree, h)) {
+        NodeData* d = node_data(g_tree, h);
+        if (!d || d->kind != NodeKind::Folder) continue;
+        ULONGLONG k = state_key(parentKey, d);
+        if (k == key) return h;
+        if (TreeView_GetItemState(g_tree, h, TVIS_EXPANDED) & TVIS_EXPANDED)
+            if (HTREEITEM r = find_visible(TreeView_GetChild(g_tree, h), k, key)) return r;
+    }
+    return nullptr;
+}
+
+// the node found for the top (searched for again when it goes or a node above it closes)
+static struct { HTREEITEM item; NodeData* node; UINT serial; } s_topFound{};
+
+static bool shown_in_tree(HTREEITEM h) {
+    for (HTREEITEM p = TreeView_GetParent(g_tree, h); p; p = TreeView_GetParent(g_tree, p))
+        if (!(TreeView_GetItemState(g_tree, p, TVIS_EXPANDED) & TVIS_EXPANDED)) return false;
+    return true;
+}
+
 static bool apply_top() {
     if (!s_topPending || !g_tree) return false;
     if (GetTickCount64() > s_topUntil) { s_topPending = false; return false; }
-    for (HTREEITEM h = TreeView_GetRoot(g_tree); h; h = TreeView_GetNextVisible(g_tree, h))
-        if (key_of(h) == s_restoring.top) { TreeView_Select(g_tree, h, TVGN_FIRSTVISIBLE); return true; }
-    return false;
+    // (every listing that comes in puts it back: nodes inserted above it push it down)
+    HTREEITEM h = s_topFound.item;
+    if (!h || !node_alive(s_topFound.node, s_topFound.serial) || node_data(g_tree, h) != s_topFound.node ||
+        !shown_in_tree(h)) {
+        h = find_visible(TreeView_GetRoot(g_tree), 0, s_restoring.top);
+        s_topFound = { h, h ? node_data(g_tree, h) : nullptr, 0 };
+        if (s_topFound.node) s_topFound.serial = s_topFound.node->serial;
+    }
+    if (h && TreeView_GetFirstVisible(g_tree) != h) TreeView_Select(g_tree, h, TVGN_FIRSTVISIBLE);
+    return h != nullptr;
 }
 
 // the sync to `target` keeps the restored top instead of scrolling to the folder
@@ -964,6 +1092,14 @@ static bool keep_restored_top(PCIDLIST_ABSOLUTE target) {
 
 static LRESULT CALLBACK tree_input_subclass(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
     switch (msg) {
+        case WM_PAINT:
+            if (perf_on()) {
+                double t0 = perf_now();
+                LRESULT r = DefSubclassProc(h, msg, wp, lp);
+                perf_paint("tree", perf_now() - t0);
+                return r;
+            }
+            break;
         case WM_MOUSEWHEEL: case WM_VSCROLL: case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_KEYDOWN:
             s_topPending = false;           // the user's own scrolling and clicks win
             break;
@@ -976,8 +1112,8 @@ void tree_capture_state(TreeState& s) {
     s.top = 0;
     s.saved = true;
     if (!g_tree) return;
-    std::unordered_set<ULONGLONG> present;
-    save_below(TreeView_GetRoot(g_tree), 0, s, present);
+    std::unordered_set<ULONGLONG> present;         // (only needed while a state is put back)
+    save_below(TreeView_GetRoot(g_tree), 0, s, s_restoreOn ? &present : nullptr);
     // a state still being put back: the nodes not listed yet keep what it wants for them
     if (s_restoreOn)
         for (ULONGLONG k : s_restoring.expanded)
@@ -1006,6 +1142,7 @@ void tree_restore_state(const TreeState& s) {
     s_topPending = true;
     s_topUntil = GetTickCount64() + 5000;
     s_topTarget = 0;
+    s_topFound = {};
     apply_top();
 }
 
@@ -1255,6 +1392,14 @@ LRESULT tree_notify(HWND, WPARAM, LPARAM lp) {
             NodeData* d = node_data(g_tree, nm->itemNew.hItem);
             if (!d || d->kind != NodeKind::Folder || d->listed) return 0;
             d->listFailed = false;            // the user asks again
+            if (d->listing) return TRUE;      // (on the way)
+            switch (use_prefetch(g_tree, nm->itemNew.hItem, d)) {
+                case 1: return FALSE;         // listed now: expands
+                case 0:                       // a prefetch is listing it: the children come with it
+                    d->listing = true;
+                    s_prefetchWaiters.push_back({ nm->itemNew.hItem, d, d->serial });
+                    return TRUE;
+            }
             start_listing(nm->itemNew.hItem, d);
             return TRUE;                      // expands when the children arrive
         }

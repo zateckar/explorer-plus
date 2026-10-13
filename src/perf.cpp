@@ -54,6 +54,12 @@ void perf_event(const char* name, double dur, long long n, const wchar_t* detail
     fflush(s_log);
 }
 
+unsigned long long perf_code_address(const void* code) {
+    // ASLR loads the exe anywhere: back to the base the file is linked at (ld's default
+    // for 64-bit executables), where nm / addr2line find it
+    return (unsigned long long)((const BYTE*)code - (const BYTE*)GetModuleHandleW(nullptr)) + 0x140000000ULL;
+}
+
 void perf_paint(const char* what, double ms) {
     if (!s_on) return;
     std::lock_guard<std::mutex> lk(s_mx);

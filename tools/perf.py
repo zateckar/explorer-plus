@@ -12,6 +12,8 @@ window messages and prints a table from the logs:
   sort        sort the 30k listing by size and back by name
   views       Details -> Large icons -> List -> Details
   resize      20 window resizes: main + list paint times
+  tree        expand C:\\Windows\\WinSxS (~17,000 subfolders) in the navigation pane:
+              the listing (worker) and inserting the nodes (UI; 0 = no message over 16 ms)
 """
 import os, sys, time, re, statistics, ctypes, ctypes.wintypes as W
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -201,3 +203,26 @@ try:
         report('resize ' + e[1], '%.2f ms' % e[2].get('mean', 0), e[3].strip())
 finally:
     app.close()
+
+# --- navigation pane: a node with ~17,000 subfolders (C:\Windows\WinSxS) -----
+sxs = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'WinSxS')
+if os.path.isdir(sxs):
+    app, log = launch(sxs, 'tree')
+    try:
+        wait_log(log, lambda l: 'tree.synced n=1' in l, 30)
+        time.sleep(0.5)
+        n0 = len(log_lines(log))
+        TVM_EXPAND, TVM_GETNEXTITEM, TVGN_CARET, TVE_EXPAND = 0x1102, 0x110A, 0x0009, 0x0002
+        u.SendMessageW(app.tree, TVM_EXPAND, TVE_EXPAND, u.SendMessageW(app.tree, TVM_GETNEXTITEM, TVGN_CARET, 0))
+        wait_log(log, lambda l: 'tree.list' in l and l.rstrip().lower().endswith('winsxs'), 60)
+        time.sleep(1.0)
+        ev = parse(log_lines(log)[n0:])
+        tl = [e for e in ev if e[1] == 'tree.list' and e[3].rstrip().lower().endswith('winsxs')]
+        if tl:
+            report('tree: list WinSxS subfolders', '%.0f ms' % tl[-1][2].get('dur', 0),
+                   '%d folders (worker)' % tl[-1][2].get('n', 0))
+            # the UI side: the longest message after the listing came in (inserting the nodes)
+            after = [e[2].get('dur', 0) for e in ev if e[1] == 'slow.msg' and e[0] >= tl[-1][0]]
+            report('tree: insert them (UI)', '%.0f ms' % max(after or [0]), 'longest message after the listing')
+    finally:
+        app.close()

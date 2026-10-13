@@ -858,6 +858,10 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             workers_shutdown();             // no new background work, results dropped
             RemoveClipboardFormatListener(hwnd);
             save_window_state(hwnd);
+            // gone from the screen now (saved first: the placement says whether it is
+            // maximized): destroying the children takes a while with a big navigation pane,
+            // the tree control spends ~50 us on each node it deletes
+            ShowWindow(hwnd, SW_HIDE);
             dnd_unregister_all();
             for_each_pane(deregister_current_watch);
             if (s_searchBrush) { DeleteObject(s_searchBrush); s_searchBrush = nullptr; }

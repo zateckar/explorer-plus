@@ -104,9 +104,9 @@ void drain_async() {
         double t0 = perf_now();
         e.apply(e.payload);
         double dur = perf_now() - t0;
-        if (dur > 8) {                      // name the handler: resolve with `nm -C` on the exe
+        if (dur > 8) {                      // name the handler: see perf.h
             WCHAR d[64]{};
-            swprintf_s(d, L"handler=%p", (void*)e.apply);
+            swprintf_s(d, L"handler=%llx", perf_code_address((const void*)e.apply));
             perf_event("slow.async", dur, -1, d);
         }
     }
