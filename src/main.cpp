@@ -47,38 +47,38 @@ void exit_app() { DestroyWindow(g_main); }
 // view mode plumbing (model lives in TabState::view)
 void set_view_mode(const View& v, bool persist) {
     PerfScope ps("view.apply");
-    bool same = (g_view.lvView == v.lvView && g_view.thumbsExtra == v.thumbsExtra);
-    bool thumbSizeChanged = g_view.thumbsExtra != v.thumbsExtra;
-    bool regroup = g_view.groupBy != v.groupBy;
-    g_view = v;
+    bool same = (g_pane->view.lvView == v.lvView && g_pane->view.thumbsExtra == v.thumbsExtra);
+    bool thumbSizeChanged = g_pane->view.thumbsExtra != v.thumbsExtra;
+    bool regroup = g_pane->view.groupBy != v.groupBy;
+    g_pane->view = v;
     TabState* t = tabmodel_active();
-    if (t) t->view = v;
+    if (t) t->nav().view = v;
     // remembered for this folder; other folders change only with "Apply to all folders"
-    if (persist) settings_set_view_for(folder_settings_key(g_current), v);
-    statusbar_refresh();
+    if (persist) settings_set_view_for(folder_settings_key(g_pane->current), v);
+    if (pane_is_active()) statusbar_refresh();
     // (navigation re-groups when its listing arrives; only a live change re-sorts here)
     if (regroup && persist) enum_sort_items();
     if (same) return;
     if (thumbSizeChanged) thumb_reset_for_new_folder();   // cached thumbs are per size
     list_apply_view();
-    InvalidateRect(g_list, nullptr, TRUE);
+    InvalidateRect(g_pane->list, nullptr, TRUE);
 }
 
 // ------------------------------------------------------------------
 // status bar
 void status_update() {
-    if (!g_status || !g_list) return;
+    if (!g_status || !g_pane->list || !pane_is_active()) return;    // (the bar shows the active list)
     int count = 0;
     ULONGLONG selBytes = 0;
     {
-        std::lock_guard<std::mutex> lk(g_itemsMx);
-        count = (int)g_items.size();
+        std::lock_guard<std::mutex> lk(g_pane->itemsMx);
+        count = (int)g_pane->items.size();
         int idx = -1;
-        while ((idx = ListView_GetNextItem(g_list, idx, LVNI_SELECTED)) != -1)
-            if (idx < (int)g_items.size() && !g_items[idx]->isFolder)
-                selBytes += g_items[idx]->bytes;
+        while ((idx = ListView_GetNextItem(g_pane->list, idx, LVNI_SELECTED)) != -1)
+            if (idx < (int)g_pane->items.size() && !g_pane->items[idx]->isFolder)
+                selBytes += g_pane->items[idx]->bytes;
     }
-    int sel = ListView_GetSelectedCount(g_list);
+    int sel = ListView_GetSelectedCount(g_pane->list);
     std::wstring a = std::to_wstring(count) + (count == 1 ? L" item" : L" items");
     std::wstring b;
     if (sel) {
@@ -107,9 +107,9 @@ static LRESULT CALLBACK search_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_KEYDOWN) {
         if (wp == VK_RETURN) { search_submit(); return 0; }
         if (wp == VK_ESCAPE) {
-            if (search_is_results(g_current)) search_cancel();     // back to the searched folder
+            if (search_is_results(g_pane->current)) search_cancel();     // back to the searched folder
             else SetWindowTextW(h, L"");
-            SetFocus(g_list);
+            SetFocus(g_pane->list);
             return 0;
         }
     }
@@ -141,8 +141,8 @@ static void set_accessible_name(HWND h, const std::wstring& name) {
 void search_update_cue() {
     if (!g_search) return;
     TabState* t = tabmodel_active();
-    PCIDLIST_ABSOLUTE scope = search_scope_of(g_current);
-    std::wstring cue = L"Search " + (scope ? pidl_abs_dispname(scope) : t ? t->name : std::wstring());
+    PCIDLIST_ABSOLUTE scope = search_scope_of(g_pane->current);
+    std::wstring cue = L"Search " + (scope ? pidl_abs_dispname(scope) : t ? t->nav().name : std::wstring());
     SendMessageW(g_search, EM_SETCUEBANNER, TRUE, (LPARAM)cue.c_str());
     set_accessible_name(g_search, cue);
 }
@@ -174,9 +174,9 @@ static void copy_paths_to_clipboard(const std::vector<PCIDLIST_ABSOLUTE>& items)
 static void copy_path_to_clipboard() {
     std::vector<PIDLIST_ABSOLUTE> own;
     for (auto c : list_selected_pidls())
-        if (PIDLIST_ABSOLUTE abs = ILCombine(g_current, c)) own.push_back(abs);
+        if (PIDLIST_ABSOLUTE abs = ILCombine(g_pane->current, c)) own.push_back(abs);
     std::vector<PCIDLIST_ABSOLUTE> items(own.begin(), own.end());
-    if (items.empty()) items.push_back(g_current);
+    if (items.empty()) items.push_back(g_pane->current);
     copy_paths_to_clipboard(items);
     for (auto p : own) CoTaskMemFree(p);
 }
@@ -225,10 +225,12 @@ static void set_text_scale(int pct) {
     theme_set_text_scale(pct);
     settings_set_pref(L"textSize", text_scale());
     tree_apply_metrics();
-    list_apply_view();                   // row spacing, tile size
-    columns_rescale();
+    for_each_pane([] {
+        list_apply_view();               // row spacing, tile size
+        columns_rescale();
+        InvalidateRect(g_pane->list, nullptr, TRUE);
+    });
     InvalidateRect(g_tree, nullptr, TRUE);
-    InvalidateRect(g_list, nullptr, TRUE);
     if (HWND pane = detailspane_hwnd()) InvalidateRect(pane, nullptr, FALSE);
 }
 
@@ -274,6 +276,7 @@ static HACCEL make_accels() {
         { FVIRTKEY | FCONTROL | FSHIFT,  'C',       IDM_COPY_PATH },
         { FVIRTKEY | FALT | FSHIFT,      'P',       IDM_VIEW_DETAILSPANE },
         { FVIRTKEY | FALT,               'P',       IDM_VIEW_PREVIEWPANE },
+        { FVIRTKEY | FCONTROL | FSHIFT,  'D',       IDM_VIEW_DUALPANE },
         // Explorer's view shortcuts
         { FVIRTKEY | FCONTROL | FSHIFT,  '1',       IDM_VIEW_XLARGE },
         { FVIRTKEY | FCONTROL | FSHIFT,  '2',       IDM_VIEW_LARGE },
@@ -339,7 +342,7 @@ static bool edit_owns_key(const MSG& m) {
     // renaming in the list or the pane: every key is the edit's (a refresh, navigation or
     // Alt+Enter would end the rename)
     HWND parent = GetParent(GetFocus());
-    if (parent == g_list || parent == g_tree) return true;
+    if (is_pane_list(parent) || parent == g_tree) return true;
     if (m.message != WM_KEYDOWN) return false;
     bool ctrl = GetKeyState(VK_CONTROL) & 0x8000;
     switch (m.wParam) {
@@ -358,11 +361,11 @@ static bool cycle_focus(const MSG& m) {
     HWND focus = GetFocus();
     if (!focus || GetAncestor(focus, GA_ROOT) != g_main) return false;
     HWND parent = GetParent(focus);
-    if (is_edit_focus() && (parent == g_list || parent == g_tree)) return false;
+    if (is_edit_focus() && (is_pane_list(parent) || parent == g_tree)) return false;
     // (the preview pane, while a handler shows a file: the handler takes the focus itself)
     HWND preview = preview_active() ? detailspane_hwnd() : nullptr;
     // (in the order they are on screen, as in Explorer; the painted rows take arrow keys)
-    HWND panes[] = { tabstrip_hwnd(), g_navbar, g_address, g_search, cmdbar_hwnd(), g_tree, g_list, preview };
+    HWND panes[] = { tabstrip_hwnd(), g_navbar, g_address, g_search, cmdbar_hwnd(), g_tree, g_panes[0].list, g_panes[1].list, preview };
     constexpr int n = (int)(sizeof(panes) / sizeof(panes[0]));
     int cur = -1;
     for (HWND h = focus; h && h != g_main && cur < 0; h = GetParent(h))
@@ -385,8 +388,9 @@ static bool cycle_focus(const MSG& m) {
 // ------------------------------------------------------------------
 // commands
 static void set_sort(int column, int asc /* -1 keep */) {
-    if (column >= 0) g_sortColumn = column;
-    if (asc >= 0) g_sortAsc = asc != 0;
+    if (column >= 0) g_pane->sortColumn = column;
+    if (asc >= 0) g_pane->sortAsc = asc != 0;
+    columns_save_sort();
     enum_sort_items();
 }
 
@@ -401,17 +405,17 @@ static void on_command(WORD id) {
             navigation_refresh();
             break;
 
-        case IDM_VIEW_DETAILS: set_view_mode({ LV_VIEW_DETAILS, 0, g_view.groupBy }, true); break;
-        case IDM_VIEW_TILES:   set_view_mode({ LV_VIEW_TILE, 0, g_view.groupBy }, true); break;
-        case IDM_VIEW_XLARGE:  set_view_mode({ LV_VIEW_ICON, 2, g_view.groupBy }, true); break;
-        case IDM_VIEW_LARGE:   set_view_mode({ LV_VIEW_ICON, 1, g_view.groupBy }, true); break;
-        case IDM_VIEW_MEDIUM:  set_view_mode({ LV_VIEW_ICON, 3, g_view.groupBy }, true); break;
-        case IDM_VIEW_SMALL:   set_view_mode({ LV_VIEW_SMALLICON, 0, g_view.groupBy }, true); break;
-        case IDM_VIEW_LIST:    set_view_mode({ LV_VIEW_LIST, 0, g_view.groupBy }, true); break;
+        case IDM_VIEW_DETAILS: set_view_mode({ LV_VIEW_DETAILS, 0, g_pane->view.groupBy }, true); break;
+        case IDM_VIEW_TILES:   set_view_mode({ LV_VIEW_TILE, 0, g_pane->view.groupBy }, true); break;
+        case IDM_VIEW_XLARGE:  set_view_mode({ LV_VIEW_ICON, 2, g_pane->view.groupBy }, true); break;
+        case IDM_VIEW_LARGE:   set_view_mode({ LV_VIEW_ICON, 1, g_pane->view.groupBy }, true); break;
+        case IDM_VIEW_MEDIUM:  set_view_mode({ LV_VIEW_ICON, 3, g_pane->view.groupBy }, true); break;
+        case IDM_VIEW_SMALL:   set_view_mode({ LV_VIEW_SMALLICON, 0, g_pane->view.groupBy }, true); break;
+        case IDM_VIEW_LIST:    set_view_mode({ LV_VIEW_LIST, 0, g_pane->view.groupBy }, true); break;
         case IDM_VIEW_HIDDEN:
             g_showHidden = !g_showHidden;
             settings_set_show_hidden(g_showHidden);
-            navigation_refresh();
+            for_each_pane(navigation_refresh, true);
             tree_refresh_all();
             break;
         case IDM_VIEW_DETAILSPANE:
@@ -427,8 +431,10 @@ static void on_command(WORD id) {
         case IDM_VIEW_CHECKBOXES:
             g_checkBoxes = !g_checkBoxes;
             settings_set_pref(L"checkBoxes", g_checkBoxes);
-            list_apply_view();
-            InvalidateRect(g_list, nullptr, TRUE);
+            for_each_pane([] {
+                list_apply_view();
+                InvalidateRect(g_pane->list, nullptr, TRUE);
+            });
             break;
         case IDM_TOOLS_MENU: cmdbar_show_tools(); break;
         case IDM_PERF_MARK: perf_flush(); perf_event("mark"); break;   // tools/perf.py: end of a scenario
@@ -441,11 +447,14 @@ static void on_command(WORD id) {
         case IDM_VIEW_COMPACT:
             g_compactView = !g_compactView;
             settings_set_pref(L"compactView", g_compactView);
-            list_apply_view();
+            for_each_pane([] {
+                list_apply_view();
+                InvalidateRect(g_pane->list, nullptr, TRUE);
+            });
             tree_apply_metrics();
-            InvalidateRect(g_list, nullptr, TRUE);
             InvalidateRect(g_tree, nullptr, TRUE);
             break;
+        case IDM_VIEW_DUALPANE: navigation_toggle_dual(); break;
         case IDM_VIEW_FOLDERSIZES:
             foldersizes_set_enabled(!foldersizes_enabled());
             settings_set_pref(L"folderSizes", foldersizes_enabled());
@@ -454,7 +463,7 @@ static void on_command(WORD id) {
             // our own choice from now on; Windows' setting stays as it is
             g_showExtensions = show_extensions_effective() ? 0 : 1;
             settings_set_pref(L"showExtensions", g_showExtensions);
-            navigation_refresh();
+            for_each_pane(navigation_refresh, true);
             break;
         case IDM_TEXT_LARGER:  set_text_scale(text_scale_step(text_scale(), +1)); break;
         case IDM_TEXT_SMALLER: set_text_scale(text_scale_step(text_scale(), -1)); break;
@@ -472,7 +481,7 @@ static void on_command(WORD id) {
                 contextmenu_invoke_verb(g_main, "Windows.Share");
             break;
         case IDM_COPY_PATH: copy_path_to_clipboard(); break;
-        case IDM_NEW_WINDOW: navigation_open_new_window(g_current); break;
+        case IDM_NEW_WINDOW: navigation_open_new_window(g_pane->current); break;
         case IDM_OPTIONS:
             ShellExecuteW(g_main, nullptr, L"rundll32.exe", L"shell32.dll,Options_RunDLL 0", nullptr, SW_SHOWNORMAL);
             break;
@@ -486,7 +495,7 @@ static void on_command(WORD id) {
         case IDM_SORT_COL_BASE ... IDM_SORT_COL_LAST: columns_sort_by(id - IDM_SORT_COL_BASE); break;
         case IDM_GROUP_BASE + GB_NONE: case IDM_GROUP_BASE + GB_NAME: case IDM_GROUP_BASE + GB_DATE:
         case IDM_GROUP_BASE + GB_TYPE: case IDM_GROUP_BASE + GB_SIZE: {
-            View v = g_view;
+            View v = g_pane->view;
             v.groupBy = id - IDM_GROUP_BASE;
             set_view_mode(v, true);
             break;
@@ -517,7 +526,7 @@ static void on_command(WORD id) {
             SetFocus(g_search);
             SendMessageW(g_search, EM_SETSEL, 0, -1);
             break;
-        case IDM_FOCUS_LIST: SetFocus(g_list); break;
+        case IDM_FOCUS_LIST: SetFocus(active_pane()->list); break;
 
         case IDM_TABNEXT: tabmodel_next_tab(+1); break;
         case IDM_TABPREV: tabmodel_next_tab(-1); break;
@@ -568,7 +577,6 @@ static void tree_context_menu(HWND hwnd, POINT pt) {
 
 // ------------------------------------------------------------------
 // window proc
-static UINT s_watchMsg = 0;
 
 // persist the window's place, the panes, the tabs and the settings
 static void save_window_state(HWND hwnd) {
@@ -577,6 +585,7 @@ static void save_window_state(HWND hwnd) {
     s.widthRight = g_splitterRight;
     s.detailsVisible = detailspane_visible();
     s.treeVisible = g_treeVisible;
+    settings_set_pref(L"dualSplit", g_dualSplit);
     WINDOWPLACEMENT wpl{ sizeof(wpl) };
     if (GetWindowPlacement(hwnd, &wpl)) {
         // the normal position is in workspace coordinates (relative to the work area);
@@ -601,17 +610,23 @@ static void save_window_state(HWND hwnd) {
 
 static void on_theme_changed(HWND hwnd) {
     theme_apply_controls();
-    groups_theme_changed();
+    for_each_pane([] {
+        groups_theme_changed();
+        list_apply_view();           // check box images follow the theme
+    });
     detailspane_theme_changed();
-    list_apply_view();               // check box images follow the theme
     chrome_theme_changed(hwnd);
     RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
 }
 
 static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == s_watchMsg && s_watchMsg) {
-        watcher_on_message(wp, lp);
-        return 0;
+    if (msg >= 0xC000) {                     // (registered messages: a list's change notifications)
+        int pane = watcher_pane_of_msg(msg);
+        if (pane >= 0) {
+            PaneScope ps(&g_panes[pane]);
+            watcher_on_message(wp, lp);
+            return 0;
+        }
     }
     // owner-drawn items and lazily-built submenus of a tracked shell menu
     if (msg == WM_INITMENUPOPUP || msg == WM_DRAWITEM || msg == WM_MEASUREITEM || msg == WM_MENUCHAR) {
@@ -635,25 +650,27 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             tabstrip_create(hwnd);
             cmdbar_create(hwnd);
             statusbar_create(hwnd);
-            list_create();
+            for (Pane& p : g_panes) {        // (the second list shows in dual-pane tabs)
+                PaneScope ps(&p);
+                list_create();
+            }
             detailspane_create(hwnd);
             theme_apply_controls();
             perf_event("create.controls");
             initialize_tree(g_tree);
             perf_event("create.tree");
             watcher_init(hwnd);
-            s_watchMsg = watcher_change_msg();
             dnd_register_sources();
             AddClipboardFormatListener(hwnd);       // Paste button state
             perf_event("create.watcher+dnd");
-            // apply active tab (its own folder + view)
-            navigate_replace(tabmodel_active());
+            // apply active tab (its own folders + views)
+            tabmodel_show_active();
             tree_sync_to_current();     // starts the tree's listings now (the posted sync would wait for ShowWindow)
             perf_event("create.navigate");
             address_history_add(current_display_path());
             layout_relayout();
             status_update();
-            SetFocus(g_list);
+            SetFocus(active_pane()->list);
             return 0;
         }
 
@@ -699,17 +716,34 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_COMMAND: on_command_ex(wp, lp); return 0;
         case WM_CLIPBOARDUPDATE: cmdbar_refresh(); return 0;
         case WM_TREE_SYNC: tree_sync_to_current(); return 0;
-        case WM_SELECTION_CHANGED: list_on_selection_changed(); cmdbar_refresh(); return 0;
+        case WM_SELECTION_CHANGED: {
+            if (wp >= (WPARAM)kPanes) return 0;
+            PaneScope ps(&g_panes[wp]);
+            list_on_selection_changed();
+            cmdbar_refresh();
+            return 0;
+        }
         case WM_ASYNC_WAKE: drain_async(); return 0;
-        case WM_ENUM_DONE: enum_apply_op((HeapEnumOp*)lp); return 0;
-        case WM_TIMER:
-            if (wp == TIMER_WATCH_REFRESH) { watcher_on_timer(); return 0; }
+        case WM_ENUM_DONE: {
+            auto* op = (HeapEnumOp*)lp;
+            PaneScope ps(op && op->pane >= 0 && op->pane < kPanes ? &g_panes[op->pane] : nullptr);
+            enum_apply_op(op);
+            return 0;
+        }
+        case WM_TIMER: {
             if (wp == TIMER_SEARCH) { search_on_timer(); return 0; }
-            if (wp == TIMER_ENUM_STREAM) { enum_on_stream_timer(); return 0; }
             if (wp == TIMER_TABS_PERSIST) { tabs_persist_now(); return 0; }
-            if (wp == TIMER_ENUM_HELD) { enum_on_held_timer(); return 0; }
-            if (wp == TIMER_FOLDER_SIZES) { foldersizes_on_timer(); return 0; }
+            // a list's own timers: the base id + 100 * its index (pane_timer)
+            if (wp / 100 >= (WPARAM)kPanes) break;
+            PaneScope ps(&g_panes[wp / 100]);
+            switch (wp % 100) {
+                case TIMER_WATCH_REFRESH: watcher_on_timer(); return 0;
+                case TIMER_ENUM_STREAM:   enum_on_stream_timer(); return 0;
+                case TIMER_ENUM_HELD:     enum_on_held_timer(); return 0;
+                case TIMER_FOLDER_SIZES:  foldersizes_on_timer(); return 0;
+            }
             break;
+        }
         case WM_SETTINGCHANGE:
             if (((lp && lstrcmpW((LPCWSTR)lp, L"ImmersiveColorSet") == 0) || wp == SPI_SETHIGHCONTRAST) && theme_reload())
                 on_theme_changed(hwnd);
@@ -744,6 +778,12 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             DragKind k = layout_splitter_kind(hwnd, pt);
             if (k != DragKind::None) { s_dragKind = k; SetCapture(hwnd); return 0; }
+            // a list's caption (two lists): that list
+            if (int i = layout_caption_pane_at(pt); i >= 0) {
+                SetFocus(g_panes[i].list);
+                navigation_activate_pane(&g_panes[i]);
+                return 0;
+            }
             // the search box's frame (around the edit) is the box too
             RECT sf = layout_search_frame();
             if (g_search && PtInRect(&sf, pt)) {
@@ -784,7 +824,13 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_NOTIFY: {
             NMHDR* hdr = (NMHDR*)lp;
             if (hdr->idFrom == IDC_TREE) return tree_notify(hwnd, wp, lp);
-            if (hdr->idFrom == IDC_LIST) return list_notify(hwnd, wp, lp);
+            if (hdr->idFrom == IDC_LIST || hdr->idFrom == IDC_LIST2) {
+                Pane* p = pane_of_list(hdr->hwndFrom);
+                if (!p) break;
+                PaneScope ps(p);
+                if (hdr->code == NM_SETFOCUS) navigation_activate_pane(p);   // commands go to this list now
+                return list_notify(hwnd, wp, lp);
+            }
             break;
         }
 
@@ -793,7 +839,11 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             // mouse right-clicks on the list are handled by NM_RCLICK (which suppresses
             // this message); what arrives here is Shift+F10 / the Apps key
-            if (child == g_list) { list_context_menu(pt); return 0; }
+            if (Pane* p = pane_of_list(child)) {
+                PaneScope ps(p);
+                list_context_menu(pt);
+                return 0;
+            }
             if (child == g_tree) { tree_context_menu(hwnd, pt); return 0; }
             break;
         }
@@ -804,8 +854,10 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
             tree_apply_metrics();
-            list_apply_view();           // row heights, tile size
-            columns_rescale();
+            for_each_pane([] {
+                list_apply_view();       // row heights, tile size
+                columns_rescale();
+            });
             layout_relayout();
             return 0;
         }
@@ -823,7 +875,7 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RemoveClipboardFormatListener(hwnd);
             save_window_state(hwnd);
             dnd_unregister_all();
-            deregister_current_watch();
+            for_each_pane(deregister_current_watch);
             if (s_searchBrush) { DeleteObject(s_searchBrush); s_searchBrush = nullptr; }
             PostQuitMessage(0);
             return 0;
@@ -865,7 +917,12 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     perf_event("theme");
 
     settings_load_all();
-    g_view = settings_default_view();
+    for (Pane& p : g_panes) {
+        PaneScope ps(&p);
+        p.view = settings_default_view();
+        columns_load_sort();             // the order chosen last
+    }
+    g_dualSplit = std::clamp(settings_pref(L"dualSplit", 500), 150, 850);
     g_showHidden = settings_show_hidden();
     g_checkBoxes = settings_pref(L"checkBoxes", 0) != 0;
     g_cmdBarVisible = settings_pref(L"commandBar", 0) != 0;
@@ -898,7 +955,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     // the system image list is set up here, once: workers asking for icons while it is
     // still being initialized get no index (and the tree showed "unknown file" icons)
     sys_imagelist_init();
-    if (TabState* t = tabmodel_active(); t && g_treeVisible) tree_prefetch(t->current);   // ready by WM_CREATE
+    if (TabState* t = tabmodel_active(); t && g_treeVisible) tree_prefetch(t->side[t->dual ? t->activeSide : 0].current);   // ready by WM_CREATE
     perf_event("tabs");
     detailspane_set_mode(settings_pref(L"paneMode", PANE_DETAILS) == PANE_PREVIEW ? PANE_PREVIEW : PANE_DETAILS);
     detailspane_set_visible(sp.detailsVisible);   // sets flags only (window created later)

@@ -4,29 +4,50 @@
 
 // globals
 HWND g_main = nullptr, g_address = nullptr, g_search = nullptr,
-     g_tree = nullptr, g_list = nullptr, g_status = nullptr, g_navbar = nullptr;
+     g_tree = nullptr, g_status = nullptr, g_navbar = nullptr;
 HFONT g_font = nullptr;
 HFONT g_iconFont = nullptr;   // Segoe Fluent Icons
 HFONT g_mdl2Font = nullptr;   // Segoe MDL2 Assets
 HINSTANCE g_hinst = nullptr;
-View g_view{ LV_VIEW_DETAILS, 0 };
 int  g_splitterX = 280, g_statusH = 24;
+int  g_dualSplit = 500;
 std::atomic<bool> g_showHidden{ false };
 std::atomic<int> g_showExtensions{ -1 };
 bool g_checkBoxes = false;
 bool g_compactView = false;
 bool g_cmdBarVisible = false;
 bool g_treeVisible = true;
-int  g_sortColumn = COL_NAME;
-PROPERTYKEY g_sortKey{};
-bool g_sortAsc = true;
 
-// items + current folder
-std::mutex g_itemsMx;
-std::vector<Item*> g_items;
-PIDLIST_ABSOLUTE g_current = nullptr;
+// the file lists
+Pane g_panes[kPanes];
+static const bool s_indexed = [] {
+    for (int i = 0; i < kPanes; ++i) g_panes[i].index = i;
+    return true;
+}();
+static Pane* s_active = &g_panes[0];
+Pane* g_pane = &g_panes[0];
+bool g_dual = false;
+static int s_scopeDepth = 0;             // PaneScopes open
 
-std::atomic<UINT> g_enumId{ 0 };
+Pane* active_pane() { return s_active; }
+
+void pane_set_active(Pane* p) {
+    s_active = p;
+    if (!s_scopeDepth) g_pane = p;       // (else the outermost scope ends on it)
+}
+
+Pane* pane_of_list(HWND list) {
+    for (Pane& p : g_panes)
+        if (p.list && p.list == list) return &p;
+    return nullptr;
+}
+
+PaneScope::PaneScope(Pane* p) : m_saved(g_pane) {
+    ++s_scopeDepth;
+    if (p) g_pane = p;
+}
+
+PaneScope::~PaneScope() { g_pane = --s_scopeDepth ? m_saved : s_active; }
 
 bool windows_shows_extensions() {
     SHELLSTATEW ss{};
@@ -94,12 +115,12 @@ void drain_async() {
 
 void fix_font(HWND h)  { if (g_font) SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE); }
 
-PIDLIST_ABSOLUTE current_clone() { return pidl_clone(g_current); }
+PIDLIST_ABSOLUTE current_clone() { return pidl_clone(g_pane->current); }
 
 void current_replace(PIDLIST_ABSOLUTE newAbs) {
     if (!newAbs) newAbs = pidl_desktop();
-    if (g_current) CoTaskMemFree(g_current);
-    g_current = newAbs;
+    if (g_pane->current) CoTaskMemFree(g_pane->current);
+    g_pane->current = newAbs;
 }
 
-std::wstring current_display_path() { return pidl_editingname(g_current); }
+std::wstring current_display_path() { return pidl_editingname(g_pane->current); }

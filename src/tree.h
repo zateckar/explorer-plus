@@ -1,5 +1,6 @@
 #pragma once
 #include "appstate.h"
+#include <unordered_set>
 
 // Win11 navigation pane: Home, Gallery, OneDrive | pinned Quick access folders |
 // This PC, Network. Children are listed on a worker thread when a node expands.
@@ -19,3 +20,12 @@ LRESULT tree_notify(HWND hwnd, WPARAM wp, LPARAM lp);
 
 // clone of the node pidl (empty pidl for the Desktop root); nullptr for separators
 PIDLIST_ABSOLUTE tree_get_pidl_of_item(HTREEITEM h);
+
+// what a tab shows of the navigation pane: each tab keeps its own folders expanded
+struct TreeState {
+    std::unordered_set<ULONGLONG> expanded;   // the nodes open (by their place in the tree)
+    ULONGLONG top = 0;                        // the node at the top of the view
+    bool saved = false;                       // false: a new tab (everything collapsed)
+};
+void tree_save_state(TreeState& s);           // leaving a tab
+void tree_restore_state(const TreeState& s);  // showing a tab (before it syncs to its folder)

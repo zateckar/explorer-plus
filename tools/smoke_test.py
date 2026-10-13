@@ -26,7 +26,8 @@ IDM = dict(NEWFOLDER=R['IDM_FILE_NEWFOLDER'], NEWTAB=R['IDM_FILE_NEWTAB'], CLOSE
            CMDBAR=R['IDM_VIEW_CMDBAR'], FOLDERSIZES=R['IDM_VIEW_FOLDERSIZES'], SORT_COL=R['IDM_SORT_COL_BASE'],
            VIEW_MENU=R['IDM_VIEW_MENU'], MORE_MENU=R['IDM_MORE_MENU'], APPLY_ALL=R['IDM_VIEW_APPLY_ALL'],
            RESET_ALL=R['IDM_VIEW_RESET_ALL'], TEXT_LARGER=R['IDM_TEXT_LARGER'], TEXT_SMALLER=R['IDM_TEXT_SMALLER'],
-           TEXT_RESET=R['IDM_TEXT_RESET'], TREE_DELETE=R['IDM_TREE_DELETE'])
+           TEXT_RESET=R['IDM_TEXT_RESET'], TREE_DELETE=R['IDM_TREE_DELETE'], DUALPANE=R['IDM_VIEW_DUALPANE'],
+           SORT_NAME=R['IDM_SORT_NAME'], SORT_DESC=R['IDM_SORT_DESC'])
 LV_VIEW_DETAILS, LV_VIEW_LIST, LV_VIEW_TILE = 1, 3, 4
 LVM_GETVIEW, TVM_GETITEMHEIGHT = 0x108F, 0x111C
 
@@ -363,6 +364,8 @@ for _ in range(20):
     if fly: break
 entries = app.flyout_entries(fly) if fly else []
 check('"..." lists the command bar commands', all(s in entries for s in ('New', 'Sort', 'View', 'Show command bar')), entries)
+check('"..." lists our own options: Dual pane, Folder sizes, Text size',
+      all(s in entries for s in ('Dual pane', 'Folder sizes', 'Text size')), entries)
 if fly:
     u.PostMessageW(fly, 0x0102, ord('b'), 0)       # "Show command &bar"
 check('"Show command bar" brings the row back', wait_for(cmdbar_visible, 3))
@@ -385,8 +388,13 @@ def choose(menu, items, label):
     return idx >= 0
 menu, items = open_popup(IDM['VIEW_MENU'])
 clean = [s.replace('&', '').split('\t')[0] for s in items]
-check('View menu offers Text size and Apply / Reset all folders',
-      all(s in clean for s in ('Text size', 'Apply this view to all folders', 'Reset all folders')), clean)
+check('View menu offers Apply / Reset all folders (our own options are in "...")',
+      all(s in clean for s in ('Apply this view to all folders', 'Reset all folders')) and 'Text size' not in clean, clean)
+app.close_menus()
+menu, items = open_popup(IDM['MORE_MENU'])
+clean = [s.replace('&', '').split('\t')[0] for s in items]
+check('the bar\'s "..." menu has Dual pane, Folder sizes, Text size',
+      all(s in clean for s in ('Dual pane', 'Folder sizes', 'Text size')), clean)
 app.close_menus()
 menu, items = open_popup(IDM['MORE_MENU'])
 check('the bar\'s "..." menu has "Hide command bar"', choose(menu, items, 'Hide command bar'), items)
@@ -995,13 +1003,80 @@ check('a big folder deleted in the list goes from the tree',
       wait_for(big_gone, 15) and wait_for(lambda: not big_in_tree(), 5),
       ('on disk' if os.path.exists(big) else 'gone from disk', 'in tree' if big_in_tree() else 'gone from tree'))
 
+# the sort order: chosen in the list, kept across a restart
+app.go(data)
+app.command(IDM['SORT_NAME']); time.sleep(0.3)
+first_asc = app.item_text(0)
+app.command(IDM['SORT_DESC']); time.sleep(0.5)
+first_desc = app.item_text(0)
+check('Sort > Descending reverses the list', first_desc and first_desc != first_asc, (first_asc, first_desc))
+
+# the navigation pane per tab: a folder opened in one tab stays closed in another
+def tree_shows(name):
+    return any(app.tree_item(h)[0] == name for h in app.tree_nodes())
+wait_for(lambda: app.tree_item(app.tree_caret())[0] == 'testdata', 5)
+send(app.tree, 0x1102, 0x0002, app.tree_caret())                    # TVM_EXPAND (TVE_EXPAND) testdata
+check('the tree opens the folder', wait_for(lambda: tree_shows('sub'), 5))
+app.command(IDM['NEWTAB']); time.sleep(1.0)
+check('a new tab has its own navigation pane (the folder closed)',
+      wait_for(lambda: app.tree_item(app.tree_caret())[0] == 'testdata', 5) and not tree_shows('sub'))
+app.command(IDM['CLOSETAB']); time.sleep(1.0)
+check('back in the first tab the folder is open again', wait_for(lambda: tree_shows('sub'), 5))
+
+# dual pane: a second list beside the first, with its own folder; the tab keeps the layout
+dual = os.path.join(data, 'dualdir')
+os.makedirs(dual)
+for n in ('x1.txt', 'x2.txt', 'x3.txt'):
+    open(os.path.join(dual, n), 'w').close()
+time.sleep(1.0)
+list2 = winauto.child_by_id(app.hwnd, R['IDC_LIST2'])
+def count2():
+    return send(list2, 0x1004, 0, 0)                                  # LVM_GETITEMCOUNT
+check('one list by default', list2 and not u.IsWindowVisible(list2))
+app.command(IDM['DUALPANE'])
+check('Dual pane shows a second list on the same folder',
+      wait_for(lambda: u.IsWindowVisible(list2) and count2() == app.item_count(), 5), (count2(), app.item_count()))
+check('... with the focus in it', wait_for(lambda: focused() == list2, 3), focused())
+app.screenshot(os.path.join(shots, '12_dual.png'))
+n_data = app.item_count()
+app.go(dual)
+check('the address bar opens a folder in the active (second) list',
+      wait_for(lambda: count2() == len(os.listdir(dual)), 5) and app.item_count() == n_data,
+      (count2(), app.item_count()))
+check('the title follows the active list', app.title().startswith('dualdir'), app.title())
+def caption_point(lst):                                              # the caption row above a list
+    r = W.RECT(); u.GetWindowRect(lst, ctypes.byref(r))
+    p = W.POINT(r.left + 40, r.top - 8); u.ScreenToClient(app.hwnd, ctypes.byref(p))
+    return (p.y << 16) | (p.x & 0xFFFF)
+lp = caption_point(app.list)
+u.PostMessageW(app.hwnd, 0x0201, 1, lp); u.PostMessageW(app.hwnd, 0x0202, 0, lp)     # click the first caption
+check('a click on the first list\'s caption makes it the active one',
+      wait_for(lambda: app.title().startswith('testdata') and focused() == app.list, 3), (app.title(), focused()))
+app.go(os.path.join(data, 'sub'))
+app.command(IDM['BACK']); time.sleep(0.8)
+check('Back goes back in the active list only', app.title().startswith('testdata') and app.item_count() == n_data
+      and count2() == len(os.listdir(dual)), (app.title(), app.item_count(), count2()))
+app.command(IDM['NEWTAB']); time.sleep(1.0)
+check('a new tab has one list', not u.IsWindowVisible(list2))
+app.command(IDM['CLOSETAB']); time.sleep(1.0)
+check('the dual-pane tab shows both lists again', wait_for(lambda: u.IsWindowVisible(list2) and count2() > 0, 5)
+      and count2() == len(os.listdir(dual)), count2())
+
 app.close()
 check('exits cleanly after the second run', app.proc.returncode == 0, app.proc.returncode)
 app = App(exe, data, settings=ini)
 app.wait_idle(2)
+list2 = winauto.child_by_id(app.hwnd, R['IDC_LIST2'])
 check('text size remembered after restart', row_h() == rows1, (row_h(), rows1))
 app.command(IDM['TEXT_RESET']); time.sleep(0.5)
 check('Reset text size', row_h() == rows0, (row_h(), rows0))
+check('the sort order is remembered after restart', wait_for(lambda: app.item_text(0) == first_desc, 3),
+      (app.item_text(0), first_desc))
+check('the dual-pane layout and its folders are remembered after restart',
+      wait_for(lambda: u.IsWindowVisible(list2) and count2() == len(os.listdir(dual)), 5),
+      (u.IsWindowVisible(list2), count2()))
+app.command(IDM['DUALPANE'])
+check('Dual pane off: one list again', wait_for(lambda: not u.IsWindowVisible(list2), 3))
 app.close()
 
 failed = [n for n, ok in results if not ok]

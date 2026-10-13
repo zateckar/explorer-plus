@@ -24,7 +24,6 @@ static std::wstring s_editName;              // as shown when the edit began
 static std::wstring s_editHiddenExt;         // the extension the shown name leaves out (ours or Windows')
 static bool s_editExtForced = false;
 static PIDLIST_ABSOLUTE s_editFolder = nullptr;  // absolute pidl of the folder the renamed item is in
-static bool s_selChangePosted = false;
 
 // ---------------------------------------------------------------
 // view application
@@ -34,55 +33,60 @@ static bool s_selChangePosted = false;
 // image with the row's height (so the next image of the strip shows under a short
 // icon). They therefore get blank image lists of the row height, which only reserve
 // the icon and check box slots; icons, overlays and boxes are drawn in item post-paint.
-static HIMAGELIST s_padSmall = nullptr, s_padState = nullptr;
-static int s_padKey = -1;
-static HTHEME s_boxTheme = nullptr;      // "Button" theme of the list (check boxes)
-static int s_boxW = 0;
+struct ListState {
+    HIMAGELIST padSmall = nullptr, padState = nullptr;
+    int padKey = -1;
+    HTHEME boxTheme = nullptr;            // "Button" theme of the list (check boxes)
+    int boxW = 0;
+    bool selChangePosted = false;
+};
+static ListState s_lists[kPanes];
+static ListState& ls() { return s_lists[g_pane->index]; }
 
 static bool padded_view(UINT v) { return v == LV_VIEW_DETAILS || v == LV_VIEW_LIST || v == LV_VIEW_SMALLICON; }
-static bool padded_rows() { return padded_view(g_view.lvView); }
+static bool padded_rows() { return padded_view(g_pane->view.lvView); }
 
 static void apply_image_lists(UINT v) {
     HIMAGELIST small = sys_imagelist(SHIL_SMALL);
-    if (s_boxTheme) { CloseThemeData(s_boxTheme); s_boxTheme = nullptr; }
+    if (ls().boxTheme) { CloseThemeData(ls().boxTheme); ls().boxTheme = nullptr; }
     if (!padded_view(v)) {
         // the control's own drawing: its check boxes (if any) and the shell icons
-        if (s_padState && ListView_GetImageList(g_list, LVSIL_STATE) == s_padState) {
-            ListView_SetImageList(g_list, nullptr, LVSIL_STATE);
+        if (ls().padState && ListView_GetImageList(g_pane->list, LVSIL_STATE) == ls().padState) {
+            ListView_SetImageList(g_pane->list, nullptr, LVSIL_STATE);
             if (g_checkBoxes) {        // re-setting the style recreates the control's box images
-                ListView_SetExtendedListViewStyleEx(g_list, LVS_EX_CHECKBOXES, 0);
-                ListView_SetExtendedListViewStyleEx(g_list, LVS_EX_CHECKBOXES, LVS_EX_CHECKBOXES);
+                ListView_SetExtendedListViewStyleEx(g_pane->list, LVS_EX_CHECKBOXES, 0);
+                ListView_SetExtendedListViewStyleEx(g_pane->list, LVS_EX_CHECKBOXES, LVS_EX_CHECKBOXES);
             }
         }
-        ListView_SetImageList(g_list, small, LVSIL_SMALL);
+        ListView_SetImageList(g_pane->list, small, LVSIL_SMALL);
         return;
     }
-    s_boxTheme = OpenThemeData(g_list, L"Button");
+    ls().boxTheme = OpenThemeData(g_pane->list, L"Button");
     int cx = 16, cy = 16;
     ImageList_GetIconSize(small, &cx, &cy);
     int h = std::max(cy, SC(g_compactView ? 21 : 29));
-    s_boxW = S(16);
-    int key = (h << 16) ^ (cx << 8) ^ s_boxW;
-    if (key != s_padKey || !s_padSmall) {
+    ls().boxW = S(16);
+    int key = (h << 16) ^ (cx << 8) ^ ls().boxW;
+    if (key != ls().padKey || !ls().padSmall) {
         // off the control first: it would paint with freed lists until they're replaced
-        if (ListView_GetImageList(g_list, LVSIL_STATE) == s_padState) ListView_SetImageList(g_list, nullptr, LVSIL_STATE);
-        if (ListView_GetImageList(g_list, LVSIL_SMALL) == s_padSmall) ListView_SetImageList(g_list, nullptr, LVSIL_SMALL);
-        if (s_padSmall) ImageList_Destroy(s_padSmall);     // (LVS_SHAREIMAGELISTS: ours to free)
-        if (s_padState) ImageList_Destroy(s_padState);
-        s_padSmall = ImageList_Create(cx, h, ILC_COLOR32, 0, 1);
-        s_padState = ImageList_Create(s_boxW, h, ILC_COLOR32, 0, 1);
-        s_padKey = key;
+        if (ListView_GetImageList(g_pane->list, LVSIL_STATE) == ls().padState) ListView_SetImageList(g_pane->list, nullptr, LVSIL_STATE);
+        if (ListView_GetImageList(g_pane->list, LVSIL_SMALL) == ls().padSmall) ListView_SetImageList(g_pane->list, nullptr, LVSIL_SMALL);
+        if (ls().padSmall) ImageList_Destroy(ls().padSmall);     // (LVS_SHAREIMAGELISTS: ours to free)
+        if (ls().padState) ImageList_Destroy(ls().padState);
+        ls().padSmall = ImageList_Create(cx, h, ILC_COLOR32, 0, 1);
+        ls().padState = ImageList_Create(ls().boxW, h, ILC_COLOR32, 0, 1);
+        ls().padKey = key;
     }
     // state list first: setting the small list is what makes the control re-measure rows
-    ListView_SetImageList(g_list, g_checkBoxes ? s_padState : nullptr, LVSIL_STATE);
-    ListView_SetImageList(g_list, nullptr, LVSIL_SMALL);
-    ListView_SetImageList(g_list, s_padSmall, LVSIL_SMALL);
+    ListView_SetImageList(g_pane->list, g_checkBoxes ? ls().padState : nullptr, LVSIL_STATE);
+    ListView_SetImageList(g_pane->list, nullptr, LVSIL_SMALL);
+    ListView_SetImageList(g_pane->list, ls().padSmall, LVSIL_SMALL);
 }
 
 void list_apply_view() {
-    if (!g_list) return;
-    UINT v = g_view.lvView;
-    ListView_SetView(g_list, v);
+    if (!g_pane->list) return;
+    UINT v = g_pane->view.lvView;
+    ListView_SetView(g_pane->list, v);
     if (v == LV_VIEW_TILE) {
         LVTILEVIEWINFO tv{};
         tv.cbSize = sizeof(tv);
@@ -91,21 +95,21 @@ void list_apply_view() {
         tv.sizeTile.cx = SC(280);
         tv.sizeTile.cy = SC(68);
         tv.cLines = 2;
-        ListView_SetTileViewInfo(g_list, &tv);
+        ListView_SetTileViewInfo(g_pane->list, &tv);
     }
     // normal (large) imagelist: thumbnails for the icon views, shell icons otherwise
     HIMAGELIST normal = nullptr;
-    if (g_view.thumbsExtra && v == LV_VIEW_ICON) normal = thumb_imagelist_for_current_view();
+    if (g_pane->view.thumbsExtra && v == LV_VIEW_ICON) normal = thumb_imagelist_for_current_view();
     if (!normal) normal = sys_imagelist(v == LV_VIEW_TILE ? SHIL_EXTRALARGE : SHIL_LARGE);
-    ListView_SetImageList(g_list, normal, LVSIL_NORMAL);
+    ListView_SetImageList(g_pane->list, normal, LVSIL_NORMAL);
     // item check boxes mirror the selection; owner-data lists keep no per-item state
     // but selection/focus, so overlays, "cut" ghosting and the boxes come from
     // LVN_GETDISPINFO. The Name header gets a select-all box.
-    ListView_SetExtendedListViewStyleEx(g_list, LVS_EX_CHECKBOXES, g_checkBoxes ? LVS_EX_CHECKBOXES : 0);
-    ListView_SetCallbackMask(g_list, LVIS_OVERLAYMASK | LVIS_CUT | (g_checkBoxes ? LVIS_STATEIMAGEMASK : 0));
+    ListView_SetExtendedListViewStyleEx(g_pane->list, LVS_EX_CHECKBOXES, g_checkBoxes ? LVS_EX_CHECKBOXES : 0);
+    ListView_SetCallbackMask(g_pane->list, LVIS_OVERLAYMASK | LVIS_CUT | (g_checkBoxes ? LVIS_STATEIMAGEMASK : 0));
     // after the style: setting LVS_EX_CHECKBOXES installs the control's own box images
     apply_image_lists(v);
-    if (HWND hdr = ListView_GetHeader(g_list)) {
+    if (HWND hdr = ListView_GetHeader(g_pane->list)) {
         LONG_PTR st = GetWindowLongPtrW(hdr, GWL_STYLE);
         LONG_PTR want = g_checkBoxes ? (st | HDS_CHECKBOXES) : (st & ~(LONG_PTR)HDS_CHECKBOXES);
         if (want != st) SetWindowLongPtrW(hdr, GWL_STYLE, want);
@@ -115,8 +119,8 @@ void list_apply_view() {
 
 // header select-all box: checked when every item is selected
 bool list_all_selected() {
-    int n = ListView_GetItemCount(g_list);
-    return n > 0 && (int)ListView_GetSelectedCount(g_list) == n;
+    int n = ListView_GetItemCount(g_pane->list);
+    return n > 0 && (int)ListView_GetSelectedCount(g_pane->list) == n;
 }
 
 // a press on an item's check box toggles just that item, like Ctrl+click
@@ -124,13 +128,13 @@ static bool toggle_check_at(POINT pt) {
     if (!g_checkBoxes) return false;
     LVHITTESTINFO ht{};
     ht.pt = pt;
-    int i = ListView_HitTest(g_list, &ht);
+    int i = ListView_HitTest(g_pane->list, &ht);
     if (i < 0 || !(ht.flags & LVHT_ONITEMSTATEICON)) return false;
-    bool sel = ListView_GetItemState(g_list, i, LVIS_SELECTED) & LVIS_SELECTED;
-    ListView_SetItemState(g_list, i, sel ? 0 : LVIS_SELECTED, LVIS_SELECTED);
-    ListView_SetItemState(g_list, i, LVIS_FOCUSED, LVIS_FOCUSED);
-    ListView_SetSelectionMark(g_list, i);
-    SetFocus(g_list);
+    bool sel = ListView_GetItemState(g_pane->list, i, LVIS_SELECTED) & LVIS_SELECTED;
+    ListView_SetItemState(g_pane->list, i, sel ? 0 : LVIS_SELECTED, LVIS_SELECTED);
+    ListView_SetItemState(g_pane->list, i, LVIS_FOCUSED, LVIS_FOCUSED);
+    ListView_SetSelectionMark(g_pane->list, i);
+    SetFocus(g_pane->list);
     return true;
 }
 
@@ -144,14 +148,15 @@ static bool toggle_group_at(POINT pt);
 static bool on_empty_space(POINT pt) {
     LVHITTESTINFO ht{};
     ht.pt = pt;
-    int i = (int)SendMessageW(g_list, LVM_HITTEST, (WPARAM)-1, (LPARAM)&ht);   // -1: group hits too
+    int i = (int)SendMessageW(g_pane->list, LVM_HITTEST, (WPARAM)-1, (LPARAM)&ht);   // -1: group hits too
     const UINT groupParts = LVHT_EX_GROUP_HEADER | LVHT_EX_GROUP_FOOTER | LVHT_EX_GROUP_COLLAPSE |
                             LVHT_EX_GROUP_STATEICON | LVHT_EX_GROUP_SUBSETLINK;
     return i < 0 && !(ht.flags & (groupParts | LVHT_ONITEM));
 }
 
 // a press on a group header's chevron toggles the group instead of selecting its items
-static LRESULT CALLBACK list_subclass(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+static LRESULT CALLBACK list_subclass(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR pane) {
+    PaneScope ps(&g_panes[pane]);         // (ref data: the pane's index)
     static bool swallowUp = false;
     static bool swallowSpace = false;     // the WM_CHAR of a Space that toggled a check box
     static DWORD lastCharTime = 0;        // a character typed to find an item by name
@@ -248,42 +253,43 @@ static LRESULT CALLBACK list_subclass(HWND h, UINT msg, WPARAM wp, LPARAM lp, UI
 
 void list_create() {
     // LVS_SHAREIMAGELISTS: the system image lists must never be destroyed by the control
-    DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+    // (the second pane's list shows in dual-pane tabs only)
+    DWORD style = WS_CHILD | (g_pane->index == 0 ? WS_VISIBLE : 0) | WS_TABSTOP |
                   LVS_REPORT | LVS_SHOWSELALWAYS | LVS_OWNERDATA | LVS_EDITLABELS | LVS_SHAREIMAGELISTS;
-    g_list = CreateWindowExW(0, WC_LISTVIEWW, L"", style,
-                             0, 0, 100, 100, g_main, (HMENU)IDC_LIST, g_hinst, nullptr);
-    SendMessageW(g_list, WM_SETFONT, (WPARAM)content_font(), FALSE);
-    ListView_SetExtendedListViewStyle(g_list,
+    g_pane->list = CreateWindowExW(0, WC_LISTVIEWW, L"", style, 0, 0, 100, 100, g_main,
+                                   (HMENU)(INT_PTR)(g_pane->index == 0 ? IDC_LIST : IDC_LIST2), g_hinst, nullptr);
+    SendMessageW(g_pane->list, WM_SETFONT, (WPARAM)content_font(), FALSE);
+    ListView_SetExtendedListViewStyle(g_pane->list,
         LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_INFOTIP | LVS_EX_HEADERDRAGDROP);
     columns_apply(columns_defaults(nullptr, nullptr));   // Name / Date modified / Type / Size until a folder lists
-    groups_install(g_list);
-    SetWindowSubclass(g_list, list_subclass, 1, 0);
+    groups_install(g_pane->list);
+    SetWindowSubclass(g_pane->list, list_subclass, 1, (DWORD_PTR)g_pane->index);
     // no dotted focus rectangle (Explorer shows none)
-    SendMessageW(g_list, WM_CHANGEUISTATE, MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS), 0);
+    SendMessageW(g_pane->list, WM_CHANGEUISTATE, MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS), 0);
     list_apply_view();
 }
 
 // ---------------------------------------------------------------
 // selection helpers
 
-// Child pidls of the selected rows. The pointers stay owned by g_items and are valid
+// Child pidls of the selected rows. The pointers stay owned by g_pane->items and are valid
 // until the next listing is applied on the UI thread — use them synchronously.
 std::vector<PCITEMID_CHILD> list_selected_pidls() {
     std::vector<PCITEMID_CHILD> out;
-    std::lock_guard<std::mutex> lk(g_itemsMx);
+    std::lock_guard<std::mutex> lk(g_pane->itemsMx);
     int idx = -1;
-    while ((idx = ListView_GetNextItem(g_list, idx, LVNI_SELECTED)) != -1)
-        if (idx < (int)g_items.size() && g_items[idx] && g_items[idx]->pidl)
-            out.push_back(g_items[idx]->pidl);
+    while ((idx = ListView_GetNextItem(g_pane->list, idx, LVNI_SELECTED)) != -1)
+        if (idx < (int)g_pane->items.size() && g_pane->items[idx] && g_pane->items[idx]->pidl)
+            out.push_back(g_pane->items[idx]->pidl);
     return out;
 }
 
-int list_first_selected() { return ListView_GetNextItem(g_list, -1, LVNI_SELECTED); }
+int list_first_selected() { return ListView_GetNextItem(g_pane->list, -1, LVNI_SELECTED); }
 
 void navigation_open_selected() {
     std::vector<PIDLIST_ABSOLUTE> full;
     for (PCITEMID_CHILD c : list_selected_pidls())
-        if (PIDLIST_ABSOLUTE f = ILCombine(g_current, c)) full.push_back(f);
+        if (PIDLIST_ABSOLUTE f = ILCombine(g_pane->current, c)) full.push_back(f);
     // a single folder (or folder shortcut) opens in place; multiple items each get
     // their default verb, folders among them navigate to the first one
     PIDLIST_ABSOLUTE navTarget = nullptr;
@@ -299,7 +305,7 @@ void navigation_open_selected() {
     }
     if (navTarget) {
         // a folder found by a search opens at its real location, not inside the result set
-        PIDLIST_ABSOLUTE real = search_is_results(g_current) ? search_real_location(navTarget) : nullptr;
+        PIDLIST_ABSOLUTE real = search_is_results(g_pane->current) ? search_real_location(navTarget) : nullptr;
         if (real) navigate_owned(real);
         else navigate_to(navTarget);
     }
@@ -313,42 +319,42 @@ void list_copy_selection(bool cut) {
     auto sel = list_selected_pidls();
     if (sel.empty()) return;
     com_ptr<IShellFolder> psf;
-    if (FAILED(bind_list(g_current, IID_PPV_ARGS(psf.put()))) || !psf) return;
+    if (FAILED(bind_list(g_pane->current, IID_PPV_ARGS(psf.put()))) || !psf) return;
     // (not on the clipboard: no row is ghosted)
     bool onClipboard = fileops_set_clipboard(psf.get(), sel, cut);
     fileops_set_cut_items(cut && onClipboard ? sel : std::vector<PCITEMID_CHILD>{});
-    InvalidateRect(g_list, nullptr, FALSE);
+    InvalidateRect(g_pane->list, nullptr, FALSE);
 }
 
 void list_delete_selection(bool permanent) {
     auto sel = list_selected_pidls();
     if (sel.empty()) return;
     com_ptr<IShellFolder> psf;
-    if (FAILED(bind_list(g_current, IID_PPV_ARGS(psf.put()))) || !psf) return;
+    if (FAILED(bind_list(g_pane->current, IID_PPV_ARGS(psf.put()))) || !psf) return;
     fileops_delete_items(g_main, psf.get(), sel, permanent);
 }
 
 void list_rename_selected() {
-    int idx = ListView_GetNextItem(g_list, -1, LVNI_FOCUSED | LVNI_SELECTED);
+    int idx = ListView_GetNextItem(g_pane->list, -1, LVNI_FOCUSED | LVNI_SELECTED);
     if (idx < 0) idx = list_first_selected();
     if (idx < 0) return;
-    SetFocus(g_list);
-    ListView_EditLabel(g_list, idx);
+    SetFocus(g_pane->list);
+    ListView_EditLabel(g_pane->list, idx);
 }
 
 void list_show_properties() { contextmenu_properties(g_main); }
 
-void list_select_all()  { ListView_SetItemState(g_list, -1, LVIS_SELECTED, LVIS_SELECTED); }
-void list_select_none() { ListView_SetItemState(g_list, -1, 0, LVIS_SELECTED); }
+void list_select_all()  { ListView_SetItemState(g_pane->list, -1, LVIS_SELECTED, LVIS_SELECTED); }
+void list_select_none() { ListView_SetItemState(g_pane->list, -1, 0, LVIS_SELECTED); }
 void list_invert_selection() {
-    int n = ListView_GetItemCount(g_list);
-    SendMessageW(g_list, WM_SETREDRAW, FALSE, 0);
+    int n = ListView_GetItemCount(g_pane->list);
+    SendMessageW(g_pane->list, WM_SETREDRAW, FALSE, 0);
     for (int i = 0; i < n; ++i) {
-        UINT st = ListView_GetItemState(g_list, i, LVIS_SELECTED);
-        ListView_SetItemState(g_list, i, (st & LVIS_SELECTED) ? 0 : LVIS_SELECTED, LVIS_SELECTED);
+        UINT st = ListView_GetItemState(g_pane->list, i, LVIS_SELECTED);
+        ListView_SetItemState(g_pane->list, i, (st & LVIS_SELECTED) ? 0 : LVIS_SELECTED, LVIS_SELECTED);
     }
-    SendMessageW(g_list, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(g_list, nullptr, FALSE);
+    SendMessageW(g_pane->list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_pane->list, nullptr, FALSE);
 }
 
 // ---------------------------------------------------------------
@@ -358,23 +364,23 @@ void list_context_menu(POINT screenPt) {
     if (screenPt.x == -1 && screenPt.y == -1) {
         // keyboard popup (Shift+F10 / Apps key): at the focused item, or top-left
         RECT rc{};
-        int idx = ListView_GetNextItem(g_list, -1, LVNI_FOCUSED | LVNI_SELECTED);
+        int idx = ListView_GetNextItem(g_pane->list, -1, LVNI_FOCUSED | LVNI_SELECTED);
         if (idx < 0) idx = list_first_selected();
         POINT c{ 8, 8 };
-        if (idx >= 0 && ListView_GetItemRect(g_list, idx, &rc, LVIR_ICON)) c = { rc.left, rc.bottom };
-        ClientToScreen(g_list, &c);
+        if (idx >= 0 && ListView_GetItemRect(g_pane->list, idx, &rc, LVIR_ICON)) c = { rc.left, rc.bottom };
+        ClientToScreen(g_pane->list, &c);
         if (idx >= 0) show_items_context_menu(g_main, c);
         else show_bg_context_menu(g_main, c);
         return;
     }
     POINT c = screenPt;
-    ScreenToClient(g_list, &c);
+    ScreenToClient(g_pane->list, &c);
     LVHITTESTINFO ht{}; ht.pt = c;
-    int idx = ListView_HitTest(g_list, &ht);
+    int idx = ListView_HitTest(g_pane->list, &ht);
     if (idx >= 0 && (ht.flags & LVHT_ONITEM)) {
-        if (!(ListView_GetItemState(g_list, idx, LVIS_SELECTED) & LVIS_SELECTED)) {
-            ListView_SetItemState(g_list, -1, 0, LVIS_SELECTED);
-            ListView_SetItemState(g_list, idx, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        if (!(ListView_GetItemState(g_pane->list, idx, LVIS_SELECTED) & LVIS_SELECTED)) {
+            ListView_SetItemState(g_pane->list, -1, 0, LVIS_SELECTED);
+            ListView_SetItemState(g_pane->list, idx, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
         }
         show_items_context_menu(g_main, screenPt);
     } else {
@@ -390,15 +396,15 @@ static void handle_getdispinfo(LV_DISPINFOW* di) {
     int i = di->item.iItem;
     // (asked before taking the lock: the list answers selection queries itself)
     bool checked = g_checkBoxes && (di->item.mask & LVIF_STATE) &&
-                   (ListView_GetItemState(g_list, i, LVIS_SELECTED) & LVIS_SELECTED);
-    std::lock_guard<std::mutex> lk(g_itemsMx);
-    if (i < 0 || i >= (int)g_items.size()) return;
-    Item* it = g_items[i];
+                   (ListView_GetItemState(g_pane->list, i, LVIS_SELECTED) & LVIS_SELECTED);
+    std::lock_guard<std::mutex> lk(g_pane->itemsMx);
+    if (i < 0 || i >= (int)g_pane->items.size()) return;
+    Item* it = g_pane->items[i];
     if (di->item.mask & LVIF_TEXT)
         wcsncpy_s(di->item.pszText, di->item.cchTextMax, columns_text(it, di->item.iSubItem), _TRUNCATE);
     if (di->item.mask & LVIF_IMAGE) {
         di->item.iImage = it->icon;
-        if (g_view.thumbsExtra && g_view.lvView == LV_VIEW_ICON) {
+        if (g_pane->view.thumbsExtra && g_pane->view.lvView == LV_VIEW_ICON) {
             int img = -1;
             thumb_get_or_request(it, i, &img);
             // until the thumbnail arrives the row shows no image (the normal
@@ -415,7 +421,7 @@ static void handle_getdispinfo(LV_DISPINFOW* di) {
             di->item.stateMask |= LVIS_STATEIMAGEMASK;
         }
     }
-    if ((di->item.mask & LVIF_COLUMNS) && g_view.lvView == LV_VIEW_TILE) {
+    if ((di->item.mask & LVIF_COLUMNS) && g_pane->view.lvView == LV_VIEW_TILE) {
         // tiles: type + size under the name. The control passes its own arrays with
         // cColumns slots: fill them (with a pointer of ours it reads its zeroed buffer,
         // and column 0 is the name)
@@ -440,11 +446,11 @@ static RECT group_chevron_rect(const RECT& header) {
 static LRESULT draw_group_header(NMLVCUSTOMDRAW* cd) {
     int id = (int)cd->nmcd.dwItemSpec;
     RECT r = cd->rcText;           // the header band
-    if (!ListView_GetGroupRect(g_list, id, LVGGR_HEADER, &r)) r = cd->rcText;
+    if (!ListView_GetGroupRect(g_pane->list, id, LVGGR_HEADER, &r)) r = cd->rcText;
     HDC dc = cd->nmcd.hdc;
     const Palette& p = pal();
     fill_rect(dc, r, p.content);
-    bool collapsed = ListView_GetGroupState(g_list, id, LVGS_COLLAPSED) & LVGS_COLLAPSED;
+    bool collapsed = ListView_GetGroupState(g_pane->list, id, LVGS_COLLAPSED) & LVGS_COLLAPSED;
     RECT chev = group_chevron_rect(r);
     draw_glyph(dc, collapsed ? L'\xE76C' : L'\xE70D', chev, p.textSecondary, 10);
     HGDIOBJ of = SelectObject(dc, content_font_bold());
@@ -461,17 +467,17 @@ static LRESULT draw_group_header(NMLVCUSTOMDRAW* cd) {
     return CDRF_SKIPDEFAULT;
 }
 
-struct DriveTile {                 // copied out of g_items: drawing calls back into the list
+struct DriveTile {                 // copied out of g_pane->items: drawing calls back into the list
     std::wstring name, type;
     int icon = 0, overlay = 0;
     ULONGLONG driveTotal = 0, driveFree = 0;
 };
 
 static bool drive_tile(int idx, DriveTile* out) {
-    if (g_view.lvView != LV_VIEW_TILE) return false;
-    std::lock_guard<std::mutex> lk(g_itemsMx);
-    if (idx < 0 || idx >= (int)g_items.size() || !g_items[idx]->driveType) return false;
-    const Item* it = g_items[idx];
+    if (g_pane->view.lvView != LV_VIEW_TILE) return false;
+    std::lock_guard<std::mutex> lk(g_pane->itemsMx);
+    if (idx < 0 || idx >= (int)g_pane->items.size() || !g_pane->items[idx]->driveType) return false;
+    const Item* it = g_pane->items[idx];
     *out = { it->name, it->type, it->icon, it->overlay, it->driveTotal, it->driveFree };
     return true;
 }
@@ -480,17 +486,17 @@ static LRESULT draw_drive_tile(NMLVCUSTOMDRAW* cd, const DriveTile* it, int idx)
     HDC dc = cd->nmcd.hdc;
     const Palette& p = pal();
     RECT r{};
-    ListView_GetItemRect(g_list, idx, &r, LVIR_BOUNDS);
+    ListView_GetItemRect(g_pane->list, idx, &r, LVIR_BOUNDS);
     // selection / hover background from the list's own (light/dark) theme
-    UINT st = ListView_GetItemState(g_list, idx, LVIS_SELECTED);
+    UINT st = ListView_GetItemState(g_pane->list, idx, LVIS_SELECTED);
     bool sel = st & LVIS_SELECTED, hot = cd->nmcd.uItemState & CDIS_HOT;
-    bool focused = GetFocus() == g_list;
+    bool focused = GetFocus() == g_pane->list;
     int part = 1 /*LVP_LISTITEM*/;
     int state = sel ? (hot ? 6 /*LISS_HOTSELECTED*/ : focused ? 3 /*LISS_SELECTED*/ : 5 /*LISS_SELECTEDNOTFOCUS*/)
                     : hot ? 2 /*LISS_HOT*/ : 0;
     fill_rect(dc, r, p.content);
     if (state) {
-        if (HTHEME th = OpenThemeData(g_list, L"ListView")) {
+        if (HTHEME th = OpenThemeData(g_pane->list, L"ListView")) {
             DrawThemeBackground(th, dc, part, state, &r, nullptr);
             CloseThemeData(th);
         } else {
@@ -545,15 +551,15 @@ static LRESULT draw_drive_tile(NMLVCUSTOMDRAW* cd, const DriveTile* it, int idx)
 static void draw_row_images(NMLVCUSTOMDRAW* cd) {
     int idx = (int)cd->nmcd.dwItemSpec;
     RECT ic{};
-    if (!ListView_GetItemRect(g_list, idx, &ic, LVIR_ICON)) return;
-    bool checked = g_checkBoxes && (ListView_GetItemState(g_list, idx, LVIS_SELECTED) & LVIS_SELECTED);
+    if (!ListView_GetItemRect(g_pane->list, idx, &ic, LVIR_ICON)) return;
+    bool checked = g_checkBoxes && (ListView_GetItemState(g_pane->list, idx, LVIS_SELECTED) & LVIS_SELECTED);
     bool hot = cd->nmcd.uItemState & CDIS_HOT;
     int icon = -1, overlay = 0;
     bool cut = false;
     {
-        std::lock_guard<std::mutex> lk(g_itemsMx);
-        if (idx < 0 || idx >= (int)g_items.size()) return;
-        const Item* it = g_items[idx];
+        std::lock_guard<std::mutex> lk(g_pane->itemsMx);
+        if (idx < 0 || idx >= (int)g_pane->items.size()) return;
+        const Item* it = g_pane->items[idx];
         icon = it->icon;
         overlay = it->overlay;
         cut = (it->attrs & SFGAO_GHOSTED) || fileops_is_cut(it->pidl);
@@ -561,10 +567,10 @@ static void draw_row_images(NMLVCUSTOMDRAW* cd) {
     HDC dc = cd->nmcd.hdc;
     int saved = SaveDC(dc);
     // Details: stay inside the Name column (it may be narrow, scrolled or moved)
-    if (HWND hdr = g_view.lvView == LV_VIEW_DETAILS ? ListView_GetHeader(g_list) : nullptr) {
+    if (HWND hdr = g_pane->view.lvView == LV_VIEW_DETAILS ? ListView_GetHeader(g_pane->list) : nullptr) {
         RECT hr{};
         if (Header_GetItemRect(hdr, 0, &hr)) {
-            MapWindowPoints(hdr, g_list, (POINT*)&hr, 2);
+            MapWindowPoints(hdr, g_pane->list, (POINT*)&hr, 2);
             IntersectClipRect(dc, hr.left, ic.top, hr.right, ic.bottom);
         }
     }
@@ -588,12 +594,12 @@ static void draw_row_images(NMLVCUSTOMDRAW* cd) {
     if (g_checkBoxes && (checked || hot)) {
         // the state slot sits right before the icon
         int box = S(13);
-        RECT slot{ ic.left - s_boxW, ic.top, ic.left, ic.bottom };
-        RECT b{ slot.left + (s_boxW - box) / 2, (slot.top + slot.bottom - box) / 2, 0, 0 };
+        RECT slot{ ic.left - ls().boxW, ic.top, ic.left, ic.bottom };
+        RECT b{ slot.left + (ls().boxW - box) / 2, (slot.top + slot.bottom - box) / 2, 0, 0 };
         b.right = b.left + box;
         b.bottom = b.top + box;
-        if (s_boxTheme)
-            DrawThemeBackground(s_boxTheme, dc, BP_CHECKBOX,
+        if (ls().boxTheme)
+            DrawThemeBackground(ls().boxTheme, dc, BP_CHECKBOX,
                                 checked ? (hot ? CBS_CHECKEDHOT : CBS_CHECKEDNORMAL)
                                         : (hot ? CBS_UNCHECKEDHOT : CBS_UNCHECKEDNORMAL), &b, nullptr);
         else
@@ -607,7 +613,7 @@ static void draw_row_images(NMLVCUSTOMDRAW* cd) {
 // The control is told the item is plain so it draws only the text on top.
 static void draw_item_background(NMLVCUSTOMDRAW* cd) {
     int idx = (int)cd->nmcd.dwItemSpec;
-    UINT st = ListView_GetItemState(g_list, idx, LVIS_SELECTED | LVIS_DROPHILITED);
+    UINT st = ListView_GetItemState(g_pane->list, idx, LVIS_SELECTED | LVIS_DROPHILITED);
     bool sel = st & LVIS_SELECTED, drop = st & LVIS_DROPHILITED;
     bool hot = (cd->nmcd.uItemState & CDIS_HOT) || drop;
     cd->nmcd.uItemState &= ~(CDIS_SELECTED | CDIS_HOT | CDIS_FOCUS);
@@ -615,8 +621,8 @@ static void draw_item_background(NMLVCUSTOMDRAW* cd) {
     cd->clrTextBk = CLR_NONE;
     if (!sel && !hot) return;
     RECT r{};
-    UINT code = g_view.lvView == LV_VIEW_DETAILS ? LVIR_BOUNDS : LVIR_SELECTBOUNDS;
-    if (!ListView_GetItemRect(g_list, idx, &r, code)) return;
+    UINT code = g_pane->view.lvView == LV_VIEW_DETAILS ? LVIR_BOUNDS : LVIR_SELECTBOUNDS;
+    if (!ListView_GetItemRect(g_pane->list, idx, &r, code)) return;
     double a = sel ? (hot ? 0.14 : 0.10) : 0.06;
     COLORREF c = blend(pal().content, g_dark ? RGB(255, 255, 255) : RGB(0, 0, 0), g_dark ? a : a * 0.75);
     fill_rrect(cd->nmcd.hdc, r, S(2), c);
@@ -652,15 +658,15 @@ static LRESULT handle_custom_draw(NMLVCUSTOMDRAW* cd) {
 static bool toggle_group_at(POINT pt) {
     LVHITTESTINFO ht{};
     ht.pt = pt;
-    SendMessageW(g_list, LVM_HITTEST, (WPARAM)-1, (LPARAM)&ht);   // -1: extended (group) hit info
+    SendMessageW(g_pane->list, LVM_HITTEST, (WPARAM)-1, (LPARAM)&ht);   // -1: extended (group) hit info
     if (!(ht.flags & LVHT_EX_GROUP_HEADER)) return false;
     RECT r{};
-    if (!ListView_GetGroupRect(g_list, ht.iGroup, LVGGR_HEADER, &r)) GetClientRect(g_list, &r);
+    if (!ListView_GetGroupRect(g_pane->list, ht.iGroup, LVGGR_HEADER, &r)) GetClientRect(g_pane->list, &r);
     RECT chev = group_chevron_rect(r);
     chev.top = LONG_MIN / 2; chev.bottom = LONG_MAX / 2;     // the header hit test did the vertical part
     if (!PtInRect(&chev, pt)) return false;
-    UINT st = ListView_GetGroupState(g_list, ht.iGroup, LVGS_COLLAPSED);
-    ListView_SetGroupState(g_list, ht.iGroup, LVGS_COLLAPSED, (st & LVGS_COLLAPSED) ? 0 : LVGS_COLLAPSED);
+    UINT st = ListView_GetGroupState(g_pane->list, ht.iGroup, LVGS_COLLAPSED);
+    ListView_SetGroupState(g_pane->list, ht.iGroup, LVGS_COLLAPSED, (st & LVGS_COLLAPSED) ? 0 : LVGS_COLLAPSED);
     return true;
 }
 
@@ -668,14 +674,14 @@ static int find_item(LPNMLVFINDITEMW fi) {
     if (!(fi->lvfi.flags & (LVFI_STRING | LVFI_PARTIAL)) || !fi->lvfi.psz) return -1;
     // type-ahead asks for a prefix (LVFI_PARTIAL / LVFI_SUBSTRING); LVFI_STRING alone is exact
     const bool prefix = fi->lvfi.flags & (LVFI_PARTIAL | 0x0004 /*LVFI_SUBSTRING*/);
-    std::lock_guard<std::mutex> lk(g_itemsMx);
-    int n = (int)g_items.size();
+    std::lock_guard<std::mutex> lk(g_pane->itemsMx);
+    int n = (int)g_pane->items.size();
     if (!n) return -1;
     size_t len = wcslen(fi->lvfi.psz);
     int start = fi->iStart > 0 ? fi->iStart % n : 0;
     for (int k = 0; k < n; ++k) {
         int i = (start + k) % n;
-        const std::wstring& name = g_items[i]->name;
+        const std::wstring& name = g_pane->items[i]->name;
         if (prefix ? _wcsnicmp(name.c_str(), fi->lvfi.psz, len) == 0 : _wcsicmp(name.c_str(), fi->lvfi.psz) == 0)
             return i;
         if (!(fi->lvfi.flags & LVFI_WRAP) && start + k + 1 >= n) break;
@@ -712,12 +718,12 @@ static void edit_forget() {
 
 static void edit_capture(int idx) {
     edit_forget();
-    std::lock_guard<std::mutex> lk(g_itemsMx);
-    if (idx < 0 || idx >= (int)g_items.size() || !g_items[idx]->pidl) return;
-    const Item* it = g_items[idx];
+    std::lock_guard<std::mutex> lk(g_pane->itemsMx);
+    if (idx < 0 || idx >= (int)g_pane->items.size() || !g_pane->items[idx]->pidl) return;
+    const Item* it = g_pane->items[idx];
     s_editIndex = idx;
     s_editPidl = pidl_clone_child(it->pidl);
-    s_editFolder = pidl_clone(g_current);       // the folder the item is in, whatever happens meanwhile
+    s_editFolder = pidl_clone(g_pane->current);       // the folder the item is in, whatever happens meanwhile
     s_editName = it->name;
     s_editHiddenExt = it->hiddenExt;
     s_editExtForced = it->extForced;
@@ -750,7 +756,7 @@ static void rename_commit(const std::wstring& newName) {
 
 // select the base name in the label editor ("report" of "report.txt"), like Explorer
 static void select_base_name() {
-    HWND edit = ListView_GetEditControl(g_list);
+    HWND edit = ListView_GetEditControl(g_pane->list);
     if (!edit) return;
     int len = GetWindowTextLengthW(edit);
     std::wstring text((size_t)len + 1, L'\0');
@@ -759,8 +765,8 @@ static void select_base_name() {
     size_t dot = text.find_last_of(L'.');
     bool folder = false;
     {
-        std::lock_guard<std::mutex> lk(g_itemsMx);
-        if (s_editIndex >= 0 && s_editIndex < (int)g_items.size()) folder = g_items[s_editIndex]->isFolder;
+        std::lock_guard<std::mutex> lk(g_pane->itemsMx);
+        if (s_editIndex >= 0 && s_editIndex < (int)g_pane->items.size()) folder = g_pane->items[s_editIndex]->isFolder;
     }
     // a hidden extension is not in the text: then the whole text is the base name.
     // (posted: the list view selects the whole text after this notification returns)
@@ -811,8 +817,8 @@ LRESULT list_notify(HWND, WPARAM, LPARAM lp) {
         case LVN_ITEMCHANGED:
         case LVN_ODSTATECHANGED: {
             // Ctrl+A on 10k items sends 10k notifications: coalesce into one update
-            if (!s_selChangePosted)       // (not posted: the next change tries again)
-                s_selChangePosted = PostMessageW(g_main, WM_SELECTION_CHANGED, 0, 0) != FALSE;
+            if (!ls().selChangePosted)       // (not posted: the next change tries again)
+                ls().selChangePosted = PostMessageW(g_main, WM_SELECTION_CHANGED, (WPARAM)g_pane->index, 0) != FALSE;
             return 0;
         }
         case LVN_ITEMACTIVATE:      // double-click and Enter
@@ -823,7 +829,7 @@ LRESULT list_notify(HWND, WPARAM, LPARAM lp) {
 }
 
 void list_on_selection_changed() {
-    s_selChangePosted = false;
+    ls().selChangePosted = false;
     status_update();
     detailspane_update();
     if (g_checkBoxes) enum_update_header_arrows();     // the select-all box follows

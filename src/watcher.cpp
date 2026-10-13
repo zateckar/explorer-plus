@@ -10,42 +10,52 @@
 #include <unordered_set>
 
 static HWND s_main = nullptr;
-static UINT s_changeMsg = 0;
-static ULONG s_regId = 0;
-static PIDLIST_ABSOLUTE s_folder = nullptr;        // the watched folder
-static PIDLIST_ABSOLUTE s_parent = nullptr;        // its parent, also watched (local folders)
-static bool s_listChanged = false;                 // a change the list has to show
-// the list's changes item by item (full paths), unless a change needs a full re-listing
-static std::vector<std::wstring> s_changedPaths;
-static std::unordered_set<std::wstring> s_changedSet;  // the same, lowercased: each path once
-static bool s_fullRefresh = false;
 static const size_t kMaxItemChanges = 200;          // more files: re-list the folder instead
+
+struct DirWatch;
+
+// each pane watches its own folder (UI thread)
+struct WatchState {
+    UINT changeMsg = 0;                             // registered message the shell posts to
+    ULONG regId = 0;
+    PIDLIST_ABSOLUTE folder = nullptr;              // the watched folder
+    PIDLIST_ABSOLUTE parent = nullptr;              // its parent, also watched (local folders)
+    bool listChanged = false;                       // a change the list has to show
+    // the list's changes item by item (full paths), unless a change needs a full re-listing
+    std::vector<std::wstring> changedPaths;
+    std::unordered_set<std::wstring> changedSet;    // the same, lowercased: each path once
+    bool fullRefresh = false;
+    ULONGLONG firstPending = 0;                     // tick of the first change the timer waits for (0: none)
+    std::shared_ptr<DirWatch> dirWatch;
+    UINT dirGen = 0;                                // bumped when the watch goes: older results are dropped
+};
+static WatchState s_watch[kPanes];
+static WatchState& ws() { return s_watch[g_pane->index]; }
 
 // a file changed (a download growing reports itself many times: it counts once);
 // too many different files make it a full re-listing
 static void add_changed(const std::wstring& path) {
-    if (s_fullRefresh) return;
+    if (ws().fullRefresh) return;
     std::wstring k = path;
     CharLowerBuffW(k.data(), (DWORD)k.size());
-    if (!s_changedSet.insert(std::move(k)).second) return;
-    s_changedPaths.push_back(path);
-    if (s_changedPaths.size() > kMaxItemChanges) {
-        s_fullRefresh = true;
-        s_changedPaths.clear();
-        s_changedSet.clear();
+    if (!ws().changedSet.insert(std::move(k)).second) return;
+    ws().changedPaths.push_back(path);
+    if (ws().changedPaths.size() > kMaxItemChanges) {
+        ws().fullRefresh = true;
+        ws().changedPaths.clear();
+        ws().changedSet.clear();
     }
 }
 
 static void clear_changed() {
-    s_changedPaths.clear();
-    s_changedSet.clear();
+    ws().changedPaths.clear();
+    ws().changedSet.clear();
 }
 static const UINT kBusyRetryMs = 300;               // the list is busy: apply the changes after this
 static std::vector<PIDLIST_ABSOLUTE> s_treeParents;   // tree nodes whose children changed
 
 static const UINT kDebounceMs = 200;    // coalesce bursts (copying 1000 files = 1 refresh)
 static const ULONGLONG kMaxWaitMs = 1000;   // ... but a steady stream (a download) still shows
-static ULONGLONG s_firstPending = 0;        // tick of the first change the timer waits for (0: none)
 static int s_hold = 0;                      // our own file operations running (watcher_hold_begin)
 
 // ------------------------------------------------------------------
@@ -55,6 +65,7 @@ static int s_hold = 0;                      // our own file operations running (
 // (Not on removable or USB disks: the open handle would stop "Safely remove"; not on shares.)
 
 struct DirWatch {
+    Pane* pane = nullptr;
     HANDLE dir = INVALID_HANDLE_VALUE;
     HANDLE ev = nullptr;              // overlapped completion
     HANDLE stop = nullptr;            // set by the UI thread
@@ -66,10 +77,9 @@ struct DirWatch {
         if (stop) CloseHandle(stop);
     }
 };
-static std::shared_ptr<DirWatch> s_dirWatch;
-static UINT s_dirGen = 0;             // bumped when the watch goes: older results are dropped
 
 struct DirChanges {
+    Pane* pane = nullptr;
     UINT gen = 0;
     std::vector<std::wstring> paths;
     bool overflow = false;            // too many to name (or the folder went): re-list
@@ -82,18 +92,19 @@ static void stop_dir_watch();
 
 static void dir_changes_apply(void* payload) {
     std::unique_ptr<DirChanges> c(static_cast<DirChanges*>(payload));
-    if (c->gen != s_dirGen) return;
+    PaneScope ps(c->pane);
+    if (c->gen != ws().dirGen) return;
     // a dead watch lets go of the folder (its handle would keep a deleted folder
     // "delete pending"); the refresh below opens a new one if the folder is still there
     if (c->ended) stop_dir_watch();
-    s_listChanged = true;
+    ws().listChanged = true;
     if (c->overflow) {
-        s_fullRefresh = true;
+        ws().fullRefresh = true;
         clear_changed();
     } else {
         for (auto& p : c->paths) add_changed(p);
     }
-    if (c->structure && s_folder) s_treeParents.push_back(pidl_clone(s_folder));   // its subfolders
+    if (c->structure && ws().folder) s_treeParents.push_back(pidl_clone(ws().folder));   // its subfolders
     if (perf_on()) perf_event("watch.dir", -1, (long long)c->paths.size(), c->overflow ? L"overflow" : nullptr);
     arm_refresh_timer();
 }
@@ -118,6 +129,7 @@ static void dir_watch_thread(std::shared_ptr<DirWatch> w) {
             failed = !GetOverlappedResult(w->dir, &ov, &got, FALSE);
         }
         auto* c = new DirChanges;
+        c->pane = w->pane;
         c->gen = w->gen;
         c->ended = failed;
         if (failed || got == 0) {
@@ -139,10 +151,10 @@ static void dir_watch_thread(std::shared_ptr<DirWatch> w) {
 }
 
 static void stop_dir_watch() {
-    ++s_dirGen;
-    if (!s_dirWatch) return;
-    SetEvent(s_dirWatch->stop);
-    s_dirWatch.reset();                  // (the thread holds its own reference)
+    ++ws().dirGen;
+    if (!ws().dirWatch) return;
+    SetEvent(ws().dirWatch->stop);
+    ws().dirWatch.reset();                  // (the thread holds its own reference)
 }
 
 static void start_dir_watch(const std::wstring& path) {
@@ -152,8 +164,9 @@ static void start_dir_watch(const std::wstring& path) {
     DWORD a = GetFileAttributesW(path.c_str());
     if (a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY)) return;   // (a zip is a file)
     auto w = std::make_shared<DirWatch>();
+    w->pane = g_pane;
     w->path = path;
-    w->gen = s_dirGen;
+    w->gen = ws().dirGen;
     // share everything: the folder can still be renamed or deleted while watched
     w->dir = CreateFileW(path.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                          nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
@@ -165,24 +178,29 @@ static void start_dir_watch(const std::wstring& path) {
     } catch (...) {
         return;                          // (the shell's notifications still come)
     }
-    s_dirWatch = w;
+    ws().dirWatch = w;
 }
 
 void watcher_init(HWND main) {
     s_main = main;
-    s_changeMsg = RegisterWindowMessageW(L"ExplorerPlus.ChangeNotify");
+    for (int i = 0; i < kPanes; ++i)
+        s_watch[i].changeMsg = RegisterWindowMessageW((L"ExplorerPlus.ChangeNotify" + std::to_wstring(i)).c_str());
 }
 
-UINT watcher_change_msg() { return s_changeMsg; }
+int watcher_pane_of_msg(UINT msg) {
+    for (int i = 0; i < kPanes; ++i)
+        if (msg && msg == s_watch[i].changeMsg) return i;
+    return -1;
+}
 
 void deregister_current_watch() {
     stop_dir_watch();
-    if (s_regId) { SHChangeNotifyDeregister(s_regId); s_regId = 0; }
-    if (s_folder) { CoTaskMemFree(s_folder); s_folder = nullptr; }
-    if (s_parent) { CoTaskMemFree(s_parent); s_parent = nullptr; }
+    if (ws().regId) { SHChangeNotifyDeregister(ws().regId); ws().regId = 0; }
+    if (ws().folder) { CoTaskMemFree(ws().folder); ws().folder = nullptr; }
+    if (ws().parent) { CoTaskMemFree(ws().parent); ws().parent = nullptr; }
     // changes of the folder left behind no longer matter
-    s_listChanged = false;
-    s_fullRefresh = false;
+    ws().listChanged = false;
+    ws().fullRefresh = false;
     clear_changed();
 }
 
@@ -190,36 +208,36 @@ void watcher_register_for(PCIDLIST_ABSOLUTE folder) {
     if (!s_main) return;
     // a refresh keeps the watch: re-registering would lose the changes in between
     // (the directory watch may have been released for a file operation: open it again)
-    if (s_regId && s_folder && (folder ? pidl_equal(s_folder, folder) : pidl_is_desktop(s_folder))) {
+    if (ws().regId && ws().folder && (folder ? pidl_equal(ws().folder, folder) : pidl_is_desktop(ws().folder))) {
         WCHAR path[MAX_PATH];
-        if (!s_dirWatch && !s_hold && folder && SHGetPathFromIDListW(folder, path)) start_dir_watch(path);
+        if (!ws().dirWatch && !s_hold && folder && SHGetPathFromIDListW(folder, path)) start_dir_watch(path);
         return;
     }
     deregister_current_watch();
     PIDLIST_ABSOLUTE root = folder ? nullptr : pidl_desktop();
-    s_folder = pidl_clone(folder ? folder : root);
+    ws().folder = pidl_clone(folder ? folder : root);
     SHChangeNotifyEntry ent[2]{};
-    ent[0].pidl = s_folder;
+    ent[0].pidl = ws().folder;
     ent[0].fRecursive = FALSE;
     // a watch on a folder is not told when the folder itself goes: the parent's is
     // (local folders only: a share's parent can be slow to watch)
     WCHAR path[MAX_PATH];
     if (folder && SHGetPathFromIDListW(folder, path) && iswalpha(path[0]) && path[1] == L':' &&
-        !PathIsRootW(path) && (s_parent = pidl_clone(folder)) && ILRemoveLastID(s_parent)) {
-        ent[1].pidl = s_parent;
+        !PathIsRootW(path) && (ws().parent = pidl_clone(folder)) && ILRemoveLastID(ws().parent)) {
+        ent[1].pidl = ws().parent;
         ent[1].fRecursive = FALSE;
-    } else if (s_parent) {
-        CoTaskMemFree(s_parent);
-        s_parent = nullptr;
+    } else if (ws().parent) {
+        CoTaskMemFree(ws().parent);
+        ws().parent = nullptr;
     }
     // InterruptLevel catches changes made outside the shell (cmd, other apps);
     // NewDelivery hands us a lock handle instead of raw pointers.
-    s_regId = SHChangeNotifyRegister(
+    ws().regId = SHChangeNotifyRegister(
         s_main,
         SHCNRF_ShellLevel | SHCNRF_InterruptLevel | SHCNRF_NewDelivery,
         SHCNE_ALLEVENTS,
-        s_changeMsg,
-        s_parent ? 2 : 1, ent);
+        ws().changeMsg,
+        ws().parent ? 2 : 1, ent);
     if (root) CoTaskMemFree(root);
     if (folder && SHGetPathFromIDListW(folder, path)) start_dir_watch(path);
 }
@@ -227,10 +245,10 @@ void watcher_register_for(PCIDLIST_ABSOLUTE folder) {
 // does the change touch the shown folder (its items, or the folder itself)? The
 // parent's watch also reports the folder's siblings: those only matter to the tree.
 static bool touches_folder(PCIDLIST_ABSOLUTE item) {
-    if (!s_parent || !item) return true;
-    if (pidl_equal(item, s_folder)) return true;
+    if (!ws().parent || !item) return true;
+    if (pidl_equal(item, ws().folder)) return true;
     PIDLIST_ABSOLUTE up = pidl_clone(item);
-    bool inside = up && ILRemoveLastID(up) && pidl_equal(up, s_folder);
+    bool inside = up && ILRemoveLastID(up) && pidl_equal(up, ws().folder);
     if (up) CoTaskMemFree(up);
     return inside;
 }
@@ -239,11 +257,11 @@ static bool touches_folder(PCIDLIST_ABSOLUTE item) {
 // those items again. Anything else — the folder itself, a whole-folder update, no item,
 // a flood of changes — re-lists the folder.
 static void note_change(LONG event, PIDLIST_ABSOLUTE* pidls) {
-    if (s_fullRefresh) return;
+    if (ws().fullRefresh) return;
     const LONG itemEvents = SHCNE_CREATE | SHCNE_MKDIR | SHCNE_DELETE | SHCNE_RMDIR | SHCNE_RENAMEITEM |
                             SHCNE_RENAMEFOLDER | SHCNE_UPDATEITEM | SHCNE_ATTRIBUTES;
     bool itemized = pidls && pidls[0] && (event & itemEvents) && !(event & ~(itemEvents | SHCNE_INTERRUPT)) &&
-                    !pidl_equal(pidls[0], s_folder);
+                    !pidl_equal(pidls[0], ws().folder);
     WCHAR path[MAX_PATH];
     for (int i = 0; itemized && i < 2; ++i) {
         if (i == 1 && !(event & (SHCNE_RENAMEITEM | SHCNE_RENAMEFOLDER))) break;
@@ -251,7 +269,7 @@ static void note_change(LONG event, PIDLIST_ABSOLUTE* pidls) {
         else add_changed(path);
     }
     if (!itemized) {
-        s_fullRefresh = true;
+        ws().fullRefresh = true;
         clear_changed();
     }
     if (perf_on()) {
@@ -280,8 +298,8 @@ void watcher_on_message(WPARAM wp, LPARAM lp) {
     // the directory watch names the files a file-system "folder updated" is about (and
     // the folder's own date / attributes changing with them): not a reason to re-list.
     // (Shell-level updates stay: an app asking for a refresh.)
-    if (s_dirWatch && (event & SHCNE_INTERRUPT) && (event & (SHCNE_UPDATEDIR | SHCNE_UPDATEITEM | SHCNE_ATTRIBUTES)) &&
-        pidls && pidls[0] && pidl_equal(pidls[0], s_folder)) {
+    if (ws().dirWatch && (event & SHCNE_INTERRUPT) && (event & (SHCNE_UPDATEDIR | SHCNE_UPDATEITEM | SHCNE_ATTRIBUTES)) &&
+        pidls && pidls[0] && pidl_equal(pidls[0], ws().folder)) {
         if (perf_on()) perf_event("watch.covered", -1, (long long)event);
         SHChangeNotification_Unlock(lock);
         return;
@@ -293,7 +311,7 @@ void watcher_on_message(WPARAM wp, LPARAM lp) {
     // (a rename can move an item in or out: either name counts)
     bool rename = (event & (SHCNE_RENAMEITEM | SHCNE_RENAMEFOLDER)) != 0;
     if (!pidls || !pidls[0] || touches_folder(pidls[0]) || (rename && pidls[1] && touches_folder(pidls[1]))) {
-        s_listChanged = true;
+        ws().listChanged = true;
         note_change(event, pidls);
     }
     SHChangeNotification_Unlock(lock);
@@ -303,43 +321,48 @@ void watcher_on_message(WPARAM wp, LPARAM lp) {
 // debounce: each change pushes the refresh back, up to kMaxWaitMs after the first
 static void arm_refresh_timer() {
     ULONGLONG now = GetTickCount64();
-    if (!s_firstPending) s_firstPending = now;
-    ULONGLONG waited = now - s_firstPending;
+    if (!ws().firstPending) ws().firstPending = now;
+    ULONGLONG waited = now - ws().firstPending;
     if (waited >= kMaxWaitMs) return;                // due any moment: let the timer fire
     UINT delay = (UINT)std::min<ULONGLONG>(kDebounceMs, kMaxWaitMs - waited);
-    SetTimer(s_main, TIMER_WATCH_REFRESH, delay, nullptr);
+    SetTimer(s_main, pane_timer(TIMER_WATCH_REFRESH), delay, nullptr);
 }
 
 void watcher_hold_begin(bool releaseDir) {
     ++s_hold;
     if (releaseDir) {
-        stop_dir_watch();
-        foldersizes_release_watch();     // (watching again once the folder is listed again)
+        for_each_pane([] {
+            stop_dir_watch();
+            foldersizes_release_watch();     // (watching again once the folder is listed again)
+        });
     }
 }
 
 void watcher_hold_end() {
     if (s_hold > 0) --s_hold;
-    if (!s_hold && (s_listChanged || !s_treeParents.empty())) arm_refresh_timer();   // what was held
+    if (s_hold) return;
+    for_each_pane([] {                       // what was held (the tree's changes go with the first pane)
+        if (ws().listChanged || (g_pane->index == 0 && !s_treeParents.empty())) arm_refresh_timer();
+    });
 }
 
 void watcher_on_timer() {
-    KillTimer(s_main, TIMER_WATCH_REFRESH);
-    s_firstPending = 0;
+    KillTimer(s_main, pane_timer(TIMER_WATCH_REFRESH));
+    ws().firstPending = 0;
     if (s_hold) return;                     // (watcher_hold_end arms the timer again)
-    if (s_listChanged && !navigation_leave_if_gone()) {
-        ChangeApply r = s_fullRefresh ? ChangeApply::Unsupported : enum_apply_changes(s_changedPaths);
+    if (ws().listChanged && !navigation_leave_if_gone()) {
+        ChangeApply r = ws().fullRefresh ? ChangeApply::Unsupported : enum_apply_changes(ws().changedPaths);
         if (r == ChangeApply::Busy) {
-            SetTimer(s_main, TIMER_WATCH_REFRESH, kBusyRetryMs, nullptr);   // (keeps the changes)
+            SetTimer(s_main, pane_timer(TIMER_WATCH_REFRESH), kBusyRetryMs, nullptr);   // (keeps the changes)
         } else {
             if (r == ChangeApply::Unsupported) navigation_refresh();
-            s_listChanged = false;
-            s_fullRefresh = false;
+            ws().listChanged = false;
+            ws().fullRefresh = false;
             clear_changed();
         }
     } else {
-        s_listChanged = false;
-        s_fullRefresh = false;
+        ws().listChanged = false;
+        ws().fullRefresh = false;
         clear_changed();
     }
     std::vector<PIDLIST_ABSOLUTE> parents;

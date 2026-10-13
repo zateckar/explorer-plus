@@ -34,6 +34,7 @@ struct Result {
 };
 
 struct Walk {
+    Pane* pane = nullptr;
     UINT opId = 0, gen = 0;
     std::vector<std::pair<std::wstring, std::wstring>> folders;   // (Item::key, \\?\ path)
     std::atomic<size_t> next{ 0 };
@@ -41,10 +42,11 @@ struct Walk {
     std::mutex mx;
     std::vector<Result> done;             // not posted yet
     ULONGLONG lastPost = 0;
-    bool cancelled() const { return opId != g_enumId.load() || gen != s_gen.load() || workers_stopping(); }
+    bool cancelled() const { return opId != pane->enumId.load() || gen != s_gen.load() || workers_stopping(); }
 };
 
 struct Batch {
+    Pane* pane = nullptr;
     UINT opId = 0, gen = 0;
     std::vector<Result> results;
     bool final = false;                   // the walk is over
@@ -53,9 +55,22 @@ struct Batch {
 struct CachedSize {
     ULONGLONG bytes, tick, walkMs;
 };
-std::unordered_map<std::wstring, CachedSize> s_cache;      // UI thread only
-// folders being walked (cache key -> the listing the walk is for), UI thread only
-std::unordered_map<std::wstring, UINT> s_walking;
+std::unordered_map<std::wstring, CachedSize> s_cache;      // UI thread only (both panes)
+
+struct DeepWatch;
+
+// each pane's walks and watch (UI thread)
+struct SizeState {
+    // folders being walked (cache key -> the listing the walk is for)
+    std::unordered_map<std::wstring, UINT> walking;
+    std::shared_ptr<DeepWatch> deep;
+    UINT deepGen = 0;                        // bumped when the watch goes: its late changes are dropped
+    std::wstring deepDir;                    // the folder watched (ends in '\')
+    std::unordered_set<std::wstring> dirty;  // subfolders (Item::key) changed and not walked again yet
+    bool dirtyAll = false;
+};
+SizeState s_sizes[kPanes];
+SizeState& ss() { return s_sizes[g_pane->index]; }
 
 std::wstring lower(std::wstring s) {
     CharLowerBuffW(s.data(), (DWORD)s.size());
@@ -156,6 +171,7 @@ void apply(void* payload);
 
 void post(Walk& w, bool final) {          // (w.mx held)
     auto* b = new Batch;
+    b->pane = w.pane;
     b->opId = w.opId;
     b->gen = w.gen;
     b->results.swap(w.done);
@@ -184,7 +200,7 @@ void walker(const std::shared_ptr<Walk>& w) {
 }
 
 void remember(const Result& r, ULONGLONG now) {
-    s_walking.erase(r.path);
+    ss().walking.erase(r.path);
     if (!r.known) { s_cache.erase(r.path); return; }
     if (s_cache.size() >= kCacheMax) s_cache.clear();     // (rarely: start over)
     s_cache[r.path] = { r.bytes, now, r.walkMs };
@@ -192,35 +208,36 @@ void remember(const Result& r, ULONGLONG now) {
 
 void apply(void* payload) {
     std::unique_ptr<Batch> b(static_cast<Batch*>(payload));
+    PaneScope ps(b->pane);
     ULONGLONG now = GetTickCount64();
     for (auto& r : b->results) remember(r, now);           // (useful even for a listing gone by)
-    if (b->opId != g_enumId.load() || b->gen != s_gen.load()) return;     // another listing by now
+    if (b->opId != g_pane->enumId.load() || b->gen != s_gen.load()) return;     // another listing by now
     bool selectedChanged = false;
     if (!b->results.empty()) {
         std::unordered_map<std::wstring, const Result*> sizes;
         sizes.reserve(b->results.size());
         for (auto& r : b->results) sizes[r.key] = &r;
-        std::lock_guard<std::mutex> lk(g_itemsMx);
-        for (int i = 0; i < (int)g_items.size(); ++i) {
-            Item* it = g_items[i];
+        std::lock_guard<std::mutex> lk(g_pane->itemsMx);
+        for (int i = 0; i < (int)g_pane->items.size(); ++i) {
+            Item* it = g_pane->items[i];
             if (!it->isFolder) continue;
             auto f = sizes.find(it->key);
             if (f == sizes.end()) continue;
             const Result& r = *f->second;
             it->bytes = r.known ? r.bytes : 0;
             it->size = r.known ? fmt_size_kb(r.bytes) : std::wstring();
-            selectedChanged |= (ListView_GetItemState(g_list, i, LVIS_SELECTED) & LVIS_SELECTED) != 0;
+            selectedChanged |= (ListView_GetItemState(g_pane->list, i, LVIS_SELECTED) & LVIS_SELECTED) != 0;
         }
-        InvalidateRect(g_list, nullptr, FALSE);
+        InvalidateRect(g_pane->list, nullptr, FALSE);
     }
     if (selectedChanged) detailspane_update();
     // sorted by size: the folders take their places once all are known (not while the
     // user may be clicking them)
-    if (b->final && g_sortColumn == COL_SIZE) enum_sort_items();
+    if (b->final && g_pane->sortColumn == COL_SIZE) enum_sort_items();
 }
 
 bool has_size_column() {
-    for (auto& c : g_columns)
+    for (auto& c : g_pane->columns)
         if (c.kind == COL_SIZE) return true;
     return false;
 }
@@ -237,6 +254,7 @@ constexpr ULONGLONG kDeepMaxWaitMs = 5000;   // ... or this long after it began
 constexpr ULONGLONG kDeepMinMs = 5000;
 
 struct DeepWatch {
+    Pane* pane = nullptr;
     HANDLE dir = INVALID_HANDLE_VALUE;
     HANDLE ev = nullptr;                  // overlapped completion
     HANDLE stop = nullptr;                // set by the UI thread
@@ -249,22 +267,19 @@ struct DeepWatch {
 };
 
 struct DeepChanges {
+    Pane* pane = nullptr;
     UINT gen = 0;
     std::unordered_set<std::wstring> names;   // subfolders changed inside (lowercased)
     bool all = false;                         // too many changes to name: every subfolder
     bool ended = false;                       // the watch failed and its thread is gone
 };
 
-std::shared_ptr<DeepWatch> s_deep;           // UI thread
-UINT s_deepGen = 0;                          // bumped when the watch goes: its late changes are dropped
-std::wstring s_deepDir;                      // the folder watched (ends in '\')
-std::unordered_set<std::wstring> s_dirty;    // subfolders (Item::key) changed and not walked again yet
-bool s_dirtyAll = false;
 
 void deep_apply(void* payload);
 
 void deep_post(const DeepWatch& w, std::unordered_set<std::wstring>& names, bool& all, bool ended = false) {
     auto* c = new DeepChanges;
+    c->pane = w.pane;
     c->gen = w.gen;
     c->names.swap(names);
     c->all = all;
@@ -329,21 +344,22 @@ void deep_thread(std::shared_ptr<DeepWatch> w) {
 }
 
 void deep_stop() {
-    ++s_deepGen;
-    s_dirty.clear();
-    s_dirtyAll = false;
-    if (g_main) KillTimer(g_main, TIMER_FOLDER_SIZES);
-    s_deepDir.clear();
-    if (!s_deep) return;
-    SetEvent(s_deep->stop);
-    s_deep.reset();                                     // (the thread holds its own reference)
+    ++ss().deepGen;
+    ss().dirty.clear();
+    ss().dirtyAll = false;
+    if (g_main) KillTimer(g_main, pane_timer(TIMER_FOLDER_SIZES));
+    ss().deepDir.clear();
+    if (!ss().deep) return;
+    SetEvent(ss().deep->stop);
+    ss().deep.reset();                                     // (the thread holds its own reference)
 }
 
 void deep_start(const std::wstring& dir) {
-    if (s_deep && CompareStringOrdinal(dir.c_str(), -1, s_deepDir.c_str(), -1, TRUE) == CSTR_EQUAL) return;
+    if (ss().deep && CompareStringOrdinal(dir.c_str(), -1, ss().deepDir.c_str(), -1, TRUE) == CSTR_EQUAL) return;
     deep_stop();
     auto w = std::make_shared<DeepWatch>();
-    w->gen = s_deepGen;
+    w->pane = g_pane;
+    w->gen = ss().deepGen;
     // share everything: the folder and what is in it can still be renamed or deleted
     w->dir = CreateFileW(long_path(dir).c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                          nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
@@ -355,34 +371,34 @@ void deep_start(const std::wstring& dir) {
     } catch (...) {
         return;                                         // (sizes still follow F5)
     }
-    s_deep = w;
-    s_deepDir = dir;
+    ss().deep = w;
+    ss().deepDir = dir;
 }
 
 // the changed subfolders that may be walked now; the others wait for the timer
 void walk_dirty() {
-    if (g_main) KillTimer(g_main, TIMER_FOLDER_SIZES);
-    if (!s_deep || (s_dirty.empty() && !s_dirtyAll)) return;
-    std::wstring dir = pidl_folder_path(g_current);
+    if (g_main) KillTimer(g_main, pane_timer(TIMER_FOLDER_SIZES));
+    if (!ss().deep || (ss().dirty.empty() && !ss().dirtyAll)) return;
+    std::wstring dir = pidl_folder_path(g_pane->current);
     if (!dir.empty() && dir.back() != L'\\') dir += L'\\';
-    if (CompareStringOrdinal(dir.c_str(), -1, s_deepDir.c_str(), -1, TRUE) != CSTR_EQUAL) {
-        s_dirty.clear();                                // on the way to another folder
-        s_dirtyAll = false;
+    if (CompareStringOrdinal(dir.c_str(), -1, ss().deepDir.c_str(), -1, TRUE) != CSTR_EQUAL) {
+        ss().dirty.clear();                                // on the way to another folder
+        ss().dirtyAll = false;
         return;
     }
     if (!enum_listing_complete()) {                     // a refresh on the way: after it
-        SetTimer(g_main, TIMER_FOLDER_SIZES, (UINT)kDeepQuietMs, nullptr);
+        SetTimer(g_main, pane_timer(TIMER_FOLDER_SIZES), (UINT)kDeepQuietMs, nullptr);
         return;
     }
     ULONGLONG now = GetTickCount64(), wait = 0;
     auto later = [&](ULONGLONG ms) { wait = wait ? std::min(wait, ms) : ms; };
     std::unordered_set<std::wstring> walk, still;
     {
-        std::lock_guard<std::mutex> lk(g_itemsMx);
-        for (Item* it : g_items) {
-            if (!it->isFolder || it->fileName.empty() || !(s_dirtyAll || s_dirty.count(it->key))) continue;
+        std::lock_guard<std::mutex> lk(g_pane->itemsMx);
+        for (Item* it : g_pane->items) {
+            if (!it->isFolder || it->fileName.empty() || !(ss().dirtyAll || ss().dirty.count(it->key))) continue;
             std::wstring ck = lower(long_path(dir + it->fileName));
-            if (auto b = s_walking.find(ck); b != s_walking.end() && b->second == g_enumId.load()) {
+            if (auto b = ss().walking.find(ck); b != ss().walking.end() && b->second == g_pane->enumId.load()) {
                 still.insert(it->key);                  // being walked: it may have read past the change
                 later(kDeepMinMs);
                 continue;
@@ -398,18 +414,19 @@ void walk_dirty() {
             walk.insert(it->key);
         }
     }
-    s_dirty.swap(still);
-    s_dirtyAll = false;
+    ss().dirty.swap(still);
+    ss().dirtyAll = false;
     if (perf_on()) perf_event("sizes.changed", -1, (long long)walk.size(), nullptr);
     if (!walk.empty()) foldersizes_start(&walk);
-    if (wait) SetTimer(g_main, TIMER_FOLDER_SIZES, (UINT)wait, nullptr);
+    if (wait) SetTimer(g_main, pane_timer(TIMER_FOLDER_SIZES), (UINT)wait, nullptr);
 }
 
 void deep_apply(void* payload) {
     std::unique_ptr<DeepChanges> c(static_cast<DeepChanges*>(payload));
-    if (c->gen != s_deepGen) return;
-    s_dirty.insert(c->names.begin(), c->names.end());
-    s_dirtyAll |= c->all;
+    PaneScope ps(c->pane);
+    if (c->gen != ss().deepGen) return;
+    ss().dirty.insert(c->names.begin(), c->names.end());
+    ss().dirtyAll |= c->all;
     walk_dirty();
     if (c->ended) deep_stop();           // (the next listing of the folder watches it again)
 }
@@ -419,11 +436,11 @@ void deep_apply(void* payload) {
 bool foldersizes_enabled() { return s_enabled; }
 
 void foldersizes_start(const std::unordered_set<std::wstring>* keys, SizeReuse reuse) {
-    if (!s_enabled || !g_current || !g_list || !has_size_column()) {
+    if (!s_enabled || !g_pane->current || !g_pane->list || !has_size_column()) {
         if (!keys) deep_stop();
         return;
     }
-    std::wstring dir = pidl_folder_path(g_current);
+    std::wstring dir = pidl_folder_path(g_pane->current);
     bool fsDir = is_fs_path(dir);
     if (fsDir && dir.back() != L'\\') dir += L'\\';
     // a listing complete: watch what is inside its folders (a plain folder on an internal disk)
@@ -432,16 +449,17 @@ void foldersizes_start(const std::unordered_set<std::wstring>* keys, SizeReuse r
         else deep_stop();
     }
     auto w = std::make_shared<Walk>();
-    w->opId = g_enumId.load();
+    w->pane = g_pane;
+    w->opId = g_pane->enumId.load();
     w->gen = s_gen.load();
     ULONGLONG now = GetTickCount64();
     ULONGLONG maxAge = reuse == SizeReuse::Any ? kReuseAnyMs : reuse == SizeReuse::Recent ? kReuseRecentMs : 0;
     int fromCache = 0;
     bool selectedFromCache = false;
     {
-        std::lock_guard<std::mutex> lk(g_itemsMx);
-        for (int i = 0; i < (int)g_items.size(); ++i) {
-            Item* it = g_items[i];
+        std::lock_guard<std::mutex> lk(g_pane->itemsMx);
+        for (int i = 0; i < (int)g_pane->items.size(); ++i) {
+            Item* it = g_pane->items[i];
             if (!it->isFolder || it->driveType || !(it->attrs & SFGAO_FILESYSTEM)) continue;
             if (keys && !keys->count(it->key)) continue;
             // search results and Home give each item's path; a plain folder its name
@@ -456,19 +474,19 @@ void foldersizes_start(const std::unordered_set<std::wstring>* keys, SizeReuse r
                     it->bytes = c->second.bytes;
                     it->size = fmt_size_kb(c->second.bytes);
                     ++fromCache;
-                    selectedFromCache |= (ListView_GetItemState(g_list, i, LVIS_SELECTED) & LVIS_SELECTED) != 0;
+                    selectedFromCache |= (ListView_GetItemState(g_pane->list, i, LVIS_SELECTED) & LVIS_SELECTED) != 0;
                     continue;
                 }
                 s_cache.erase(c);                            // stale, or it changed
             }
-            s_walking[ck] = w->opId;
+            ss().walking[ck] = w->opId;
             w->folders.push_back({ it->key, std::move(lp) });
         }
     }
     if (fromCache) {
-        InvalidateRect(g_list, nullptr, FALSE);
+        InvalidateRect(g_pane->list, nullptr, FALSE);
         if (selectedFromCache) detailspane_update();
-        if (w->folders.empty() && g_sortColumn == COL_SIZE) enum_sort_items();   // (no walk to wait for)
+        if (w->folders.empty() && g_pane->sortColumn == COL_SIZE) enum_sort_items();   // (no walk to wait for)
     }
     if (w->folders.empty()) return;
     int n = (int)std::min<size_t>(kWalkers, w->folders.size());
@@ -481,15 +499,15 @@ void foldersizes_on_timer() { walk_dirty(); }
 void foldersizes_release_watch() { deep_stop(); }
 
 void foldersizes_forget_shown() {
-    if (!g_current) return;
-    std::wstring dir = pidl_folder_path(g_current);
+    if (!g_pane->current) return;
+    std::wstring dir = pidl_folder_path(g_pane->current);
     if (is_fs_path(dir)) {                               // a plain folder: everything inside it
         std::wstring prefix = lower(long_path(dir));
         if (prefix.back() != L'\\') prefix += L'\\';
         std::erase_if(s_cache, [&](const auto& e) { return e.first.rfind(prefix, 0) == 0; });
     }
-    std::lock_guard<std::mutex> lk(g_itemsMx);           // search results, Home: the items' own paths
-    for (Item* it : g_items)
+    std::lock_guard<std::mutex> lk(g_pane->itemsMx);           // search results, Home: the items' own paths
+    for (Item* it : g_pane->items)
         if (it->isFolder && is_fs_path(it->path)) s_cache.erase(lower(long_path(it->path)));
 }
 
@@ -497,19 +515,21 @@ void foldersizes_set_enabled(bool on) {
     if (on == s_enabled) return;
     s_enabled = on;
     ++s_gen;
-    s_walking.clear();                                   // (the walks running stop)
-    if (!on) deep_stop();
-    if (!g_list) return;
-    if (on) {
-        if (enum_listing_complete()) foldersizes_start(nullptr, SizeReuse::Recent);   // (else when it is)
-        return;
-    }
-    {
-        std::lock_guard<std::mutex> lk(g_itemsMx);
-        for (Item* it : g_items)
-            if (it->isFolder && !it->driveType) { it->bytes = 0; it->size.clear(); }
-    }
-    InvalidateRect(g_list, nullptr, FALSE);
-    detailspane_update();
-    if (g_sortColumn == COL_SIZE) enum_sort_items();
+    for_each_pane([on] {
+        ss().walking.clear();                               // (the walks running stop)
+        if (!on) deep_stop();
+        if (!pane_shown(g_pane)) return;
+        if (on) {
+            if (enum_listing_complete()) foldersizes_start(nullptr, SizeReuse::Recent);   // (else when it is)
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_pane->itemsMx);
+            for (Item* it : g_pane->items)
+                if (it->isFolder && !it->driveType) { it->bytes = 0; it->size.clear(); }
+        }
+        InvalidateRect(g_pane->list, nullptr, FALSE);
+        detailspane_update();
+        if (g_pane->sortColumn == COL_SIZE) enum_sort_items();
+    });
 }

@@ -509,7 +509,7 @@ void show_items_context_menu(HWND hwnd, POINT pt) {
     auto sel = list_selected_pidls();
     if (sel.empty()) { show_bg_context_menu(hwnd, pt); return; }
     com_ptr<IShellFolder> parent;
-    if (FAILED(bind_list(g_current, IID_PPV_ARGS(parent.put()))) || !parent) return;
+    if (FAILED(bind_list(g_pane->current, IID_PPV_ARGS(parent.put()))) || !parent) return;
     // clone: a refresh while the menu is up would free the rows' pidls
     std::vector<PITEMID_CHILD> own;
     for (auto c : sel) own.push_back(pidl_clone_child(c));
@@ -568,9 +568,9 @@ static bool menu_has_id(HMENU m, UINT id) {
 
 // runs a New item and selects the created item in rename mode, like Explorer
 static void invoke_new_item(HWND hwnd, IContextMenu* cm, UINT id, POINT pt) {
-    std::vector<std::wstring> before = folder_names(g_current);
-    invoke_id(hwnd, cm, id, pt, g_current, false);
-    std::vector<std::wstring> after = folder_names(g_current);
+    std::vector<std::wstring> before = folder_names(g_pane->current);
+    invoke_id(hwnd, cm, id, pt, g_pane->current, false);
+    std::vector<std::wstring> after = folder_names(g_pane->current);
     for (auto& n : after) {
         if (std::find(before.begin(), before.end(), n) == before.end()) {
             enum_set_pending_select(n, true);
@@ -630,7 +630,7 @@ void show_bg_context_menu(HWND hwnd, POINT pt) {
 
     com_ptr<IShellFolder> psf;
     com_ptr<IContextMenu> cm;
-    if (SUCCEEDED(bind_list(g_current, IID_PPV_ARGS(psf.put()))) && psf)
+    if (SUCCEEDED(bind_list(g_pane->current, IID_PPV_ARGS(psf.put()))) && psf)
         psf->CreateViewObject(hwnd, IID_PPV_ARGS(cm.put()));
     if (cm && FAILED(cm->QueryContextMenu(m, fixed, kIdFirst, kIdLast, CMF_NORMAL)))
         cm.reset();
@@ -654,7 +654,7 @@ void show_bg_context_menu(HWND hwnd, POINT pt) {
         std::wstring verb = verb_of(cm.get(), id);
         if (verb == L"paste") fileops_paste_into_current();
         else if (menu_has_id(newSub, id)) invoke_new_item(hwnd, cm.get(), id, pt);
-        else invoke_id(hwnd, cm.get(), id, pt, g_current);
+        else invoke_id(hwnd, cm.get(), id, pt, g_pane->current);
     } else if (id) {
         SendMessageW(g_main, WM_COMMAND, MAKEWPARAM(id, 0), 0);
     }
@@ -685,7 +685,7 @@ static std::vector<std::wstring> folder_names(PCIDLIST_ABSOLUTE folder) {
 void show_new_menu(HWND hwnd, POINT pt, UINT tpmAlign) {
     com_ptr<IShellFolder> psf;
     com_ptr<IContextMenu> cm;
-    if (FAILED(bind_list(g_current, IID_PPV_ARGS(psf.put()))) || !psf ||
+    if (FAILED(bind_list(g_pane->current, IID_PPV_ARGS(psf.put()))) || !psf ||
         FAILED(psf->CreateViewObject(hwnd, IID_PPV_ARGS(cm.put()))) || !cm)
         return;
     HMENU host = CreatePopupMenu();
@@ -707,9 +707,9 @@ static bool invoke_verb_with(HWND hwnd, IShellFolder* parent, PIDLIST_ABSOLUTE f
 // selection, or on the current folder itself when nothing is selected
 bool contextmenu_invoke_verb(HWND hwnd, const char* verb) {
     auto sel = list_selected_pidls();
-    if (sel.empty()) return contextmenu_invoke_verb_on(hwnd, g_current, verb);
+    if (sel.empty()) return contextmenu_invoke_verb_on(hwnd, g_pane->current, verb);
     com_ptr<IShellFolder> parent;
-    if (FAILED(bind_list(g_current, IID_PPV_ARGS(parent.put())))) return false;
+    if (FAILED(bind_list(g_pane->current, IID_PPV_ARGS(parent.put())))) return false;
     std::vector<PITEMID_CHILD> own;
     for (auto c : sel) own.push_back(pidl_clone_child(c));
     return invoke_verb_with(hwnd, parent.get(), current_clone(), own, verb);
@@ -759,8 +759,8 @@ static bool invoke_verb_with(HWND hwnd, IShellFolder* parent, PIDLIST_ABSOLUTE f
 void contextmenu_properties(HWND hwnd) {
     if (contextmenu_invoke_verb(hwnd, "properties")) return;
     // virtual roots without a parent item
-    if (pidl_is_desktop(g_current) || list_selected_pidls().empty())
-        SHObjectProperties(hwnd, SHOP_FILEPATH, pidl_folder_path(g_current).c_str(), nullptr);
+    if (pidl_is_desktop(g_pane->current) || list_selected_pidls().empty())
+        SHObjectProperties(hwnd, SHOP_FILEPATH, pidl_folder_path(g_pane->current).c_str(), nullptr);
 }
 
 void contextmenu_properties_of(HWND hwnd, PCIDLIST_ABSOLUTE item) {

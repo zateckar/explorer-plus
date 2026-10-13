@@ -171,10 +171,10 @@ void search_submit() {
     if (!g_search) return;
     std::wstring q = box_text();
     if (q.empty()) { search_cancel(); return; }
-    const SearchRec* cur = find_rec(g_current);
+    const SearchRec* cur = find_rec(g_pane->current);
     if (cur && cur->query == q) return;                    // already showing it
     const bool refining = cur != nullptr;
-    PCIDLIST_ABSOLUTE scope = refining ? cur->scope : g_current;
+    PCIDLIST_ABSOLUTE scope = refining ? cur->scope : g_pane->current;
     PIDLIST_ABSOLUTE results = make_search(scope, q);
     if (!results) { MessageBeep(MB_ICONASTERISK); return; }
     SearchRec r;
@@ -196,11 +196,11 @@ void search_submit() {
 
 void search_cancel() {
     KillTimer(g_main, TIMER_SEARCH);
-    const SearchRec* cur = find_rec(g_current);
+    const SearchRec* cur = find_rec(g_pane->current);
     if (!cur) return;
     // back to the searched folder: through history when it is right behind us
     TabState* t = tabmodel_active();
-    if (t && tabmodel_can_back() && pidl_equal(t->back.back(), cur->scope)) navigation_go_back();
+    if (t && tabmodel_can_back() && pidl_equal(t->nav().back.back(), cur->scope)) navigation_go_back();
     else navigate_to(cur->scope);
 }
 
@@ -219,7 +219,7 @@ void search_on_timer() {
 
 void search_on_navigated() {
     if (!g_search) return;
-    const SearchRec* r = find_rec(g_current);
+    const SearchRec* r = find_rec(g_pane->current);
     std::wstring want = r ? r->query : std::wstring();
     if (box_text() != want) {
         s_settingText = true;

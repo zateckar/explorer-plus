@@ -281,9 +281,9 @@ struct ExpandJob {
 
 // what listings keep in view although hidden: the folder the tree follows
 static std::wstring keep_target() {
-    if (g_showHidden || !g_current) return {};
-    PCIDLIST_ABSOLUTE t = search_scope_of(g_current);
-    return pidl_folder_path(t ? t : g_current);
+    if (g_showHidden || !active_pane()->current) return {};
+    PCIDLIST_ABSOLUTE t = search_scope_of(active_pane()->current);
+    return pidl_folder_path(t ? t : active_pane()->current);
 }
 
 static bool s_syncPending = false;  // a sync waits for an ancestor's children
@@ -299,6 +299,8 @@ static void resume_sync() {
         tree_sync_to_current();
     }
 }
+
+static void restore_children(HTREEITEM h);
 
 static void expand_apply(void* payload) {
     std::unique_ptr<ExpandJob> job(static_cast<ExpandJob*>(payload));
@@ -321,6 +323,7 @@ static void expand_apply(void* payload) {
         TreeNoRedraw nr(g_tree);
         insert_children(g_tree, job->item, job->kids);
         if (!job->kids.empty()) TreeView_Expand(g_tree, job->item, TVE_EXPAND);
+        restore_children(job->item);          // (a tab's state being put back: below this node too)
     }
     resume_sync();
 }
@@ -813,8 +816,8 @@ void tree_sync_to_current_deferred() {
 void tree_sync_to_current() {
     if (!g_tree || !g_treeVisible) return;     // (showing the pane syncs it)
     // search results keep the searched folder highlighted
-    PCIDLIST_ABSOLUTE target = search_scope_of(g_current);
-    if (!target) target = g_current;
+    PCIDLIST_ABSOLUTE target = search_scope_of(active_pane()->current);
+    if (!target) target = active_pane()->current;
     // network locations are listed only on demand: walking there could block
     std::wstring path = pidl_folder_path(target);
     bool remote = path.rfind(L"\\\\", 0) == 0;
@@ -853,6 +856,78 @@ void tree_refresh_all() {
 }
 
 void tree_reread_pins() { if (g_tree) read_pins(); }
+
+// ------------------------------------------------------------------
+// each tab's own state (TreeState): the nodes expanded and the scroll position. A node is
+// known by its place in the tree, so a folder shown twice (as a pin and under This PC)
+// keeps each one's state.
+
+static ULONGLONG state_key(ULONGLONG parentKey, const NodeData* d) {
+    return (parentKey * 0x100000001B3ULL) ^ pidl_sig(d->abs);
+}
+
+static ULONGLONG key_of(HTREEITEM h) {
+    NodeData* d = node_data(g_tree, h);
+    if (!d || d->kind != NodeKind::Folder) return 0;
+    HTREEITEM parent = TreeView_GetParent(g_tree, h);
+    return state_key(parent ? key_of(parent) : 0, d);
+}
+
+static void save_below(HTREEITEM first, ULONGLONG parentKey, TreeState& s) {
+    for (HTREEITEM h = first; h; h = TreeView_GetNextSibling(g_tree, h)) {
+        NodeData* d = node_data(g_tree, h);
+        if (!d || d->kind != NodeKind::Folder || !(TreeView_GetItemState(g_tree, h, TVIS_EXPANDED) & TVIS_EXPANDED))
+            continue;
+        ULONGLONG k = state_key(parentKey, d);
+        s.expanded.insert(k);
+        save_below(TreeView_GetChild(g_tree, h), k, s);
+    }
+}
+
+static TreeState s_restoring;             // the state being put back (nodes still listing get it when listed)
+static bool s_restoreOn = false;
+
+// (every level, collapsed ones too: their children keep their own state for when they open)
+static void restore_below(HTREEITEM first, ULONGLONG parentKey) {
+    for (HTREEITEM h = first; h; h = TreeView_GetNextSibling(g_tree, h)) {
+        NodeData* d = node_data(g_tree, h);
+        if (!d || d->kind != NodeKind::Folder) continue;
+        ULONGLONG k = state_key(parentKey, d);
+        bool want = s_restoring.expanded.count(k) > 0;
+        bool open = (TreeView_GetItemState(g_tree, h, TVIS_EXPANDED) & TVIS_EXPANDED) != 0;
+        if (want && !open) TreeView_Expand(g_tree, h, TVE_EXPAND);   // (not listed yet: when it is)
+        else if (!want && open) TreeView_Expand(g_tree, h, TVE_COLLAPSE);
+        restore_below(TreeView_GetChild(g_tree, h), k);
+    }
+}
+
+static void restore_children(HTREEITEM h) {
+    if (s_restoreOn && h) restore_below(TreeView_GetChild(g_tree, h), key_of(h));
+}
+
+void tree_save_state(TreeState& s) {
+    s_restoreOn = false;
+    s.expanded.clear();
+    s.top = 0;
+    s.saved = true;
+    if (!g_tree) return;
+    save_below(TreeView_GetRoot(g_tree), 0, s);
+    if (HTREEITEM top = TreeView_GetFirstVisible(g_tree)) s.top = key_of(top);
+}
+
+void tree_restore_state(const TreeState& s) {
+    if (!g_tree) return;
+    s_restoring = s;
+    s_restoreOn = true;
+    TreeNoRedraw nr(g_tree);
+    restore_below(TreeView_GetRoot(g_tree), 0);
+    if (!s.saved || !s.top) {
+        TreeView_Select(g_tree, TreeView_GetRoot(g_tree), TVGN_FIRSTVISIBLE);
+        return;
+    }
+    for (HTREEITEM h = TreeView_GetRoot(g_tree); h; h = TreeView_GetNextVisible(g_tree, h))
+        if (key_of(h) == s.top) { TreeView_Select(g_tree, h, TVGN_FIRSTVISIBLE); break; }
+}
 
 static void set_has_children(HTREEITEM h, bool has) {
     TVITEMW ti{}; ti.mask = TVIF_CHILDREN; ti.hItem = h; ti.cChildren = has ? 1 : 0;
@@ -986,8 +1061,8 @@ void tree_rename_menu_node() {
 // is the folder the current one, or one it is in? (by ID; for file-system folders also
 // by path, in case the node and the current folder were reached by different routes)
 static bool holds_current(PCIDLIST_ABSOLUTE abs) {
-    if (pidl_equal(abs, g_current) || pidl_is_ancestor(abs, g_current)) return true;
-    std::wstring p = pidl_folder_path(abs), cur = pidl_folder_path(g_current);
+    if (pidl_equal(abs, active_pane()->current) || pidl_is_ancestor(abs, active_pane()->current)) return true;
+    std::wstring p = pidl_folder_path(abs), cur = pidl_folder_path(active_pane()->current);
     bool fs = p.size() >= 3 && ((p[1] == L':' && p[2] == L'\\') || p.compare(0, 2, L"\\\\") == 0);
     return fs && path_within(p, cur);
 }
@@ -1086,7 +1161,7 @@ static void select_by_keyboard(void* payload) {
     if (!g_tree || !node_alive(ks->node, ks->serial) || node_data(g_tree, ks->item) != ks->node) return;
     TreeView_SelectItem(g_tree, ks->item);          // programmatic: TVN_SELCHANGED ignores it
     TreeView_EnsureVisible(g_tree, ks->item);
-    if (!pidl_equal(ks->node->abs, g_current)) navigate_to(ks->node->abs);
+    if (!pidl_equal(ks->node->abs, active_pane()->current)) navigate_to(ks->node->abs);
 }
 
 LRESULT tree_notify(HWND, WPARAM, LPARAM lp) {
@@ -1124,7 +1199,7 @@ LRESULT tree_notify(HWND, WPARAM, LPARAM lp) {
             // only user selection navigates; programmatic syncs report TVC_UNKNOWN
             if (nm->action != TVC_BYMOUSE && nm->action != TVC_BYKEYBOARD) return 0;
             NodeData* d = node_data(g_tree, nm->itemNew.hItem);
-            if (d && d->kind == NodeKind::Folder && !pidl_equal(d->abs, g_current)) {
+            if (d && d->kind == NodeKind::Folder && !pidl_equal(d->abs, active_pane()->current)) {
                 if (perf_on()) perf_event("tree.select", -1, (long long)nm->action, pidl_folder_path(d->abs).c_str());
                 navigate_to(d->abs);
             }
@@ -1159,7 +1234,7 @@ LRESULT tree_notify(HWND, WPARAM, LPARAM lp) {
             PIDLIST_ABSOLUTE parentAbs = pidl_clone(d->abs);
             ILRemoveLastID(parentAbs);
             // renaming the current folder or one of its ancestors: follow it (fs paths)
-            std::wstring oldPath = pidl_folder_path(d->abs), cur = pidl_folder_path(g_current);
+            std::wstring oldPath = pidl_folder_path(d->abs), cur = pidl_folder_path(active_pane()->current);
             bool follow = holds_current(d->abs) && PathIsDirectoryW(oldPath.c_str()) && cur.size() >= oldPath.size();
             bool renamed = fileops_rename_item(g_main, parent.get(), child, nm->item.pszText);
             if (follow && renamed) {

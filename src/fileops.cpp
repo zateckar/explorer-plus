@@ -48,14 +48,14 @@ static DWORD s_cutClipSeq = 0;
 void fileops_set_cut_items(const std::vector<PCITEMID_CHILD>& children) {
     s_cutSigs.clear();
     for (auto c : children) s_cutSigs.insert(pidl_sig(c));
-    s_cutFolderSig = pidl_sig(g_current);
+    s_cutFolderSig = pidl_sig(g_pane->current);
     s_cutClipSeq = GetClipboardSequenceNumber();
 }
 
 bool fileops_is_cut(PCITEMID_CHILD child) {
     if (s_cutSigs.empty()) return false;
     if (GetClipboardSequenceNumber() != s_cutClipSeq) { s_cutSigs.clear(); return false; }
-    return s_cutFolderSig == pidl_sig(g_current) && s_cutSigs.count(pidl_sig(child));
+    return s_cutFolderSig == pidl_sig(g_pane->current) && s_cutSigs.count(pidl_sig(child));
 }
 
 // Drop `pdo` onto a folder through the folder's own drop target — the same path
@@ -101,7 +101,7 @@ static bool cut_files_still_there(IDataObject* pdo) {
     return all;
 }
 
-void fileops_paste_into_current() { fileops_paste_into(g_current); }
+void fileops_paste_into_current() { fileops_paste_into(g_pane->current); }
 
 void fileops_paste_into(PCIDLIST_ABSOLUTE folder) {
     com_ptr<IDataObject> pdo;
@@ -115,7 +115,7 @@ void fileops_paste_into(PCIDLIST_ABSOLUTE folder) {
         OleSetClipboard(nullptr);    // a cut is consumed by the paste
         s_cutSigs.clear();
     }
-    if (pidl_equal(folder, g_current)) navigation_refresh();
+    for_each_pane([folder] { if (pidl_equal(folder, g_pane->current)) navigation_refresh(); }, true);
 }
 
 bool fileops_set_clipboard(IShellFolder* parent, const std::vector<PCITEMID_CHILD>& children, bool cut) {
@@ -222,8 +222,8 @@ static bool name_exists(IShellFolder* psf, const std::wstring& name) {
 void fileops_new_folder() {
     com_ptr<IShellItem> dest;
     com_ptr<IShellFolder> psf;
-    if (FAILED(shell_item_for(g_current, dest.put())) || !dest) return;
-    if (FAILED(bind_list(g_current, IID_PPV_ARGS(psf.put()))) || !psf) return;
+    if (FAILED(shell_item_for(g_pane->current, dest.put())) || !dest) return;
+    if (FAILED(bind_list(g_pane->current, IID_PPV_ARGS(psf.put()))) || !psf) return;
     com_ptr<IFileOperation> fo;
     if (FAILED(CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL,
                                 IID_PPV_ARGS(fo.put()))) || !fo) return;

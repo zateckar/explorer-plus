@@ -12,7 +12,7 @@ bool is_this_pc_folder(PCIDLIST_ABSOLUTE abs);
 int  groups_effective();                     // GB_* in force for the current folder
 bool groups_keep_enum_order();               // Home: the shell's own order inside groups
 
-// UI thread, under g_itemsMx: give each item its group rank (Item::group), then the
+// UI thread, under g_pane->itemsMx: give each item its group rank (Item::group), then the
 // caller sorts by (group, ...) and records the ranges
 void groups_assign(std::vector<Item*>& items);
 void groups_record(const std::vector<Item*>& items);

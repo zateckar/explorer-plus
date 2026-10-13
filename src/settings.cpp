@@ -144,7 +144,7 @@ static std::map<std::wstring, std::wstring> s_columns;     // folder -> serializ
 static std::vector<std::wstring> s_tabLines;
 static int s_activeTab = 0;
 static bool s_tabsDirty = false;         // the tab set isn't in the file yet
-static std::map<std::wstring, int> s_prefs;
+static std::map<std::wstring, std::wstring> s_prefs;
 
 // what this process changed since loading / its last save
 static std::set<std::wstring> s_viewsDirty, s_columnsDirty, s_prefsDirty;
@@ -209,7 +209,7 @@ void settings_load_all() {
     // per-folder views and columns ("escaped-key=value"), small integer preferences
     for (auto& [k, v] : d.entries(L"views")) s_byFolder[ini_unescape_key(k)] = int_to_view(_wtoi(v.c_str()));
     for (auto& [k, v] : d.entries(L"columns")) s_columns[ini_unescape_key(k)] = v;
-    for (auto& [k, v] : d.entries(L"prefs")) s_prefs[k] = _wtoi(v.c_str());
+    for (auto& [k, v] : d.entries(L"prefs")) s_prefs[k] = v;
     s_mainLoaded = main_now();
 }
 
@@ -281,7 +281,7 @@ bool settings_save_all() {
         for (auto& k : s_prefsDirty) {
             auto it = s_prefs.find(k);
             if (it == s_prefs.end()) d.erase(L"prefs", k);
-            else d.set(L"prefs", k, std::to_wstring(it->second));
+            else d.set(L"prefs", k, it->second);
         }
         prune(d, L"views", kMaxViews);
         prune(d, L"columns", kMaxColumns);
@@ -347,9 +347,15 @@ void settings_set_tree_pins(const std::vector<std::wstring>& pins) {
 
 int settings_pref(const wchar_t* key, int def) {
     auto it = s_prefs.find(key);
-    return it == s_prefs.end() ? def : it->second;
+    return it == s_prefs.end() || it->second.empty() ? def : _wtoi(it->second.c_str());
 }
-void settings_set_pref(const wchar_t* key, int v) {
+void settings_set_pref(const wchar_t* key, int v) { settings_set_pref_text(key, std::to_wstring(v)); }
+
+std::wstring settings_pref_text(const wchar_t* key) {
+    auto it = s_prefs.find(key);
+    return it == s_prefs.end() ? std::wstring() : it->second;
+}
+void settings_set_pref_text(const wchar_t* key, const std::wstring& v) {
     s_prefs[key] = v;
     s_prefsDirty.insert(key);
 }

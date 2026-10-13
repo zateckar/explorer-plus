@@ -8,7 +8,7 @@ void list_context_menu(POINT screenPt);    // (-1,-1) = keyboard invocation
 void list_on_selection_changed();          // WM_SELECTION_CHANGED handler
 int  list_sort_display_column();           // header column showing the sort arrow (-1: none)
 
-std::vector<PCITEMID_CHILD> list_selected_pidls();   // owned by g_items; use synchronously
+std::vector<PCITEMID_CHILD> list_selected_pidls();   // owned by g_pane->items; use synchronously
 void list_copy_selection(bool cut);
 void list_delete_selection(bool permanent);
 void list_rename_selected();

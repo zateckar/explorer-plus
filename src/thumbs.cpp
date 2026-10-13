@@ -7,11 +7,14 @@
 // extracted by a small pool of worker threads. Requests are served newest-first so
 // the rows being looked at win.
 
-static HIMAGELIST s_lists[4] = {};       // index by View::thumbsExtra (1..3)
+// each pane has its own image lists and request ids
+static HIMAGELIST s_lists[kPanes][4] = {};   // index by View::thumbsExtra (1..3)
 static int thumb_px(int extra) { return extra == 2 ? 256 : extra == 3 ? 48 : 96; }
-static std::atomic<UINT> s_opId{ 1 };
+static std::atomic<UINT> s_opId[kPanes] = { 1, 1 };
+static HIMAGELIST* lists() { return s_lists[g_pane->index]; }
 
 struct ThumbReq {
+    int pane = 0;
     UINT opId = 0;
     ULONGLONG sig = 0;
     int px = 96;
@@ -19,6 +22,7 @@ struct ThumbReq {
     PIDLIST_ABSOLUTE abs = nullptr;   // owned
 };
 struct ThumbResult {
+    int pane;
     UINT opId;
     ULONGLONG sig;
     int extra;
@@ -81,7 +85,7 @@ static void pool_worker() {
             s_queue.pop_back();
         }
         HBITMAP hbm = nullptr;
-        if (r->opId == s_opId.load()) {
+        if (r->opId == s_opId[r->pane].load()) {
             com_ptr<IShellItemImageFactory> f;
             if (SUCCEEDED(SHCreateItemFromIDList(r->abs, IID_PPV_ARGS(f.put()))) && f) {
                 HBITMAP raw = nullptr;
@@ -93,8 +97,8 @@ static void pool_worker() {
             }
         }
         CoTaskMemFree(r->abs);
-        if (r->opId == s_opId.load())
-            post_async(apply_result, new ThumbResult{ r->opId, r->sig, r->extra, hbm });
+        if (r->opId == s_opId[r->pane].load())
+            post_async(apply_result, new ThumbResult{ r->pane, r->opId, r->sig, r->extra, hbm });
         else if (hbm)
             DeleteObject(hbm);
         delete r;
@@ -106,7 +110,7 @@ static void pool_worker() {
 // dropped and their rows ask again if they come back into view.
 static const size_t kMaxQueued = 512, kDropSlack = 256;
 
-// (UI thread, g_itemsMx held: from LVN_GETDISPINFO)
+// (UI thread, g_pane->itemsMx held: from LVN_GETDISPINFO)
 static void enqueue(ThumbReq* r) {
     std::vector<ThumbReq*> dropped;
     {
@@ -126,42 +130,49 @@ static void enqueue(ThumbReq* r) {
     }
     s_qCv.notify_one();
     if (dropped.empty()) return;
-    std::unordered_set<ULONGLONG> sigs;
+    std::unordered_set<ULONGLONG> sigs[kPanes];
     for (ThumbReq* d : dropped) {
-        if (d->opId == s_opId.load()) sigs.insert(d->sig);
+        if (d->opId == s_opId[d->pane].load()) sigs[d->pane].insert(d->sig);
         CoTaskMemFree(d->abs);
         delete d;
     }
-    for (Item* it : g_items)             // not requested any more: asked again when shown
-        if (sigs.count(it->sig)) {
-            int queued = 1;
-            it->thumbReady.compare_exchange_strong(queued, 0);
-        }
+    // not requested any more: asked again when shown (the other pane's items too: only
+    // this thread changes them)
+    for (Pane& p : g_panes)
+        for (Item* it : p.items)
+            if (sigs[p.index].count(it->sig)) {
+                int queued = 1;
+                it->thumbReady.compare_exchange_strong(queued, 0);
+            }
 }
 
-static void drop_queued() {
+static void drop_queued() {                    // (g_pane's requests)
     std::lock_guard<std::mutex> lk(s_qMx);
-    for (ThumbReq* r : s_queue) { CoTaskMemFree(r->abs); delete r; }
-    s_queue.clear();
+    std::erase_if(s_queue, [](ThumbReq* r) {
+        if (r->pane != g_pane->index) return false;
+        CoTaskMemFree(r->abs);
+        delete r;
+        return true;
+    });
 }
 
 static HIMAGELIST ensure_list(int extra) {
     if (extra < 1 || extra > 3) return nullptr;
-    if (!s_lists[extra]) {
+    if (!lists()[extra]) {
         int px = thumb_px(extra);
-        s_lists[extra] = ImageList_Create(px, px, ILC_COLOR32, 32, 64);
+        lists()[extra] = ImageList_Create(px, px, ILC_COLOR32, 32, 64);
     }
-    return s_lists[extra];
+    return lists()[extra];
 }
 
 void thumb_reset_for_new_folder() {
-    ++s_opId;
+    ++s_opId[g_pane->index];
     drop_queued();
     for (int e = 1; e <= 3; ++e)
-        if (s_lists[e]) ImageList_SetImageCount(s_lists[e], 0);
+        if (lists()[e]) ImageList_SetImageCount(lists()[e], 0);
     // items carry their own thumbReady/thumbIndex; reset them for the current listing
-    std::lock_guard<std::mutex> lk(g_itemsMx);
-    for (Item* it : g_items) { it->thumbReady.store(0); it->thumbIndex = -1; }
+    std::lock_guard<std::mutex> lk(g_pane->itemsMx);
+    for (Item* it : g_pane->items) { it->thumbReady.store(0); it->thumbIndex = -1; }
 }
 
 // the image list may hold this many thumbnails (~256 MB): beyond it they start over —
@@ -172,34 +183,36 @@ static int max_images(int extra) { int px = thumb_px(extra); return (256 << 20) 
 // carried them over), only the requests still queued are for the old ones. Images of
 // items that went stay in the list until it is worth starting over.
 void thumb_keep_for_refresh(size_t kept) {
-    ++s_opId;
+    ++s_opId[g_pane->index];
     drop_queued();
-    HIMAGELIST il = g_view.thumbsExtra ? s_lists[g_view.thumbsExtra] : nullptr;
+    HIMAGELIST il = g_pane->view.thumbsExtra ? lists()[g_pane->view.thumbsExtra] : nullptr;
     int count = il ? ImageList_GetImageCount(il) : 0;
-    if (count > 2 * (int)kept + 512 || count >= max_images(g_view.thumbsExtra)) thumb_reset_for_new_folder();
+    if (count > 2 * (int)kept + 512 || count >= max_images(g_pane->view.thumbsExtra)) thumb_reset_for_new_folder();
 }
 
-// Called with g_itemsMx held (from LVN_GETDISPINFO).
+// Called with g_pane->itemsMx held (from LVN_GETDISPINFO).
 void thumb_get_or_request(Item* it, int, int* outImageIndex) {
     *outImageIndex = -1;
-    int extra = g_view.thumbsExtra;
+    int extra = g_pane->view.thumbsExtra;
     if (!it || !extra) return;
     if (it->thumbReady.load() == 2) { *outImageIndex = it->thumbIndex; return; }
     int expected = 0;
     if (!it->thumbReady.compare_exchange_strong(expected, 1)) return;
     ThumbReq* r = new ThumbReq;
-    r->opId = s_opId.load();
+    r->pane = g_pane->index;
+    r->opId = s_opId[g_pane->index].load();
     r->sig = it->sig;
     r->px = thumb_px(extra);
     r->extra = extra;
-    r->abs = ILCombine(g_current, it->pidl);
+    r->abs = ILCombine(g_pane->current, it->pidl);
     if (!r->abs) { delete r; it->thumbReady.store(0); return; }
     enqueue(r);
 }
 
 static void apply_result(void* payload) {
     ThumbResult* m = static_cast<ThumbResult*>(payload);
-    if (m->opId != s_opId.load() || m->extra != g_view.thumbsExtra) {
+    PaneScope ps(&g_panes[m->pane]);
+    if (m->opId != s_opId[m->pane].load() || m->extra != g_pane->view.thumbsExtra) {
         if (m->hbm) DeleteObject(m->hbm);
         delete m;
         return;
@@ -210,28 +223,28 @@ static void apply_result(void* payload) {
         if (m->hbm) DeleteObject(m->hbm);
         delete m;
         thumb_reset_for_new_folder();
-        InvalidateRect(g_list, nullptr, FALSE);
+        InvalidateRect(g_pane->list, nullptr, FALSE);
         return;
     }
     // find the row by signature (the list may have been re-sorted meanwhile); an item
     // that went meanwhile gets no slot in the image list
     int row = -1;
     {
-        std::lock_guard<std::mutex> lk(g_itemsMx);
-        for (size_t i = 0; i < g_items.size(); ++i) {
-            if (g_items[i]->sig != m->sig) continue;
+        std::lock_guard<std::mutex> lk(g_pane->itemsMx);
+        for (size_t i = 0; i < g_pane->items.size(); ++i) {
+            if (g_pane->items[i]->sig != m->sig) continue;
             row = (int)i;
             int imgIndex = m->hbm && il ? ImageList_Add(il, m->hbm, nullptr) : -1;
-            if (imgIndex >= 0) { g_items[i]->thumbIndex = imgIndex; g_items[i]->thumbReady.store(2); }
+            if (imgIndex >= 0) { g_pane->items[i]->thumbIndex = imgIndex; g_pane->items[i]->thumbReady.store(2); }
             // failure: leave "queued" so we don't retry forever; the row keeps its icon
             break;
         }
     }
     if (m->hbm) DeleteObject(m->hbm);
-    if (row >= 0) ListView_RedrawItems(g_list, row, row);
+    if (row >= 0) ListView_RedrawItems(g_pane->list, row, row);
     delete m;
 }
 
 HIMAGELIST thumb_imagelist_for_current_view() {
-    return ensure_list(g_view.thumbsExtra);
+    return ensure_list(g_pane->view.thumbsExtra);
 }

@@ -42,6 +42,8 @@ std::vector<std::wstring> settings_menu_promotions();
 std::vector<std::wstring> settings_tree_pins();
 void settings_set_tree_pins(const std::vector<std::wstring>& pins);
 
-// small integer preferences ([prefs]: checkBoxes, showExtensions, ...)
+// small preferences ([prefs]: checkBoxes, showExtensions, sort, ...)
 int  settings_pref(const wchar_t* key, int def);
 void settings_set_pref(const wchar_t* key, int v);
+std::wstring settings_pref_text(const wchar_t* key);           // empty: not set
+void settings_set_pref_text(const wchar_t* key, const std::wstring& v);

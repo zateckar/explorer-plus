@@ -12,6 +12,10 @@
 #include "searchbox.h"
 #include "columns.h"
 #include "perf.h"
+#include "foldersizes.h"
+#include "layout.h"
+#include "statusbar.h"
+#include "cmdbar.h"
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -32,25 +36,115 @@ void address_history_add(const std::wstring& s) {
 
 // (re)list the current folder; keepView = refresh in place
 static void start_enum_current(bool keepView) {
-    enumerate_start(g_current, keepView);
-    watcher_register_for(g_current);
+    enumerate_start(g_pane->current, keepView);
+    watcher_register_for(g_pane->current);
 }
 
-// Apply a tab's state to the UI: current folder, view, address, tree, strip.
+// the active list's folder on everything around the lists: address bar, navigation
+// pane, buttons, details pane, search box, title, status bar
+static void show_active_folder(TabState* t) {
+    SetWindowTextW(g_address, current_display_path().c_str());
+    tree_sync_to_current_deferred();
+    navbar_refresh();
+    detailspane_update();
+    search_on_navigated();
+    std::wstring name = t ? t->nav().name : std::wstring();
+    std::wstring title = name.empty() ? L"Explorer Plus" : (name + L" \x2013 Explorer Plus");
+    SetWindowTextW(g_main, title.c_str());
+    status_update();
+    statusbar_refresh();
+}
+
+// Apply g_pane's side of a tab to its list: folder, view, listing (and the bars when it
+// is the active list).
 void navigate_replace(TabState* t) {
     if (!t) return;
     ++s_typedGen;
-    current_replace(pidl_clone(t->current));
-    set_view_mode(t->view, false);
-    SetWindowTextW(g_address, current_display_path().c_str());
+    PaneNav& n = t->nav();
+    current_replace(pidl_clone(n.current));
+    set_view_mode(n.view, false);
     start_enum_current(false);
-    tree_sync_to_current_deferred();
-    navbar_refresh();
+    layout_pane_caption_changed();
+    if (pane_is_active()) show_active_folder(t);
     tabstrip_refresh();
-    detailspane_update();
-    search_on_navigated();
-    std::wstring title = t->name.empty() ? L"Explorer Plus" : (t->name + L" \x2013 Explorer Plus");
-    SetWindowTextW(g_main, title.c_str());
+}
+
+// a list the tab doesn't show: nothing listed, watched or walked there
+static void pane_stop() {
+    ++g_pane->enumId;
+    enum_clear_items();
+    deregister_current_watch();
+    foldersizes_release_watch();
+}
+
+void navigation_show_tab(TabState* t, bool anotherTab) {
+    if (!t) return;
+    if (t->dual && !t->side[1].current) t->dual = false;    // (nothing to show there)
+    g_dual = t->dual;
+    if (anotherTab) tree_restore_state(t->tree);             // (before the tree syncs to the folder)
+    HWND focus = GetFocus();
+    bool listFocused = !focus || is_pane_list(focus) || is_pane_list(GetParent(focus));
+    Pane* active = &g_panes[g_dual ? t->activeSide : 0];
+    pane_set_active(active);
+    for (Pane& p : g_panes) {
+        if (!p.list) continue;
+        PaneScope ps(&p);
+        if (pane_shown(&p)) navigate_replace(t);
+        else pane_stop();
+    }
+    layout_relayout();                                       // (shows / hides the second list)
+    if (listFocused && GetFocus() != active->list && IsWindowVisible(g_main)) SetFocus(active->list);
+    cmdbar_refresh();
+}
+
+// the focus went to the other list: commands, the bars and the navigation pane follow it
+void navigation_activate_pane(Pane* p) {
+    if (!p || p == active_pane() || !pane_shown(p)) return;
+    pane_set_active(p);
+    TabState* t = tabmodel_active();
+    if (t) t->activeSide = p->index;
+    PaneScope ps(p);
+    show_active_folder(t);
+    layout_pane_caption_changed();
+    tabstrip_refresh();
+    cmdbar_refresh();
+    tabs_persist_soon();
+}
+
+// Ctrl+Shift+D: a second list beside the first (on the folder it showed last in this tab,
+// else the first list's), or back to one
+void navigation_toggle_dual() {
+    TabState* t = tabmodel_active();
+    if (!t || !g_panes[1].list) return;
+    if (!t->dual) {
+        PaneNav& n = t->side[1];
+        if (!n.current) {
+            n.current = pidl_clone(t->side[0].current);
+            n.name = t->side[0].name;
+            n.view = t->side[0].view;
+        }
+        t->dual = g_dual = true;
+        {
+            PaneScope ps(&g_panes[1]);
+            navigate_replace(t);
+        }
+        layout_relayout();
+        SetFocus(g_panes[1].list);
+        navigation_activate_pane(&g_panes[1]);
+    } else {
+        navigation_activate_pane(&g_panes[0]);
+        t->dual = g_dual = false;
+        t->activeSide = 0;
+        {
+            PaneScope ps(&g_panes[1]);
+            pane_stop();
+        }
+        layout_relayout();
+        SetFocus(g_panes[0].list);
+    }
+    tabstrip_refresh();
+    cmdbar_refresh();
+    tabs_persist_soon();
 }
 
 // settings key of a folder's view and columns; all search results share one
@@ -76,7 +170,7 @@ View view_for_folder(PCIDLIST_ABSOLUTE abs) {
 void views_apply_to_all() {
     if (!columns_can_apply_to_all()) { MessageBeep(MB_ICONASTERISK); return; }
     columns_set_default_from_current();
-    settings_set_default_view(g_view);
+    settings_set_default_view(g_pane->view);
     settings_forget_fs_folders();
 }
 
@@ -86,8 +180,9 @@ void views_reset_all() {
     columns_forget_default();
     settings_set_default_view(View{ LV_VIEW_DETAILS, 0, GB_AUTO });
     if (TabState* t = tabmodel_active()) {
-        t->view = view_for_folder(t->current);
-        navigate_replace(t);            // lists again with the folder's (default) columns
+        for (auto& n : t->side)
+            if (n.current) n.view = view_for_folder(n.current);
+        navigation_show_tab(t, false);  // lists again with the folders' (default) columns
     }
 }
 
@@ -95,18 +190,18 @@ void views_reset_all() {
 void navigate_owned(PIDLIST_ABSOLUTE pidl) {
     if (!pidl) pidl = pidl_desktop();
     TabState* t = tabmodel_active();
-    if (t && pidl_equal(t->current, pidl)) {        // same folder: just refresh
+    if (t && pidl_equal(t->nav().current, pidl)) {  // same folder: just refresh
         CoTaskMemFree(pidl);
         navigation_refresh();
         return;
     }
-    if (t && t->pinned) {                           // a pinned tab keeps its folder
+    if (t && t->pinned && g_pane->index == 0) {     // a pinned tab keeps its (first list's) folder
         tabmodel_open_in_new_tab(pidl);             // adopts pidl
         address_history_add(current_display_path());
         return;
     }
     tabmodel_on_navigate(pidl, true);   // adopts pidl
-    if (t) t->view = view_for_folder(t->current);
+    if (t) t->nav().view = view_for_folder(t->nav().current);
     navigate_replace(tabmodel_active());
     address_history_add(current_display_path());
 }
@@ -198,8 +293,8 @@ static void typed_worker(TypedNav* job) {
 void navigate_path_text(const std::wstring& text) {
     auto* job = new TypedNav{ ++s_typedGen, text, {} };
     WCHAR fsDir[MAX_PATH]{};
-    if (!pidl_is_desktop(g_current) &&
-        SHGetPathFromIDListW(g_current, fsDir))
+    if (!pidl_is_desktop(g_pane->current) &&
+        SHGetPathFromIDListW(g_pane->current, fsDir))
         job->fsDir = fsDir;
     worker_submit([job] { typed_worker(job); });
 }
@@ -223,13 +318,13 @@ void navigation_open_new_window(PCIDLIST_ABSOLUTE folder) {
 void navigation_go_back() {
     if (!tabmodel_go_back()) return;
     TabState* t = tabmodel_active();
-    t->view = view_for_folder(t->current);
+    t->nav().view = view_for_folder(t->nav().current);
     navigate_replace(t);
 }
 void navigation_go_forward() {
     if (!tabmodel_go_forward()) return;
     TabState* t = tabmodel_active();
-    t->view = view_for_folder(t->current);
+    t->nav().view = view_for_folder(t->nav().current);
     navigate_replace(t);
 }
 
@@ -238,14 +333,14 @@ void navigate_in_place(PIDLIST_ABSOLUTE pidl) {
     tabmodel_on_navigate(pidl, false);  // adopts pidl
     TabState* t = tabmodel_active();
     if (!t) return;
-    t->view = view_for_folder(t->current);
+    t->nav().view = view_for_folder(t->nav().current);
     navigate_replace(t);
 }
-bool navigation_can_up() { return !pidl_is_desktop(g_current); }
+bool navigation_can_up() { return !pidl_is_desktop(g_pane->current); }
 void navigation_go_up() {
     if (!navigation_can_up()) return;
-    if (PCIDLIST_ABSOLUTE scope = search_scope_of(g_current)) { navigate_to(scope); return; }   // results -> searched folder
-    PIDLIST_ABSOLUTE parent = pidl_clone(g_current);
+    if (PCIDLIST_ABSOLUTE scope = search_scope_of(g_pane->current)) { navigate_to(scope); return; }   // results -> searched folder
+    PIDLIST_ABSOLUTE parent = pidl_clone(g_pane->current);
     if (!parent) return;
     ILRemoveLastID(parent);       // a top-level item leaves the empty (Desktop) pidl
     navigate_owned(parent);
@@ -255,8 +350,8 @@ void navigation_refresh() { start_enum_current(true); }
 // The current folder was deleted or moved away behind our back: go to the nearest
 // folder above it that still exists, in place (Back must not lead into the void).
 bool navigation_leave_if_gone() {
-    if (search_is_results(g_current) || !fs_folder_missing(g_current)) return false;
-    PIDLIST_ABSOLUTE up = pidl_clone(g_current);
+    if (search_is_results(g_pane->current) || !fs_folder_missing(g_pane->current)) return false;
+    PIDLIST_ABSOLUTE up = pidl_clone(g_pane->current);
     while (up && !pidl_is_desktop(up) && fs_folder_missing(up)) ILRemoveLastID(up);
     if (!up) return false;
     if (perf_on()) perf_event("nav.leave_gone", -1, -1, pidl_folder_path(up).c_str());

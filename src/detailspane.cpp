@@ -191,14 +191,14 @@ static void add_line(PCWSTR k, const std::wstring& v) {
     if (!v.empty()) s_lines.push_back({ k, v });
 }
 
-// the selected items (UI thread: the only writer of g_items, so the pointers stay valid)
+// the selected items (UI thread: the only writer of g_pane->items, so the pointers stay valid)
 static std::vector<Item*> selected_items(int* count) {
     std::vector<Item*> sel;
-    std::lock_guard<std::mutex> lk(g_itemsMx);
-    if (count) *count = (int)g_items.size();
+    std::lock_guard<std::mutex> lk(g_pane->itemsMx);
+    if (count) *count = (int)g_pane->items.size();
     int idx = -1;
-    while ((idx = ListView_GetNextItem(g_list, idx, LVNI_SELECTED)) != -1)
-        if (idx < (int)g_items.size()) sel.push_back(g_items[idx]);
+    while ((idx = ListView_GetNextItem(g_pane->list, idx, LVNI_SELECTED)) != -1)
+        if (idx < (int)g_pane->items.size()) sel.push_back(g_pane->items[idx]);
     return sel;
 }
 
@@ -212,7 +212,7 @@ static void gather_for_selection() {
     if (sel.empty()) {
         // folder info
         s_title = tabmodel_active_name();
-        std::wstring path = pidl_folder_path(g_current);
+        std::wstring path = pidl_folder_path(g_pane->current);
         if (path.rfind(L"::", 0) != 0) add_line(L"Path", path);   // virtual folders have no path
         add_line(L"Items", std::to_wstring(count));
         // free space of the folder's drive (on the pool, not the thumbnail thread: a
@@ -237,7 +237,7 @@ static void gather_for_selection() {
     if (!it->size.empty()) add_line(L"Size", it->size);      // (a folder's once worked out)
     add_line(L"Date modified", it->date);
     // queue preview thumbnail + image dimensions (as large as the pane draws it)
-    if (PIDLIST_ABSOLUTE full = ILCombine(g_current, it->pidl))
+    if (PIDLIST_ABSOLUTE full = ILCombine(g_pane->current, it->pidl))
         request_thumbnail(full, S(260));
 }
 
@@ -249,7 +249,7 @@ static void load_preview() {
     preview_close();
     std::vector<Item*> sel = selected_items(nullptr);
     PIDLIST_ABSOLUTE full = sel.size() == 1 && !sel[0]->isFolder
-                          ? ILCombine(g_current, sel[0]->pidl) : nullptr;
+                          ? ILCombine(g_pane->current, sel[0]->pidl) : nullptr;
     if (!full) {
         s_message = L"Select a file to preview.";
     } else if (preview_open(s_hostWnd, full)) {
@@ -404,6 +404,7 @@ HWND detailspane_create(HWND parent) {
 
 void detailspane_update() {
     if (!s_pane || !s_visible) return;    // nothing to show: skip the work
+    if (!pane_is_active()) return;        // (it shows the active list's selection)
     if (s_mode == PANE_PREVIEW) {
         // wait for the selection to settle (arrowing through files would load each one)
         SetTimer(s_pane, kTimerPreview, 150, nullptr);

@@ -25,11 +25,15 @@ static int s_nextTabId = 1;
 static bool s_persist = true;        // this window owns the saved tab set
 int g_activeTab = 0;
 
+static void free_nav(PaneNav& n) {
+    if (n.current) { CoTaskMemFree(n.current); n.current = nullptr; }
+    for (auto p : n.back) CoTaskMemFree(p);
+    for (auto p : n.fwd) CoTaskMemFree(p);
+    n.back.clear(); n.fwd.clear();
+}
+
 static void free_tab(TabState& t) {
-    if (t.current) { CoTaskMemFree(t.current); t.current = nullptr; }
-    for (auto p : t.back) CoTaskMemFree(p);
-    for (auto p : t.fwd) CoTaskMemFree(p);
-    t.back.clear(); t.fwd.clear();
+    for (auto& n : t.side) free_nav(n);
 }
 
 static std::wstring name_of(PCIDLIST_ABSOLUTE p) {
@@ -42,16 +46,16 @@ static std::wstring name_of(PCIDLIST_ABSOLUTE p) {
 static TabState make_tab(PIDLIST_ABSOLUTE adoptCurrent) {
     TabState t;
     t.id = s_nextTabId++;
-    t.current = adoptCurrent ? adoptCurrent : pidl_desktop();
-    t.name = name_of(t.current);
+    t.side[0].current = adoptCurrent ? adoptCurrent : pidl_desktop();
+    t.side[0].name = name_of(t.side[0].current);
     return t;
 }
 
 static TabState make_tab_named(PIDLIST_ABSOLUTE adoptCurrent, const std::wstring& name) {
     TabState t;
     t.id = s_nextTabId++;
-    t.current = adoptCurrent ? adoptCurrent : pidl_desktop();
-    t.name = name;
+    t.side[0].current = adoptCurrent ? adoptCurrent : pidl_desktop();
+    t.side[0].name = name;
     return t;
 }
 
@@ -70,75 +74,95 @@ void tabmodel_on_navigate(PIDLIST_ABSOLUTE newAbs, bool pushHistory) {
     TabState* t = tabmodel_active();
     if (!t) { CoTaskMemFree(newAbs); return; }
     if (!newAbs) newAbs = pidl_desktop();
-    if (t->current) {
-        if (pushHistory) t->back.push_back(t->current);   // adopt old
-        else CoTaskMemFree(t->current);
+    PaneNav& n = t->nav();
+    if (n.current) {
+        if (pushHistory) n.back.push_back(n.current);       // adopt old
+        else CoTaskMemFree(n.current);
     }
-    t->current = newAbs;                                    // adopt new
-    if (pushHistory) { for (auto p : t->fwd) CoTaskMemFree(p); t->fwd.clear(); }
+    n.current = newAbs;                                     // adopt new
+    if (pushHistory) { for (auto p : n.fwd) CoTaskMemFree(p); n.fwd.clear(); }
     // in place onto the folder right behind (a deleted folder's parent): Back skips it
-    if (!pushHistory && !t->back.empty() && pidl_equal(t->back.back(), newAbs)) {
-        CoTaskMemFree(t->back.back());
-        t->back.pop_back();
+    if (!pushHistory && !n.back.empty() && pidl_equal(n.back.back(), newAbs)) {
+        CoTaskMemFree(n.back.back());
+        n.back.pop_back();
     }
-    t->name = name_of(newAbs);
-    if (t->back.size() > 200) { CoTaskMemFree(t->back.front()); t->back.erase(t->back.begin()); }
+    n.name = name_of(newAbs);
+    if (n.back.size() > 200) { CoTaskMemFree(n.back.front()); n.back.erase(n.back.begin()); }
     tabs_persist_soon();
 }
 
-// a pinned tab stays on its folder: no Back / Forward (the history comes back on unpin)
-bool tabmodel_can_back() { TabState* t = tabmodel_active(); return t && !t->pinned && !t->back.empty(); }
-bool tabmodel_can_forward() { TabState* t = tabmodel_active(); return t && !t->pinned && !t->fwd.empty(); }
+// a pinned tab stays on its folder: no Back / Forward in its first list (the history
+// comes back on unpin)
+static bool history_fixed(const TabState* t) { return t->pinned && g_pane->index == 0; }
+bool tabmodel_can_back() { TabState* t = tabmodel_active(); return t && !history_fixed(t) && !t->nav().back.empty(); }
+bool tabmodel_can_forward() { TabState* t = tabmodel_active(); return t && !history_fixed(t) && !t->nav().fwd.empty(); }
 
 bool tabmodel_go_back() {
     TabState* t = tabmodel_active();
     if (!tabmodel_can_back()) return false;
-    t->fwd.push_back(t->current);
-    t->current = t->back.back();
-    t->back.pop_back();
-    t->name = name_of(t->current);
+    PaneNav& n = t->nav();
+    n.fwd.push_back(n.current);
+    n.current = n.back.back();
+    n.back.pop_back();
+    n.name = name_of(n.current);
     tabs_persist_soon();
     return true;
 }
 bool tabmodel_go_forward() {
     TabState* t = tabmodel_active();
     if (!tabmodel_can_forward()) return false;
-    t->back.push_back(t->current);
-    t->current = t->fwd.back();
-    t->fwd.pop_back();
-    t->name = name_of(t->current);
+    PaneNav& n = t->nav();
+    n.back.push_back(n.current);
+    n.current = n.fwd.back();
+    n.fwd.pop_back();
+    n.name = name_of(n.current);
     tabs_persist_soon();
     return true;
+}
+
+// Put the active tab on screen. The tab that was there keeps its navigation pane's state.
+static int s_shownId = 0;
+
+static void show_active() {
+    TabState* t = tabmodel_active();
+    if (!t) return;
+    int was = index_of_id(s_shownId);
+    bool another = t->id != s_shownId;
+    if (another && was >= 0) tree_save_state(s_tabs[was].tree);
+    s_shownId = t->id;
+    navigation_show_tab(t, another);
 }
 
 void tabmodel_switch_to(int idx) {
     if (idx < 0 || idx >= (int)s_tabs.size() || idx == g_activeTab) return;
     g_activeTab = idx;
-    navigate_replace(tabmodel_active());
+    show_active();
     tabs_persist_soon();
 }
 
 void tabmodel_new_tab() {
     TabState t = make_tab(current_clone());
-    t.view = g_view;
+    t.side[0].view = g_pane->view;
     s_tabs.push_back(std::move(t));
     g_activeTab = (int)s_tabs.size() - 1;
-    navigate_replace(tabmodel_active());
+    show_active();
     tabs_persist_soon();
     tabstrip_refresh();
 }
 
 // a folder opened from a pinned tab: its own tab, whose Back returns to the pinned folder
 void tabmodel_open_in_new_tab(PIDLIST_ABSOLUTE abs) {
-    PIDLIST_ABSOLUTE from = tabmodel_active() ? pidl_clone(tabmodel_active()->current) : nullptr;
+    PIDLIST_ABSOLUTE from = tabmodel_active() ? pidl_clone(tabmodel_active()->nav().current) : nullptr;
     TabState t = make_tab(abs);
-    if (from) t.back.push_back(from);
-    t.view = view_for_folder(t.current);
+    if (from) t.side[0].back.push_back(from);
+    t.side[0].view = view_for_folder(t.side[0].current);
     s_tabs.push_back(std::move(t));
     g_activeTab = (int)s_tabs.size() - 1;
-    navigate_replace(tabmodel_active());
+    show_active();
     tabs_persist_soon();
 }
+
+void tabmodel_show_active() { show_active(); }
 
 bool tabmodel_is_pinned(int idx) {
     return idx >= 0 && idx < (int)s_tabs.size() && s_tabs[idx].pinned;
@@ -154,7 +178,7 @@ void tabmodel_close_tab(int idx) {
     s_tabs.erase(s_tabs.begin() + idx);
     if (idx < g_activeTab) --g_activeTab;        // keep the same tab active
     if (g_activeTab >= (int)s_tabs.size()) g_activeTab = (int)s_tabs.size() - 1;
-    if (wasActive) navigate_replace(tabmodel_active());
+    if (wasActive) show_active();
     tabs_persist_soon();
     tabstrip_refresh();
 }
@@ -178,11 +202,22 @@ void tabmodel_toggle_pin(int idx) {
 
 void tabmodel_duplicate_tab(int idx) {
     if (idx < 0 || idx >= (int)s_tabs.size()) return;
-    TabState t = make_tab(pidl_clone(s_tabs[idx].current));
-    t.view = s_tabs[idx].view;
+    // both lists' folders and views, the layout and the navigation pane as they are
+    const TabState& src = s_tabs[idx];
+    TabState t = make_tab(pidl_clone(src.side[0].current));
+    for (int s = 0; s < kPanes; ++s) {
+        if (!src.side[s].current) continue;
+        if (s) t.side[s].current = pidl_clone(src.side[s].current);
+        t.side[s].view = src.side[s].view;
+        t.side[s].name = src.side[s].name;
+    }
+    t.dual = src.dual;
+    t.activeSide = src.activeSide;
+    if (idx == g_activeTab) tree_save_state(s_tabs[idx].tree);   // (the one on screen: as it is now)
+    t.tree = s_tabs[idx].tree;
     s_tabs.insert(s_tabs.begin() + idx + 1, std::move(t));
     g_activeTab = idx + 1;
-    navigate_replace(tabmodel_active());
+    show_active();
     tabs_persist_soon();
     tabstrip_refresh();
 }
@@ -199,7 +234,7 @@ void tabmodel_close_others(int idx) {
     }
     int stillActive = index_of_id(activeId);
     g_activeTab = stillActive >= 0 ? stillActive : max(0, index_of_id(keepId));
-    if (stillActive < 0) navigate_replace(tabmodel_active());
+    if (stillActive < 0) show_active();
     tabs_persist_soon();
     tabstrip_refresh();
 }
@@ -239,7 +274,7 @@ void tabmodel_switch_index_1_based(int one) {
 
 std::wstring tabmodel_active_name() {
     TabState* t = tabmodel_active();
-    return t ? t->name : L"";
+    return t ? t->shown().name : L"";
 }
 
 // path used for tab persistence: prefer a plain fs path so it survives across
@@ -314,12 +349,21 @@ void tabs_deserialize(const std::wstring& tabs, int active) {
             if (s == std::wstring::npos) break;
             p2 = s + 1;
         }
-        while (f.size() < 4) f.push_back(L"");
+        while (f.size() < 9) f.push_back(L"");
         TabState t = path_is_network(f[0]) && !f[1].empty()
                    ? make_tab_named(parse_persisted(f[0]), f[1])     // (its name needs no server either)
                    : make_tab(parse_persisted(f[0]));
-        t.view = int_to_view(_wtoi(f[2].c_str()));
+        t.side[0].view = int_to_view(_wtoi(f[2].c_str()));
         t.pinned = (f[3] == L"1");
+        // the second list (a tab that had two once): its folder is kept while it is off
+        if (!f[5].empty()) {
+            PaneNav& n = t.side[1];
+            n.current = parse_persisted(f[5]);
+            n.name = path_is_network(f[5]) && !f[6].empty() ? f[6] : name_of(n.current);
+            n.view = int_to_view(_wtoi(f[7].c_str()));
+            t.dual = f[4] == L"1";
+            t.activeSide = t.dual && f[8] == L"1" ? 1 : 0;
+        }
         s_tabs.push_back(std::move(t));
     }
     if (s_tabs.empty()) {
@@ -333,17 +377,23 @@ void tabs_deserialize(const std::wstring& tabs, int active) {
     // `active` indexes the saved order: pick the tab first, then let the sort keep it active
     g_activeTab = max(0, min(active, (int)s_tabs.size() - 1));
     sort_pinned_first();
-    current_replace(pidl_clone(tabmodel_active()->current));
+    current_replace(pidl_clone(tabmodel_active()->side[0].current));
 }
 
 void tabs_serialize_lines(std::vector<std::wstring>& lines, int& outActive) {
     lines.clear();
+    // search results live only in this session: such a tab reopens on the searched folder
+    auto place = [](const PaneNav& n) {
+        PCIDLIST_ABSOLUTE scope = search_scope_of(n.current);
+        std::wstring name = scope ? pidl_abs_dispname(scope) : n.name;
+        return tab_persist_path(scope ? scope : n.current) + L"\x1" + name + L"\x1" + std::to_wstring(view_to_int(n.view));
+    };
     for (auto& t : s_tabs) {
-        // search results live only in this session: such a tab reopens on the searched folder
-        PCIDLIST_ABSOLUTE scope = search_scope_of(t.current);
-        std::wstring name = scope ? pidl_abs_dispname(scope) : t.name;
-        lines.push_back(tab_persist_path(scope ? scope : t.current) + L"\x1" + name + L"\x1" +
-                        std::to_wstring(view_to_int(t.view)) + L"\x1" + (t.pinned ? L"1" : L"0"));
+        std::wstring line = place(t.side[0]) + L"\x1" + (t.pinned ? L"1" : L"0");
+        if (t.side[1].current)
+            line += std::wstring(L"\x1") + (t.dual ? L"1" : L"0") + L"\x1" + place(t.side[1]) + L"\x1" +
+                    (t.activeSide == 1 ? L"1" : L"0");
+        lines.push_back(line);
     }
     outActive = g_activeTab;
 }
@@ -387,20 +437,22 @@ void tabmodel_init(const std::wstring& openPath, bool restore) {
             }
         }
     }
-    for (size_t i = 0; i < s_tabs.size(); ++i) {           // already open: just activate it
-        if (pidl_equal(s_tabs[i].current, p)) {
+    // already open: just activate it (the tab that was active, if it is one of them)
+    for (int k = -1; k < (int)s_tabs.size(); ++k) {
+        int i = k < 0 ? g_activeTab : k;
+        if (i >= 0 && i < (int)s_tabs.size() && pidl_equal(s_tabs[i].side[0].current, p)) {
             CoTaskMemFree(p);
-            g_activeTab = (int)i;
-            current_replace(pidl_clone(s_tabs[i].current));
+            g_activeTab = i;
+            current_replace(pidl_clone(s_tabs[i].side[0].current));
             return;
         }
     }
     TabState t = netName.empty() ? make_tab(p)
                                  : make_tab_named(p, netName);
-    t.view = view_for_folder(t.current);
+    t.side[0].view = view_for_folder(t.side[0].current);
     s_tabs.push_back(std::move(t));
     g_activeTab = (int)s_tabs.size() - 1;
-    current_replace(pidl_clone(tabmodel_active()->current));
+    current_replace(pidl_clone(tabmodel_active()->side[0].current));
 }
 
 // ------------------------------------------------------------------
@@ -464,7 +516,7 @@ static void layout_tabs(int stripW, std::vector<TabUI>& out, RECT* plus) {
     std::vector<int> widths;
     int total = 0;
     for (auto& t : s_tabs) {
-        int tw = hdc ? text_width(hdc, t.name.c_str(), (int)t.name.size()) : 0;
+        int tw = hdc ? text_width(hdc, t.shown().name.c_str(), (int)t.shown().name.size()) : 0;
         int w = S(12) + S(16) + S(10) + tw + S(8) + (t.pinned ? S(4) : S(28)) + S(4);
         widths.push_back(max((int)S(96), min(w, (int)S(240))));
         total += widths.back();
@@ -542,13 +594,13 @@ static void paint_strip(HWND hwnd) {
             RECT pr{ x, u.rect.top, x + S(16), u.rect.bottom };
             draw_glyph(bp.dc, L'\xE718', pr, active ? p.accent : p.textSecondary, 12);
         } else {
-            int icon = tab_icon(s_tabs[i].current);
+            int icon = tab_icon(s_tabs[i].shown().current);
             if (icon >= 0) ImageList_Draw(il, icon, bp.dc, x, cy - iconH / 2, ILD_TRANSPARENT);
         }
         x += S(16) + S(10);
         RECT tr{ x, u.rect.top, (s_tabs[i].pinned ? u.rect.right - S(8) : u.close.left - S(4)), u.rect.bottom };
         SetTextColor(bp.dc, activeWnd ? p.text : p.textSecondary);
-        DrawTextW(bp.dc, s_tabs[i].name.c_str(), -1, &tr,
+        DrawTextW(bp.dc, s_tabs[i].shown().name.c_str(), -1, &tr,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         if (s_kbd.focus == (int)i) {
             RECT fr{ u.rect.left + S(2), u.rect.top + S(2), u.rect.right - S(2), u.rect.bottom - S(4) };
@@ -590,10 +642,10 @@ static const AccSource s_acc = [] {
         if (it.plus) {
             c.name = L"New tab"; c.shortcut = L"Ctrl+T"; c.action = L"Press"; c.rc = plus;
         } else if (it.close) {
-            c.name = L"Close tab " + s_tabs[it.tab].name; c.shortcut = L"Ctrl+W"; c.action = L"Press";
+            c.name = L"Close tab " + s_tabs[it.tab].shown().name; c.shortcut = L"Ctrl+W"; c.action = L"Press";
             c.rc = uis[it.tab].close;
         } else {
-            c.name = s_tabs[it.tab].name + (s_tabs[it.tab].pinned ? L" (pinned)" : L"");
+            c.name = s_tabs[it.tab].shown().name + (s_tabs[it.tab].pinned ? L" (pinned)" : L"");
             c.role = ROLE_SYSTEM_PAGETAB;
             c.state = STATE_SYSTEM_SELECTABLE | (it.tab == g_activeTab ? STATE_SYSTEM_SELECTED : 0);
             c.action = L"Switch";

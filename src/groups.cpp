@@ -27,29 +27,39 @@ struct GroupRange {
     int first = 0, count = 0;
 };
 
-static HWND s_list = nullptr;
-static std::vector<GroupRange> s_groups;       // shown groups, in list order (index = group id)
-static std::vector<std::wstring> s_rankNames;  // name of each group rank of the last assign
-
 enum Kind { KIND_NORMAL, KIND_HOME, KIND_THISPC };
-static Kind s_kind = KIND_NORMAL;
 // internal modes beyond GROUP_*
 enum { MODE_HOME = 100, MODE_THISPC };
 
-static int group_of_index(int item) {
+// each pane's groups (UI thread)
+struct GroupState {
+    HWND list = nullptr;
+    std::vector<GroupRange> groups;        // shown groups, in list order (index = group id)
+    std::vector<std::wstring> rankNames;   // name of each group rank of the last assign
+    Kind kind = KIND_NORMAL;
+    // a refresh rebuilds the groups: the ones the user collapsed stay collapsed
+    std::vector<std::wstring> shown;       // header names on screen
+    ULONGLONG shownFolder = 0;
+};
+static GroupState s_state[kPanes];
+static GroupState& gs() { return s_state[g_pane->index]; }
+
+static int group_of_index(const std::vector<GroupRange>& groups, int item) {
     // ranges are sorted and contiguous: binary search
-    int lo = 0, hi = (int)s_groups.size() - 1;
+    int lo = 0, hi = (int)groups.size() - 1;
     while (lo <= hi) {
         int mid = (lo + hi) / 2;
-        if (item < s_groups[mid].first) hi = mid - 1;
-        else if (item >= s_groups[mid].first + s_groups[mid].count) lo = mid + 1;
+        if (item < groups[mid].first) hi = mid - 1;
+        else if (item >= groups[mid].first + groups[mid].count) lo = mid + 1;
         else return mid;
     }
     return 0;
 }
 
+// (the list calls it while painting too, outside any PaneScope: it knows its own pane)
 class OwnerData final : public IOwnerDataCallback {
 public:
+    int pane = 0;
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
         if (!ppv) return E_POINTER;
         if (riid == IID_IUnknown || riid == kIID_IOwnerDataCallback) { *ppv = this; return S_OK; }
@@ -61,13 +71,14 @@ public:
     HRESULT STDMETHODCALLTYPE GetItemPosition(int, POINT*) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE SetItemPosition(int, POINT) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE GetItemInGroup(int g, int n, int* total) override {
-        if (!total || g < 0 || g >= (int)s_groups.size()) return E_INVALIDARG;
-        *total = s_groups[g].first + n;
+        const auto& groups = s_state[pane].groups;
+        if (!total || g < 0 || g >= (int)groups.size()) return E_INVALIDARG;
+        *total = groups[g].first + n;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetItemGroup(int item, int, int* g) override {
         if (!g) return E_POINTER;
-        *g = group_of_index(item);
+        *g = group_of_index(s_state[pane].groups, item);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetItemGroupCount(int, int* n) override {
@@ -77,11 +88,15 @@ public:
     }
     HRESULT STDMETHODCALLTYPE OnCacheHint(LVITEMINDEX, LVITEMINDEX) override { return S_OK; }
 };
-static OwnerData s_callback;
+static OwnerData s_callback[kPanes];
 
 void groups_install(HWND list) {
-    s_list = list;
-    SendMessageW(list, LVM_SETOWNERDATACALLBACK, (WPARAM)static_cast<IOwnerDataCallback*>(&s_callback), 0);
+    Pane* p = pane_of_list(list);
+    if (!p) return;
+    PaneScope ps(p);
+    gs().list = list;
+    s_callback[p->index].pane = p->index;
+    SendMessageW(list, LVM_SETOWNERDATACALLBACK, (WPARAM)static_cast<IOwnerDataCallback*>(&s_callback[p->index]), 0);
     groups_theme_changed();
 }
 
@@ -108,9 +123,9 @@ bool is_home_folder(PCIDLIST_ABSOLUTE abs)    { return abs && home_pidl() && pid
 bool is_this_pc_folder(PCIDLIST_ABSOLUTE abs) { return abs && this_pc_pidl() && pidl_equal(abs, this_pc_pidl()); }
 
 static int mode() {
-    if (g_view.groupBy != GB_AUTO) return g_view.groupBy;
-    if (s_kind == KIND_HOME) return MODE_HOME;
-    if (s_kind == KIND_THISPC) return MODE_THISPC;
+    if (g_pane->view.groupBy != GB_AUTO) return g_pane->view.groupBy;
+    if (gs().kind == KIND_HOME) return MODE_HOME;
+    if (gs().kind == KIND_THISPC) return MODE_THISPC;
     return GB_NONE;
 }
 
@@ -177,20 +192,20 @@ static int name_rank(const Item* it) {
 }
 
 void groups_assign(std::vector<Item*>& items) {
-    s_kind = is_home_folder(g_current) ? KIND_HOME : is_this_pc_folder(g_current) ? KIND_THISPC : KIND_NORMAL;
-    s_rankNames.clear();
+    gs().kind = is_home_folder(g_pane->current) ? KIND_HOME : is_this_pc_folder(g_pane->current) ? KIND_THISPC : KIND_NORMAL;
+    gs().rankNames.clear();
     int m = mode();
     switch (m) {
         case GB_NAME:
-            s_rankNames.assign(std::begin(kNameNames), std::end(kNameNames));
+            gs().rankNames.assign(std::begin(kNameNames), std::end(kNameNames));
             for (Item* it : items) it->group = name_rank(it);
             break;
         case GB_SIZE:
-            s_rankNames.assign(std::begin(kSizeNames), std::end(kSizeNames));
+            gs().rankNames.assign(std::begin(kSizeNames), std::end(kSizeNames));
             for (Item* it : items) it->group = size_rank(it);
             break;
         case GB_DATE: {
-            s_rankNames.assign(std::begin(kDateNames), std::end(kDateNames));
+            gs().rankNames.assign(std::begin(kDateNames), std::end(kDateNames));
             SYSTEMTIME now; GetLocalTime(&now);
             FILETIME nowFt; SystemTimeToFileTime(&now, &nowFt);
             LONGLONG today = (LONGLONG)(ULARGE_INTEGER{ { nowFt.dwLowDateTime, nowFt.dwHighDateTime } }.QuadPart / 864000000000ULL);
@@ -219,16 +234,16 @@ void groups_assign(std::vector<Item*>& items) {
             std::sort(types.begin(), types.end(), less);
             for (auto& [t, r] : rank)        // (types equal but for case share the first one's group)
                 r = (int)(std::lower_bound(types.begin(), types.end(), t, less) - types.begin());
-            s_rankNames = types;
+            gs().rankNames = types;
             for (Item* it : items) it->group = rank[type_of(it)];
             break;
         }
         case MODE_HOME:
-            s_rankNames = { L"Quick access", L"Favorites", L"Recent" };
+            gs().rankNames = { L"Quick access", L"Favorites", L"Recent" };
             for (Item* it : items) it->group = it->isFolder ? 0 : it->homePinned ? 1 : 2;
             break;
         case MODE_THISPC:
-            s_rankNames = { L"Folders", L"Devices and drives", L"Network locations" };
+            gs().rankNames = { L"Folders", L"Devices and drives", L"Network locations" };
             for (Item* it : items)
                 it->group = it->driveType == DRIVE_REMOTE || (!it->driveType && (it->attrs & SFGAO_SHARE)) ? 2
                           : it->driveType ? 1 : 0;
@@ -240,72 +255,72 @@ void groups_assign(std::vector<Item*>& items) {
 }
 
 void groups_record(const std::vector<Item*>& items) {
-    s_groups.clear();
-    if (s_rankNames.empty()) return;
+    gs().groups.clear();
+    if (gs().rankNames.empty()) return;
     int last = -1;
     for (int i = 0; i < (int)items.size(); ++i) {
         int r = items[i]->group;
         if (r != last) {
             GroupRange g;
-            g.name = s_rankNames[r];
+            g.name = gs().rankNames[r];
             g.first = i;
-            s_groups.push_back(g);
+            gs().groups.push_back(g);
             last = r;
         }
-        ++s_groups.back().count;
+        ++gs().groups.back().count;
     }
 }
 
 const wchar_t* groups_name(int id) {
-    return id >= 0 && id < (int)s_groups.size() ? s_groups[id].name.c_str() : L"";
+    return id >= 0 && id < (int)gs().groups.size() ? gs().groups[id].name.c_str() : L"";
 }
 
 void groups_clear() {
-    s_groups.clear();
+    gs().groups.clear();
     groups_apply();
 }
 
 void groups_apply() {
-    if (!s_list) return;
+    if (!gs().list) return;
     // a refresh rebuilds the groups: keep the ones the user collapsed collapsed
-    static std::vector<std::wstring> s_shown, s_collapsed;    // header names on screen / collapsed
-    static ULONGLONG s_shownFolder = 0;
-    ULONGLONG folder = pidl_sig(g_current);
-    s_collapsed.clear();
-    if (folder == s_shownFolder) {
-        int n = (int)ListView_GetGroupCount(s_list);
-        for (int i = 0; i < n && i < (int)s_shown.size(); ++i)
-            if (ListView_GetGroupState(s_list, i, LVGS_COLLAPSED) & LVGS_COLLAPSED) s_collapsed.push_back(s_shown[i]);
+    GroupState& st = gs();
+    std::vector<std::wstring> collapsed;
+    ULONGLONG folder = pidl_sig(g_pane->current);
+    if (folder == st.shownFolder) {
+        int n = (int)ListView_GetGroupCount(st.list);
+        for (int i = 0; i < n && i < (int)st.shown.size(); ++i)
+            if (ListView_GetGroupState(st.list, i, LVGS_COLLAPSED) & LVGS_COLLAPSED) collapsed.push_back(st.shown[i]);
     }
-    s_shownFolder = folder;
-    s_shown.clear();
-    for (auto& g : s_groups) s_shown.push_back(g.name);
-    ListView_RemoveAllGroups(s_list);
-    bool on = !s_groups.empty();
-    ListView_EnableGroupView(s_list, on);
+    st.shownFolder = folder;
+    st.shown.clear();
+    for (auto& g : st.groups) st.shown.push_back(g.name);
+    ListView_RemoveAllGroups(st.list);
+    bool on = !gs().groups.empty();
+    ListView_EnableGroupView(st.list, on);
     if (!on) return;
-    for (int i = 0; i < (int)s_groups.size(); ++i) {
+    for (int i = 0; i < (int)gs().groups.size(); ++i) {
         LVGROUP g{};
         g.cbSize = sizeof(g);
         g.mask = LVGF_HEADER | LVGF_GROUPID | LVGF_STATE | LVGF_ITEMS;
-        g.pszHeader = const_cast<LPWSTR>(s_groups[i].name.c_str());
+        g.pszHeader = const_cast<LPWSTR>(gs().groups[i].name.c_str());
         g.iGroupId = i;
         g.stateMask = LVGS_COLLAPSIBLE | LVGS_COLLAPSED;
         g.state = LVGS_COLLAPSIBLE;
-        if (std::find(s_collapsed.begin(), s_collapsed.end(), s_groups[i].name) != s_collapsed.end())
+        if (std::find(collapsed.begin(), collapsed.end(), st.groups[i].name) != collapsed.end())
             g.state |= LVGS_COLLAPSED;
-        g.cItems = s_groups[i].count;
-        g.iFirstItem = s_groups[i].first;
-        ListView_InsertGroup(s_list, -1, &g);
+        g.cItems = gs().groups[i].count;
+        g.iFirstItem = gs().groups[i].first;
+        ListView_InsertGroup(st.list, -1, &g);
     }
 }
 
 void groups_theme_changed() {
-    if (!s_list) return;
+    HWND list = gs().list;
+    if (!list) return;
     LVGROUPMETRICS m{};
     m.cbSize = sizeof(m);
     m.mask = LVGMF_TEXTCOLOR;
     m.crHeader = pal().text;
     m.crFooter = pal().textSecondary;
-    ListView_SetGroupMetrics(s_list, &m);
+    ListView_SetGroupMetrics(list, &m);
 }

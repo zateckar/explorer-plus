@@ -21,8 +21,8 @@ static RECT toggle_rect(const RECT& rc, int i) {
 }
 
 static bool toggle_on(int i) {
-    return i == 0 ? g_view.lvView == LV_VIEW_DETAILS
-                  : (g_view.lvView == LV_VIEW_ICON && g_view.thumbsExtra == 1);
+    return i == 0 ? g_pane->view.lvView == LV_VIEW_DETAILS
+                  : (g_pane->view.lvView == LV_VIEW_ICON && g_pane->view.thumbsExtra == 1);
 }
 
 // screen readers: the status text, then the two view buttons

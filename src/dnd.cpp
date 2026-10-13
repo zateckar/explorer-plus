@@ -88,7 +88,7 @@ private:
     static HRESULT target_for_background(IDropTarget** out) {
         *out = nullptr;
         com_ptr<IShellFolder> psf;
-        HRESULT hr = bind_list(g_current, IID_PPV_ARGS(psf.put()));
+        HRESULT hr = bind_list(g_pane->current, IID_PPV_ARGS(psf.put()));
         if (FAILED(hr)) return hr;
         return psf->CreateViewObject(g_main, IID_PPV_ARGS(out));
     }
@@ -109,6 +109,7 @@ private:
             if (abs) CoTaskMemFree(abs);
             return key;
         }
+        PaneScope ps(pane_of_list(m_hwnd));      // (either pane's list)
         LVHITTESTINFO ht{}; ht.pt = c;
         int idx = ListView_HitTest(m_hwnd, &ht);
         PIDLIST_ABSOLUTE abs = nullptr;
@@ -116,9 +117,9 @@ private:
         // never the rows being dragged
         if (idx >= 0 && (ht.flags & LVHT_ONITEM) &&
             !(ListView_GetItemState(m_hwnd, idx, LVIS_SELECTED) & LVIS_SELECTED)) {
-            std::lock_guard<std::mutex> lk(g_itemsMx);
-            if (idx < (int)g_items.size() && (g_items[idx]->attrs & SFGAO_DROPTARGET))
-                abs = ILCombine(g_current, g_items[idx]->pidl);
+            std::lock_guard<std::mutex> lk(g_pane->itemsMx);
+            if (idx < (int)g_pane->items.size() && (g_pane->items[idx]->attrs & SFGAO_DROPTARGET))
+                abs = ILCombine(g_pane->current, g_pane->items[idx]->pidl);
         }
         ULONGLONG key = abs ? (pidl_sig(abs) | 1) : 2;     // 2 = background
         if (key != m_targetKey) {
@@ -208,17 +209,21 @@ public:
 // registration
 
 void dnd_register_sources() {
-    if (!g_list || !g_tree) return;
-    auto* lt = new PaneDropTarget(g_list, false);
+    if (!g_tree) return;
+    for (Pane& p : g_panes) {
+        if (!p.list) continue;
+        auto* lt = new PaneDropTarget(p.list, false);
+        RegisterDragDrop(p.list, lt);     // OLE holds its own references
+        lt->Release();
+    }
     auto* tt = new PaneDropTarget(g_tree, true);
-    RegisterDragDrop(g_list, lt);   // OLE holds its own references
     RegisterDragDrop(g_tree, tt);
-    lt->Release();
     tt->Release();
 }
 
 void dnd_unregister_all() {
-    if (g_list) RevokeDragDrop(g_list);
+    for (Pane& p : g_panes)
+        if (p.list) RevokeDragDrop(p.list);
     if (g_tree) RevokeDragDrop(g_tree);
 }
 
@@ -227,7 +232,7 @@ void dnd_begin_list_drag() {
     auto sel = list_selected_pidls();
     if (sel.empty()) return;
     com_ptr<IShellFolder> psf;
-    if (FAILED(bind_list(g_current, IID_PPV_ARGS(psf.put()))) || !psf) return;
+    if (FAILED(bind_list(g_pane->current, IID_PPV_ARGS(psf.put()))) || !psf) return;
     com_ptr<IDataObject> pdo;
     if (FAILED(dataobject_from_children(g_main, psf.get(), sel, pdo.put())) || !pdo) return;
     DWORD effect = 0;

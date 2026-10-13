@@ -14,7 +14,6 @@ std::wstring columns_serialize(const ColumnSet& cols);
 void columns_fill(IShellItem2* si, const ColumnSet& cols, Item* it);   // extra values of one item
 
 // --- UI thread ---
-extern ColumnSet g_columns;                    // columns of the shown listing
 ColumnSet columns_for_folder(PCIDLIST_ABSOLUTE folder);   // persisted set or empty (= defaults)
 // "Apply to all folders": the shown set (order, widths) becomes the file-system folders' default
 bool columns_can_apply_to_all();               // the current folder is a file-system folder
@@ -26,9 +25,11 @@ const UINT* columns_tile_lines(UINT* count);   // tile view: type + size sub-ite
 int  columns_sort_display_index();             // header column showing the sort arrow
 void columns_header_click(int subItem);        // sort by that column (toggles direction)
 void columns_sort_by(int subItem);             // Sort menu: that column, its default direction
-int  columns_compare_extra(const Item* a, const Item* b);   // g_sortColumn == COL_EXTRA (values both there)
+int  columns_compare_extra(const Item* a, const Item* b);   // g_pane->sortColumn == COL_EXTRA (values both there)
 int  columns_compare_extra_empty(const Item* a, const Item* b);   // items without a value go last
-void columns_prepare_sort();                   // resolve g_sortKey before a sort
+void columns_prepare_sort();                   // resolve g_pane->sortKey before a sort
+void columns_save_sort();                      // remember g_pane's sort order (the user chose it)
+void columns_load_sort();                      // g_pane's sort order as remembered (startup)
 void columns_header_menu(POINT screen);        // header right-click: column chooser
 void columns_widths_changed();                 // the user resized a column
 void columns_rescale();                        // DPI or text size changed: widths follow

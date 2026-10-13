@@ -49,7 +49,7 @@ static void rebuild_crumbs() {
         s_crumbs.push_back(std::move(c));
     }
     CoTaskMemFree(p);
-    s_iconIndex = sys_icon_index(g_current);
+    s_iconIndex = sys_icon_index(g_pane->current);
 }
 
 // measure with the DC we paint with (dc may be null: use a window DC)
@@ -213,7 +213,7 @@ static void show_chevron_menu(int crumb) {
     clear_menu_entries();
     HMENU m = CreatePopupMenu();
     PIDLIST_ABSOLUTE parent = crumb > 0 ? pidl_clone(s_crumbs[crumb - 1].abs) : pidl_desktop();
-    fill_children_menu(m, parent, g_current);
+    fill_children_menu(m, parent, g_pane->current);
     CoTaskMemFree(parent);
     if (GetMenuItemCount(m) == 0) AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"(empty)");
     POINT pt{ s_crumbs[crumb].chevron.left, s_crumbs[crumb].chevron.bottom + S(4) };
@@ -254,7 +254,7 @@ static void show_history_menu() {
 static void end_edit(bool focusList) {
     if (!IsWindowVisible(s_edit)) return;
     // focus first: hiding the focused edit hands focus to the box, which would edit again
-    if (focusList && g_list) SetFocus(g_list);
+    if (focusList && g_pane->list) SetFocus(g_pane->list);
     ShowWindow(s_edit, SW_HIDE);
     InvalidateRect(s_box, nullptr, FALSE);
 }
@@ -374,7 +374,7 @@ static LRESULT CALLBACK box_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_SETFOCUS:
             // reached with Tab / F6: type a path, like Explorer's address bar (but focus
             // falling back from the edit as it hides goes on to the list)
-            if ((HWND)wp == s_edit) { if (g_list) SetFocus(g_list); }
+            if ((HWND)wp == s_edit) { if (g_pane->list) SetFocus(g_pane->list); }
             else address_begin_edit();
             return 0;
         case kAccAction: {

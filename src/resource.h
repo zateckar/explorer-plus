@@ -82,6 +82,9 @@
 // Delete / Shift+Delete on the navigation pane's selected folder
 #define IDM_TREE_DELETE      40103
 #define IDM_TREE_DELETE_PERM 40104
+// a second file list beside the first (this tab)
+#define IDM_VIEW_DUALPANE    40105
+#define IDC_LIST2            1010
 // Group by: IDM_GROUP_BASE + GB_* (GB_AUTO .. GB_SIZE)
 #define IDM_GROUP_BASE    40140
 #define IDM_GROUP_LAST    40145

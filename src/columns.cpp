@@ -9,8 +9,6 @@
 #include <propvarutil.h>
 #include <algorithm>
 
-ColumnSet g_columns;
-
 // ------------------------------------------------------------------
 // column definitions (any thread)
 
@@ -190,7 +188,7 @@ ColumnSet columns_for_folder(PCIDLIST_ABSOLUTE folder) {
     return {};
 }
 
-bool columns_can_apply_to_all() { return is_fs_folder(g_current) && !g_columns.empty(); }
+bool columns_can_apply_to_all() { return is_fs_folder(g_pane->current) && !g_pane->columns.empty(); }
 
 static bool same_set(const ColumnSet& a, const ColumnSet& b) {
     if (a.size() != b.size()) return false;
@@ -199,41 +197,41 @@ static bool same_set(const ColumnSet& a, const ColumnSet& b) {
     return true;
 }
 
-// the folder the shown columns belong to: g_current changes as soon as a navigation
+// the folder the shown columns belong to: g_pane->current changes as soon as a navigation
 // starts, the columns only when its listing arrives
-static std::wstring s_columnsKey;
+static std::wstring s_columnsKey[kPanes];
 
 void columns_apply(const ColumnSet& cols) {
-    if (cols.empty() || !g_list) return;
-    s_columnsKey = folder_settings_key(g_current);     // (called with the listing of g_current)
+    if (cols.empty() || !g_pane->list) return;
+    s_columnsKey[g_pane->index] = folder_settings_key(g_pane->current);   // (called with the listing of g_pane->current)
     // a sort by a column this folder doesn't have falls back to Name
-    if (g_sortColumn == COL_EXTRA &&
-        std::none_of(cols.begin(), cols.end(), [](const Column& c) { return same_key(c.key, g_sortKey); })) {
-        g_sortColumn = COL_NAME;
-        g_sortAsc = true;
+    if (g_pane->sortColumn == COL_EXTRA &&
+        std::none_of(cols.begin(), cols.end(), [](const Column& c) { return same_key(c.key, g_pane->sortKey); })) {
+        g_pane->sortColumn = COL_NAME;
+        g_pane->sortAsc = true;
     }
-    if (same_set(cols, g_columns)) return;
-    g_columns = cols;
-    SendMessageW(g_list, WM_SETREDRAW, FALSE, 0);
-    HWND hdr = ListView_GetHeader(g_list);
-    for (int n = hdr ? Header_GetItemCount(hdr) : 0; n > 0; --n) ListView_DeleteColumn(g_list, n - 1);
-    for (int i = 0; i < (int)g_columns.size(); ++i) {
+    if (same_set(cols, g_pane->columns)) return;
+    g_pane->columns = cols;
+    SendMessageW(g_pane->list, WM_SETREDRAW, FALSE, 0);
+    HWND hdr = ListView_GetHeader(g_pane->list);
+    for (int n = hdr ? Header_GetItemCount(hdr) : 0; n > 0; --n) ListView_DeleteColumn(g_pane->list, n - 1);
+    for (int i = 0; i < (int)g_pane->columns.size(); ++i) {
         LVCOLUMNW c{};
         c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT | LVCF_SUBITEM;
-        c.fmt = g_columns[i].fmt;
-        c.cx = SC(g_columns[i].width96);
-        c.pszText = const_cast<LPWSTR>(g_columns[i].title.c_str());
+        c.fmt = g_pane->columns[i].fmt;
+        c.cx = SC(g_pane->columns[i].width96);
+        c.pszText = const_cast<LPWSTR>(g_pane->columns[i].title.c_str());
         c.iSubItem = i;
-        ListView_InsertColumn(g_list, i, &c);
+        ListView_InsertColumn(g_pane->list, i, &c);
     }
-    SendMessageW(g_list, WM_SETREDRAW, TRUE, 0);
+    SendMessageW(g_pane->list, WM_SETREDRAW, TRUE, 0);
     enum_update_header_arrows();
-    InvalidateRect(g_list, nullptr, TRUE);
+    InvalidateRect(g_pane->list, nullptr, TRUE);
 }
 
 const wchar_t* columns_text(const Item* it, int sub) {
-    if (sub < 0 || sub >= (int)g_columns.size()) return L"";
-    const Column& c = g_columns[sub];
+    if (sub < 0 || sub >= (int)g_pane->columns.size()) return L"";
+    const Column& c = g_pane->columns[sub];
     switch (c.kind) {
         case COL_NAME: return it->name.c_str();
         case COL_SIZE: return it->size.c_str();
@@ -247,41 +245,78 @@ const UINT* columns_tile_lines(UINT* count) {
     static UINT lines[2];
     UINT n = 0;
     for (int want : { COL_TYPE, COL_SIZE })
-        for (int i = 1; i < (int)g_columns.size() && n < 2; ++i)
-            if (g_columns[i].kind == want) lines[n++] = i;
-    for (int i = 1; i < (int)g_columns.size() && n < 2; ++i)
+        for (int i = 1; i < (int)g_pane->columns.size() && n < 2; ++i)
+            if (g_pane->columns[i].kind == want) lines[n++] = i;
+    for (int i = 1; i < (int)g_pane->columns.size() && n < 2; ++i)
         if (n == 0 || lines[0] != (UINT)i) lines[n++] = i;
     *count = n;
     return lines;
 }
 
 int columns_sort_display_index() {
-    for (int i = 0; i < (int)g_columns.size(); ++i) {
-        const Column& c = g_columns[i];
-        if (g_sortColumn == COL_EXTRA ? (c.kind == COL_EXTRA && same_key(c.key, g_sortKey)) : c.kind == g_sortColumn)
+    for (int i = 0; i < (int)g_pane->columns.size(); ++i) {
+        const Column& c = g_pane->columns[i];
+        if (g_pane->sortColumn == COL_EXTRA ? (c.kind == COL_EXTRA && same_key(c.key, g_pane->sortKey)) : c.kind == g_pane->sortColumn)
             return i;
     }
     return -1;
 }
 
 void columns_header_click(int sub) {
-    if (sub < 0 || sub >= (int)g_columns.size()) return;
-    const Column& c = g_columns[sub];
+    if (sub < 0 || sub >= (int)g_pane->columns.size()) return;
+    const Column& c = g_pane->columns[sub];
     if (c.kind != COL_EXTRA) {
-        if (g_sortColumn == c.kind) g_sortAsc = !g_sortAsc;
-        else { g_sortColumn = c.kind; g_sortAsc = c.kind != COL_DATE && c.kind != COL_SIZE; }  // newest/largest first
-    } else if (g_sortColumn == COL_EXTRA && same_key(g_sortKey, c.key)) {
-        g_sortAsc = !g_sortAsc;
+        if (g_pane->sortColumn == c.kind) g_pane->sortAsc = !g_pane->sortAsc;
+        else { g_pane->sortColumn = c.kind; g_pane->sortAsc = c.kind != COL_DATE && c.kind != COL_SIZE; }  // newest/largest first
+    } else if (g_pane->sortColumn == COL_EXTRA && same_key(g_pane->sortKey, c.key)) {
+        g_pane->sortAsc = !g_pane->sortAsc;
     } else {
-        g_sortColumn = COL_EXTRA;
-        g_sortKey = c.key;
-        g_sortAsc = true;
+        g_pane->sortColumn = COL_EXTRA;
+        g_pane->sortKey = c.key;
+        g_pane->sortAsc = true;
     }
+    columns_save_sort();
     enum_sort_items();
 }
 
+// ------------------------------------------------------------------
+// the order chosen last, per pane: [prefs] sort / sort2 = "<ColKind>,<asc 0|1>[,{fmtid}/pid]"
+
+static const wchar_t* sort_pref() { return g_pane->index == 0 ? L"sort" : L"sort2"; }
+
+void columns_save_sort() {
+    std::wstring v = std::to_wstring(g_pane->sortColumn) + (g_pane->sortAsc ? L",1" : L",0");
+    if (g_pane->sortColumn == COL_EXTRA) {
+        WCHAR g[64]{};
+        StringFromGUID2(g_pane->sortKey.fmtid, g, 64);
+        v += L"," + std::wstring(g) + L"/" + std::to_wstring(g_pane->sortKey.pid);
+    }
+    settings_set_pref_text(sort_pref(), v);
+}
+
+void columns_load_sort() {
+    std::wstring v = settings_pref_text(sort_pref());
+    if (v.empty() && g_pane->index) v = settings_pref_text(L"sort");    // (the second pane starts as the first)
+    if (v.empty()) return;
+    int col = _wtoi(v.c_str());
+    size_t a = v.find(L',');
+    if (col < COL_NAME || col > COL_EXTRA || a == std::wstring::npos) return;
+    bool asc = v[a + 1] != L'0';
+    PROPERTYKEY key{};
+    if (col == COL_EXTRA) {
+        size_t b = v.find(L',', a + 1), s = v.find(L'/', b == std::wstring::npos ? v.size() : b);
+        if (b == std::wstring::npos || s == std::wstring::npos ||
+            FAILED(CLSIDFromString(v.substr(b + 1, s - b - 1).c_str(), &key.fmtid)))
+            return;
+        key.pid = (DWORD)wcstoul(v.c_str() + s + 1, nullptr, 10);
+    }
+    g_pane->sortColumn = col;
+    g_pane->sortAsc = asc;
+    g_pane->sortKey = key;
+}
+
 void columns_sort_by(int sub) {
-    if (sub < 0 || sub >= (int)g_columns.size() || sub == columns_sort_display_index()) return;
+    if (sub < 0 || sub >= (int)g_pane->columns.size() || sub == columns_sort_display_index()) return;
     columns_header_click(sub);              // a column not sorted by yet: its default direction
 }
 
@@ -289,9 +324,9 @@ static int s_sortExtra = -1;
 
 void columns_prepare_sort() {
     s_sortExtra = -1;
-    if (g_sortColumn != COL_EXTRA) return;
-    for (auto& c : g_columns)
-        if (c.kind == COL_EXTRA && same_key(c.key, g_sortKey)) s_sortExtra = c.extra;
+    if (g_pane->sortColumn != COL_EXTRA) return;
+    for (auto& c : g_pane->columns)
+        if (c.kind == COL_EXTRA && same_key(c.key, g_pane->sortKey)) s_sortExtra = c.extra;
 }
 
 static bool has_sort_value(const Item* it) {
@@ -317,19 +352,19 @@ int columns_compare_extra(const Item* a, const Item* b) {
 static int width96_of(int px) { return MulDiv(px, 96 * 100, theme_dpi() * text_scale()); }
 
 void columns_rescale() {
-    for (int i = 0; i < (int)g_columns.size(); ++i) ListView_SetColumnWidth(g_list, i, SC(g_columns[i].width96));
+    for (int i = 0; i < (int)g_pane->columns.size(); ++i) ListView_SetColumnWidth(g_pane->list, i, SC(g_pane->columns[i].width96));
 }
 
 static std::wstring current_serialized() {
-    int n = (int)g_columns.size();
+    int n = (int)g_pane->columns.size();
     std::vector<int> order(n);
-    if (!ListView_GetColumnOrderArray(g_list, n, order.data()))
+    if (!ListView_GetColumnOrderArray(g_pane->list, n, order.data()))
         for (int i = 0; i < n; ++i) order[i] = i;
     ColumnSet ordered;
     for (int i : order) {
         if (i < 0 || i >= n) continue;
-        Column c = g_columns[i];
-        int w = ListView_GetColumnWidth(g_list, i);
+        Column c = g_pane->columns[i];
+        int w = ListView_GetColumnWidth(g_pane->list, i);
         if (w > 0) c.width96 = width96_of(w);
         ordered.push_back(c);
     }
@@ -337,8 +372,9 @@ static std::wstring current_serialized() {
 }
 
 static void save_current() {
-    if (g_columns.empty() || s_columnsKey.empty()) return;
-    settings_set_columns_for(s_columnsKey, current_serialized());
+    const std::wstring& key = s_columnsKey[g_pane->index];
+    if (g_pane->columns.empty() || key.empty()) return;
+    settings_set_columns_for(key, current_serialized());
 }
 
 void columns_set_default_from_current() {
@@ -349,9 +385,9 @@ void columns_set_default_from_current() {
 void columns_forget_default() { settings_set_columns_for(kDefaultKey, L""); }
 
 void columns_widths_changed() {
-    for (int i = 0; i < (int)g_columns.size(); ++i) {
-        int w = ListView_GetColumnWidth(g_list, i);
-        if (w > 0) g_columns[i].width96 = width96_of(w);
+    for (int i = 0; i < (int)g_pane->columns.size(); ++i) {
+        int w = ListView_GetColumnWidth(g_pane->list, i);
+        if (w > 0) g_pane->columns[i].width96 = width96_of(w);
     }
     save_current();
 }
@@ -372,9 +408,9 @@ static bool commonly_offered(const PROPERTYKEY& k) {
 void columns_header_menu(POINT screen) {
     struct Cand { PROPERTYKEY key; std::wstring title; int fmt, cxChar; bool shown; };
     std::vector<Cand> cands;
-    for (auto& c : g_columns) cands.push_back({ c.key, c.title, c.fmt, 0, true });
+    for (auto& c : g_pane->columns) cands.push_back({ c.key, c.title, c.fmt, 0, true });
     com_ptr<IShellFolder2> sf2;
-    if (SUCCEEDED(bind_list(g_current, IID_PPV_ARGS(sf2.put()))) && sf2) {
+    if (SUCCEEDED(bind_list(g_pane->current, IID_PPV_ARGS(sf2.put()))) && sf2) {
         for (UINT i = 0; i < 1024; ++i) {
             SHELLDETAILS sd{};
             if (FAILED(sf2->GetDetailsOf(nullptr, i, &sd))) break;
@@ -399,7 +435,7 @@ void columns_header_menu(POINT screen) {
     UINT id = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, g_main, nullptr);
     DestroyMenu(m);
     if (id == 1) {
-        for (int i = 0; i < (int)g_columns.size(); ++i) ListView_SetColumnWidth(g_list, i, LVSCW_AUTOSIZE_USEHEADER);
+        for (int i = 0; i < (int)g_pane->columns.size(); ++i) ListView_SetColumnWidth(g_pane->list, i, LVSCW_AUTOSIZE_USEHEADER);
         columns_widths_changed();
         return;
     }
@@ -410,13 +446,13 @@ void columns_header_menu(POINT screen) {
     // set's order); Name stays first, the value slots (Column::extra) as they are
     ColumnSet next;
     {
-        int n = (int)g_columns.size();
+        int n = (int)g_pane->columns.size();
         std::vector<int> order(n);
-        if (!ListView_GetColumnOrderArray(g_list, n, order.data()))
+        if (!ListView_GetColumnOrderArray(g_pane->list, n, order.data()))
             for (int i = 0; i < n; ++i) order[i] = i;
         for (int i : order)
-            if (i >= 0 && i < n) next.push_back(g_columns[i]);
-        if (next.size() != g_columns.size()) next = g_columns;
+            if (i >= 0 && i < n) next.push_back(g_pane->columns[i]);
+        if (next.size() != g_pane->columns.size()) next = g_pane->columns;
         auto name = std::find_if(next.begin(), next.end(), [](const Column& c) { return c.kind == COL_NAME; });
         if (name != next.end() && name != next.begin()) std::rotate(next.begin(), name, name + 1);
     }
@@ -439,9 +475,10 @@ void columns_header_menu(POINT screen) {
     // it doesn't show, with no arrow to say so)
     bool resort = false;
     if (pick.shown && kind_of(pick.key) != COL_NAME &&
-        (g_sortColumn == COL_EXTRA ? same_key(g_sortKey, pick.key) : g_sortColumn == kind_of(pick.key))) {
-        g_sortColumn = COL_NAME;
-        g_sortAsc = true;
+        (g_pane->sortColumn == COL_EXTRA ? same_key(g_pane->sortKey, pick.key) : g_pane->sortColumn == kind_of(pick.key))) {
+        g_pane->sortColumn = COL_NAME;
+        g_pane->sortAsc = true;
+        columns_save_sort();
         resort = true;
     }
     columns_apply(next);

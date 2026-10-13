@@ -225,7 +225,7 @@ static void push_fonts() {
     if (!g_main) return;
     EnumChildWindows(g_main, [](HWND h, LPARAM) -> BOOL {
         if (GetParent(h) != g_main) return TRUE;
-        bool content = h == g_tree || h == g_list;
+        bool content = h == g_tree || is_pane_list(h);
         SendMessageW(h, WM_SETFONT, (WPARAM)(content ? s_content : g_font), TRUE);
         return TRUE;
     }, 0);
@@ -277,7 +277,8 @@ void theme_set_text_scale(int pct) {
     HFONT oldContent = nullptr, oldBold = nullptr;
     make_content_fonts(&oldContent, &oldBold);
     if (g_tree) SendMessageW(g_tree, WM_SETFONT, (WPARAM)s_content, TRUE);
-    if (g_list) SendMessageW(g_list, WM_SETFONT, (WPARAM)s_content, TRUE);
+    for (Pane& pn : g_panes)
+        if (pn.list) SendMessageW(pn.list, WM_SETFONT, (WPARAM)s_content, TRUE);
     if (oldContent) DeleteObject(oldContent);
     if (oldBold) DeleteObject(oldBold);
 }
@@ -407,13 +408,14 @@ void theme_apply_controls() {
         SetWindowTheme(h, dark ? darkTheme : lightTheme, nullptr);
         SendMessageW(h, WM_THEMECHANGED, 0, 0);
     };
-    if (g_list) {
-        dark_win(g_list, L"DarkMode_Explorer", L"Explorer");      // dark scrollbars
-        if (HWND hdr = ListView_GetHeader(g_list)) dark_win(hdr, L"DarkMode_ItemsView", L"Explorer");
-        ListView_SetBkColor(g_list, p.content);
-        ListView_SetTextBkColor(g_list, p.content);
-        ListView_SetTextColor(g_list, p.text);
-        InvalidateRect(g_list, nullptr, TRUE);
+    for (Pane& pn : g_panes) {
+        if (!pn.list) continue;
+        dark_win(pn.list, L"DarkMode_Explorer", L"Explorer");      // dark scrollbars
+        if (HWND hdr = ListView_GetHeader(pn.list)) dark_win(hdr, L"DarkMode_ItemsView", L"Explorer");
+        ListView_SetBkColor(pn.list, p.content);
+        ListView_SetTextBkColor(pn.list, p.content);
+        ListView_SetTextColor(pn.list, p.text);
+        InvalidateRect(pn.list, nullptr, TRUE);
     }
     if (g_tree) {
         dark_win(g_tree, L"DarkMode_Explorer", L"Explorer");

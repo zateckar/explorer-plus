@@ -23,7 +23,7 @@ ChangeApply enum_apply_changes(const std::vector<std::wstring>& paths);
 void enum_apply_op(HeapEnumOp* op);      // WM_ENUM_DONE handler (takes ownership of op)
 void enum_on_stream_timer();             // TIMER_ENUM_STREAM: show the rows found so far
 void enum_on_held_timer();               // TIMER_ENUM_HELD: apply what waited for a rename box
-void enum_sort_items();                  // re-sort / re-group g_items (g_sortColumn, g_view.groupBy) and refresh
+void enum_sort_items();                  // re-sort / re-group g_pane->items (g_pane->sortColumn, g_pane->view.groupBy) and refresh
 void enum_update_header_arrows();        // put sort arrows in the details header
 void enum_clear_items();                 // drop all items (navigation away)
 const std::wstring& enum_last_error();   // non-empty when the current folder failed to list

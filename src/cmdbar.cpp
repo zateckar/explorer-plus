@@ -86,7 +86,7 @@ static void layout(HWND hwnd) {
 }
 
 static bool enabled(int cmd) {
-    int sel = g_list ? ListView_GetSelectedCount(g_list) : 0;
+    int sel = g_pane->list ? ListView_GetSelectedCount(g_pane->list) : 0;
     switch (cmd) {
         case IDM_EDIT_CUT: case IDM_EDIT_COPY: case IDM_EDIT_DELETE:
         case IDM_EDIT_RENAME: case IDM_SHARE:
@@ -177,17 +177,17 @@ HMENU menu_group_by() {
 HMENU menu_sort_by() {
     HMENU m = CreatePopupMenu();
     int sorted = columns_sort_display_index();
-    for (int i = 0; i < (int)g_columns.size() && IDM_SORT_COL_BASE + i <= IDM_SORT_COL_LAST; ++i)
-        append_radio(m, IDM_SORT_COL_BASE + i, g_columns[i].title.c_str(), i == sorted);
+    for (int i = 0; i < (int)g_pane->columns.size() && IDM_SORT_COL_BASE + i <= IDM_SORT_COL_LAST; ++i)
+        append_radio(m, IDM_SORT_COL_BASE + i, g_pane->columns[i].title.c_str(), i == sorted);
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    append_radio(m, IDM_SORT_ASC, L"Ascending", g_sortAsc);
-    append_radio(m, IDM_SORT_DESC, L"Descending", !g_sortAsc);
+    append_radio(m, IDM_SORT_ASC, L"Ascending", g_pane->sortAsc);
+    append_radio(m, IDM_SORT_DESC, L"Descending", !g_pane->sortAsc);
     return m;
 }
 
 HMENU menu_view_modes() {
     HMENU m = CreatePopupMenu();
-    const View& v = g_view;
+    const View& v = g_pane->view;
     bool icons = v.lvView == LV_VIEW_ICON;
     append_radio(m, IDM_VIEW_XLARGE,  L"Extra large icons\tCtrl+Shift+1", icons && v.thumbsExtra == 2);
     append_radio(m, IDM_VIEW_LARGE,   L"Large icons\tCtrl+Shift+2",       icons && v.thumbsExtra == 1);
@@ -220,7 +220,6 @@ static HMENU build_view_menu() {
     HMENU m = menu_view_modes();
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | menu_flag(g_compactView), IDM_VIEW_COMPACT, L"Compact view");
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)build_text_size_menu(), L"Text size");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (columns_can_apply_to_all() ? 0 : MF_GRAYED), IDM_VIEW_APPLY_ALL,
                 L"Apply this view to all folders");
@@ -235,14 +234,13 @@ static HMENU build_view_menu() {
     AppendMenuW(show, MF_STRING | menu_flag(g_checkBoxes), IDM_VIEW_CHECKBOXES, L"Item check boxes");
     AppendMenuW(show, MF_STRING | menu_flag(show_extensions_effective()), IDM_VIEW_EXTENSIONS, L"File name extensions");
     AppendMenuW(show, MF_STRING | menu_flag(g_showHidden), IDM_VIEW_HIDDEN, L"Hidden items");
-    AppendMenuW(show, MF_STRING | menu_flag(foldersizes_enabled()), IDM_VIEW_FOLDERSIZES, L"Folder sizes");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)show, L"Show");
     return m;
 }
 
 static HMENU build_more_menu() {
     HMENU m = CreatePopupMenu();
-    bool sel = g_list && ListView_GetSelectedCount(g_list) > 0;
+    bool sel = g_pane->list && ListView_GetSelectedCount(g_pane->list) > 0;
     AppendMenuW(m, MF_STRING, IDM_EDIT_SELALL, L"Select all\tCtrl+A");
     AppendMenuW(m, MF_STRING | (sel ? 0 : MF_GRAYED), IDM_EDIT_SELNONE, L"Select none");
     AppendMenuW(m, MF_STRING, IDM_EDIT_INVERT, L"Invert selection");
@@ -252,6 +250,11 @@ static HMENU build_more_menu() {
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_NEW_WINDOW, L"New window\tCtrl+N");
     AppendMenuW(m, MF_STRING, IDM_OPTIONS, L"Options");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    // Explorer Plus' own options
+    AppendMenuW(m, MF_STRING | menu_flag(g_dual), IDM_VIEW_DUALPANE, L"Dual pane\tCtrl+Shift+D");
+    AppendMenuW(m, MF_STRING | menu_flag(foldersizes_enabled()), IDM_VIEW_FOLDERSIZES, L"Folder sizes");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)build_text_size_menu(), L"Text size");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_VIEW_CMDBAR, L"Hide command bar");   // back into the nav row's "..."
     return m;
@@ -294,9 +297,9 @@ void cmdbar_show_tools() {
     for (const CmdItem& it : kItems)
         if (it.kind == Kind::Button && !it.label && it.cmd != IDM_MORE_MENU)
             row.push_back({ (UINT)it.cmd, it.glyph, it.tip, !enabled(it.cmd) });
-    HMENU sort = build_sort_menu(), view = build_view_menu();
+    HMENU sort = build_sort_menu(), view = build_view_menu(), text = build_text_size_menu();
     bool pane = detailspane_visible();
-    bool sel = g_list && ListView_GetSelectedCount(g_list) > 0;
+    bool sel = g_pane->list && ListView_GetSelectedCount(g_pane->list) > 0;
     std::vector<FlyEntry> list;
     auto item = [&](UINT id, const wchar_t* text, wchar_t glyph, const wchar_t* accel = L"",
                     bool checked = false, bool disabled = false) {
@@ -328,10 +331,16 @@ void cmdbar_show_tools() {
     sep();
     item(IDM_NEW_WINDOW, L"New &window", L'\xE8A7', L"Ctrl+N");
     item(IDM_OPTIONS, L"Op&tions", L'\xE713');
+    sep();
+    // Explorer Plus' own options
+    item(IDM_VIEW_DUALPANE, L"D&ual pane", L'\xE8A0', L"Ctrl+Shift+D", g_dual);
+    item(IDM_VIEW_FOLDERSIZES, L"Folder si&zes", 0, L"", foldersizes_enabled());
+    sub(text, L"Te&xt size", L'\xE8D2');
     item(IDM_VIEW_CMDBAR, L"Show command &bar", 0, L"", g_cmdBarVisible);
     UINT id = flyout_track(g_main, pt, row, list);
     DestroyMenu(sort);
     DestroyMenu(view);
+    DestroyMenu(text);
     if (id == IDM_NEW_MENU) show_new_menu(g_main, pt, TPM_LEFTALIGN | TPM_TOPALIGN);
     else if (id) SendMessageW(g_main, WM_COMMAND, MAKEWPARAM(id, 0), 0);
 }

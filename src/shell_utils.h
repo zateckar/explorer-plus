@@ -71,7 +71,7 @@ struct OleInit {
 
 // pidl helpers
 // The Desktop (namespace root) is represented by an EMPTY absolute pidl; nullptr is
-// accepted everywhere as a synonym, but g_current / tab state always hold a real pidl.
+// accepted everywhere as a synonym, but g_pane->current / tab state always hold a real pidl.
 bool pidl_is_desktop(PCUIDLIST_RELATIVE pidl);
 PIDLIST_ABSOLUTE pidl_desktop();                            // newly allocated empty pidl
 std::wstring pidl_abs_dispname(PCIDLIST_ABSOLUTE abs);      // display name of an absolute pidl ("Downloads")

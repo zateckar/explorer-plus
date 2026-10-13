@@ -1,9 +1,14 @@
 #pragma once
 #include "appstate.h"
 
-// Apply a tab state to the whole UI (tabs.cpp / tab switching uses this)
 struct TabState;
+// Apply g_pane's side of a tab to its list (and the bars, for the active list)
 void navigate_replace(TabState* t);
+// Put a tab on screen: one list or two, the active one, the navigation pane's state
+// (anotherTab: the tab wasn't on screen)
+void navigation_show_tab(TabState* t, bool anotherTab);
+void navigation_activate_pane(Pane* p);        // the other list got the focus
+void navigation_toggle_dual();                 // two lists in this tab, or one
 void navigate_owned(PIDLIST_ABSOLUTE pidl);    // adopts; nullptr = Desktop
 void navigate_to(PCIDLIST_ABSOLUTE pidl);   // clones; nullptr = Desktop
 void navigate_in_place(PIDLIST_ABSOLUTE pidl); // adopts; replaces the current folder, no history entry

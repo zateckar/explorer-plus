@@ -21,6 +21,10 @@ static int splitter_w() { return S(5); }
 
 static RECT s_tree{}, s_list{}, s_pane{}, s_search{};
 static bool s_details = false;
+// two lists: each one's place (with its caption row above it), within s_list
+static RECT s_lists[kPanes]{}, s_captions[kPanes]{};
+
+static int pane_caption_h() { return S(30); }
 
 static bool details_shown(int clientW) { return detailspane_visible() && clientW > S(760); }
 
@@ -42,7 +46,20 @@ DragKind layout_splitter_kind(HWND hwnd, POINT pt) {
     if (pt.y < s_list.top || pt.y >= s_list.bottom) return DragKind::None;
     if (g_treeVisible && pt.x >= s_tree.right && pt.x < s_list.left) return DragKind::Left;
     if (s_details && pt.x >= s_list.right && pt.x < s_pane.left) return DragKind::Right;
+    if (g_dual && pt.x >= s_lists[0].right && pt.x < s_lists[1].left) return DragKind::Middle;
     return DragKind::None;
+}
+
+int layout_caption_pane_at(POINT pt) {
+    if (!g_dual) return -1;
+    for (int i = 0; i < kPanes; ++i)
+        if (PtInRect(&s_captions[i], pt)) return i;
+    return -1;
+}
+
+void layout_pane_caption_changed() {
+    if (!g_main || !g_dual) return;
+    for (auto& r : s_captions) InvalidateRect(g_main, &r, FALSE);
 }
 
 void layout_splitter_drag(HWND hwnd, POINT pt, DragKind kind) {
@@ -53,6 +70,9 @@ void layout_splitter_drag(HWND hwnd, POINT pt, DragKind kind) {
     } else if (kind == DragKind::Right) {
         int nw = max((int)S(140), min((int)(rc.right - pt.x), (int)S(480)));
         g_splitterRight = MulDiv(nw, 96, theme_dpi());
+    } else if (kind == DragKind::Middle) {
+        int listW = s_list.right - s_list.left - splitter_w();
+        if (listW > 0) g_dualSplit = max(150, min(850, (int)MulDiv(pt.x - s_list.left, 1000, listW)));
     }
     layout_resize(hwnd, rc.right, rc.bottom);
     // only the panes' row moved: its gaps repaint (the rows above don't change)
@@ -130,13 +150,32 @@ void layout_resize(HWND main, int w, int h) {
     s_list = { listX, top, listR, bottom };
     s_pane = { w - paneW, top, w, bottom };
     if (g_treeVisible) place(g_tree, s_tree.left, top, treeW, bottom - top);
-    place(g_list, s_list.left, top, s_list.right - s_list.left, bottom - top);
+    // one list, or two side by side, each under its caption row (folder name, active one marked)
+    if (!g_dual) {
+        s_lists[0] = s_list;
+        s_lists[1] = s_captions[0] = s_captions[1] = RECT{};
+    } else {
+        int listW = s_list.right - s_list.left - sw;
+        int leftW = MulDiv(listW, g_dualSplit, 1000);
+        int capH = min(pane_caption_h(), (bottom - top) / 3);
+        s_captions[0] = { s_list.left, top, s_list.left + leftW, top + capH };
+        s_captions[1] = { s_captions[0].right + sw, top, s_list.right, top + capH };
+        for (int i = 0; i < kPanes; ++i) s_lists[i] = { s_captions[i].left, top + capH, s_captions[i].right, bottom };
+    }
+    for (Pane& p : g_panes) {
+        if (!p.list) continue;
+        const RECT& r = s_lists[p.index];
+        if (pane_shown(&p)) place(p.list, r.left, r.top, r.right - r.left, r.bottom - r.top);
+    }
     HWND pane = detailspane_hwnd();
     if (pane) {
         if (s_details) place(pane, s_pane.left, top, paneW, bottom - top);
         ShowWindow(pane, s_details ? SW_SHOWNA : SW_HIDE);
     }
     EndDeferWindowPos(dw);
+    for (Pane& p : g_panes)
+        if (p.list && p.index && (IsWindowVisible(p.list) != 0) != pane_shown(&p))
+            ShowWindow(p.list, pane_shown(&p) ? SW_SHOWNA : SW_HIDE);
 }
 
 void layout_paint(HDC dc, const RECT& client) {
@@ -171,4 +210,27 @@ void layout_paint(HDC dc, const RECT& client) {
         RECT d{ x, s_list.top, x + 1, s_list.bottom };
         fill_rect(dc, d, p.divider);
     }
+    if (!g_dual) return;
+    {
+        int x = s_lists[0].right + splitter_w() / 2;
+        RECT d{ x, s_list.top, x + 1, s_list.bottom };
+        fill_rect(dc, d, p.divider);
+    }
+    // the lists' captions: the folder each one shows; the active one (where commands go)
+    // in the accent color
+    TabState* t = tabmodel_active();
+    HGDIOBJ of = SelectObject(dc, g_font);
+    SetBkMode(dc, TRANSPARENT);
+    for (int i = 0; i < kPanes; ++i) {
+        RECT c = s_captions[i];
+        bool active = active_pane()->index == i;
+        fill_rect(dc, c, active ? blend(p.content, p.accent, 0.10) : p.content);
+        RECT ul{ c.left, c.bottom - S(2), c.right, c.bottom };
+        fill_rect(dc, ul, active ? p.accent : p.divider);
+        RECT tr{ c.left + S(10), c.top, c.right - S(8), c.bottom - S(2) };
+        SetTextColor(dc, active ? p.text : p.textSecondary);
+        std::wstring name = t ? t->side[i].name : std::wstring();
+        DrawTextW(dc, name.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    }
+    SelectObject(dc, of);
 }

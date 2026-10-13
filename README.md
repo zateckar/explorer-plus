@@ -14,11 +14,19 @@ File Explorer while starting in well under 100 ms.
 - **Pinned tabs** (right-click a tab ▸ Pin tab) stay first, can't be closed, and keep
   their folder: a folder opened from one (file list, navigation pane, address bar, Up,
   search) comes up in a new tab, whose Back leads to the pinned folder.
+- **Dual pane** ("…" ▸ Dual pane, Ctrl+Shift+D): a second file list beside the first, as
+  in Total Commander, each with its own folder, view and history. The list you click or
+  tab into is the active one (its caption is marked): the address bar, Back / Forward,
+  the navigation pane, search, the details pane and the commands act on it. Drag files
+  from one list to the other to move or copy them; drag the gap between them to resize.
+  Each tab remembers whether it shows one list or two, and their folders, across restarts.
 - **Navigation pane**: Home, Gallery, OneDrive, pinned Quick access folders, This PC,
-  Network; children listed in the background; follows the current folder.
+  Network; children listed in the background; follows the current folder. Each tab keeps
+  its own folders expanded.
 - **Views**: Details (with Win11 row spacing, or Compact like Windows' setting), Extra large /
   Large / Medium / Small icons, List, Tiles; per-folder columns (any shell property), sort,
-  Group by; item check boxes; This PC drive tiles with free-space bars. Each folder
+  Group by; item check boxes; This PC drive tiles with free-space bars. The sort order
+  you choose is remembered across restarts. Each folder
   remembers its own view; View ▸ "Apply this view to all folders" makes the current view
   and columns the default (like Explorer's Folder Options), "Reset all folders" goes back.
   Double-click on empty space goes up a level.
@@ -26,8 +34,8 @@ File Explorer while starting in well under 100 ms.
   included; junctions and symbolic links not followed, and show no size themselves;
   folders you have no access to left out), worked out in the background
   after the listing and filled in as known; sorting by Size takes them into account.
-  View ▸ Show ▸ Folder sizes turns it off.
-- **Text size**: View ▸ Text size, or Ctrl+Plus / Ctrl+Minus / Ctrl+0, scales the text of
+  "…" ▸ Folder sizes turns it off.
+- **Text size**: "…" ▸ Text size, or Ctrl+Plus / Ctrl+Minus / Ctrl+0, scales the text of
   the navigation pane, the file list and the details pane (80–200 %), remembered.
 - **Command bar**: folded into the "…" menu by default; "…" ▸ Show command bar puts the
   row back, and its own "…" menu (or a right-click on it) has "Hide command bar".
