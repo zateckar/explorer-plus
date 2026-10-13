@@ -4,6 +4,7 @@
 #include <winioctl.h>
 #include <cstddef>
 #include <cwctype>
+#include <atomic>
 
 bool pidl_is_desktop(PCUIDLIST_RELATIVE pidl) { return !pidl || ILIsEmpty(pidl); }
 
@@ -310,11 +311,17 @@ HIMAGELIST sys_imagelist(int shil) {
     // (this MinGW's uuid library lacks IID_IImageList)
     static const IID kIID_IImageList =
         { 0x46EB5926, 0x582E, 0x4017, { 0x9F, 0xDF, 0xE8, 0x99, 0x8D, 0xAA, 0x09, 0x50 } };
+    // the system image lists live for the process: asked for once (asking takes the lock
+    // that workers adding icons hold, and rows ask as they are drawn)
+    static std::atomic<HIMAGELIST> known[SHIL_LAST + 1]{};
+    if (shil < 0 || shil > SHIL_LAST) return nullptr;
+    if (HIMAGELIST h = known[shil].load()) return h;
     IImageList* il = nullptr;
     if (FAILED(SHGetImageList(shil, kIID_IImageList, (void**)&il)) || !il) return nullptr;
-    // the system image list lives for the process; drop the extra reference
+    // (drop the extra reference)
     HIMAGELIST h = reinterpret_cast<HIMAGELIST>(il);
     il->Release();
+    known[shil] = h;
     return h;
 }
 

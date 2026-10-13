@@ -50,6 +50,8 @@ struct Item {
     ULONGLONG       sig  = 0;
     SFGAOF          attrs = 0;
     int             icon = 0;               // system image list index
+    bool            ownIcon = false;        // an icon of its own (a program's...), read after the listing
+    bool            iconPending = false;    // ownIcon: the type's icon shows until it is read
     int             overlay = 0;            // 1-based overlay index (0 = none)
     bool            isFolder = false;
     bool            homePinned = false;     // Home: a pinned (Favorites) file

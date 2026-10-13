@@ -115,7 +115,7 @@ bool fs_folder_missing(PCIDLIST_ABSOLUTE abs);    // a local file-system folder 
 int sys_icon_index(PCIDLIST_ABSOLUTE abs, bool open = false, int fallback = 0);
 int sys_folder_icon_index(bool open);     // the stock folder icon
 HIMAGELIST sys_imagelist(int shil);       // SHIL_SMALL / SHIL_LARGE / SHIL_EXTRALARGE (shared, never destroy)
-void sys_imagelist_init();                // once, on the UI thread, before workers ask for icons
+void sys_imagelist_init();                // once at startup, before workers ask for icons
 
 // create IDataObject from child PIDLs (same parent)
 HRESULT dataobject_from_children(HWND hwnd, IShellFolder* psf,

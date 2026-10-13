@@ -9,6 +9,10 @@
 #include <propsys.h>
 #include "workers.h"
 #include <memory>
+#include <deque>
+#include <thread>
+#include <condition_variable>
+#include <utility>
 #include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
@@ -49,6 +53,48 @@ static std::wstring fs_type_for(const std::wstring& name, bool folder) {
     std::lock_guard<std::mutex> lk(s_typeMx);
     s_typeByExt[ext] = t;
     return t;
+}
+
+// the icon a type shows for a file whose own icon isn't read yet (a program's: the generic
+// program icon); folders: the plain folder
+static std::unordered_map<std::wstring, int> s_typeIconByExt;
+
+static int type_icon_for(const std::wstring& name, bool folder) {
+    if (folder) return sys_folder_icon_index(false);
+    std::wstring ext = PathFindExtensionW(name.c_str());
+    CharLowerBuffW(ext.data(), (DWORD)ext.size());
+    {
+        std::lock_guard<std::mutex> lk(s_typeMx);
+        auto it = s_typeIconByExt.find(ext);
+        if (it != s_typeIconByExt.end()) return it->second;
+    }
+    SHFILEINFOW fi{};
+    std::wstring probe = L"x" + ext;
+    int idx = SHGetFileInfoW(probe.c_str(), FILE_ATTRIBUTE_NORMAL, &fi, sizeof(fi),
+                             SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES) ? fi.iIcon : 0;
+    std::lock_guard<std::mutex> lk(s_typeMx);
+    s_typeIconByExt[ext] = idx;
+    return idx;
+}
+
+// A file's icon goes by its type, unless the type gives each file its own (programs,
+// shortcuts, icon files). Asking the folder costs ~0.1 ms a file (half of System32's
+// listing), so it is asked once per extension. -1: the type's files have icons of their own.
+static std::unordered_map<std::wstring, int> s_fileIconByExt;
+
+static int file_icon_by_type(IShellIcon* icons, PCUITEMID_CHILD child, const std::wstring& name) {
+    std::wstring ext = PathFindExtensionW(name.c_str());
+    CharLowerBuffW(ext.data(), (DWORD)ext.size());
+    {
+        std::lock_guard<std::mutex> lk(s_typeMx);
+        auto it = s_fileIconByExt.find(ext);
+        if (it != s_fileIconByExt.end()) return it->second;
+    }
+    int idx = -1;
+    if (icons->GetIconOf(child, GIL_FORSHELL, &idx) != S_OK) idx = -1;
+    std::lock_guard<std::mutex> lk(s_typeMx);
+    s_fileIconByExt[ext] = idx;
+    return idx;
 }
 
 // extensions Explorer hides when "File name extensions" is off: those of registered types
@@ -96,8 +142,10 @@ static bool has_extra_columns(const ColumnSet& cols) {
 // Overlays (shortcut arrow, OneDrive / Git states...) ask every registered handler about
 // every item: about half of a big folder's listing time. The listing goes out without
 // them; the worker then works them out and they follow in batches, like in Explorer.
+// So do icons of their own, with deferIcon (see IconPass).
 static Item* make_item(IShellFolder* psf, IShellIcon* icons, PCIDLIST_ABSOLUTE folderAbs,
-                       PITEMID_CHILD child, SFGAOF attrs, bool drives, const ColumnSet& cols, ExtMode ext) {
+                       PITEMID_CHILD child, SFGAOF attrs, bool drives, const ColumnSet& cols, ExtMode ext,
+                       bool deferIcon) {
     Item* it = new Item;
     it->pidl = child;        // adopted
     it->sig  = pidl_sig(child);
@@ -170,10 +218,19 @@ static Item* make_item(IShellFolder* psf, IShellIcon* icons, PCIDLIST_ABSOLUTE f
     if (attrs & SFGAO_STREAM) it->isFolder = false;   // archives sort/size like files
 
     int idx = -1;
-    if (!icons || icons->GetIconOf(child, GIL_FORSHELL, &idx) != S_OK) {
-        PIDLIST_ABSOLUTE full = ILCombine(folderAbs, child);
-        idx = full ? sys_icon_index(full) : 0;
-        if (full) CoTaskMemFree(full);
+    const std::wstring& fname = it->fileName.empty() ? it->name : it->fileName;
+    bool byType = deferIcon && icons && fsItem && !it->driveType;
+    if (byType && !plainFolder) idx = file_icon_by_type(icons, child, fname);
+    else if (!icons || icons->GetIconOf(child, GIL_FORSHELL, &idx) != S_OK) idx = -1;
+    if (idx < 0) {
+        if (byType) {
+            idx = type_icon_for(fname, plainFolder);
+            it->ownIcon = it->iconPending = true;
+        } else {
+            PIDLIST_ABSOLUTE full = ILCombine(folderAbs, child);
+            idx = full ? sys_icon_index(full) : 0;
+            if (full) CoTaskMemFree(full);
+        }
     }
     it->icon = idx;
     columns_fill(si.get(), cols, it);      // the folder's extra columns (after driveType)
@@ -283,6 +340,21 @@ struct StreamBuf {
     ~StreamBuf() { free_items(items); }
 };
 
+// opened once; wait() returns when it is
+struct Gate {
+    std::mutex mx;
+    std::condition_variable cv;
+    bool open = false;
+    void wait() {
+        std::unique_lock<std::mutex> lk(mx);
+        cv.wait(lk, [this] { return open; });
+    }
+    void release() {
+        { std::lock_guard<std::mutex> lk(mx); open = true; }
+        cv.notify_all();
+    }
+};
+
 struct EnumJob {
     Pane* pane = nullptr;             // the pane listing (its enumId says when the job is stale)
     UINT opId = 0;
@@ -291,13 +363,57 @@ struct EnumJob {
     ExtMode ext;
     ColumnSet columns;                // empty: the folder's default columns (read by the worker)
     std::shared_ptr<StreamBuf> stream;   // null: collect everything for WM_ENUM_DONE
+    std::shared_ptr<Gate> gate;       // a startup listing: WM_ENUM_DONE waits for it (EnumEarly)
 };
+
+// The startup folders' listings start as soon as the tabs are read, while the window is
+// still being built (about half the time to the first paint); enumerate_start finds its
+// folder's listing running and takes it over. Until then the worker holds its result back:
+// the window, and the pane's listing state it goes into, aren't there yet.
+struct EnumEarly {
+    UINT opId = 0;
+    ULONGLONG folderSig = 0;
+    bool showHidden = false;
+    ExtMode ext;
+    ColumnSet columns;
+    std::shared_ptr<StreamBuf> stream;
+    std::shared_ptr<Gate> gate;
+};
+static EnumEarly s_early[kPanes];
 
 // overlays worked out after the listing went out: (seq, overlay or 0) per item
 struct OverlayBatch {
     Pane* pane;
     UINT opId;
     std::vector<std::pair<int, int>> results;
+};
+
+// Icons of their own (programs, shortcuts, icon files, folders with a desktop.ini icon)
+// are read from each file: on one thread, most of a big folder's listing time (System32:
+// 1 s of 1.2 s). The listing goes out with the type's icon in their place while a few
+// threads read them, from the first such item on; they follow in batches of (seq, icon),
+// and `last` says the listing has them all.
+struct IconBatch {
+    Pane* pane;
+    UINT opId;
+    std::vector<std::pair<int, int>> results;
+    bool last = false;
+};
+
+struct IconPass {
+    Pane* pane = nullptr;
+    UINT opId = 0;
+    PIDLIST_ABSOLUTE folder = nullptr;                 // owned
+    std::mutex mx;
+    std::deque<std::pair<int, PITEMID_CHILD>> queue;   // (seq, copy of the item's ID)
+    std::vector<std::pair<int, int>> done;             // read, not sent yet
+    ULONGLONG lastPost = 0;
+    int running = 0;                                   // threads reading
+    bool closed = false;                               // the listing has no more
+    ~IconPass() {
+        for (auto& q : queue) CoTaskMemFree(q.second);
+        if (folder) CoTaskMemFree(folder);
+    }
 };
 
 // results held while a rename box is open (see hold_while_renaming)
@@ -310,6 +426,11 @@ struct EnumState {
     // WM_ENUM_DONE, or the listing is still streaming in).
     UINT completeOpId = 0;                    // listing applied in full
     std::vector<OverlayBatch*> deferredOverlays;
+    // icons read before their items came (a small folder's often are): (seq, icon) of
+    // listing iconsOpId; iconsSettledOpId: that listing's last batch is in
+    std::vector<std::pair<int, int>> earlyIcons;
+    UINT iconsOpId = 0, iconsSettledOpId = 0;
+    UINT shownOpId = 0;                       // listing whose items g_pane->items are
     bool pendingKeepView = false;             // the listing on the way is a refresh in place
     ULONGLONG shownFolderSig = 0;             // folder whose listing is on screen
     ULONGLONG pendingFolderSig = 0;           // folder being enumerated
@@ -345,6 +466,51 @@ static void overlay_apply(void* payload) {
     InvalidateRect(g_pane->list, nullptr, FALSE);
 }
 
+// icons read for `items` (by seq): those whose items aren't there stay in `results`
+static bool set_icons(const std::vector<Item*>& items, std::vector<std::pair<int, int>>& results) {   // (g_pane->itemsMx held)
+    if (results.empty() || items.empty()) return false;
+    int maxSeq = 0;
+    for (Item* it : items) maxSeq = std::max(maxSeq, it->seq);
+    std::vector<Item*> bySeq(maxSeq + 1, nullptr);
+    for (Item* it : items) if (it->seq >= 0) bySeq[it->seq] = it;
+    bool any = false;
+    auto rest = std::remove_if(results.begin(), results.end(), [&](const std::pair<int, int>& r) {
+        Item* it = r.first >= 0 && r.first <= maxSeq ? bySeq[r.first] : nullptr;
+        if (!it) return false;
+        if (it->iconPending) {
+            if (r.second >= 0) it->icon = r.second;     // (not read: the type's icon stays)
+            it->iconPending = false;
+            any = true;
+        }
+        return true;
+    });
+    results.erase(rest, results.end());
+    return any;
+}
+
+static void icon_apply(void* payload) {
+    std::unique_ptr<IconBatch> b(static_cast<IconBatch*>(payload));
+    PaneScope ps(b->pane);
+    if (b->opId != g_pane->enumId.load()) return;      // another listing by now
+    if (es().iconsOpId != b->opId) { es().earlyIcons.clear(); es().iconsOpId = b->opId; }
+    bool any = false;
+    {
+        std::lock_guard<std::mutex> lk(g_pane->itemsMx);
+        if (es().shownOpId == b->opId) any = set_icons(g_pane->items, b->results);
+        es().earlyIcons.insert(es().earlyIcons.end(), b->results.begin(), b->results.end());   // their items come later
+    }
+    if (b->last) {
+        es().iconsSettledOpId = b->opId;
+        if (perf_on()) perf_event("enum.icons", -1, (long long)es().earlyIcons.size());   // (n: still waiting for items)
+    }
+    if (any) InvalidateRect(g_pane->list, nullptr, FALSE);
+}
+
+// items of listing `opId` arriving: icons that were read before them
+static void take_early_icons(const std::vector<Item*>& fresh, UINT opId) {   // (g_pane->itemsMx held)
+    if (es().iconsOpId == opId) set_icons(fresh, es().earlyIcons);
+}
+
 // the listing `opId` is complete on screen: overlays that came early go on now, and the
 // subfolders' sizes are worked out
 static void listing_complete(UINT opId) {
@@ -358,6 +524,16 @@ static void listing_complete(UINT opId) {
 }
 
 bool enum_listing_complete() { return g_pane->enumId.load() == es().completeOpId; }
+
+bool enum_startup_settled() {
+    for (Pane& p : g_panes) {
+        if (!p.list || !pane_shown(&p)) continue;
+        PaneScope ps(&p);
+        UINT id = p.enumId.load();
+        if (es().completeOpId != id || es().iconsSettledOpId != id) return false;
+    }
+    return true;
+}
 
 static void overlay_pass(Pane* pane, UINT opId, IShellIconOverlay* overlays,
                          std::vector<std::pair<int, PITEMID_CHILD>>& ids) {
@@ -393,13 +569,165 @@ static void overlay_pass(Pane* pane, UINT opId, IShellIconOverlay* overlays,
     }
 }
 
+static void icon_post(IconPass* p, bool last) {   // (p->mx held)
+    auto* b = new IconBatch{ p->pane, p->opId, std::move(p->done), last };
+    p->done.clear();
+    p->lastPost = GetTickCount64();
+    post_async(icon_apply, b);
+}
+
+// one of the pass's threads: reads icons until none are waiting
+static void icon_reader(const std::shared_ptr<IconPass>& p) {
+    for (;;) {
+        std::pair<int, PITEMID_CHILD> next;
+        {
+            std::lock_guard<std::mutex> lk(p->mx);
+            if (p->opId != p->pane->enumId.load()) {          // navigated on: not needed
+                for (auto& q : p->queue) CoTaskMemFree(q.second);
+                p->queue.clear();
+            }
+            if (p->queue.empty()) {
+                bool last = --p->running == 0 && p->closed;   // (else more may come: a reader starts for them)
+                if (last || !p->done.empty()) icon_post(p.get(), last);
+                return;
+            }
+            next = p->queue.front();
+            p->queue.pop_front();
+        }
+        PIDLIST_ABSOLUTE full = ILCombine(p->folder, next.second);
+        CoTaskMemFree(next.second);
+        int idx = full ? sys_icon_index(full, false, -1) : -1;
+        if (full) CoTaskMemFree(full);
+        std::lock_guard<std::mutex> lk(p->mx);
+        p->done.push_back({ next.first, idx });
+        if (GetTickCount64() - p->lastPost >= 100) icon_post(p.get(), false);
+    }
+}
+
+// an item whose icon is to be read: a reader for it, and more while they fall behind
+static void icon_later(const std::shared_ptr<IconPass>& p, int seq, PCUITEMID_CHILD child) {
+    static const int kReaders = (int)std::clamp(std::thread::hardware_concurrency(), 2u, 5u) - 1;
+    PITEMID_CHILD copy = pidl_clone_child(child);
+    if (!copy) return;                                  // (it keeps the type's icon)
+    std::lock_guard<std::mutex> lk(p->mx);
+    p->queue.push_back({ seq, copy });
+    if (p->running < kReaders && (p->running == 0 || p->queue.size() > 4u * p->running)) {
+        ++p->running;
+        worker_submit([p] { icon_reader(p); });
+    }
+}
+
+// the listing is complete: the last batch says so once the readers are done
+static void icon_close(const std::shared_ptr<IconPass>& p) {
+    std::lock_guard<std::mutex> lk(p->mx);
+    p->closed = true;
+    if (p->running == 0) icon_post(p.get(), true);
+}
+
+static constexpr SFGAOF kItemAttrs = SFGAO_HIDDEN | SFGAO_SYSTEM | SFGAO_FOLDER | SFGAO_STREAM |
+                                     SFGAO_FILESYSTEM | SFGAO_LINK | SFGAO_SHARE | SFGAO_GHOSTED |
+                                     SFGAO_DROPTARGET;
+
+// A plain folder's items are read on a few threads at once, each with its own binding of
+// the folder: every type costs ~3 ms of registry reads the first time it is seen (its
+// attributes, icon and name), so 60 items of a dozen types took 45 ms on one thread, and
+// a big folder is read faster too. The listing thread hands the IDs out as it finds them.
+struct ItemReader {
+    Pane* pane = nullptr;
+    UINT opId = 0;
+    PIDLIST_ABSOLUTE folder = nullptr;                 // owned
+    ColumnSet columns;
+    ExtMode ext;
+    std::shared_ptr<StreamBuf> stream;                 // the items go here, else into `items`
+    std::shared_ptr<IconPass> icons;
+    bool overlays = false;                             // keep (seq, ID) for the overlay pass
+    std::mutex mx;
+    std::condition_variable cv;
+    std::deque<std::pair<int, PITEMID_CHILD>> queue;   // (seq, ID) to read
+    std::vector<Item*> items;
+    std::vector<std::pair<int, PITEMID_CHILD>> overlayIds;
+    int busy = 0;                                      // being read now
+    int helpers = 0;                                   // threads asked for
+    bool closed = false;                               // the listing found them all
+    ~ItemReader() {
+        for (auto& q : queue) CoTaskMemFree(q.second);
+        for (auto& o : overlayIds) CoTaskMemFree(o.second);
+        free_items(items);
+        if (folder) CoTaskMemFree(folder);
+    }
+};
+
+static Item* read_item(IShellFolder* psf, IShellIcon* icons, PCIDLIST_ABSOLUTE folder, PITEMID_CHILD child,
+                       int seq, bool drives, const ColumnSet& cols, ExtMode ext, const std::shared_ptr<IconPass>& pass) {
+    SFGAOF attrs = kItemAttrs;
+    psf->GetAttributesOf(1, const_cast<PCUITEMID_CHILD*>(&child), &attrs);
+    Item* it = make_item(psf, icons, folder, child, attrs, drives, cols, ext, true);
+    it->seq = seq;
+    if (it->iconPending) icon_later(pass, seq, child);
+    return it;
+}
+
+// reads queued items until the listing is done and none are left
+static void reader_lane(ItemReader* r, IShellFolder* psf, IShellIcon* icons) {
+    for (;;) {
+        std::pair<int, PITEMID_CHILD> next;
+        {
+            std::unique_lock<std::mutex> lk(r->mx);
+            r->cv.wait(lk, [r] { return !r->queue.empty() || r->closed; });
+            if (r->queue.empty()) return;
+            next = r->queue.front();
+            r->queue.pop_front();
+            ++r->busy;
+        }
+        Item* it = nullptr;
+        PITEMID_CHILD overlayId = nullptr;
+        if (r->opId == r->pane->enumId.load()) {
+            if (r->overlays) overlayId = pidl_clone_child(next.second);
+            it = read_item(psf, icons, r->folder, next.second, next.first, false, r->columns, r->ext, r->icons);
+        } else {
+            CoTaskMemFree(next.second);                 // navigated on
+        }
+        if (it && r->stream) {                          // (in before `busy` drops: the listing waits for it)
+            std::lock_guard<std::mutex> lk(r->stream->mx);
+            r->stream->items.push_back(it);
+            it = nullptr;
+        }
+        {
+            std::lock_guard<std::mutex> lk(r->mx);
+            if (it) r->items.push_back(it);
+            if (overlayId) r->overlayIds.push_back({ next.first, overlayId });
+            --r->busy;
+        }
+        r->cv.notify_all();
+    }
+}
+
+static void reader_helper(const std::shared_ptr<ItemReader>& r) {
+    com_ptr<IShellFolder> psf;
+    com_ptr<IShellIcon> icons;
+    if (FAILED(bind_list(r->folder, IID_PPV_ARGS(psf.put()))) || !psf) return;   // (the others read them)
+    psf->QueryInterface(IID_PPV_ARGS(icons.put()));
+    reader_lane(r.get(), psf.get(), icons.get());
+}
+
+static bool plain_folder(PCIDLIST_ABSOLUTE folder) {
+    WCHAR path[MAX_PATH];
+    return folder && !ILIsEmpty(folder) && SHGetPathFromIDListW(folder, path) && !search_is_results(folder);
+}
+
 static void worker(EnumJob* job) {
     ComInit ci;
+    perf_sample_begin("enum");
     HeapEnumOp* op = new HeapEnumOp;
     Pane* pane = job->pane;
     op->pane = pane->index;
     op->opId = job->opId;
     UINT opId = job->opId;
+    auto iconPass = std::make_shared<IconPass>();
+    iconPass->pane = pane;
+    iconPass->opId = opId;
+    iconPass->folder = pidl_clone(job->folder);
+    iconPass->lastPost = GetTickCount64();
 
     com_ptr<IShellFolder> psf;
     com_ptr<IShellIconOverlay> overlays;
@@ -428,6 +756,20 @@ static void worker(EnumJob* job) {
             std::lock_guard<std::mutex> lk(job->stream->mx);
             job->stream->columns = op->columns;
         }
+        // (Home and This PC: their own extras per item, and few items)
+        std::shared_ptr<ItemReader> reader;
+        if (!home && !thisPC && plain_folder(job->folder)) {
+            reader = std::make_shared<ItemReader>();
+            reader->pane = pane;
+            reader->opId = opId;
+            reader->folder = pidl_clone(job->folder);
+            reader->columns = op->columns;
+            reader->ext = job->ext;
+            reader->stream = job->stream;
+            reader->icons = iconPass;
+            reader->overlays = overlays.get() != nullptr;
+        }
+        static const int kHelpers = (int)std::clamp(std::thread::hardware_concurrency(), 2u, 4u) - 1;
         int seq = 0;
         double tEnum = perf_on() ? perf_now() : 0;
         com_ptr<IEnumIDList> e;
@@ -442,15 +784,22 @@ static void worker(EnumJob* job) {
                     CoTaskMemFree(child);
                     break;
                 }
-                SFGAOF attrs = SFGAO_HIDDEN | SFGAO_SYSTEM | SFGAO_FOLDER | SFGAO_STREAM |
-                               SFGAO_FILESYSTEM | SFGAO_LINK | SFGAO_SHARE | SFGAO_GHOSTED |
-                               SFGAO_DROPTARGET;
-                psf->GetAttributesOf(1, const_cast<PCUITEMID_CHILD*>(&child), &attrs);
+                if (reader) {
+                    {
+                        std::lock_guard<std::mutex> lk(reader->mx);
+                        reader->queue.push_back({ seq++, child });
+                        if (reader->helpers < kHelpers && reader->queue.size() > 2u * (reader->helpers + 1)) {
+                            ++reader->helpers;
+                            worker_submit([reader] { reader_helper(reader); });
+                        }
+                    }
+                    reader->cv.notify_one();
+                    continue;
+                }
                 if (overlays)
                     if (PITEMID_CHILD copy = pidl_clone_child(child)) overlayIds.push_back({ seq, copy });
-                Item* it = make_item(psf.get(), icons.get(), job->folder, child, attrs, thisPC, op->columns, job->ext);
-                if (seq == 0 && perf_on()) perf_event("enum.first_item", perf_now() - tEnum);
-                it->seq = seq++;
+                Item* it = read_item(psf.get(), icons.get(), job->folder, child, seq++, thisPC, op->columns, job->ext, iconPass);
+                if (seq == 1 && perf_on()) perf_event("enum.first_item", perf_now() - tEnum);
                 if (home && !it->isFolder) {
                     VARIANT v; VariantInit(&v);
                     it->homePinned = SUCCEEDED(home->GetDetailsEx(child, &kPinned, &v)) &&
@@ -470,28 +819,46 @@ static void worker(EnumJob* job) {
             bool endCode = next == HRESULT_FROM_WIN32(ERROR_NO_MORE_FILES) ||
                            next == HRESULT_FROM_WIN32(ERROR_NO_MORE_ITEMS);
             hr = FAILED(next) && !endCode ? next : S_OK;
-            if (perf_on()) perf_event("enum.worker_done", perf_now() - tEnum, seq);
         } else if (hr == S_FALSE) {
             hr = S_OK;    // user cancelled a prompt (e.g. empty drive) — just empty
         }
+        if (reader) {
+            // all found: this thread reads too, then waits for the others' last items
+            { std::lock_guard<std::mutex> lk(reader->mx); reader->closed = true; }
+            reader->cv.notify_all();
+            reader_lane(reader.get(), psf.get(), icons.get());
+            std::unique_lock<std::mutex> lk(reader->mx);
+            reader->cv.wait(lk, [&] { return reader->busy == 0 && reader->queue.empty(); });
+            op->items = std::move(reader->items);
+            reader->items.clear();
+            overlayIds = std::move(reader->overlayIds);
+            reader->overlayIds.clear();
+            std::sort(overlayIds.begin(), overlayIds.end(),      // (the first rows' first)
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+        }
+        if (perf_on()) perf_event("enum.worker_done", perf_now() - tEnum, seq);
     }
     if (job->stream) {                       // whatever the UI has not taken yet
         std::lock_guard<std::mutex> lk(job->stream->mx);
-        op->items = std::move(job->stream->items);
+        op->items.insert(op->items.end(), job->stream->items.begin(), job->stream->items.end());
         job->stream->items.clear();
         job->stream->closed = true;
     }
     op->enumHr = hr;
+    icon_close(iconPass);
+    std::shared_ptr<Gate> gate = std::move(job->gate);
     if (job->folder) CoTaskMemFree(job->folder);
     delete job;                              // (drops the worker's share of the stream)
+    if (gate) gate->wait();                  // (a startup listing: until it is taken over)
     if (!PostMessageW(g_main, WM_ENUM_DONE, 0, (LPARAM)op)) {
         free_items(op->items);
         delete op;
     }
     // (posted after WM_ENUM_DONE, so the listing is applied before its overlays)
     if (overlays) overlay_pass(pane, opId, overlays.get(), overlayIds);
+    else for (auto& o : overlayIds) CoTaskMemFree(o.second);
+    perf_sample_end();
 }
-
 // what identifies an item across listings (Item::key): its path where the folder mixes
 // folders (search results), else its file name — not the display name, which changes
 // when file name extensions are switched, nor the ID, which changes with size and date
@@ -580,43 +947,89 @@ void enum_clear_items() {
         free_items(g_pane->items);
     }
     es().shownFolderSig = 0;
+    es().shownOpId = 0;
     groups_clear();
     ListView_SetItemCount(g_pane->list, 0);
 }
 
+static ExtMode ext_mode() {
+    ExtMode m;
+    m.windows = windows_shows_extensions();
+    m.show = g_showExtensions.load() < 0 ? m.windows : g_showExtensions.load() != 0;
+    return m;
+}
+
+static EnumJob* new_job(PCIDLIST_ABSOLUTE folderAbs, UINT id) {
+    EnumJob* job = new EnumJob;
+    job->pane = g_pane;
+    job->opId = id;
+    job->folder = folderAbs ? pidl_clone(folderAbs) : pidl_desktop();
+    job->showHidden = g_showHidden.load();
+    job->ext = ext_mode();
+    return job;
+}
+
+void enum_start_early(Pane* pane, PCIDLIST_ABSOLUTE folderAbs) {
+    PaneScope ps(pane);
+    EnumEarly& e = s_early[pane->index];
+    EnumJob* job = new_job(folderAbs, ++pane->enumId);
+    if (perf_on()) perf_event("enum.early", -1, job->opId, pidl_folder_path(job->folder).c_str());
+    e.opId = job->opId;
+    e.folderSig = pidl_sig(job->folder);
+    e.showHidden = job->showHidden;
+    e.ext = job->ext;
+    e.columns = job->columns = columns_for_folder(job->folder);
+    e.stream = job->stream = std::make_shared<StreamBuf>();
+    e.stream->opId = job->opId;
+    e.gate = job->gate = std::make_shared<Gate>();
+    worker_submit([job] { worker(job); });
+}
+
+void enum_early_done() {
+    for (Pane& p : g_panes) {
+        EnumEarly e = std::exchange(s_early[p.index], {});
+        if (!e.gate) continue;
+        p.enumId.compare_exchange_strong(e.opId, e.opId + 1);     // (its result is dropped)
+        e.gate->release();
+    }
+}
+
 void enumerate_start(PCIDLIST_ABSOLUTE folderAbs, bool keepView) {
-    UINT id = ++g_pane->enumId;
-    if (perf_on()) perf_event("enum.start", -1, id, pidl_folder_path(folderAbs).c_str());
+    // this folder's startup listing, running already: taken over (another one: dropped)
+    EnumEarly early = std::exchange(s_early[g_pane->index], {});
+    ExtMode ext = ext_mode();
+    bool adopt = early.gate && !keepView && early.opId == g_pane->enumId.load() &&
+                 early.folderSig == pidl_sig(folderAbs) && early.showHidden == g_showHidden.load() &&
+                 early.ext.show == ext.show && early.ext.windows == ext.windows;
+    UINT id = adopt ? early.opId : ++g_pane->enumId;
+    if (perf_on()) perf_event(adopt ? "enum.adopt" : "enum.start", -1, id, pidl_folder_path(folderAbs).c_str());
     es().pendingFolderSig = pidl_sig(folderAbs);
     es().pendingKeepView = keepView && es().pendingFolderSig == es().shownFolderSig;
     if (!es().pendingKeepView) {
         enum_clear_items();
         foldersizes_release_watch();     // another folder (its listing watches that one)
     }
-    EnumJob* job = new EnumJob;
-    job->pane = g_pane;
-    job->opId = id;
-    job->folder = folderAbs ? pidl_clone(folderAbs) : pidl_desktop();
-    job->showHidden = g_showHidden.load();
-    job->ext.windows = windows_shows_extensions();
-    job->ext.show = g_showExtensions.load() < 0 ? job->ext.windows : g_showExtensions.load() != 0;
+    EnumJob* job = adopt ? nullptr : new_job(folderAbs, id);
     // a refresh keeps the shown columns; a new folder uses its remembered set or defaults
-    job->columns = es().pendingKeepView ? g_pane->columns : columns_for_folder(job->folder);
+    ColumnSet columns = adopt ? early.columns
+                      : es().pendingKeepView ? g_pane->columns : columns_for_folder(job->folder);
     // the header is the new folder's at once (the list is empty now): the last folder's, or
     // at startup the template, would be rearranged when the listing comes, a horizontal
     // scroll bar showing meanwhile if they are wider. (No set remembered: the listing finds
     // the folder's defaults.)
-    if (!es().pendingKeepView) columns_apply(job->columns);
+    if (!es().pendingKeepView) columns_apply(columns);
     stream_stop();
     if (!es().pendingKeepView) {
-        es().stream = std::make_shared<StreamBuf>();
+        es().stream = adopt ? early.stream : std::make_shared<StreamBuf>();
         es().stream->opId = id;
-        job->stream = es().stream;
+        if (job) job->stream = es().stream;
         SetTimer(g_main, pane_timer(TIMER_ENUM_STREAM), kFirstStreamMs, nullptr);
     }
+    if (early.gate) early.gate->release();
+    if (!job) return;
+    job->columns = std::move(columns);
     worker_submit([job] { worker(job); });
 }
-
 // A rename box sits on a row: the rows must not move under it. Another folder's listing
 // ends the rename (as in Explorer); a refresh's rows, a later batch and a change wait
 // until the box is gone, then apply in the order they came.
@@ -680,16 +1093,17 @@ static void set_error(HRESULT hr) {
 }
 
 // A refresh's or a change's new items take over what the old ones with the same key
-// had: the overlay (until the overlay pass has the new one: no blinking arrows) and the
-// thumbnail, while the ID is the same (an unchanged file), and a folder its size (until
+// had: the overlay and an icon of its own (until the passes have the new ones: no blinking
+// arrows or icons) and the thumbnail, while the ID is the same (an unchanged file), and a folder its size (until
 // the folder sizes are worked out again). Returns the thumbnails kept.
 static size_t carry_over(const std::vector<Item*>& old, std::vector<Item*>& fresh) {   // (g_pane->itemsMx held)
-    struct Carry { int overlay; int thumbIndex; ULONGLONG sig; const Item* folder; };
+    struct Carry { int overlay; int icon; int thumbIndex; ULONGLONG sig; const Item* folder; };
     std::unordered_map<std::wstring, Carry> carry;
     for (Item* it : old) {
         int thumb = it->thumbReady.load() == 2 ? it->thumbIndex : -1;
         const Item* folder = it->isFolder && !it->driveType && !it->size.empty() ? it : nullptr;
-        if (it->overlay || thumb >= 0 || folder) carry.emplace(it->key, Carry{ it->overlay, thumb, it->sig, folder });
+        int icon = it->ownIcon && !it->iconPending ? it->icon : -1;
+        if (it->overlay || icon >= 0 || thumb >= 0 || folder) carry.emplace(it->key, Carry{ it->overlay, icon, thumb, it->sig, folder });
     }
     size_t kept = 0;
     if (carry.empty()) return kept;
@@ -697,6 +1111,7 @@ static size_t carry_over(const std::vector<Item*>& old, std::vector<Item*>& fres
         auto f = carry.find(it->key);
         if (f == carry.end()) continue;
         if (!it->overlay) it->overlay = f->second.overlay;
+        if (it->iconPending && f->second.icon >= 0) it->icon = f->second.icon;
         if (const Item* folder = f->second.folder; folder && it->isFolder && it->size.empty()) {
             it->bytes = folder->bytes;
             it->size = folder->size;
@@ -760,8 +1175,7 @@ static void change_worker(ChangeJob* job) {
             // (parsing reads the file now: gone = no item, the old one goes)
             if (FAILED(psf->ParseDisplayName(nullptr, nullptr, n.data(), nullptr, &rel, nullptr)) || !rel) continue;
             auto child = reinterpret_cast<PITEMID_CHILD>(rel);
-            SFGAOF attrs = SFGAO_HIDDEN | SFGAO_SYSTEM | SFGAO_FOLDER | SFGAO_STREAM |
-                           SFGAO_FILESYSTEM | SFGAO_LINK | SFGAO_SHARE | SFGAO_GHOSTED | SFGAO_DROPTARGET;
+            SFGAOF attrs = kItemAttrs;
             psf->GetAttributesOf(1, const_cast<PCUITEMID_CHILD*>(&child), &attrs);
             // what the listing would leave out (SHCONTF without / with INCLUDEHIDDEN)
             bool hidden = (attrs & SFGAO_HIDDEN) != 0;
@@ -772,7 +1186,7 @@ static void change_worker(ChangeJob* job) {
             }
             int ov = 0;
             if (overlays && (FAILED(overlays->GetOverlayIndex(child, &ov)) || ov < 0 || ov > 15)) ov = 0;
-            Item* it = make_item(psf.get(), icons.get(), job->folder, child, attrs, false, job->columns, job->ext);
+            Item* it = make_item(psf.get(), icons.get(), job->folder, child, attrs, false, job->columns, job->ext, false);
             it->overlay = ov;
             res->items.push_back(it);
         }
@@ -895,6 +1309,7 @@ static void append_batch(HeapEnumOp* op) {
         std::lock_guard<std::mutex> lk(g_pane->itemsMx);
         SelectionByItem sel = capture_selection();
         hadSelection = sel.any();
+        take_early_icons(op->items, op->opId);
         merge_batch(op->items);
         op->items.clear();                         // (now owned by g_pane->items)
         n = (int)g_pane->items.size();
@@ -993,6 +1408,8 @@ void enum_apply_op(HeapEnumOp* op) {
         }
         free_items(g_pane->items);
         g_pane->items = std::move(op->items);
+        es().shownOpId = op->opId;
+        take_early_icons(g_pane->items, op->opId);
         sort_items();
     }
     es().shownFolderSig = es().pendingFolderSig;

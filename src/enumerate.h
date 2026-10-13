@@ -7,6 +7,14 @@
 // visible until the new listing arrives, and selection/focus/scroll are restored.
 void enumerate_start(PCIDLIST_ABSOLUTE folderAbs, bool keepView);
 
+// Startup: list `folderAbs` in `pane` before the window is there (settings read); the
+// window's enumerate_start of that folder takes the listing over. enum_early_done, once
+// the window is created, drops one that wasn't. enum_startup_settled: the shown lists
+// have their listings and icons in full (the first paint can wait a moment for them).
+void enum_start_early(Pane* pane, PCIDLIST_ABSOLUTE folderAbs);
+void enum_early_done();
+bool enum_startup_settled();
+
 // After the next listing is applied, select (and optionally start renaming) this item.
 void enum_set_pending_select(const std::wstring& name, bool beginRename);
 // select `name` (an in-folder file name) when `folder` is next listed: opening a file's folder

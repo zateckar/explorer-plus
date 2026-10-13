@@ -133,7 +133,7 @@ try:
     ok = wait_log(log, lambda l: 'enum.complete' in l, 120)
     time.sleep(0.5)
     ev = parse(log_lines(log))
-    starts = [e for e in ev if e[1] == 'enum.start' and big.lower() in e[3].lower()]
+    starts = [e for e in ev if e[1] in ('enum.start', 'enum.early') and big.lower() in e[3].lower()]   # (early: started before the window)
     t0 = starts[-1][0] if starts else 0
     fi = [e for e in ev if e[1] == 'enum.first_item']
     af = [e for e in ev if e[1] == 'enum.apply_first']

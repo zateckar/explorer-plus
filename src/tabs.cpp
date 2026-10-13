@@ -12,6 +12,8 @@ using std::min;
 #include "searchbox.h"
 #include <unordered_map>
 #include <memory>
+#include <atomic>
+#include <thread>
 #include "workers.h"
 #include "acc.h"
 #include "kbdrow.h"
@@ -334,9 +336,37 @@ static PIDLIST_ABSOLUTE parse_persisted(const std::wstring& path) {
     return pidl_desktop();
 }
 
+// The saved tabs' folders: each is parsed (the disk asked, ~1.4 ms), a few at a time, so
+// eight tabs don't hold the window back for 11 ms. Shares keep their saved name (it needs
+// no server); the others get the shell's.
+struct SavedFolder {
+    std::wstring path, savedName;
+    PIDLIST_ABSOLUTE pidl = nullptr;
+    std::wstring name;
+};
+
+static void parse_saved(std::vector<SavedFolder>& v) {
+    std::atomic<size_t> next{ 0 };
+    auto run = [&] {
+        ComInit ci;
+        for (size_t i; (i = next++) < v.size();) {
+            SavedFolder& s = v[i];
+            s.pidl = parse_persisted(s.path);
+            s.name = path_is_network(s.path) && !s.savedName.empty() ? s.savedName : name_of(s.pidl);
+        }
+    };
+    std::vector<std::thread> helpers;
+    try {
+        for (size_t k = 1; k < std::min<size_t>(4, v.size()); ++k) helpers.emplace_back(run);
+    } catch (...) {}                // (no thread now: fewer do it)
+    run();
+    for (auto& t : helpers) t.join();
+}
+
 void tabs_deserialize(const std::wstring& tabs, int active) {
     for (auto& t : s_tabs) free_tab(t);
     s_tabs.clear();
+    std::vector<std::vector<std::wstring>> lines;
     size_t pos = 0;
     while (pos < tabs.size()) {
         size_t nl = tabs.find(L'\n', pos);
@@ -352,16 +382,27 @@ void tabs_deserialize(const std::wstring& tabs, int active) {
             p2 = s + 1;
         }
         while (f.size() < 10) f.push_back(L"");
-        TabState t = path_is_network(f[0]) && !f[1].empty()
-                   ? make_tab_named(parse_persisted(f[0]), f[1])     // (its name needs no server either)
-                   : make_tab(parse_persisted(f[0]));
+        lines.push_back(std::move(f));
+    }
+    // each tab's folder, and the second list's where it had one
+    std::vector<SavedFolder> folders;
+    for (auto& f : lines) {
+        folders.push_back({ f[0], f[1] });
+        if (!f[5].empty()) folders.push_back({ f[5], f[6] });
+    }
+    parse_saved(folders);
+    size_t k = 0;
+    for (auto& f : lines) {
+        SavedFolder& first = folders[k++];
+        TabState t = make_tab_named(first.pidl, first.name);
         t.side[0].view = int_to_view(_wtoi(f[2].c_str()));
         t.pinned = (f[3] == L"1");
         // the second list (a tab that had two once): its folder is kept while it is off
         if (!f[5].empty()) {
+            SavedFolder& second = folders[k++];
             PaneNav& n = t.side[1];
-            n.current = parse_persisted(f[5]);
-            n.name = path_is_network(f[5]) && !f[6].empty() ? f[6] : name_of(n.current);
+            n.current = second.pidl;
+            n.name = second.name;
             n.view = int_to_view(_wtoi(f[7].c_str()));
             t.dual = f[4] == L"1";
             t.activeSide = t.dual && f[8] == L"1" ? 1 : 0;
@@ -371,14 +412,13 @@ void tabs_deserialize(const std::wstring& tabs, int active) {
             wchar_t* end = nullptr;
             t.tree.top = _wcstoui64(p, &end, 16);
             while (end && *end == L',') {
-                ULONGLONG k = _wcstoui64(end + 1, &end, 16);
-                if (k) t.tree.expanded.insert(k);
+                ULONGLONG key = _wcstoui64(end + 1, &end, 16);
+                if (key) t.tree.expanded.insert(key);
             }
             t.tree.saved = true;
         }
         s_tabs.push_back(std::move(t));
-    }
-    if (s_tabs.empty()) {
+    }    if (s_tabs.empty()) {
         // first run: Home, like Windows 11 (older systems: the user's profile)
         PIDLIST_ABSOLUTE dp = nullptr;
         if (FAILED(SHParseDisplayName(L"shell:::{f874310e-b6b7-47dc-bc84-b9e6b38f5903}", nullptr, &dp, 0, nullptr)) &&

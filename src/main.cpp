@@ -2,6 +2,7 @@
 // row (buttons, breadcrumb, search), command bar, tree / list / details, status bar.
 #include <algorithm>
 #include <cstdlib>
+#include <thread>
 using std::max;
 using std::min;
 #include "appstate.h"
@@ -645,7 +646,6 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             initialize_tree(g_tree);
             perf_event("create.tree");
             watcher_init(hwnd);
-            dnd_register_sources();
             AddClipboardFormatListener(hwnd);       // Paste button state
             perf_event("create.watcher+dnd");
             // apply active tab (its own folders + views)
@@ -940,11 +940,19 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         }
     }
     perf_event("settings");
+    // the system image list is set up here, once, before any worker asks for icons (those
+    // asking while it is still being initialized get no index: the tree showed "unknown
+    // file" icons) — on a thread while the tabs are read
+    std::thread icons;
+    try { icons = std::thread([] { ComInit ci; sys_imagelist_init(); }); } catch (...) { sys_imagelist_init(); }
     tabmodel_init(openPath, !newWindow);          // restored tabs (+ command-line folder)
-    // the system image list is set up here, once: workers asking for icons while it is
-    // still being initialized get no index (and the tree showed "unknown file" icons)
-    sys_imagelist_init();
-    if (TabState* t = tabmodel_active(); t && g_treeVisible) tree_prefetch(t->side[t->dual ? t->activeSide : 0].current);   // ready by WM_CREATE
+    if (icons.joinable()) icons.join();
+    if (TabState* t = tabmodel_active()) {
+        // its folders are listed while the window is built (taken over by its navigation)
+        int lists = t->dual && t->side[1].current ? kPanes : 1;
+        for (int i = 0; i < lists; ++i) enum_start_early(&g_panes[i], t->side[i].current);
+        if (g_treeVisible) tree_prefetch(t->side[t->dual ? t->activeSide : 0].current);   // ready by WM_CREATE
+    }
     perf_event("tabs");
     detailspane_set_mode(settings_pref(L"paneMode", PANE_DETAILS) == PANE_PREVIEW ? PANE_PREVIEW : PANE_DETAILS);
     detailspane_set_visible(sp.detailsVisible);   // sets flags only (window created later)
@@ -999,27 +1007,27 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
                                wx, wy, ww, wh, nullptr, nullptr, g_hinst, nullptr);
     if (!wnd) return 2;
     perf_event("window.created");
-    // the folder's listing is usually done by now (or nearly): its rows go into the first
-    // paint, not into an empty list a moment after it. A slow folder isn't waited for long.
-    {
+    enum_early_done();
+    // the folder's listing is usually done by now (it started before the window): its rows
+    // and icons go into the first paint, not into an empty list a moment after it. A slow
+    // folder isn't waited for long.
+    for (ULONGLONG until = GetTickCount64() + 30; !enum_startup_settled();) {
         MSG em;
-        ULONGLONG until = GetTickCount64() + 30;
-        for (;;) {
-            if (PeekMessageW(&em, wnd, WM_ENUM_DONE, WM_ENUM_DONE, PM_REMOVE)) {
-                DispatchMessageW(&em);
-                if (!PeekMessageW(&em, wnd, WM_ENUM_DONE, WM_ENUM_DONE, PM_NOREMOVE)) break;   // (dual pane: both)
-                continue;
-            }
-            ULONGLONG now = GetTickCount64();
-            if (now >= until) break;
-            MsgWaitForMultipleObjects(0, nullptr, FALSE, (DWORD)(until - now), QS_POSTMESSAGE);
+        if (PeekMessageW(&em, wnd, WM_ENUM_DONE, WM_ENUM_DONE, PM_REMOVE) ||
+            PeekMessageW(&em, wnd, WM_ASYNC_WAKE, WM_ASYNC_WAKE, PM_REMOVE)) {    // (the icons read)
+            DispatchMessageW(&em);
+            continue;
         }
-        perf_event("window.listing");
+        ULONGLONG now = GetTickCount64();
+        if (now >= until) break;
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, (DWORD)(until - now), QS_POSTMESSAGE);
     }
+    perf_event("window.listing");
 
     ShowWindow(wnd, sp.maximized && !newWindow ? SW_SHOWMAXIMIZED : nCmdShow);
     UpdateWindow(wnd);
     perf_event("window.shown");
+    dnd_register_sources();         // (~4 ms: once the window is on screen)
 
     HACCEL acc = s_accel;
     MSG m{};
