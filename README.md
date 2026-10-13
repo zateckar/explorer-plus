@@ -57,8 +57,11 @@ File Explorer while starting in well under 100 ms.
   folder.jpg, … in the track's folder, else its biggest picture, else the art in the
   file), the tags (album, year, genre, track, …) with the format, bitrate and sample
   rate, and a scrolling spectrogram or a visualization (mirrored bars, waveform, circle,
-  particles, ribbons, a synthwave horizon, a tunnel: right-click the player ▸ Visualization,
-  or V; drawn on the GPU at the display's refresh rate; in full screen it fills the screen);
+  particles, ribbons, a synthwave horizon, a tunnel, a warp through stars, ridges,
+  fireworks: right-click the player ▸ Visualization, or V; "Another with each track" picks
+  one by chance as tracks change; they move with the beat, found in the bass drum, eased so
+  nothing flashes; drawn on the GPU at the display's refresh rate; in full screen it fills
+  the screen);
   the play queue (Enter plays, Delete removes, drop files on it); seek, volume, shuffle,
   repeat, full screen. Tracks are evened out in
   loudness (each measured as it comes up, the next one ahead; right-click the player to

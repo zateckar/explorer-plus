@@ -59,6 +59,21 @@ float vis_level(float v255);
 // `n` bars from bands `from` .. `to` - 1 (log-spaced, low first), spread evenly over them:
 // each the loudest band of its share, or (more bars than bands) between two in proportion
 void vis_bars(const float* bands, int from, int to, float* bars, int n);
+// how loud (dB, RMS) the last `tail` of `n` samples are in a band: below `hz` (high false)
+// or above it, through a second-order filter the samples before warm up; -120: silence
+float band_db(const float* s, size_t n, size_t tail, unsigned rate, float hz, bool high);
+// Beats in a loudness (dB, e.g. the bass's) given frame by frame: a quick rise well over
+// its recent average, after it fell back from the last one (or a while went by)
+class BeatDetector {
+public:
+    bool update(float db, float dt);                // dt: seconds since the last; true: a beat now
+    float level() const { return m_level; }         // 0..1: within 36 dB under the recent peak
+    float punch() const { return m_punch; }         // 0..1: how far over its average it is now
+private:
+    float m_peak = -120, m_level = 0, m_avg = 0, m_dev = 0.05f, m_floor = 0, m_punch = 0;
+    float m_cool = 0, m_since = 10;
+    bool m_armed = true, m_started = false;
+};
 
 // --- loudness ---
 // A track's loudness (LUFS, ITU-R BS.1770: K-weighting, 400 ms blocks every 100 ms,

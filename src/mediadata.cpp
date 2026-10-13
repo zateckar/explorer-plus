@@ -181,6 +181,50 @@ void vis_bars(const float* bands, int from, int to, float* bars, int n) {
     }
 }
 
+float band_db(const float* s, size_t n, size_t tail, unsigned rate, float hz, bool high) {
+    if (!n || !rate) return -120;
+    tail = std::clamp<size_t>(tail, 1, n);
+    // (RBJ's cookbook: Butterworth, Q 0.707)
+    const double pi = 3.14159265358979323846, w = 2 * pi * std::min<double>(hz, rate * 0.45) / rate;
+    const double cw = std::cos(w), al = std::sin(w) / (2 * 0.70710678), a0 = 1 + al;
+    const double b0 = (high ? (1 + cw) / 2 : (1 - cw) / 2) / a0, b1 = (high ? -(1 + cw) : 1 - cw) / a0, b2 = b0;
+    const double a1 = -2 * cw / a0, a2 = (1 - al) / a0;
+    double x1 = 0, x2 = 0, y1 = 0, y2 = 0, sum = 0;
+    for (size_t i = 0; i < n; ++i) {
+        double x = s[i], y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        x2 = x1; x1 = x;
+        y2 = y1; y1 = y;
+        if (i >= n - tail) sum += y * y;
+    }
+    double ms = sum / (double)tail;
+    return ms > 1e-12 ? (float)(10 * std::log10(ms)) : -120.f;
+}
+
+bool BeatDetector::update(float db, float dt) {
+    dt = std::clamp(dt, 0.001f, 0.1f);
+    // the level: the loudness under the peak of late (a quiet track as lively as a loud one)
+    m_peak = std::max(db, m_peak - dt * 4);
+    m_level = std::clamp((db - m_peak + 36) / 36, 0.f, 1.f);
+    float lvl = m_level;
+    if (!m_started) { m_started = true; m_avg = m_floor = lvl; }
+    float thr = std::max(0.06f, 1.5f * m_dev);
+    float rise = lvl - m_floor;                     // (over the lowest of the last ~50 ms)
+    m_cool -= dt;
+    m_since += dt;
+    if (lvl < m_avg + thr * 0.5f || m_since > 0.4f) m_armed = true;
+    bool beat = m_armed && m_cool <= 0 && lvl > m_avg + thr && rise > thr * 0.6f;
+    if (beat) {
+        m_armed = false;
+        m_cool = 0.12f;
+        m_since = 0;
+    }
+    m_punch = std::clamp((lvl - m_avg) / (thr * 2.5f), 0.f, 1.f);
+    m_avg += (lvl - m_avg) * (1 - std::exp(-dt / 0.6f));
+    m_dev += (std::fabs(lvl - m_avg) - m_dev) * (1 - std::exp(-dt / 1.5f));
+    m_floor = std::min(lvl, m_floor + dt * 3);      // (follows down at once, up slowly: a slow swell isn't a beat)
+    return beat;
+}
+
 // ------------------------------------------------------------------
 // loudness
 // ------------------------------------------------------------------

@@ -394,6 +394,62 @@ static void visuals() {
     CHECK(about(fine[0], 0.1) && about(fine[1], 0.3) && about(fine[2], 0.7) && about(fine[3], 0.9));
 }
 
+// the visualizations' beats: a track's bass drum found frame by frame, nothing else
+static void beats() {
+    const unsigned rate = 44100;
+    const double pi = 3.14159265358979323846;
+    // a band's loudness: a full-scale sine is -3 dB; out of the band, far less
+    std::vector<float> tone(4096);
+    for (size_t i = 0; i < tone.size(); ++i) tone[i] = (float)std::sin(2 * pi * 1000 * i / rate);
+    CHECK(std::fabs(band_db(tone.data(), tone.size(), 1024, rate, 20000, false) + 3) < 0.5);
+    CHECK(band_db(tone.data(), tone.size(), 1024, rate, 150, false) < -30);
+    CHECK(band_db(tone.data(), tone.size(), 1024, rate, 4000, true) < -20);
+    std::vector<float> none(2048, 0.0f);
+    CHECK(band_db(none.data(), none.size(), 1024, rate, 150, false) == -120);
+    // 20 s at 124 BPM: a kick on each beat, hi-hats on the eighths, a bass line and a pad throughout
+    const double period = 60.0 / 124, secs = 20;
+    std::vector<float> kick((size_t)(rate * secs)), hats(kick.size()), drone(kick.size());
+    uint32_t seed = 1;
+    auto noise = [&] { seed = seed * 1664525 + 1013904223; return (float)((seed >> 8) / 8388608.0 - 1); };
+    for (size_t i = 0; i < kick.size(); ++i) {
+        double t = (double)i / rate, k = std::fmod(t, period), e = std::fmod(t, period / 2);
+        kick[i] = (float)(0.7 * std::exp(-k / 0.12) * std::sin(2 * pi * (50 * k + 60 * 0.03 * (1 - std::exp(-k / 0.03)))));
+        hats[i] = (float)(0.3 * std::exp(-e / 0.03) * noise());
+        drone[i] = (float)(0.25 * std::sin(2 * pi * 55 * t) + 0.1 * std::sin(2 * pi * 220 * t));
+    }
+    // the beats found in a mix, the bass's loudness given at `fps`; their times
+    auto found = [&](bool withKick, bool withHats, bool withDrone, double fps) {
+        std::vector<float> mix(kick.size());
+        for (size_t i = 0; i < mix.size(); ++i)
+            mix[i] = (withKick ? kick[i] : 0) + (withHats ? hats[i] : 0) + (withDrone ? drone[i] : 0);
+        BeatDetector d;
+        std::vector<double> at;
+        for (double t = 1 / fps; t < secs; t += 1 / fps) {
+            size_t end = (size_t)(t * rate);
+            if (end < 2048) continue;
+            if (d.update(band_db(mix.data() + end - 2048, 2048, rate / 40, rate, 150, false), (float)(1 / fps))) at.push_back(t);
+        }
+        return at;
+    };
+    for (double fps : { 60.0, 144.0 }) {
+        std::vector<double> at = found(true, true, true, fps);
+        int expected = 0, late = 0;
+        for (double t = 2; t < secs - 0.1; t += period) ++expected;
+        int got = 0;
+        for (double t : at) {
+            if (t < 2) continue;
+            ++got;
+            double since = std::fmod(t, period);    // (just after a kick starts)
+            if (since > 0.06) ++late;
+        }
+        CHECK(std::abs(got - expected) <= 1);
+        CHECK(late == 0);
+    }
+    // no kick: the hi-hats and the bass line aren't beats
+    CHECK(found(false, true, true, 60).size() <= 1);
+    CHECK(found(false, false, true, 60).size() <= 1);
+}
+
 static void formats() {
     CHECK_EQ(audio_format_name(0x55), L"MP3");
     CHECK_EQ(audio_format_name(0x1610), L"AAC");
@@ -441,6 +497,7 @@ int wmain() {
     spectrum_math();
     loudness();
     visuals();
+    beats();
     formats();
     opus_head();
     ini_round_trip();

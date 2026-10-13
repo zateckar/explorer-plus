@@ -7,6 +7,8 @@
 // blurred, gives it its glow; then background, glow and scene go to the back buffer, the
 // overlays (the style's name, the full-screen caption) on top. While the sound is paused
 // the motion settles and the thread waits; it waits too while the window is hidden.
+// The beat (the bass drum, found in the newest samples) moves and grows things, eased in
+// and out; it changes their brightness only a little: nothing flashes (photosensitivity).
 #include "visual.h"
 #include "mediadata.h"
 #include "perf.h"
@@ -62,7 +64,11 @@ float smooth_to(float v, float target, float dt, float tau) { return v + (target
 struct Sound {
     float level[B]{};                   // per band, 0..1, smoothed (quick up, slower down)
     float bass = 0, mid = 0, treble = 0, energy = 0;
-    float beat = 0;                     // 1 at a beat in the bass, then fading
+    float beat = 0;                     // 1 at a beat (the bass drum), then fading
+    float kick = 0;                     // the pulse to move by: a beat's (quickly fading), or the bass pushing
+    float snap = 0;                     // the same for the highs (snare, hi-hats)
+    int beats = 0;                      // beats so far (a style's cue for something new)
+    int snaps = 0;                      // the same for the highs
     std::vector<float> wave;            // the newest samples, about -1..1 (scaled to the recent peak)
     unsigned rate = 44100;
     bool quiet = true;                  // (nothing left to settle)
@@ -71,6 +77,14 @@ struct Sound {
 class Analyzer {
 public:
     void update(const SpectrumTap& tap, LONGLONG pos, bool live, float dt, Sound& s) {
+        update_bands(tap, pos, live, dt, s);
+        update_wave(tap, pos, live, dt, s);
+        float most = 0;
+        for (float v : s.wave) most = std::max(most, std::fabs(v));
+        s.quiet = !live && s.energy < 0.004f && s.beat < 0.01f && s.kick < 0.01f && s.snap < 0.01f && most < 0.01f;
+    }
+private:
+    void update_bands(const SpectrumTap& tap, LONGLONG pos, bool live, float dt, Sound& s) {
         float raw[B];
         bool have = live && tap && tap.bands(pos, raw);
         // (a quiet track is drawn bigger: the levels scaled to the loudest band of late)
@@ -93,36 +107,46 @@ public:
         s.mid = mi / 74;
         s.treble = hi / 50;
         s.energy = sum / B;
-        // a beat: the bass well over its recent average, rising
-        m_bassAvg = smooth_to(m_bassAvg, s.bass, dt, 0.6f);
-        m_cool -= dt;
-        if (s.bass > m_bassAvg * 1.18f + 0.04f && s.bass > m_lastBass && m_cool <= 0) {
-            s.beat = 1;
-            m_cool = 0.22f;
-        } else {
-            s.beat *= std::exp(-dt / 0.22f);
-        }
-        m_lastBass = s.bass;
-        // the samples
+    }
+    void update_wave(const SpectrumTap& tap, LONGLONG pos, bool live, float dt, Sound& s) {
         unsigned rate = tap ? tap.rate() : 0;
         if (rate) s.rate = rate;
         s.wave.resize(4096);
-        float pk = 0;
-        if (live && tap) {
-            tap.samples(pos, s.wave.data(), s.wave.size());
+        float pk = 0, kdb = -120, sdb = -120;
+        if (live && tap && tap.samples(pos, s.wave.data(), s.wave.size())) {
             for (float v : s.wave) pk = std::max(pk, std::fabs(v));
+            // the beats, from the newest 25 ms (the spectrum's columns are too blurred for
+            // them): the bass drum below 150 Hz, the snare and hi-hats above 3 kHz
+            size_t tail = s.rate / 40;
+            kdb = band_db(s.wave.data(), s.wave.size(), tail, s.rate, 150, false);
+            sdb = band_db(s.wave.data(), s.wave.size(), tail, s.rate, 3000, true);
         } else {
             for (float& v : s.wave) v *= std::exp(-dt / 0.15f);    // (paused: the line flattens)
         }
+        if (m_kick.update(kdb, dt)) {
+            s.beat = 1;
+            m_kickHit = 1;
+            ++s.beats;
+        } else {
+            s.beat *= std::exp(-dt / 0.25f);
+            m_kickHit *= std::exp(-dt / 0.16f);
+        }
+        if (m_snap.update(sdb, dt)) {
+            m_snapHit = 1;
+            ++s.snaps;
+        } else {
+            m_snapHit *= std::exp(-dt / 0.1f);
+        }
+        // (eased in and out: it moves things, never flashes)
+        float kick = std::max(m_kickHit, 0.8f * m_kick.punch()), snap = std::max(m_snapHit, 0.6f * m_snap.punch());
+        s.kick = smooth_to(s.kick, kick, dt, kick > s.kick ? 0.04f : 0.25f);
+        s.snap = smooth_to(s.snap, snap, dt, snap > s.snap ? 0.04f : 0.2f);
         m_wavePeak = std::max({ pk, m_wavePeak * std::exp(-dt / 1.5f), 0.05f });
-        if (live && tap)
+        if (pk > 0)
             for (float& v : s.wave) v /= m_wavePeak;
-        float most = 0;
-        for (float v : s.wave) most = std::max(most, std::fabs(v));
-        s.quiet = !have && s.energy < 0.004f && s.beat < 0.01f && most < 0.01f;
     }
-private:
-    float m_peak = 0.5f, m_bassAvg = 0, m_lastBass = 0, m_cool = 0, m_wavePeak = 0.2f;
+    float m_peak = 0.5f, m_wavePeak = 0.2f, m_kickHit = 0, m_snapHit = 0;
+    BeatDetector m_kick, m_snap;
 };
 
 // --- a frame's drawing context ---
@@ -164,30 +188,42 @@ void stroke(Frame& f, const std::vector<D2D1_POINT_2F>& p, float width) {
     }
 }
 
-// a smooth curve through the points as short straight lines, each drawn on its own:
-// no path to widen and tessellate (the costly part of a long curve on a big screen)
-void stroke_lines(Frame& f, const std::vector<D2D1_POINT_2F>& p, bool closed, float width) {
+// a smooth curve (Catmull-Rom) through the points, as points about `step` apart (closed:
+// back to the first)
+void smooth_curve(const std::vector<D2D1_POINT_2F>& p, bool closed, float step, std::vector<D2D1_POINT_2F>& out) {
+    out.clear();
     size_t n = p.size();
-    if (n < 2) return;
+    if (n < 2) { out = p; return; }
     auto at = [&](long k) {
         if (closed) return p[(size_t)((k % (long)n + (long)n) % (long)n)];
         return p[(size_t)std::clamp(k, 0L, (long)n - 1)];
     };
+    out.push_back(p[0]);
     size_t segs = closed ? n : n - 1;
     for (size_t i = 0; i < segs; ++i) {
         D2D1_POINT_2F p0 = at((long)i - 1), p1 = at((long)i), p2 = at((long)i + 1), p3 = at((long)i + 2);
-        int steps = std::clamp((int)(std::hypot(p2.x - p1.x, p2.y - p1.y) / (10 * f.s)), 1, 12);
-        D2D1_POINT_2F last = p1;
+        int steps = std::clamp((int)(std::hypot(p2.x - p1.x, p2.y - p1.y) / step), 1, 12);
         for (int k = 1; k <= steps; ++k) {
             float t = (float)k / steps, t2 = t * t, t3 = t2 * t;
             auto cr = [&](float a, float b, float c, float d) {
                 return 0.5f * (2 * b + (c - a) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (3 * b - a - 3 * c + d) * t3);
             };
-            D2D1_POINT_2F q{ cr(p0.x, p1.x, p2.x, p3.x), cr(p0.y, p1.y, p2.y, p3.y) };
-            f.dc->DrawLine(last, q, f.brush, width);
-            last = q;
+            out.push_back({ cr(p0.x, p1.x, p2.x, p3.x), cr(p0.y, p1.y, p2.y, p3.y) });
         }
     }
+}
+
+// points joined by straight lines, each drawn on its own: no path to widen and tessellate
+// (the costly part of a long curve on a big screen)
+void draw_lines(Frame& f, const std::vector<D2D1_POINT_2F>& p, float width) {
+    for (size_t i = 1; i < p.size(); ++i) f.dc->DrawLine(p[i - 1], p[i], f.brush, width);
+}
+
+// a smooth curve through the points, as short straight lines
+void stroke_lines(Frame& f, const std::vector<D2D1_POINT_2F>& p, bool closed, float width) {
+    static thread_local std::vector<D2D1_POINT_2F> curve;
+    smooth_curve(p, closed, 10 * f.s, curve);
+    draw_lines(f, curve, width);
 }
 
 ID2D1GradientStopCollection* stops(ID2D1DeviceContext* dc, std::initializer_list<D2D1_GRADIENT_STOP> s) {
@@ -225,21 +261,27 @@ struct Style {
     virtual D2D1_MATRIX_3X2_F trail_move(Frame&) { return D2D1::IdentityMatrix(); }
     virtual float glow() const { return 0.8f; }         // its strength (1: as bright as the scene)
     virtual float glow_radius() const { return 9; }     // (at 96 dpi)
+    virtual float pump() const { return 0.2f; }         // the glow's more at a beat: by this much (a little)
 };
 
-// --- bars from the middle, up and down; red to green from the bass up ---
+// --- bars from the middle, up and down; red to green from the bass up; their peaks fall ---
 struct Bars : Style {
-    std::vector<float> v;
+    std::vector<float> v, peak, hold, fall;
     ID2D1LinearGradientBrush* grad = nullptr;
     bool gradDark = false;
     void lost() override { release(grad); }
     float glow() const override { return 0.5f; }
+    float pump() const override { return 0.3f; }
     void draw(Frame& f) override {
+        const Sound& snd = f.snd;
         float pitch = 11 * f.s;
         int n = std::clamp((int)(f.w / pitch), 12, 160);
         pitch = f.w / n;
         v.resize(n);
-        vis_bars(f.snd.level, 6, 150, v.data(), n);     // (~50 Hz to ~13 kHz)
+        peak.resize(n);
+        hold.resize(n);
+        fall.resize(n);
+        vis_bars(snd.level, 6, 150, v.data(), n);       // (~50 Hz to ~13 kHz)
         if (!grad || gradDark != f.dark) {
             release(grad);
             gradDark = f.dark;
@@ -250,23 +292,46 @@ struct Bars : Style {
         }
         grad->SetStartPoint({ 0, 0 });
         grad->SetEndPoint({ f.w, 0 });
-        float bw = std::max(2.f, pitch * 0.55f), mid = f.h / 2, most = mid - bw / 2 - 2 * f.s;
+        float bw = std::max(2.f, pitch * 0.55f), mid = f.h / 2, gap = 3 * f.s, most = mid - bw / 2 - gap - bw * 0.7f;
+        float lift = 0.88f + 0.22f * snd.kick;          // (the bass drum: all of them taller a moment)
         for (int k = 0; k < n; ++k) {
+            v[k] = std::min(1.f, v[k] * lift);
             float x = (k + 0.5f) * pitch, hh = std::max(v[k] * most, 0.75f * f.s);
             f.dc->DrawLine({ x, mid - hh }, { x, mid + hh }, grad, bw, f.round);
+            // its peak: held a moment, then falling faster and faster
+            if (v[k] >= peak[k]) {
+                peak[k] = v[k];
+                hold[k] = 0.3f;
+                fall[k] = 0;
+            } else if ((hold[k] -= f.dt) < 0) {
+                fall[k] += f.dt * 2.2f;
+                peak[k] = std::max(v[k], peak[k] - fall[k] * f.dt);
+            }
+        }
+        f.color(f.dark ? hex(0xFFFFFF, 0.85f) : hex(0x303030, 0.7f));
+        for (int k = 0; k < n; ++k) {
+            if (peak[k] < 0.03f) continue;
+            float x = (k + 0.5f) * pitch, y = peak[k] * most + bw / 2 + gap + bw * 0.3f;
+            f.dc->DrawLine({ x - bw * 0.2f, mid - y }, { x + bw * 0.2f, mid - y }, f.brush, bw * 0.5f, f.round);
+            f.dc->DrawLine({ x - bw * 0.2f, mid + y }, { x + bw * 0.2f, mid + y }, f.brush, bw * 0.5f, f.round);
         }
     }
 };
 
-// --- the waveform, glowing, its last moments trailing behind ---
+// --- the waveform, glowing, its echoes spreading out behind it ---
 struct Waveform : Style {
     std::vector<D2D1_POINT_2F> pts;
-    float trail() const override { return 0.72f; }
+    float trail() const override { return 0.78f; }
+    D2D1_MATRIX_3X2_F trail_move(Frame& f) override {
+        return D2D1::Matrix3x2F::Scale(1, 1.012f + 0.06f * f.snd.kick, { f.w / 2, f.h / 2 });
+    }
     float glow() const override { return 1.1f; }
+    float pump() const override { return 0.25f; }
     void draw(Frame& f) override {
-        const std::vector<float>& w = f.snd.wave;
+        const Sound& snd = f.snd;
+        const std::vector<float>& w = snd.wave;
         int N = (int)w.size();
-        int show = std::clamp((int)(f.snd.rate * 0.035), 256, N / 2);
+        int show = std::clamp((int)(snd.rate * 0.035), 256, N / 2);
         // (it starts at a rising zero crossing, so a steady tone stands still)
         int start = N - show, best = -1;
         float steepest = 0;
@@ -274,42 +339,69 @@ struct Waveform : Style {
             if (w[i - 1] < 0 && w[i] >= 0 && w[i] - w[i - 1] > steepest) { steepest = w[i] - w[i - 1]; best = i; }
         if (best > 0) start = best;
         int P = std::clamp((int)(f.w / (3 * f.s)), 48, 480);
-        float mid = f.h / 2, amp = f.h * 0.4f;
+        float mid = f.h / 2, amp = f.h * 0.36f * (1 + 0.15f * snd.kick);
         pts.resize(P);
         for (int k = 0; k < P; ++k) {
             int a = start + show * k / P, b = std::max(a + 1, start + show * (k + 1) / P);
             float v = 0;                                // (the bucket's biggest swing, its sign kept)
             for (int i = a; i < b && i < N; ++i) if (std::fabs(w[i]) > std::fabs(v)) v = w[i];
-            pts[k] = { f.w * k / (P - 1), mid - std::clamp(v, -1.2f, 1.2f) * amp };
+            pts[k] = { f.w * k / (P - 1), mid - std::clamp(v, -1.25f, 1.25f) * amp };
         }
         f.color(f.dark ? hex(0xFFFFFF, 0.07f) : hex(0x000000, 0.06f));
         f.dc->DrawLine({ 0, mid }, { f.w, mid }, f.brush, 1 * f.s);
-        f.color(f.dark ? hex(0xFF7A38) : hex(0xE0561A));
-        stroke(f, pts, 2.2f * f.s * f.zoom);
+        // at a beat: thicker, a little warmer
+        f.color(f.dark ? mix(hex(0xFF7A38), hex(0xFFB060), 0.4f * snd.kick) : mix(hex(0xE0561A), hex(0xC03A10), 0.5f * snd.kick));
+        stroke(f, pts, 2.2f * f.s * f.zoom * (1 + 0.4f * snd.kick));
     }
 };
 
-// --- bars around a glowing core, in the colours of the rainbow ---
+// --- bars around a glowing core, in the colours of the rainbow; the core beats, waves go out ---
 struct Circle : Style {
     std::vector<float> v;
-    float spin = 0;
+    float spin = 0, swirl = 0;
+    int seen = 0;
+    struct Wave { float r, a, hue; };
+    std::vector<Wave> waves;
     ID2D1RadialGradientBrush* core = nullptr;
     void lost() override { release(core); }
+    float trail() const override { return 0.5f; }
+    D2D1_MATRIX_3X2_F trail_move(Frame& f) override {   // (its echoes go out)
+        float k = 1.02f + 0.035f * f.snd.kick;
+        return D2D1::Matrix3x2F::Scale(k, k, { f.w / 2, f.h / 2 });
+    }
     float glow() const override { return 0.7f; }
+    float pump() const override { return 0.25f; }
     void draw(Frame& f) override {
+        const Sound& snd = f.snd;
         const int n = 128;
         v.resize(n);
-        vis_bars(f.snd.level, 4, 144, v.data(), n);
+        vis_bars(snd.level, 4, 144, v.data(), n);
         float cx = f.w / 2, cy = f.h / 2, m = std::min(f.w, f.h);
-        float r0 = m * 0.2f * (1 + 0.05f * f.snd.beat + 0.05f * f.snd.bass), len = m * 0.27f;
-        spin += f.dt * (0.04f + 0.3f * f.snd.energy);
+        float r0 = m * 0.17f * (1 + 0.24f * snd.kick + 0.06f * snd.bass), len = m * 0.25f * (1 + 0.2f * snd.kick);
+        float hue0 = 0.07f + (float)f.t * 0.015f;
+        if (snd.beats != seen) {                        // a beat: a wave goes out, the bars swirl
+            seen = snd.beats;
+            swirl += 0.9f;
+            waves.push_back({ r0, 0.6f, hue0 + 0.5f * (seen % 2) });
+        }
+        swirl *= std::exp(-f.dt / 0.45f);
+        spin += f.dt * (0.04f + 0.3f * snd.energy + swirl);
+        for (Wave& w : waves) {
+            w.r += f.dt * m * (0.35f + 0.8f * w.a);
+            w.a *= std::exp(-f.dt / 0.45f);
+        }
+        waves.erase(std::remove_if(waves.begin(), waves.end(), [&](const Wave& w) { return w.a < 0.03f || w.r > m; }), waves.end());
+        for (const Wave& w : waves) {
+            f.color(hsv(w.hue, f.dark ? 0.45f : 0.8f, f.dark ? 1.f : 0.75f, w.a * 0.8f));
+            f.dc->DrawEllipse(D2D1::Ellipse({ cx, cy }, w.r, w.r), f.brush, (1 + 4 * w.a) * f.s * std::sqrt(f.zoom));
+        }
         if (!core) core = radial(f.dc, { { 0, hex(0xFF5A28) }, { 0.45f, hex(0xB0605A, 0.75f) }, { 0.8f, hex(0x503050, 0.35f) },
                                          { 1, hex(0x503050, 0) } });
         if (core) {
             core->SetCenter({ cx, cy });
             core->SetRadiusX(r0 * 0.95f);
             core->SetRadiusY(r0 * 0.95f);
-            core->SetOpacity(0.45f + 0.55f * std::min(1.f, f.snd.bass * 1.3f));
+            core->SetOpacity(0.55f + 0.3f * std::min(1.f, std::max(snd.kick, snd.bass * 0.8f)));
             f.dc->FillEllipse(D2D1::Ellipse({ cx, cy }, r0 * 0.95f, r0 * 0.95f), core);
         }
         float bw = std::max(1.5f * f.s, 2 * kPi * r0 / n * 0.5f);
@@ -317,7 +409,7 @@ struct Circle : Style {
             float a = -kPi / 2 + spin + 2 * kPi * k / n;
             float L = r0 * 0.04f + v[k] * len;
             float c = std::cos(a), s = std::sin(a), r = r0 + bw;
-            f.color(hsv(0.07f + (float)k / n, f.dark ? 0.72f : 0.85f, f.dark ? 1.f : 0.85f));
+            f.color(hsv(hue0 + (float)k / n, f.dark ? 0.72f : 0.85f, f.dark ? 1.f : 0.85f));
             f.dc->DrawLine({ cx + c * r, cy + s * r }, { cx + c * (r + L), cy + s * (r + L) }, f.brush, bw, f.round);
         }
     }
@@ -332,10 +424,12 @@ struct Particles : Style {
     struct Shown { float x, y, r, a, lvl; };
     std::vector<Shown> shown;
     ID2D1Bitmap1* dot[4]{};
-    float yaw = 0;
+    float yaw = 0, swirl = 0;
+    int seen = 0;
     void lost() override { for (auto*& d : dot) release(d); }
     float glow() const override { return 0.5f; }
     float glow_radius() const override { return 7; }
+    float pump() const override { return 0.25f; }
     const uint32_t colors[2][4] = { { 0x1898B0, 0xC89010, 0x50607A, 0x23955A },     // (on light)
                                     { 0x7FE8F0, 0xF3EB8F, 0xFFFFFF, 0x8FE0B0 } };  // (on dark)
     bool dotsDark = false;
@@ -387,18 +481,21 @@ struct Particles : Style {
             make_dots(f);
         }
         const Sound& snd = f.snd;
-        if (f.dark) {                                   // (far stars, twinkling with the treble)
+        if (f.dark) {                                   // (far stars, twinkling with the highs)
             for (const Star& st : stars) {
-                float a = 0.15f + 0.25f * st.b + 0.3f * snd.treble * (0.5f + 0.5f * std::sin((float)f.t * 2.5f + st.phase));
-                f.color(hex(0x59E07A, std::min(a, 0.8f)));
+                float a = 0.15f + 0.25f * st.b + (0.3f * snd.treble + 0.1f * snd.snap) * (0.5f + 0.5f * std::sin((float)f.t * 2.5f + st.phase));
+                f.color(hex(0x59E07A, std::min(a, 0.85f)));
                 float r = 1.1f * f.s * std::sqrt(f.zoom);
                 f.dc->FillEllipse(D2D1::Ellipse({ st.x * f.w, st.y * f.h }, r, r), f.brush);
             }
         }
-        yaw += f.dt * (0.05f + 0.35f * snd.energy);
+        if (snd.beats != seen) { seen = snd.beats; swirl += 0.5f; }
+        swirl *= std::exp(-f.dt / 0.5f);
+        yaw += f.dt * (0.05f + 0.35f * snd.energy + swirl);
         float tilt = 0.25f * std::sin((float)f.t * 0.07f);
         float cy_ = std::cos(yaw), sy_ = std::sin(yaw), ct = std::cos(tilt), st = std::sin(tilt);
-        float cx = f.w / 2, cy = f.h / 2, scale = std::min(f.w * 0.5f, f.h * 0.85f) * (1 + 0.06f * snd.beat);
+        // (a beat: the cloud bursts out a little, the points flare)
+        float cx = f.w / 2, cy = f.h / 2, scale = std::min(f.w * 0.5f, f.h * 0.85f) * (1 + 0.16f * snd.kick);
         shown.resize(ps.size());
         for (size_t i = 0; i < ps.size(); ++i) {
             const P& p = ps[i];
@@ -407,20 +504,21 @@ struct Particles : Style {
             z = p.y * st + z * ct;
             float k = 2.2f / (2.2f + z);                // (nearer: bigger)
             float lvl = snd.level[p.band];
-            float r = (0.8f + 1.0f * p.size + 4.5f * p.size * lvl * lvl) * f.s * f.zoom * k;
-            float a = std::clamp((0.25f + 0.65f * lvl) * (0.5f + 0.5f * k), 0.f, 1.f);
+            float r = (0.8f + 1.0f * p.size + 4.5f * p.size * lvl * lvl) * (1 + 0.3f * snd.kick) * f.s * f.zoom * k;
+            float a = std::clamp((0.25f + 0.65f * lvl + 0.1f * snd.kick) * (0.5f + 0.5f * k), 0.f, 1.f);
             shown[i] = { cx + x * k * scale * 0.8f, cy + y * k * scale * 0.55f, r, a, lvl };
         }
         // links between near, lively points
         f.color(f.dark ? hex(0x9FE0A0) : hex(0x2E8A5A));
         int links = 0;
+        float reach = 0.08f * (1 + 0.6f * snd.kick);
         for (size_t i = 0; i < ps.size() && links < 900; ++i) {
             if (shown[i].lvl < 0.25f) continue;
             for (size_t j = i + 1; j < ps.size(); ++j) {
                 float dx = ps[i].x - ps[j].x, dy = ps[i].y - ps[j].y, dz = ps[i].z - ps[j].z;
                 float d2 = dx * dx + dy * dy + dz * dz;
-                if (d2 > 0.08f || shown[j].lvl < 0.25f) continue;
-                float a = (1 - std::sqrt(d2 / 0.08f)) * std::min(shown[i].lvl, shown[j].lvl) * 0.55f;
+                if (d2 > reach || shown[j].lvl < 0.25f) continue;
+                float a = (1 - std::sqrt(d2 / reach)) * std::min(shown[i].lvl, shown[j].lvl) * (0.55f + 0.15f * snd.kick);
                 f.brush->SetOpacity(a);
                 f.dc->DrawLine({ shown[i].x, shown[i].y }, { shown[j].x, shown[j].y }, f.brush, 0.7f * f.s * std::sqrt(f.zoom));
                 ++links;
@@ -445,12 +543,13 @@ struct Ribbons : Style {
     float trail() const override { return 0.5f; }
     float glow() const override { return 1.3f; }
     float glow_radius() const override { return 11; }
+    float pump() const override { return 0.15f; }
     void draw(Frame& f) override {
         const Sound& snd = f.snd;
         const int M = 56;
         const std::vector<float>& w = snd.wave;
         int N = (int)w.size();
-        phase += f.dt * (0.5f + 1.6f * snd.energy);
+        phase += f.dt * (0.5f + 1.6f * snd.energy + 3.0f * snd.kick);
         // each ribbon: the waveform smoothed to M points (from a stretch of its own)
         for (int r = 0; r < 3; ++r) {
             int span = N / 2, from = N - span - r * N / 8, per = std::max(1, span / M);
@@ -462,8 +561,8 @@ struct Ribbons : Style {
         }
         const float angles[3] = { 0.5f, -0.5f, 0.0f };
         const uint32_t cols[3] = { 0xF7EA48, 0x3FF0F0, 0xFF4FA8 };
-        const float drive[3] = { snd.bass, snd.treble * 1.6f, snd.mid * 1.2f };
-        float cx = f.w / 2, cy = f.h / 2, L = std::hypot(f.w, f.h) * 1.05f, A = f.h * 0.2f;
+        const float drive[3] = { snd.bass + 0.6f * snd.kick, snd.treble * 1.6f + 0.5f * snd.snap, snd.mid * 1.2f };
+        float cx = f.w / 2, cy = f.h / 2, L = std::hypot(f.w, f.h) * 1.05f, A = f.h * 0.2f * (1 + 0.3f * snd.kick);
         f.dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_ADD);
         pts.resize(M);
         for (int r = 0; r < 3; ++r) {
@@ -476,12 +575,12 @@ struct Ribbons : Style {
                     float spread = 0.12f + 0.88f * u * u;           // (tight in the middle, wide at the ends)
                     float d = A * spread * (sm[r][i] * (0.5f + drive[r]) * (1 + 0.15f * j) +
                                             0.4f * std::sin(u * 3.2f + phase * (1 + 0.17f * j) + j * 1.3f + r * 2.1f)) +
-                              (j - 2) * 7 * f.s * spread;
+                              (j - 2) * 7 * f.s * spread * (1 + snd.kick);
                     float along = u * L / 2;
                     pts[i] = { cx + ca * along - sa * d, cy + sa * along + ca * d };
                 }
-                f.color(alpha(c, 0.55f + 0.1f * (j == 2)));
-                stroke_lines(f, pts, false, (j == 2 ? 2.0f : 1.4f) * f.s * f.zoom);
+                f.color(alpha(c, std::min(1.f, 0.55f + 0.1f * (j == 2) + 0.1f * snd.kick)));
+                stroke_lines(f, pts, false, (j == 2 ? 2.0f : 1.4f) * f.s * f.zoom * (1 + 0.4f * snd.kick));
             }
         }
         f.dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
@@ -496,9 +595,11 @@ struct Horizon : Style {
     std::vector<Star> stars;
     float travel = 0;
     ID2D1LinearGradientBrush *sky = nullptr, *floor_ = nullptr, *sun = nullptr, *grid = nullptr, *hill = nullptr;
+    ID2D1RadialGradientBrush* halo = nullptr;
     D2D1_COLOR_F madeFor{ -1, 0, 0, 0 };                // (the background they were made for)
-    void lost() override { release(sky); release(floor_); release(sun); release(grid); release(hill); }
+    void lost() override { release(sky); release(floor_); release(sun); release(grid); release(hill); release(halo); }
     float glow() const override { return 0.55f; }
+    float pump() const override { return 0.2f; }
     float horizon(const Frame& f) const { return f.h * 0.6f; }
     void make(Frame& f) {
         lost();
@@ -514,6 +615,7 @@ struct Horizon : Style {
         grid = linear(f.dc, { { 0, alpha(g, 0.1f) }, { 1, alpha(g, 1) } });
         hill = linear(f.dc, { { 0, f.full ? hex(0x1A1024) : mix(f.bg, hex(0x40205A), 0.3f) },
                               { 1, f.full ? hex(0x06040C) : mix(f.bg, hex(0x40205A), 0.1f) } });
+        halo = radial(f.dc, { { 0, hex(0xFF5AA0, 0.7f) }, { 0.55f, hex(0xFF5AA0, 0.25f) }, { 1, hex(0xFF5AA0, 0) } });
         if (stars.empty()) {
             std::mt19937 rng(11);
             std::uniform_real_distribution<float> u(0, 1);
@@ -537,14 +639,23 @@ struct Horizon : Style {
         float yh = horizon(f), cx = f.w / 2;
         if (f.dark)
             for (const Star& st : stars) {
-                float a = 0.25f + 0.45f * st.b * (0.6f + 0.4f * std::sin((float)f.t * 1.7f + st.phase)) + 0.3f * snd.treble;
-                f.color(hex(0xFFFFFF, std::min(a, 0.9f)));
+                float a = 0.25f + 0.45f * st.b * (0.6f + 0.4f * std::sin((float)f.t * 1.7f + st.phase)) + 0.25f * snd.treble +
+                          0.1f * snd.snap * st.b;
+                f.color(hex(0xFFFFFF, std::min(a, 0.95f)));
                 f.dc->FillEllipse(D2D1::Ellipse({ st.x * f.w, st.y * yh * 0.85f }, 1.2f * f.s, 1.2f * f.s), f.brush);
             }
-        // the sun, its lower half cut by stripes drifting down
-        float R = std::min(f.w * 0.17f, yh * 0.7f) * (1 + 0.05f * snd.bass + 0.03f * snd.beat);
+        // the sun, beating, its lower half cut by stripes drifting down; a halo around it
+        float R = std::min(f.w * 0.17f, yh * 0.7f) * (1 + 0.12f * snd.kick + 0.04f * snd.bass);
         float sy = yh - R * 0.3f;
         f.dc->PushAxisAlignedClip(D2D1::RectF(0, 0, f.w, yh), D2D1_ANTIALIAS_MODE_ALIASED);
+        if (halo) {
+            float hr = R * (1.25f + 0.3f * snd.kick);
+            halo->SetCenter({ cx, sy });
+            halo->SetRadiusX(hr);
+            halo->SetRadiusY(hr);
+            halo->SetOpacity((f.dark ? 0.4f : 0.3f) + 0.15f * snd.kick);
+            f.dc->FillEllipse(D2D1::Ellipse({ cx, sy }, hr, hr), halo);
+        }
         sun->SetStartPoint({ 0, sy - R });
         sun->SetEndPoint({ 0, sy + R });
         sun->SetOpacity(0.9f);
@@ -574,7 +685,7 @@ struct Horizon : Style {
         pts.push_back({ -2, yh });
         for (int i = 0; i <= n; ++i) {
             float sm = (vs[std::max(0, i - 1)] + 2 * vs[i] + vs[std::min(n, i + 1)]) / 4;
-            pts.push_back({ f.w * i / n, yh - sm * f.h * 0.3f });
+            pts.push_back({ f.w * i / n, yh - sm * f.h * 0.3f * (1 + 0.12f * snd.kick) });
         }
         pts.push_back({ f.w + 2, yh });
         hill->SetStartPoint({ 0, yh - f.h * 0.3f });
@@ -586,69 +697,306 @@ struct Horizon : Style {
         std::vector<D2D1_POINT_2F> ridge(pts.begin() + 1, pts.end() - 1);
         for (auto [dx, col] : { std::pair{ -1.5f, 0xFF3C78u }, std::pair{ 1.5f, 0x3CE0FFu } }) {    // (a little colour fringe)
             std::vector<D2D1_POINT_2F> o = ridge;
-            for (auto& p : o) p.x += dx * f.s;
+            for (auto& p : o) p.x += dx * f.s * (1 + 1.5f * snd.kick);
             f.color(hex(col, f.dark ? 0.55f : 0.35f));
             stroke(f, o, 1.2f * f.s * std::sqrt(f.zoom));
         }
         f.color(f.dark ? hex(0xFFC24A) : hex(0xE08A10));
-        stroke(f, ridge, 1.8f * f.s * std::sqrt(f.zoom));
-        // the floor's grid, coming nearer with the beat
-        travel += f.dt * (0.7f + 2.8f * snd.bass + 1.5f * snd.beat);
+        stroke(f, ridge, 1.8f * f.s * std::sqrt(f.zoom) * (1 + 0.4f * snd.kick));
+        // the floor's grid, racing in at a beat, lit up
+        travel += f.dt * (0.6f + 2.0f * snd.bass + 4.0f * snd.kick);
         float depth = f.h - yh, fr = travel - std::floor(travel);
         grid->SetStartPoint({ 0, yh });
         grid->SetEndPoint({ 0, f.h });
+        grid->SetOpacity(0.8f + 0.1f * snd.kick);
+        float gw = 1 + 0.4f * snd.kick;
         for (int k = 0; k < 26; ++k) {
             float z = k + 1 - fr;                       // 0..26 (1: the bottom edge)
             if (z <= 0.05f) continue;
             float y = yh + depth / z;
             if (y > f.h + 2) continue;
-            f.dc->DrawLine({ 0, y }, { f.w, y }, grid, std::max(1.f, 1.6f * f.s * std::sqrt(f.zoom) / std::sqrt(z)));
+            f.dc->DrawLine({ 0, y }, { f.w, y }, grid, std::max(1.f, 1.6f * f.s * std::sqrt(f.zoom) * gw / std::sqrt(z)));
         }
         float spacing = f.w * 0.09f;
         for (int i = -16; i <= 16; ++i)
-            f.dc->DrawLine({ cx + i * spacing / 40, yh + depth / 40 }, { cx + i * spacing * 1.6f, f.h + depth * 0.6f }, grid, 1.3f * f.s * std::sqrt(f.zoom));
+            f.dc->DrawLine({ cx + i * spacing / 40, yh + depth / 40 }, { cx + i * spacing * 1.6f, f.h + depth * 0.6f }, grid,
+                           1.3f * f.s * std::sqrt(f.zoom) * gw);
+        grid->SetOpacity(1);
         f.color(f.dark ? hex(0xFFD27A, 0.7f) : hex(0xE0A040, 0.6f));
         f.dc->DrawLine({ 0, yh }, { f.w, yh }, f.brush, 1.2f * f.s);
     }
 };
 
-// --- a tunnel of rings, each the spectrum of its moment, flying past ---
+// --- a tunnel of rings, each the spectrum of its moment, flying past; a light at its end ---
 struct Tunnel : Style {
-    struct Ring { float z, hue, rot; std::array<float, 40> r; };
+    struct Ring { float z, hue, rot; bool hit; std::array<float, 40> r; };
     std::deque<Ring> rings;
-    float spawn = 0;
+    float spawn = 0, hueKick = 0;
+    int seen = 0;
     std::vector<float> v;
     std::vector<D2D1_POINT_2F> pts;
+    ID2D1RadialGradientBrush* light = nullptr;
+    bool lightDark = false;
+    float lightHue = -1;
+    void lost() override { release(light); }
     float glow() const override { return 0.75f; }
+    float pump() const override { return 0.2f; }
+    // where a ring at depth z is: the far end wanders, the tunnel bends
+    D2D1_POINT_2F centre(const Frame& f, float z) const {
+        float k = std::pow(std::clamp(z / 3.2f, 0.f, 1.f), 0.8f);
+        float vx = f.w * 0.1f * std::sin((float)f.t * 0.23f), vy = f.h * 0.09f * std::sin((float)f.t * 0.31f + 1);
+        return { f.w / 2 + vx * k, f.h / 2 + vy * k };
+    }
     void draw(Frame& f) override {
         const Sound& snd = f.snd;
-        float speed = 0.5f + 1.1f * snd.energy + 0.8f * snd.beat;
+        float speed = 0.45f + 1.1f * snd.energy + 2.4f * snd.kick;
         for (Ring& r : rings) r.z -= f.dt * speed;
         while (!rings.empty() && rings.front().z < 0.1f) rings.pop_front();
+        bool hit = snd.beats != seen;
+        if (hit) { seen = snd.beats; hueKick += 0.07f; }
         spawn += f.dt;
-        if (spawn >= 0.08f || rings.empty()) {
+        if (spawn >= 0.08f || rings.empty() || hit) {   // (a beat: a ring of its own, bright)
             spawn = 0;
-            Ring r{ 3.2f, (float)std::fmod(f.t * 0.1, 1.0), (float)f.t * 0.25f, {} };
+            Ring r{ 3.2f, (float)std::fmod(f.t * 0.1 + hueKick, 1.0), (float)f.t * 0.25f, hit, {} };
             v.resize(20);
             vis_bars(snd.level, 4, 140, v.data(), 20);
             for (int k = 0; k < 40; ++k) r.r[k] = v[k < 20 ? k : 39 - k];     // (mirrored: the same left and right)
             rings.push_back(r);
         }
-        float cx = f.w / 2, cy = f.h / 2, R = std::min(f.w, f.h) * 0.16f;
+        float R = std::min(f.w, f.h) * 0.16f * (1 + 0.15f * snd.kick);
+        // the light at the end, in the far rings' colour, flaring at a beat
+        float hue = rings.back().hue;
+        if (!light || lightDark != f.dark || std::fabs(hue - lightHue) > 0.02f) {
+            release(light);
+            lightDark = f.dark;
+            lightHue = hue;
+            D2D1_COLOR_F c = hsv(hue, 0.6f, f.dark ? 1.f : 0.85f), core = f.dark ? hex(0xFFFFFF) : c;
+            light = radial(f.dc, { { 0, core }, { 0.12f, alpha(mix(core, c, 0.5f), 0.85f) }, { 0.4f, alpha(c, 0.3f) }, { 1, alpha(c, 0) } });
+        }
+        if (light) {
+            D2D1_POINT_2F end = centre(f, 3.2f);
+            float lr = R * (0.7f + 0.5f * snd.kick + 0.4f * snd.energy);
+            light->SetCenter(end);
+            light->SetRadiusX(lr);
+            light->SetRadiusY(lr);
+            light->SetOpacity(0.45f + 0.15f * snd.kick);
+            f.dc->FillEllipse(D2D1::Ellipse(end, lr, lr), light);
+        }
         pts.resize(40);
         for (auto it = rings.rbegin(); it != rings.rend(); ++it) { // (the far ones first)
             const Ring& r = *it;
             float rad = R / r.z;
             float a = std::clamp((3.2f - r.z) / 0.8f, 0.f, 1.f) * std::clamp((r.z - 0.1f) / 0.35f, 0.f, 1.f);
             if (a <= 0.01f) continue;
+            D2D1_POINT_2F c = centre(f, r.z);
             for (int k = 0; k < 40; ++k) {
                 float ang = r.rot + 2 * kPi * k / 40;
                 float rr = rad * (1 + 0.55f * r.r[k]);
-                pts[k] = { cx + std::cos(ang) * rr, cy + std::sin(ang) * rr * 0.92f };
+                pts[k] = { c.x + std::cos(ang) * rr, c.y + std::sin(ang) * rr * 0.92f };
             }
-            f.color(hsv(r.hue, f.dark ? 0.65f : 0.8f, f.dark ? 1.f : 0.8f, a * 0.85f));
-            stroke_lines(f, pts, true, std::clamp(1.4f * f.s * f.zoom / std::sqrt(r.z), 0.8f, 5.f * f.s * f.zoom));
+            D2D1_COLOR_F col = hsv(r.hue, f.dark ? 0.65f : 0.8f, f.dark ? 1.f : 0.8f, a * 0.85f);
+            if (r.hit) col = alpha(col, a);
+            float wd = std::clamp(1.4f * f.s * f.zoom / std::sqrt(r.z), 0.8f, 5.f * f.s * f.zoom) * (r.hit ? 2.f : 1.f);
+            f.color(col);
+            stroke_lines(f, pts, true, wd);
         }
+    }
+};
+
+// --- flying through stars: faster with the music, a leap at each beat ---
+struct Warp : Style {
+    struct Star { float x, y, z, hue; int band; };
+    std::vector<Star> stars;
+    std::mt19937 rng{ 3 };
+    float speed = 0.2f, hue = 0.58f;
+    int seen = 0;
+    D2D1_POINT_2F vp{};                                 // (the vanishing point)
+    ID2D1RadialGradientBrush* core = nullptr;
+    void lost() override { release(core); }
+    float trail() const override { return 0.45f; }
+    D2D1_MATRIX_3X2_F trail_move(Frame& f) override {   // (the trails stream out from the middle)
+        float k = 1.01f + 0.03f * std::min(speed, 2.f);
+        return D2D1::Matrix3x2F::Scale(k, k, vp);
+    }
+    float glow() const override { return 0.9f; }
+    float pump() const override { return 0.15f; }
+    void place(Star& s, bool back) {
+        std::uniform_real_distribution<float> u(-1, 1), u01(0, 1);
+        do { s.x = u(rng); s.y = u(rng); } while (s.x * s.x + s.y * s.y < 0.01f);
+        s.z = back ? 1.f + 0.2f * u01(rng) : 0.05f + 1.15f * u01(rng);
+        s.hue = u01(rng);
+        s.band = std::clamp((int)(u01(rng) * 140) + 4, 4, 150);
+    }
+    void draw(Frame& f) override {
+        const Sound& snd = f.snd;
+        if (stars.empty()) {
+            stars.resize(700);
+            for (Star& s : stars) place(s, false);
+        }
+        if (snd.beats != seen) { seen = snd.beats; hue += 0.04f; }
+        speed = smooth_to(speed, 0.12f + 0.9f * snd.energy + 1.8f * snd.kick, f.dt, 0.12f);
+        vp = { f.w / 2 + f.w * 0.05f * std::sin((float)f.t * 0.17f), f.h / 2 + f.h * 0.05f * std::sin((float)f.t * 0.13f + 2) };
+        float F = std::max(f.w, f.h) * 0.22f;
+        // a glow where it all comes from
+        if (!core) core = radial(f.dc, { { 0, hex(0xFFFFFF, 0.9f) }, { 0.3f, hex(0xB0C8FF, 0.35f) }, { 1, hex(0x6080FF, 0) } });
+        if (core && f.dark) {
+            float cr = std::min(f.w, f.h) * (0.08f + 0.04f * snd.kick);
+            core->SetCenter(vp);
+            core->SetRadiusX(cr);
+            core->SetRadiusY(cr);
+            core->SetOpacity((f.dark ? 0.35f : 0.2f) + 0.1f * snd.kick);
+            f.dc->FillEllipse(D2D1::Ellipse(vp, cr, cr), core);
+        }
+        float tail = 0.02f + 0.16f * speed;             // (the streak: how far back, as a share of the depth)
+        float wk = std::sqrt(f.zoom) * f.s;
+        for (Star& s : stars) {
+            s.z -= f.dt * speed * 0.5f;
+            if (s.z <= 0.02f) { place(s, true); continue; }
+            float z1 = s.z * (1 + tail);
+            D2D1_POINT_2F head{ vp.x + s.x / s.z * F, vp.y + s.y / s.z * F }, back{ vp.x + s.x / z1 * F, vp.y + s.y / z1 * F };
+            if (head.x < -50 || head.x > f.w + 50 || head.y < -50 || head.y > f.h + 50) { place(s, true); continue; }
+            float close = std::clamp(1 - s.z, 0.f, 1.f), lvl = snd.level[s.band];
+            float a = std::clamp((1.2f - s.z) * 2.f, 0.f, 1.f) * (0.35f + 0.65f * lvl);
+            D2D1_COLOR_F c = f.dark ? hsv(hue + (s.hue - 0.5f) * 0.3f, 0.15f + 0.55f * lvl, 1, a)
+                                    : hsv(hue + (s.hue - 0.5f) * 0.3f, 0.75f, 0.55f, a);
+            f.color(c);
+            f.dc->DrawLine(back, head, f.brush, (0.6f + 2.6f * close * close) * wk, f.round);
+        }
+    }
+};
+
+// --- lines of the spectrum one behind another, the newest in front, rolling away ---
+struct Ridges : Style {
+    static const int P = 72;
+    std::deque<std::array<float, P>> rows;
+    float age = 0;                                      // (since the newest row came)
+    std::mt19937 rng{ 5 };
+    std::vector<float> v;
+    std::vector<D2D1_POINT_2F> pts, curve;
+    float glow() const override { return 0.45f; }
+    float pump() const override { return 0.2f; }
+    void draw(Frame& f) override {
+        const Sound& snd = f.snd;
+        const float step = 1 / 24.f;
+        int N = std::clamp((int)(f.h / (11 * f.s * std::sqrt(f.zoom))), 12, 40);
+        age += f.dt;
+        if (rows.empty() || age >= step) {             // a new row: the spectrum, the bass in the middle
+            age = rows.empty() ? 0 : std::fmod(age, step);
+            v.resize(P / 2);
+            vis_bars(snd.level, 4, 140, v.data(), P / 2);
+            std::array<float, P> row;
+            std::uniform_real_distribution<float> jit(-1, 1);
+            for (int p = 0; p < P; ++p) {
+                float u = (float)p / (P - 1) * 2 - 1;
+                int k = std::clamp((int)(std::fabs(u) * (P / 2)), 0, P / 2 - 1);
+                float e = std::max(0.f, 1 - u * u * 1.3f), env = 0.06f + 0.94f * e * e;
+                row[p] = std::max(0.f, env * v[k] * (0.85f + 0.3f * snd.kick) + 0.015f * (0.3f + env) * jit(rng));
+            }
+            rows.push_front(row);
+        }
+        while ((int)rows.size() > N + 1) rows.pop_back();
+        float W = f.full ? std::min(f.w * 0.62f, f.h * 1.3f) : f.w * 0.8f;
+        float bottom = f.h * 0.95f, sp = f.h * 0.86f / N, A = sp * 7;
+        float shift = age / step;                       // (the rows move a step back in that time)
+        D2D1_COLOR_F hide = f.dark ? D2D1::ColorF(0, 0, 0, 1) : f.bg;
+        D2D1_COLOR_F ink = f.dark ? hex(0xFFFFFF) : hex(0x202020);
+        float hueNow = (float)std::fmod(f.t * 0.03, 1.0);
+        for (int i = (int)rows.size() - 1; i >= 0; --i) {   // (the farthest first: the nearer hide them)
+            float d = (i + shift) / N;                  // 0 front .. 1 back
+            if (d > 1) continue;
+            float base = bottom - (i + shift) * sp, wi = W * (1 - 0.3f * d), ai = A * (1 - 0.35f * d);
+            pts.resize(P);
+            for (int p = 0; p < P; ++p) pts[p] = { f.w / 2 + ((float)p / (P - 1) - 0.5f) * wi, base - rows[i][p] * ai };
+            smooth_curve(pts, false, 12 * f.s, curve);
+            curve.push_back({ curve.back().x, base + sp });
+            curve.push_back({ curve.front().x, base + sp });
+            f.color(hide);
+            if (ID2D1PathGeometry* g = make_path(f.factory, curve, true, true)) {
+                f.dc->FillGeometry(g, f.brush);
+                g->Release();
+            }
+            curve.resize(curve.size() - 2);
+            float a = std::min({ 1.f, (1 - d) * 1.6f, i == 0 ? shift * 3 : 1.f });
+            // (the nearest rows take a colour at a beat)
+            D2D1_COLOR_F c = mix(ink, hsv(hueNow, 0.6f, 1), f.dark ? snd.kick * std::max(0.f, 1 - d * 4) * 0.5f : 0);
+            f.color(alpha(c, a * (0.55f + 0.45f * (1 - d))));
+            draw_lines(f, curve, 1.3f * f.s * std::sqrt(f.zoom) * (1 - 0.3f * d));
+        }
+    }
+};
+
+// --- fireworks: a burst at each beat, crackles with the snare, the sparks falling, fading ---
+struct Fireworks : Style {
+    struct Spark { float x, y, vx, vy, life, max, w; D2D1_COLOR_F c; };
+    std::vector<Spark> sparks;
+    std::mt19937 rng{ 9 };
+    int seen = 0, seenSnap = 0, kind = 0;
+    float idle = 0, sinceSnap = 0;
+    float trail() const override { return 0.8f; }
+    D2D1_MATRIX_3X2_F trail_move(Frame& f) override { return D2D1::Matrix3x2F::Translation(0, 0.6f * f.s); }  // (the smoke sinks)
+    float glow() const override { return 1.0f; }
+    float glow_radius() const override { return 10; }
+    float pump() const override { return 0.05f; }
+    void burst(Frame& f, float strength, bool small) {
+        std::uniform_real_distribution<float> u(0, 1);
+        const Sound& snd = f.snd;
+        float m = std::min(f.w, f.h);
+        float x = f.w * (0.15f + 0.7f * u(rng)), y = f.h * (small ? 0.2f + 0.6f * u(rng) : 0.18f + 0.4f * u(rng));
+        // its colour: where the spectrum is loudest (the bass red, the highs violet); a second one
+        int loud = 4;
+        for (int b = 4; b < 150; ++b) if (snd.level[b] > snd.level[loud]) loud = b;
+        float h1 = (loud - 4) / 146.f * 0.8f + 0.12f * u(rng), h2 = h1 + 0.3f + 0.25f * u(rng);
+        int kindNow = small ? -1 : kind++ % 4;          // sphere, ring, willow, two rings
+        int count = small ? 18 : (int)(70 + 120 * strength);
+        float speed = m * (small ? 0.18f : 0.4f + 0.45f * strength);
+        float wd = (small ? 1.2f : 1.8f) * f.s * std::pow(f.zoom, 0.7f);
+        for (int i = 0; i < count; ++i) {
+            float a = 2 * kPi * u(rng), c = u(rng) * 2 - 1;
+            float sp = kindNow == 1 ? 1.f : kindNow == 3 ? (i % 2 ? 1.f : 0.55f) : std::sqrt(1 - c * c);    // (a ball, seen from the side)
+            float life = small ? 0.35f + 0.3f * u(rng) : kindNow == 2 ? 2.0f + u(rng) : 1.1f + 0.7f * u(rng);
+            D2D1_COLOR_F col = small ? hsv(0.13f, 0.25f, 1) : kindNow == 2 ? hsv(0.1f, 0.75f, 1)
+                             : hsv(i % 3 == 0 ? h2 : h1, 0.72f, 1);
+            if (!f.dark) col = hsv(small ? 0.1f : i % 3 == 0 ? h2 : h1, 0.85f, small ? 0.55f : 0.75f);
+            float v = speed * sp * (0.92f + 0.16f * u(rng));
+            sparks.push_back({ x, y, std::cos(a) * v, std::sin(a) * v, life, life, wd, col });
+        }
+        if (sparks.size() > 5000) sparks.erase(sparks.begin(), sparks.begin() + (long)(sparks.size() - 5000));
+    }
+    void draw(Frame& f) override {
+        const Sound& snd = f.snd;
+        idle += f.dt;
+        if (snd.beats != seen) {
+            seen = snd.beats;
+            burst(f, std::min(1.f, 0.4f + 0.8f * snd.bass), false);
+            idle = 0;
+        } else if (idle > 1.4f && snd.energy > 0.1f) {  // (no beat for a while: one now and then anyway)
+            burst(f, snd.energy, false);
+            idle = 0;
+        }
+        sinceSnap += f.dt;
+        if (snd.snaps != seenSnap) {
+            seenSnap = snd.snaps;
+            if (sinceSnap > 0.3f) { burst(f, 0, true); sinceSnap = 0; }
+        }
+        float g = std::min(f.w, f.h) * 0.35f, drag = std::exp(-f.dt * 1.4f);
+        if (f.dark) f.dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_ADD);     // (light on light: laid over)
+        size_t live = 0;
+        for (size_t i = 0; i < sparks.size(); ++i) {
+            Spark s = sparks[i];
+            s.life -= f.dt;
+            if (s.life <= 0) continue;
+            s.vx *= drag;
+            s.vy = s.vy * drag + g * f.dt * (s.max > 1.9f ? 1.6f : 1.f);     // (a willow's droop more)
+            s.x += s.vx * f.dt;
+            s.y += s.vy * f.dt;
+            sparks[live++] = s;
+            float k = s.life / s.max, a = std::pow(k, 1.3f);
+            if (k < 0.4f) a *= 0.55f + 0.45f * std::sin((float)f.t * 37 + (float)i);      // (twinkling as they die)
+            f.color(alpha(s.c, std::clamp(a, 0.f, 1.f)));
+            f.dc->DrawLine({ s.x - s.vx * 0.035f, s.y - s.vy * 0.035f }, { s.x, s.y }, f.brush, s.w);
+        }
+        sparks.resize(live);
+        f.dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
     }
 };
 
@@ -660,6 +1008,9 @@ std::unique_ptr<Style> make_style(int s) {
         case VIS_RIBBONS: return std::make_unique<Ribbons>();
         case VIS_HORIZON: return std::make_unique<Horizon>();
         case VIS_TUNNEL: return std::make_unique<Tunnel>();
+        case VIS_WARP: return std::make_unique<Warp>();
+        case VIS_RIDGES: return std::make_unique<Ridges>();
+        case VIS_FIREWORKS: return std::make_unique<Fireworks>();
         default: return std::make_unique<Bars>();
     }
 }
@@ -686,7 +1037,8 @@ const Dlls& dlls() {
 
 const wchar_t* vis_name(int style) {
     static const wchar_t* names[VIS_COUNT] = { L"Spectrogram", L"Mirrored bars", L"Waveform", L"Circle",
-                                               L"Particles", L"Ribbons", L"Horizon", L"Tunnel" };
+                                               L"Particles", L"Ribbons", L"Horizon", L"Tunnel", L"Warp", L"Ridges",
+                                               L"Fireworks" };
     return style >= 0 && style < VIS_COUNT ? names[style] : L"";
 }
 
@@ -988,7 +1340,7 @@ bool Renderer::frame(const Snapshot& s, bool& busy) {
         D2D1_RECT_F q4 = D2D1::RectF(0, 0, w / 4.f, h / 4.f);
         m_dc->DrawBitmap(m_scene[m_cur], &q4, 1, D2D1_INTERPOLATION_MODE_LINEAR, nullptr, nullptr);
         m_blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, m_style->glow_radius() * scale / 4);
-        float g = dark ? glow : glow * 0.6f;
+        float g = (dark ? glow : glow * 0.6f) * (1 + m_style->pump() * m_snd.kick);     // (it pumps with the beat)
         D2D1_MATRIX_5X4_F m{};
         m.m[0][0] = m.m[1][1] = m.m[2][2] = m.m[3][3] = g;
         m_strength->SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX, m);

@@ -10,6 +10,7 @@
 // display. Direct3D, Direct2D and DirectWrite are loaded the first time one is shown.
 enum VisStyle {
     VIS_SPECTROGRAM, VIS_BARS, VIS_WAVEFORM, VIS_CIRCLE, VIS_PARTICLES, VIS_RIBBONS, VIS_HORIZON, VIS_TUNNEL,
+    VIS_WARP, VIS_RIDGES, VIS_FIREWORKS,    // (the settings keep the number: new ones go last)
     VIS_COUNT
 };
 const wchar_t* vis_name(int style);           // "Mirrored bars", ...

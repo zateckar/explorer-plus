@@ -51,6 +51,7 @@ const size_t kMaxFiles = 10000;             // a folder walk stops there
 enum Cmd : UINT {
     CMD_PLAYPAUSE = 100, CMD_PREV, CMD_NEXT, CMD_SHUFFLE, CMD_REPEAT, CMD_MUTE, CMD_QUEUE, CMD_FULL,
     CMD_CLEAR, CMD_PLAY_SELECTED, CMD_REMOVE_SELECTED, CMD_LEVEL, CMD_VIS_NEXT, CMD_VIS_PREV,
+    CMD_VIS_CYCLE,
     CMD_SLIDE = 200,                // + seconds: the slide show's interval
     CMD_VIS = 300,                  // + VisStyle: the visualization
 };
@@ -126,6 +127,7 @@ struct Player {
     std::map<std::wstring, double> loud;    // measured: path -> LUFS (not finite: couldn't)
     // the visualization (sound): the spectrogram (drawn here) or one of visual.cpp's
     int visStyle = VIS_SPECTROGRAM;
+    bool visCycle = false;          // another one with each track
     Visualizer vis;
     std::wstring visCaption;        // (what the caption was last made of)
 };
@@ -784,6 +786,10 @@ void command(Player& p, UINT cmd) {
             apply_volume(p);
             InvalidateRect(p.video, nullptr, FALSE);
             break;
+        case CMD_VIS_CYCLE:
+            p.visCycle = !p.visCycle;
+            settings_set_pref(L"playerVisualCycle", p.visCycle);
+            break;
         case CMD_VIS_NEXT: case CMD_VIS_PREV: {
             // (the spectrogram and the others in turn; only it when they can't be drawn)
             int n = p.vis.failed() ? 1 : VIS_COUNT;
@@ -836,6 +842,11 @@ void on_note(Player& p, LPARAM lp) {
                 if (!p.mp->has_video()) {
                     p.feed.start(e.path, p.mp->position(), std::max(30, MulDiv(60, p.dpi, 96)));
                     p.vis.set_source(p.feed.tap());
+                    if (p.visCycle && !p.vis.failed()) {    // (another visualization, by chance)
+                        bool some = p.visStyle != VIS_SPECTROGRAM;
+                        int s = 1 + (int)(GetTickCount64() % (VIS_COUNT - 1 - some));
+                        set_vis(p, some && s >= p.visStyle ? s + 1 : s);
+                    }
                 }
             }
             InvalidateRect(p.video, nullptr, FALSE);
@@ -2070,6 +2081,8 @@ void view_menu(Player& p, POINT pt) {
     CheckMenuRadioItem(vis, CMD_VIS, CMD_VIS + (UINT)VIS_COUNT - 1, CMD_VIS + p.visStyle, MF_BYCOMMAND);
     AppendMenuW(vis, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(vis, MF_STRING, CMD_VIS_NEXT, L"Next visualization\tV");
+    AppendMenuW(vis, MF_STRING | (p.visCycle ? MF_CHECKED : 0) | (p.vis.failed() ? MF_GRAYED : 0), CMD_VIS_CYCLE,
+                L"Another with each track");
     HMENU slides = CreatePopupMenu();
     for (int s : kSlideSecs)
         AppendMenuW(slides, MF_STRING | (s == p.slideSecs ? MF_CHECKED : 0), CMD_SLIDE + s, (std::to_wstring(s) + L" seconds").c_str());
@@ -2608,6 +2621,7 @@ bool create_player(bool activate) {
     p.level = settings_pref(L"playerLevel", 1) != 0;
     p.slideSecs = std::clamp(settings_pref(L"playerSlideSeconds", 5), 1, 60);
     p.visStyle = std::clamp(settings_pref(L"playerVisual", VIS_SPECTROGRAM), 0, VIS_COUNT - 1);
+    p.visCycle = settings_pref(L"playerVisualCycle", 0) != 0;
     bool maximized = false;
     RECT r = initial_rect(maximized);
     HWND w = CreateWindowExW(0, player_class().c_str(), L"Player", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
