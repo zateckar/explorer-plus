@@ -76,7 +76,13 @@ set_source_files_properties(res/resource.rc PROPERTIES
     INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/res;${CMAKE_CURRENT_SOURCE_DIR}/src;${CMAKE_CURRENT_BINARY_DIR}/generated"
     OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/res/app.manifest;${CMAKE_CURRENT_SOURCE_DIR}/res/app.ico;${CMAKE_CURRENT_SOURCE_DIR}/res/player.ico;${CMAKE_CURRENT_SOURCE_DIR}/src/resource.h;${CMAKE_CURRENT_BINARY_DIR}/generated/version.h")
 
-target_compile_options(explorer-plus PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-cast-function-type)
+# optimized for size: a third smaller than -O2, and tools/perf.py measures no difference
+# (listing, sorting, scrolling 30,000 files). The number crunching (loudness scans whole
+# files, the spectrum and the visualizations run every frame) keeps -O2. Each function
+# and variable in its own section: the linker drops the ones nothing calls.
+target_compile_options(explorer-plus PRIVATE -Os -ffunction-sections -fdata-sections -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-cast-function-type)
+set_source_files_properties(src/loudness.cpp src/spectrum.cpp src/visual.cpp PROPERTIES COMPILE_OPTIONS -O2)
+target_link_options(explorer-plus PRIVATE -Wl,--gc-sections)
 # STRICT_TYPED_ITEMIDS: absolute ID lists and child IDs are different types, so the compiler
 # tells an absolute pidl passed where a child belongs (and the other way round)
 target_compile_definitions(explorer-plus PRIVATE UNICODE _UNICODE STRICT_TYPED_ITEMIDS)

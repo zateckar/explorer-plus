@@ -27,7 +27,7 @@ struct GroupRange {
     int first = 0, count = 0;
 };
 
-enum Kind { KIND_NORMAL, KIND_HOME, KIND_THISPC };
+namespace { enum Kind { KIND_NORMAL, KIND_HOME, KIND_THISPC }; }   // (cmdbar.cpp has a Kind too)
 // internal modes beyond GROUP_*
 enum { MODE_HOME = 100, MODE_THISPC };
 

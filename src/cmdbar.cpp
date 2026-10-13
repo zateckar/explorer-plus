@@ -15,6 +15,7 @@ using std::min;
 #include "foldersizes.h"
 #include <vector>
 
+namespace {                            // (groups.cpp has a Kind of its own)
 enum class Kind { Button, Separator, Spacer };
 struct CmdItem {
     Kind kind;
@@ -24,6 +25,7 @@ struct CmdItem {
     bool dropdown = false;
     const wchar_t* tip = nullptr;
 };
+}
 
 static const CmdItem kItems[] = {
     { Kind::Button, IDM_NEW_MENU,     L'\xE710', L"New",  true,  L"Create a new item in the current location." },
