@@ -30,6 +30,7 @@ struct NodeData {
     bool refreshAgain = false;     // another refresh was asked for meanwhile
     bool pinned = false;           // Quick access pin (glyph on the right)
     NodeKind kind = NodeKind::Folder;
+    ULONGLONG id = 0;              // its parsing name's hash, once asked (node_id)
 };
 
 static std::unordered_set<NodeData*> s_live;     // nodes still in the tree (for async results)
@@ -257,6 +258,8 @@ struct TreeNoRedraw {
     TreeNoRedraw& operator=(const TreeNoRedraw&) = delete;
 };
 
+static void restore_children(HTREEITEM h);
+
 static void insert_children(HWND tree, HTREEITEM parent, std::vector<NodeInfo>& kids) {
     TreeNoRedraw nr(tree);
     for (auto& k : kids) insert_node(tree, parent, k);
@@ -264,6 +267,8 @@ static void insert_children(HWND tree, HTREEITEM parent, std::vector<NodeInfo>& 
         TVITEMW ti{}; ti.mask = TVIF_CHILDREN; ti.hItem = parent; ti.cChildren = 0;
         TreeView_SetItem(tree, &ti);
     }
+    // a tab's state being put back: the new nodes get theirs (listed by expanding or by a sync)
+    if (tree == g_tree) restore_children(parent);
 }
 
 // asynchronous listing: slow / network folders never block the UI. Expanding a node and
@@ -300,8 +305,6 @@ static void resume_sync() {
     }
 }
 
-static void restore_children(HTREEITEM h);
-
 static void expand_apply(void* payload) {
     std::unique_ptr<ExpandJob> job(static_cast<ExpandJob*>(payload));
     CoTaskMemFree(job->abs);
@@ -323,7 +326,6 @@ static void expand_apply(void* payload) {
         TreeNoRedraw nr(g_tree);
         insert_children(g_tree, job->item, job->kids);
         if (!job->kids.empty()) TreeView_Expand(g_tree, job->item, TVE_EXPAND);
-        restore_children(job->item);          // (a tab's state being put back: below this node too)
     }
     resume_sync();
 }
@@ -860,10 +862,26 @@ void tree_reread_pins() { if (g_tree) read_pins(); }
 // ------------------------------------------------------------------
 // each tab's own state (TreeState): the nodes expanded and the scroll position. A node is
 // known by its place in the tree, so a folder shown twice (as a pin and under This PC)
-// keeps each one's state.
+// keeps each one's state. The keys are saved with the tabs: they hash parsing names, not
+// pidl bytes (a file system pidl carries its folder's timestamps).
 
-static ULONGLONG state_key(ULONGLONG parentKey, const NodeData* d) {
-    return (parentKey * 0x100000001B3ULL) ^ pidl_sig(d->abs);
+static ULONGLONG node_id(NodeData* d) {
+    if (!d->id) {
+        std::wstring name = pidl_parsingname(d->abs);
+        if (name.empty()) {
+            d->id = pidl_sig(d->abs) | 1;
+        } else {
+            CharLowerBuffW(name.data(), (DWORD)name.size());
+            ULONGLONG h = 1469598103934665603ULL;          // FNV-1a
+            for (wchar_t c : name) { h ^= (ULONGLONG)c; h *= 1099511628211ULL; }
+            d->id = h | 1;
+        }
+    }
+    return d->id;
+}
+
+static ULONGLONG state_key(ULONGLONG parentKey, NodeData* d) {
+    return (parentKey * 0x100000001B3ULL) ^ node_id(d);
 }
 
 static ULONGLONG key_of(HTREEITEM h) {
@@ -873,14 +891,16 @@ static ULONGLONG key_of(HTREEITEM h) {
     return state_key(parent ? key_of(parent) : 0, d);
 }
 
-static void save_below(HTREEITEM first, ULONGLONG parentKey, TreeState& s) {
+// (every level: a folder open inside a closed one is open again when that one opens)
+static void save_below(HTREEITEM first, ULONGLONG parentKey, TreeState& s,
+                       std::unordered_set<ULONGLONG>& present) {
     for (HTREEITEM h = first; h; h = TreeView_GetNextSibling(g_tree, h)) {
         NodeData* d = node_data(g_tree, h);
-        if (!d || d->kind != NodeKind::Folder || !(TreeView_GetItemState(g_tree, h, TVIS_EXPANDED) & TVIS_EXPANDED))
-            continue;
+        if (!d || d->kind != NodeKind::Folder) continue;
         ULONGLONG k = state_key(parentKey, d);
-        s.expanded.insert(k);
-        save_below(TreeView_GetChild(g_tree, h), k, s);
+        present.insert(k);
+        if (TreeView_GetItemState(g_tree, h, TVIS_EXPANDED) & TVIS_EXPANDED) s.expanded.insert(k);
+        save_below(TreeView_GetChild(g_tree, h), k, s, present);
     }
 }
 
@@ -905,14 +925,23 @@ static void restore_children(HTREEITEM h) {
     if (s_restoreOn && h) restore_below(TreeView_GetChild(g_tree, h), key_of(h));
 }
 
-void tree_save_state(TreeState& s) {
-    s_restoreOn = false;
+void tree_capture_state(TreeState& s) {
     s.expanded.clear();
     s.top = 0;
     s.saved = true;
     if (!g_tree) return;
-    save_below(TreeView_GetRoot(g_tree), 0, s);
+    std::unordered_set<ULONGLONG> present;
+    save_below(TreeView_GetRoot(g_tree), 0, s, present);
+    // a state still being put back: the nodes not listed yet keep what it wants for them
+    if (s_restoreOn)
+        for (ULONGLONG k : s_restoring.expanded)
+            if (!present.count(k)) s.expanded.insert(k);
     if (HTREEITEM top = TreeView_GetFirstVisible(g_tree)) s.top = key_of(top);
+}
+
+void tree_save_state(TreeState& s) {
+    tree_capture_state(s);
+    s_restoreOn = false;
 }
 
 void tree_restore_state(const TreeState& s) {
@@ -1178,6 +1207,9 @@ LRESULT tree_notify(HWND, WPARAM, LPARAM lp) {
             start_listing(nm->itemNew.hItem, d);
             return TRUE;                      // expands when the children arrive
         }
+        case TVN_ITEMEXPANDEDW:
+            tabs_persist_soon();              // (the tab's navigation pane is saved with it)
+            return 0;
         case TVN_SELCHANGINGW: {
             NM_TREEVIEWW* nm = (NM_TREEVIEWW*)lp;
             NodeData* d = node_data(g_tree, nm->itemNew.hItem);

@@ -22,7 +22,7 @@ File Explorer while starting in well under 100 ms.
   Each tab remembers whether it shows one list or two, and their folders, across restarts.
 - **Navigation pane**: Home, Gallery, OneDrive, pinned Quick access folders, This PC,
   Network; children listed in the background; follows the current folder. Each tab keeps
-  its own folders expanded.
+  its own folders expanded, also across restarts.
 - **Views**: Details (with Win11 row spacing, or Compact like Windows' setting), Extra large /
   Large / Medium / Small icons, List, Tiles; per-folder columns (any shell property), sort,
   Group by; item check boxes; This PC drive tiles with free-space bars. The sort order

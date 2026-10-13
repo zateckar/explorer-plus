@@ -27,5 +27,6 @@ struct TreeState {
     ULONGLONG top = 0;                        // the node at the top of the view
     bool saved = false;                       // false: a new tab (everything collapsed)
 };
+void tree_capture_state(TreeState& s);        // the shown tab's, as it is now (saving the tabs)
 void tree_save_state(TreeState& s);           // leaving a tab
 void tree_restore_state(const TreeState& s);  // showing a tab (before it syncs to its folder)

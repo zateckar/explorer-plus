@@ -54,7 +54,9 @@ bool tabmodel_can_forward();
 bool tabmodel_go_back();
 bool tabmodel_go_forward();
 
-// persistence: one line per tab, "path\x1name\x1view\x1pinned[\x1dual\x1path2\x1name2\x1view2\x1activeSide]"
+// persistence: one line per tab,
+// "path\x1name\x1view\x1pinned\x1dual\x1path2\x1name2\x1view2\x1activeSide\x1tree" (the second
+// list's fields empty when it never had one; tree: "top,expanded,..." hex keys, empty: never shown)
 void tabs_serialize_lines(std::vector<std::wstring>& lines, int& outActive);
 void tabs_deserialize(const std::wstring& tabs, int active);
 

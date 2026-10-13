@@ -1075,6 +1075,8 @@ check('the sort order is remembered after restart', wait_for(lambda: app.item_te
 check('the dual-pane layout and its folders are remembered after restart',
       wait_for(lambda: u.IsWindowVisible(list2) and count2() == len(os.listdir(dual)), 5),
       (u.IsWindowVisible(list2), count2()))
+check("the tab's navigation pane is remembered after restart (the folder open)",
+      wait_for(lambda: tree_shows('sub'), 5))
 app.command(IDM['DUALPANE'])
 check('Dual pane off: one list again', wait_for(lambda: not u.IsWindowVisible(list2), 3))
 app.close()

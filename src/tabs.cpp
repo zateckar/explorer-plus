@@ -213,7 +213,7 @@ void tabmodel_duplicate_tab(int idx) {
     }
     t.dual = src.dual;
     t.activeSide = src.activeSide;
-    if (idx == g_activeTab) tree_save_state(s_tabs[idx].tree);   // (the one on screen: as it is now)
+    if (idx == g_activeTab) tree_capture_state(s_tabs[idx].tree);   // (the one on screen: as it is now)
     t.tree = s_tabs[idx].tree;
     s_tabs.insert(s_tabs.begin() + idx + 1, std::move(t));
     g_activeTab = idx + 1;
@@ -349,7 +349,7 @@ void tabs_deserialize(const std::wstring& tabs, int active) {
             if (s == std::wstring::npos) break;
             p2 = s + 1;
         }
-        while (f.size() < 9) f.push_back(L"");
+        while (f.size() < 10) f.push_back(L"");
         TabState t = path_is_network(f[0]) && !f[1].empty()
                    ? make_tab_named(parse_persisted(f[0]), f[1])     // (its name needs no server either)
                    : make_tab(parse_persisted(f[0]));
@@ -363,6 +363,16 @@ void tabs_deserialize(const std::wstring& tabs, int active) {
             n.view = int_to_view(_wtoi(f[7].c_str()));
             t.dual = f[4] == L"1";
             t.activeSide = t.dual && f[8] == L"1" ? 1 : 0;
+        }
+        if (!f[9].empty()) {
+            const wchar_t* p = f[9].c_str();
+            wchar_t* end = nullptr;
+            t.tree.top = _wcstoui64(p, &end, 16);
+            while (end && *end == L',') {
+                ULONGLONG k = _wcstoui64(end + 1, &end, 16);
+                if (k) t.tree.expanded.insert(k);
+            }
+            t.tree.saved = true;
         }
         s_tabs.push_back(std::move(t));
     }
@@ -388,11 +398,26 @@ void tabs_serialize_lines(std::vector<std::wstring>& lines, int& outActive) {
         std::wstring name = scope ? pidl_abs_dispname(scope) : n.name;
         return tab_persist_path(scope ? scope : n.current) + L"\x1" + name + L"\x1" + std::to_wstring(view_to_int(n.view));
     };
+    // the navigation pane: "top,expanded,expanded..." (hex node keys); the shown tab's as it is now
+    auto tree = [](const TabState& t) {
+        TreeState live;
+        const TreeState* s = &t.tree;
+        if (t.id == s_shownId) { tree_capture_state(live); s = &live; }
+        if (!s->saved) return std::wstring();
+        wchar_t buf[24];
+        swprintf_s(buf, L"%llx", s->top);
+        std::wstring out = buf;
+        for (ULONGLONG k : s->expanded) { swprintf_s(buf, L",%llx", k); out += buf; }
+        return out;
+    };
     for (auto& t : s_tabs) {
         std::wstring line = place(t.side[0]) + L"\x1" + (t.pinned ? L"1" : L"0");
         if (t.side[1].current)
             line += std::wstring(L"\x1") + (t.dual ? L"1" : L"0") + L"\x1" + place(t.side[1]) + L"\x1" +
                     (t.activeSide == 1 ? L"1" : L"0");
+        else
+            line += L"\x1\x1\x1\x1\x1";
+        line += L"\x1" + tree(t);
         lines.push_back(line);
     }
     outActive = g_activeTab;
