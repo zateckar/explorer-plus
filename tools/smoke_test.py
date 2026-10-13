@@ -1113,6 +1113,10 @@ with open(os.path.join(media, 'notes.txt'), 'w') as f:
 ini_player = ini + '.player'
 if os.path.exists(ini_player):
     os.remove(ini_player)
+# extensions shown, as in the main settings above: a fresh image hides them, and then the
+# list's names would be "one", not "one.wav"
+with open(ini_player, 'w', encoding='utf-16') as f:
+    f.write('[prefs]\nshowExtensions=1\n')
 app = App(exe, media, settings=ini_player)
 app.wait_idle(2)
 def player():
@@ -1128,7 +1132,9 @@ def player_state():
     return text(b) if b else None
 def media_entry(name, entry):
     """Choose `entry` in the compact menu of `name` by keyboard; the menu's entries."""
-    app.select_name(name)
+    idx = app.select_name(name)
+    # (a name not in the list opens the folder's menu instead, and the checks would pass vacuously)
+    check('"%s" is in the list' % name, idx >= 0, idx)
     fly = app.open_context_flyout()
     stops = [s for s in app.flyout_entries(fly) if s != '-'] if fly else []
     if entry and entry in stops:
