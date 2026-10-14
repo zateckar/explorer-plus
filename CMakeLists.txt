@@ -86,6 +86,9 @@ target_link_options(explorer-plus PRIVATE -Wl,--gc-sections)
 # STRICT_TYPED_ITEMIDS: absolute ID lists and child IDs are different types, so the compiler
 # tells an absolute pidl passed where a child belongs (and the other way round)
 target_compile_definitions(explorer-plus PRIVATE UNICODE _UNICODE STRICT_TYPED_ITEMIDS)
+# the Windows 10 API for every file, whatever it includes first (some GCC 16 builds'
+# <thread> brings windows.h in with an older default, before shell_utils.h sets these)
+target_compile_definitions(explorer-plus PRIVATE _WIN32_WINNT=0x0A00 NTDDI_VERSION=0x0A000000)
 # stack buffer overruns end the process instead of returning through a smashed frame
 target_compile_options(explorer-plus PRIVATE -fstack-protector-strong)
 target_link_options(explorer-plus PRIVATE -fstack-protector-strong)
