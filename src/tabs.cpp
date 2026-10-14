@@ -328,8 +328,11 @@ static PIDLIST_ABSOLUTE parse_persisted(const std::wstring& path) {
     while (!fb.empty()) {
         size_t s1 = fb.find_last_of(L"\\/");
         if (s1 == std::wstring::npos) break;
-        fb.erase(s1);
-        if (!fb.empty() && fb.back() == L':') fb += L'\\';
+        std::wstring up = fb.substr(0, s1);
+        if (!up.empty() && up.back() == L':') up += L'\\';
+        // a drive's root has no parent ("X:\" -> "X:\"): a removed drive ends here
+        if (up.size() >= fb.size()) break;
+        fb = std::move(up);
         if (SUCCEEDED(SHParseDisplayName(fb.c_str(), nullptr, &p, 0, nullptr)) && p)
             return p;
     }
