@@ -22,12 +22,13 @@ const wchar_t* const kKindNames[K_COUNT] = { L"Music and sound", L"Video", L"Pic
 
 // the types offered: the common ones Windows has for each kind
 const wchar_t* const kAudio[] = { L".mp3", L".m4a", L".aac", L".flac", L".wav", L".wma", L".ogg", L".oga", L".opus",
-                                  L".mka", L".ac3", L".amr", L".aif", L".aiff", L".m4b", L".3ga" };
+                                  L".mka", L".ac3", L".amr", L".aif", L".aiff", L".m4b", L".3ga", L".mid", L".midi", L".rmi", L".kar" };
 const wchar_t* const kVideo[] = { L".mp4", L".m4v", L".mkv", L".webm", L".avi", L".wmv", L".mov", L".mpg", L".mpeg",
                                   L".m2ts", L".mts", L".ts", L".3gp", L".3g2", L".asf" };
 const wchar_t* const kPictures[] = { L".jpg", L".jpeg", L".jfif", L".png", L".gif", L".bmp", L".tif", L".tiff", L".webp",
-                                     L".heic", L".heif", L".avif", L".jxr", L".jxl", L".ico" };
-const wchar_t* const kPlaylists[] = { L".m3u", L".m3u8" };
+                                     L".heic", L".heif", L".avif", L".jxr", L".jxl", L".ico", L".apng", L".svg", L".emf",
+                                     L".wmf", L".tga", L".qoi", L".hdr", L".psd", L".psb", L".pcx" };
+const wchar_t* const kPlaylists[] = { L".m3u", L".m3u8", L".pls", L".wpl", L".zpl", L".asx", L".wax", L".wvx", L".xspf" };
 
 struct Row {
     std::wstring ext;
