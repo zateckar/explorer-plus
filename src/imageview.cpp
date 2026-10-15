@@ -308,7 +308,7 @@ bool apng_frames(IWICImagingFactory* wic, const std::vector<uint8_t>& file, int 
 
 // ------------------------------------------------------------------
 // drawings: SVG (Direct2D), EMF / WMF (GDI+); drawn to fit the box, enlarged up to
-// nlarge times
+// `enlarge` times
 // ------------------------------------------------------------------
 void drawing_size(double w, double h, int maxW, int maxH, double enlarge, int& tw, int& th) {
     double k = std::min({ enlarge, std::max(1, maxW) / w, std::max(1, maxH) / h });
@@ -360,8 +360,11 @@ bool svg_render(IWICImagingFactory* wic, const std::wstring& path, int maxW, int
         ok = SUCCEEDED(bmp->CopyPixels(nullptr, (UINT)tw * 4, (UINT)(px->size() * 4), (BYTE*)px->data()));
         if (ok) {
             out.pixels = px;
-            out.w = out.fullW = tw;
-            out.h = out.fullH = th;
+            out.w = tw;
+            out.h = th;
+            out.fullW = std::max(1, (int)(w + 0.5));
+            out.fullH = std::max(1, (int)(h + 0.5));
+            out.drawing = true;
         }
     }
     release(doc);
@@ -395,12 +398,15 @@ bool metafile_render(const std::wstring& path, int maxW, int maxH, double enlarg
         if (g.DrawImage(&mf, 0, 0, tw, th) != Gdiplus::Ok) return false;
     }
     out.pixels = px;
-    out.w = out.fullW = tw;
-    out.h = out.fullH = th;
+    out.w = tw;
+    out.h = th;
+    out.fullW = std::max(1, (int)(w + 0.5));
+    out.fullH = std::max(1, (int)(h + 0.5));
+    out.drawing = true;
     return true;
 }
 
-// nlarge: how far a drawing may grow to fill the box
+// `enlarge`: how far a drawing may grow to fill the box
 bool decode(IWICImagingFactory* wic, const std::wstring& path, int maxW, int maxH, int page, ImageNote& out,
             double enlarge = 4.0) {
     if (!wic) return false;
@@ -458,8 +464,8 @@ bool decode(IWICImagingFactory* wic, const std::wstring& path, int maxW, int max
 // ------------------------------------------------------------------
 // the thread: the newest request, then the next picture ahead
 // ------------------------------------------------------------------
-struct Request { HWND notify; UINT msg; unsigned id; std::wstring path; int maxW, maxH; std::wstring next; int page; };
-struct Cached { std::wstring path; int maxW, maxH, page; FILETIME time; ImageNote img; };
+struct Request { HWND notify; UINT msg; unsigned id; std::wstring path; int maxW, maxH; std::wstring next; int page; double enlarge; };
+struct Cached { std::wstring path; int maxW, maxH, page; double enlarge; FILETIME time; ImageNote img; };
 std::mutex s_mx;
 std::condition_variable s_cv;
 std::unique_ptr<Request> s_req;
@@ -472,22 +478,23 @@ FILETIME write_time(const std::wstring& path) {
     return fa.ftLastWriteTime;
 }
 
-const ImageNote* cached(const std::wstring& path, int maxW, int maxH, int page) {
+const ImageNote* cached(const std::wstring& path, int maxW, int maxH, int page, double enlarge) {
     FILETIME t = write_time(path);
     for (auto& c : s_cache)
-        if (c.path == path && c.maxW == maxW && c.maxH == maxH && c.page == page && CompareFileTime(&c.time, &t) == 0)
+        if (c.path == path && c.maxW == maxW && c.maxH == maxH && c.page == page && c.enlarge == enlarge && CompareFileTime(&c.time, &t) == 0)
             return &c.img;
     return nullptr;
 }
 
-ImageNote load(IWICImagingFactory* wic, const std::wstring& path, int maxW, int maxH, int page) {
-    if (const ImageNote* c = cached(path, maxW, maxH, page)) return *c;
+ImageNote load(IWICImagingFactory* wic, const std::wstring& path, int maxW, int maxH, int page, double enlarge) {
+    if (const ImageNote* c = cached(path, maxW, maxH, page, enlarge)) return *c;
     ImageNote img;
     img.path = path;
     FILETIME t = write_time(path);
-    if (decode(wic, path, maxW, maxH, page, img)) {
+    if (decode(wic, path, maxW, maxH, page, img, enlarge)) {
         img.path = path;
-        s_cache.push_front({ path, maxW, maxH, page, t, img });
+        if ((long long)img.w * img.h <= (1 << 23))         // (one zoomed into, decoded big: not kept)
+            s_cache.push_front({ path, maxW, maxH, page, enlarge, t, img });
         if (s_cache.size() > 3) s_cache.pop_back();
     }
     return img;
@@ -504,7 +511,7 @@ void worker() {
             s_cv.wait(lk, [] { return s_req != nullptr; });
             req = std::move(s_req);
         }
-        auto* note = new ImageNote(load(wic, req->path, req->maxW, req->maxH, req->page));
+        auto* note = new ImageNote(load(wic, req->path, req->maxW, req->maxH, req->page, req->enlarge));
         note->id = req->id;
         note->path = req->path;
         if (!PostMessageW(req->notify, req->msg, 0, (LPARAM)note)) delete note;
@@ -513,7 +520,7 @@ void worker() {
             std::lock_guard<std::mutex> lk(s_mx);
             newer = s_req != nullptr;
         }
-        if (!newer && !req->next.empty()) load(wic, req->next, req->maxW, req->maxH, 0);
+        if (!newer && !req->next.empty()) load(wic, req->next, req->maxW, req->maxH, 0, 4.0);
     }
     (void)co;                               // (the thread lives as long as the process)
 }
@@ -540,9 +547,9 @@ bool image_decode_full(const std::wstring& path, ImageNote& out) {
 }
 
 void image_request(HWND notify, UINT msg, unsigned id, const std::wstring& path, int maxW, int maxH,
-                   const std::wstring& next, int page) {
+                   const std::wstring& next, int page, double enlarge) {
     std::lock_guard<std::mutex> lk(s_mx);
-    s_req = std::make_unique<Request>(Request{ notify, msg, id, path, maxW, maxH, next, page });
+    s_req = std::make_unique<Request>(Request{ notify, msg, id, path, maxW, maxH, next, page, enlarge });
     if (!s_running) {
         s_running = true;
         std::thread(worker).detach();

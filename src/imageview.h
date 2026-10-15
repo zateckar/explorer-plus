@@ -20,7 +20,8 @@ struct ImageNote {
     std::wstring path;
     std::shared_ptr<const std::vector<uint32_t>> pixels;     // premultiplied BGRA, w x h; null: couldn't
     int w = 0, h = 0;                // as decoded (fits the box asked for)
-    int fullW = 0, fullH = 0;        // the picture's own size, turned upright
+    int fullW = 0, fullH = 0;        // the picture's own size, turned upright (a drawing: the size it asks for)
+    bool drawing = false;            // SVG, EMF, WMF: drawn sharp at any size asked for
     // an animation (GIF, APNG): every frame as the canvas shows it (w x h; `pixels` is the
     // first) and how long each stays (ms); empty: a still picture
     std::vector<std::shared_ptr<const std::vector<uint32_t>>> frames;
@@ -32,8 +33,9 @@ struct ImageNote {
 // animation's first frame, a document's first page
 bool image_decode_full(const std::wstring& path, ImageNote& out);
 
-// decodes `path` (fitting maxW x maxH; never enlarged, but for drawings: SVG, EMF, WMF)
-// and posts `msg` with lParam an ImageNote* (the window deletes it); then decodes `next`
-// ahead. `page`: a TIFF's page. A newer request replaces one not started yet.
+// decodes `path` (fitting maxW x maxH; never enlarged, but for drawings: SVG, EMF, WMF, up
+// to `enlarge` times their size) and posts `msg` with lParam an ImageNote* (the window
+// deletes it); then decodes `next` ahead. `page`: a TIFF's page. A newer request replaces
+// one not started yet.
 void image_request(HWND notify, UINT msg, unsigned id, const std::wstring& path, int maxW, int maxH,
-                   const std::wstring& next, int page = 0);
+                   const std::wstring& next, int page = 0, double enlarge = 4.0);

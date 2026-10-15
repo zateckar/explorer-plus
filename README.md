@@ -72,7 +72,9 @@ File Explorer while starting in well under 100 ms.
   icons, HEIC / WebP / AVIF / camera raw with their Store extensions) and SVG, EMF / WMF,
   TGA, QOI, Radiance HDR, Photoshop PSD / PSB (the saved composite) and PCX; GIF and APNG
   animations play, a TIFF's pages turn with Page Up / Page Down, drawings are drawn sharp
-  at the size shown. Its own taskbar button, with
+  at the size shown. Ctrl+wheel or + / − zoom in at the pointer (up to 16 screen pixels a
+  pixel; a photo is decoded again at its full size, a drawing drawn again sharp), drag to
+  look around, 1 actual size, 0 fitted. Its own taskbar button, with
   the track's progress and Previous / Play / Next in the thumbnail. Windows' own Media
   Foundation plays (the formats and codecs Windows has, Opus in MP4 too; Windows N needs
   the Media Feature Pack), nothing to install. Keys: Space

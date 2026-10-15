@@ -58,7 +58,7 @@ enum Cmd : UINT {
     CMD_PLAYPAUSE = 100, CMD_PREV, CMD_NEXT, CMD_SHUFFLE, CMD_REPEAT, CMD_MUTE, CMD_QUEUE, CMD_FULL,
     CMD_CLEAR, CMD_PLAY_SELECTED, CMD_REMOVE_SELECTED, CMD_LEVEL, CMD_VIS_NEXT, CMD_VIS_PREV,
     CMD_VIS_CYCLE, CMD_SAVE_PLAYLIST, CMD_EDIT_PICTURE, CMD_SUBS_OFF, CMD_SUBS_CHOOSE, CMD_SUBS_NEXT, CMD_AUDIO_NEXT,
-    CMD_PAGE_PREV, CMD_PAGE_NEXT,
+    CMD_PAGE_PREV, CMD_PAGE_NEXT, CMD_ZOOM_IN, CMD_ZOOM_OUT, CMD_ZOOM_FIT, CMD_ZOOM_ACTUAL,
     CMD_SLIDE = 200,                // + seconds: the slide show's interval
     CMD_VIS = 300,                  // + VisStyle: the visualization
     CMD_SUB = 400,                  // + index: the subtitles shown (Player::subs)
@@ -130,6 +130,13 @@ struct Player {
     ULONGLONG slideStart = 0;       // when the picture came on screen (0: not yet)
     ULONGLONG slideDone = 0;        // ms of it shown before a pause
     size_t animFrame = 0;           // an animation's frame on screen (img.frames)
+    // zoomed into: `zoom` times the fitted size (1: fitted), the picture's point at the
+    // area's centre (fractions of it); dragged about
+    double zoom = 1, zoomX = 0.5, zoomY = 0.5;
+    int sharpW = 0, sharpH = 0;     // the size last decoded again for it (0: none)
+    bool panning = false;
+    POINT panFrom{};
+    double panX = 0, panY = 0;      // zoomX, zoomY as the drag began
     // loudness levelling: tracks brought to about the same loudness
     bool level = true;
     double gainDb = 0;              // the current track's
@@ -267,6 +274,36 @@ bool player_file(const std::wstring& path) { return media_file_playable(path) ||
 bool image_entry(Player& p, int i) { return i >= 0 && i < p.q.size() && image_file(p.q.at(i).path); }
 bool image_current(Player& p) { return image_entry(p, p.q.current()); }
 
+// a picture in an area aw x ah: fitted (full screen: filling it, a small picture enlarged up
+// to 3x; in a window: as big as it is at most), zoomed; `s` screen pixels a pixel of its own
+// size, its top-left at x0, y0, dw x dh big
+struct ImageView { double fit = 0, s = 0, x0 = 0, y0 = 0, dw = 0, dh = 0; };
+
+ImageView image_view(Player& p, int aw, int ah) {
+    ImageView v;
+    const ImageNote& im = p.img;
+    int fw = im.fullW > 0 ? im.fullW : im.w, fh = im.fullH > 0 ? im.fullH : im.h;
+    if (!im.pixels || fw <= 0 || fh <= 0 || aw <= 0 || ah <= 0) return v;
+    v.fit = std::min({ p.full ? 3.0 : 1.0, (double)aw / fw, (double)ah / fh });
+    v.s = v.fit * p.zoom;
+    v.dw = fw * v.s;
+    v.dh = fh * v.s;
+    // (bigger than the area: covering it, the centre kept so; smaller: centred)
+    auto place = [](double& c, double d, int a) {
+        c = d <= a ? 0.5 : std::clamp(c, a / 2.0 / d, 1 - a / 2.0 / d);
+        return a / 2.0 - c * d;
+    };
+    v.x0 = place(p.zoomX, v.dw, aw);
+    v.y0 = place(p.zoomY, v.dh, ah);
+    return v;
+}
+
+ImageView image_view(Player& p) {
+    RECT rc{};
+    GetClientRect(p.video, &rc);
+    return image_view(p, rc.right, rc.bottom);
+}
+
 // sound Media Foundation decodes from a file: measured for levelling, analysed for the
 // spectrogram (not a stream, nor MIDI or a CD track, which other devices play)
 bool decodable(const std::wstring& path) { return !media_url(path) && !midi_file(path) && !cd_track_file(path); }
@@ -290,11 +327,13 @@ std::wstring current_title(Player& p) {
 }
 
 std::wstring current_detail(Player& p) {
-    if (image_current(p)) {                 // "4032 × 3024 · 3 of 120"
+    if (image_current(p)) {                 // "4032 × 3024 · 250 % · 3 of 120"
         std::wstring s;
-        if (p.img.id == p.q.at(p.q.current()).id && p.img.fullW > 0)
+        if (p.img.id == p.q.at(p.q.current()).id && p.img.fullW > 0) {
             s = std::to_wstring(p.img.fullW) + L" \x00D7 " + std::to_wstring(p.img.fullH) + L" \x00B7 " +
                 (p.img.pages > 1 ? L"page " + std::to_wstring(p.img.page + 1) + L" of " + std::to_wstring(p.img.pages) + L" \x00B7 " : L"");
+            if (p.zoom != 1) s += std::to_wstring((int)(image_view(p).s * 100 + 0.5)) + L" % \x00B7 ";
+        }
         return s + std::to_wstring(p.q.current() + 1) + L" of " + std::to_wstring(p.q.size());
     }
     std::wstring a = p.mp->artist(), b = p.mp->album();
@@ -526,8 +565,38 @@ void on_failed(Player& p);
 void spectrum_reset(Player& p);
 void set_vis(Player& p, int style);
 
+void image_zoom_reset(Player& p) {
+    p.zoom = 1;
+    p.zoomX = p.zoomY = 0.5;
+    p.sharpW = p.sharpH = 0;
+    if (p.panning) ReleaseCapture();
+    p.panning = false;
+}
+
+// zoomed past the size decoded: decoded again as big as shown (a photo: its own size, all of
+// it at once; a drawing: with room to zoom on), 32 megapixels at most
+void image_sharpen(Player& p, const ImageView& v) {
+    const ImageNote& im = p.img;
+    int i = p.q.current();
+    if (p.zoom == 1 || v.fit <= 0 || i < 0 || im.id != p.q.at(i).id) return;
+    auto capped = [](double w, double h, int& bw, int& bh) {
+        double k = std::sqrt(std::min(1.0, (double)(1 << 25) / (w * h)));
+        bw = std::max(1, (int)(w * k));
+        bh = std::max(1, (int)(h * k));
+    };
+    int nw = 0, nh = 0, bw = 0, bh = 0;
+    capped(im.drawing ? v.dw : std::min(v.dw, (double)im.fullW), im.drawing ? v.dh : std::min(v.dh, (double)im.fullH), nw, nh);
+    if (nw <= im.w * 1.05 + 1 && nh <= im.h * 1.05 + 1) return;
+    capped(im.drawing ? v.dw * 1.5 : im.fullW, im.drawing ? v.dh * 1.5 : im.fullH, bw, bh);
+    if (bw == p.sharpW && bh == p.sharpH) return;       // (asked for already)
+    p.sharpW = bw;
+    p.sharpH = bh;
+    image_request(p.wnd, WM_IMAGE, im.id, p.q.at(i).path, bw, bh, std::wstring(), im.page, 1e6);
+}
+
 void image_forget(Player& p) {
     KillTimer(p.wnd, TIMER_ANIM);
+    image_zoom_reset(p);
     p.img = {};
     if (p.imgBmp) DeleteObject(p.imgBmp);
     p.imgBmp = nullptr;
@@ -664,6 +733,55 @@ void set_slideshow(Player& p, bool on) {
     p.slideshow = on;
 }
 
+// zoomed to `z` times the fitted size, the area's point `at` (null: its centre) staying on
+// the same spot of the picture; from its own size (or fitted, if smaller) to 16 screen
+// pixels a pixel, stopping at fitted and at its own size on the way
+void image_zoom_to(Player& p, double z, const POINT* at) {
+    if (!image_current(p) || !p.message.empty()) return;
+    RECT rc{};
+    GetClientRect(p.video, &rc);
+    ImageView v = image_view(p, rc.right, rc.bottom);
+    if (v.fit <= 0) return;
+    z = std::clamp(z, std::min(1.0, 1 / v.fit), std::max(1.0, 16 / v.fit));
+    for (double stop : { 1.0, 1 / v.fit })
+        if ((p.zoom - stop) * (z - stop) < 0 || std::abs(z - stop) < 0.01 * stop) z = stop;
+    if (z == p.zoom) return;
+    POINT m = at ? *at : POINT{ rc.right / 2, rc.bottom / 2 };
+    double fx = (m.x - v.x0) / v.dw, fy = (m.y - v.y0) / v.dh;      // (the picture's point there)
+    double dw = v.dw / p.zoom * z, dh = v.dh / p.zoom * z;
+    p.zoomX = (rc.right / 2.0 - m.x) / dw + fx;
+    p.zoomY = (rc.bottom / 2.0 - m.y) / dh + fy;
+    p.zoom = z;
+    if (z != 1) set_slideshow(p, false);    // (looked into: it stays)
+    image_sharpen(p, image_view(p, rc.right, rc.bottom));
+    InvalidateRect(p.video, nullptr, FALSE);
+    refresh_bar(p);
+}
+
+void image_zoom_command(Player& p, UINT cmd) {
+    ImageView v = image_view(p);
+    if (v.fit <= 0) return;
+    image_zoom_to(p, cmd == CMD_ZOOM_IN ? p.zoom * 1.25 : cmd == CMD_ZOOM_OUT ? p.zoom / 1.25 : cmd == CMD_ZOOM_FIT ? 1 : 1 / v.fit, nullptr);
+}
+
+// zoomed in further than the area: dragged about
+bool image_pannable(Player& p) {
+    if (p.zoom == 1 || !image_current(p) || !p.message.empty()) return false;
+    RECT rc{};
+    GetClientRect(p.video, &rc);
+    ImageView v = image_view(p, rc.right, rc.bottom);
+    return v.dw > rc.right + 0.5 || v.dh > rc.bottom + 0.5;
+}
+
+void image_pan(Player& p, POINT pt) {
+    ImageView v = image_view(p);
+    if (v.fit <= 0) return;
+    p.zoomX = p.panX - (pt.x - p.panFrom.x) / v.dw;
+    p.zoomY = p.panY - (pt.y - p.panFrom.y) / v.dh;
+    InvalidateRect(p.video, nullptr, FALSE);
+    UpdateWindow(p.video);
+}
+
 void play_pause(Player& p) {
     if (p.q.empty()) return;
     if (image_current(p)) { set_slideshow(p, !p.slideshow); return; }
@@ -717,6 +835,7 @@ void on_image(Player& p, ImageNote* n) {
     if (i >= 0 && image_current(p) && p.q.at(i).id == n->id) {
         QueueEntry& e = p.q.at(i);
         if (n->pixels) {
+            if (p.img.id != n->id || p.img.page != n->page) image_zoom_reset(p);     // (not this one decoded sharper)
             p.img = std::move(*n);
             anim_start(p);
             p.message.clear();
@@ -895,6 +1014,7 @@ void command(Player& p, UINT cmd) {
         }
         case CMD_SUBS_OFF: case CMD_SUBS_CHOOSE: case CMD_SUBS_NEXT: subs_command(p, cmd); break;
         case CMD_PAGE_PREV: case CMD_PAGE_NEXT: image_page(p, cmd == CMD_PAGE_NEXT ? 1 : -1); break;
+        case CMD_ZOOM_IN: case CMD_ZOOM_OUT: case CMD_ZOOM_FIT: case CMD_ZOOM_ACTUAL: image_zoom_command(p, cmd); break;
         case CMD_AUDIO_NEXT: {
             int n = (int)p.mp->audio_tracks().size();
             if (n > 1) p.mp->set_audio_track((p.mp->audio_track() + 1) % n);
@@ -1920,7 +2040,27 @@ void paint_idle(Player& p, HDC dc, const RECT& rc) {
     }
 }
 
-// a picture: fitted to the area, centred; black around it in full screen
+// zoomed into: the part in view, drawn from the pixels decoded (much enlarged: as squares)
+void paint_zoomed(Player& p, HDC dc, const RECT& rc, const ImageView& v) {
+    const ImageNote& im = p.img;
+    int aw = rc.right - rc.left, ah = rc.bottom - rc.top;
+    double l = std::max(0.0, v.x0), t = std::max(0.0, v.y0);
+    double r = std::min((double)aw, v.x0 + v.dw), b = std::min((double)ah, v.y0 + v.dh);
+    if (r <= l || b <= t) return;
+    double kx = im.w / v.dw, ky = im.h / v.dh;          // (pixels decoded a screen pixel)
+    Gdiplus::Bitmap src(im.w, im.h, im.w * 4, PixelFormat32bppPARGB, (BYTE*)const_cast<uint32_t*>(im.pixels->data()));
+    Gdiplus::Graphics g(dc);
+    bool squares = kx <= 0.5;
+    g.SetInterpolationMode(squares ? Gdiplus::InterpolationModeNearestNeighbor : Gdiplus::InterpolationModeHighQualityBilinear);
+    g.SetPixelOffsetMode(squares ? Gdiplus::PixelOffsetModeHalf : Gdiplus::PixelOffsetModeHighQuality);
+    Gdiplus::ImageAttributes clampEdges;
+    clampEdges.SetWrapMode(Gdiplus::WrapModeTileFlipXY);
+    g.DrawImage(&src, Gdiplus::RectF((float)(rc.left + l), (float)(rc.top + t), (float)(r - l), (float)(b - t)),
+                (float)((l - v.x0) * kx), (float)((t - v.y0) * ky), (float)((r - l) * kx), (float)((b - t) * ky),
+                Gdiplus::UnitPixel, &clampEdges);
+}
+
+// a picture: fitted to the area, centred (or zoomed into); black around it in full screen
 void paint_image(Player& p, HDC dc, const RECT& rc) {
     const Palette& c = pal();
     fill_rect(dc, rc, p.full ? RGB(0, 0, 0) : c.content);
@@ -1937,10 +2077,9 @@ void paint_image(Player& p, HDC dc, const RECT& rc) {
     }
     const ImageNote& im = p.img;             // (the one before while the next decodes)
     if (!im.pixels || aw <= 0 || ah <= 0) return;
-    int fw = im.fullW > 0 ? im.fullW : im.w, fh = im.fullH > 0 ? im.fullH : im.h;
-    // (full screen: filling it, a small picture enlarged up to 3x; in a window: as big as it is at most)
-    double k = std::min({ p.full ? 3.0 : 1.0, (double)aw / fw, (double)ah / fh });
-    int dw = std::max(1, (int)(fw * k + 0.5)), dh = std::max(1, (int)(fh * k + 0.5));
+    ImageView v = image_view(p, aw, ah);
+    if (p.zoom != 1) { paint_zoomed(p, dc, rc, v); return; }
+    int dw = std::max(1, (int)(v.dw + 0.5)), dh = std::max(1, (int)(v.dh + 0.5));
     if (!p.imgBmp || p.imgBmpW != dw || p.imgBmpH != dh || p.imgBmpOf != im.pixels.get()) {
         if (p.imgBmp) DeleteObject(p.imgBmp);
         p.imgBmp = nullptr;
@@ -2611,6 +2750,13 @@ void view_menu(Player& p, POINT pt) {
     if (image_current(p)) {
         AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(m, MF_STRING | (p.message.empty() ? 0 : MF_GRAYED), CMD_EDIT_PICTURE, L"Edit picture\tCtrl+E");
+        HMENU zoom = CreatePopupMenu();
+        UINT can = p.message.empty() && p.img.pixels ? 0 : MF_GRAYED;
+        AppendMenuW(zoom, MF_STRING | can, CMD_ZOOM_IN, L"Zoom in\t+");
+        AppendMenuW(zoom, MF_STRING | can, CMD_ZOOM_OUT, L"Zoom out\t-");
+        AppendMenuW(zoom, MF_STRING | can | (p.zoom == 1 ? MF_CHECKED : 0), CMD_ZOOM_FIT, L"Fit\t0");
+        AppendMenuW(zoom, MF_STRING | can, CMD_ZOOM_ACTUAL, L"Actual size\t1");
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)zoom, L"Zoom");
         if (p.img.pages > 1) {
             AppendMenuW(m, MF_STRING | (p.img.page > 0 ? 0 : MF_GRAYED), CMD_PAGE_PREV, L"Previous page\tPage Up");
             AppendMenuW(m, MF_STRING | (p.img.page + 1 < p.img.pages ? 0 : MF_GRAYED), CMD_PAGE_NEXT, L"Next page\tPage Down");
@@ -2623,7 +2769,7 @@ void view_menu(Player& p, POINT pt) {
     if (id) command(p, id);
 }
 
-// the wheel over a picture: the previous / next one
+// the wheel over a picture: the previous / next one; with Ctrl, zooming at the pointer
 bool image_wheel(Player& p, WPARAM wp) {
     if (!image_current(p)) return false;
     POINT c{};
@@ -2631,6 +2777,11 @@ bool image_wheel(Player& p, WPARAM wp) {
     RECT r{};
     GetWindowRect(p.video, &r);
     if (!PtInRect(&r, c)) return false;
+    if (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL) {
+        ScreenToClient(p.video, &c);
+        image_zoom_to(p, p.zoom * std::pow(1.25, GET_WHEEL_DELTA_WPARAM(wp) / (double)WHEEL_DELTA), &c);
+        return true;
+    }
     command(p, GET_WHEEL_DELTA_WPARAM(wp) > 0 ? CMD_PREV : CMD_NEXT);
     return true;
 }
@@ -2657,17 +2808,35 @@ LRESULT CALLBACK video_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_SIZE:
             p.mp->video_resized();
             subs_tick(p);
+            if (image_current(p)) image_sharpen(p, image_view(p));     // (zoomed: as big again now)
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
-        case WM_LBUTTONDOWN: SetFocus(p.wnd); return 0;
+        case WM_LBUTTONDOWN:
+            SetFocus(p.wnd);
+            if (image_pannable(p)) {               // (zoomed in: dragged about)
+                p.panning = true;
+                p.panFrom = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+                p.panX = p.zoomX;
+                p.panY = p.zoomY;
+                SetCapture(hwnd);
+            }
+            return 0;
+        case WM_LBUTTONUP:
+            if (p.panning) ReleaseCapture();
+            return 0;
+        case WM_CAPTURECHANGED: p.panning = false; return 0;
         case WM_LBUTTONDBLCLK: command(p, CMD_FULL); return 0;
-        case WM_MOUSEMOVE: full_show_bar(p); return 0;
+        case WM_MOUSEMOVE:
+            if (p.panning) { image_pan(p, { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }); return 0; }
+            full_show_bar(p);
+            return 0;
         case WM_CONTEXTMENU: view_menu(p, { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }); return 0;
         case WM_MOUSEWHEEL:
             if (image_wheel(p, wp)) return 0;
             break;
         case WM_SETCURSOR:
             if (p.full && !p.barInFull) { SetCursor(nullptr); return TRUE; }
+            if (LOWORD(lp) == HTCLIENT && image_pannable(p)) { SetCursor(LoadCursorW(nullptr, IDC_SIZEALL)); return TRUE; }
             break;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -3346,6 +3515,12 @@ bool player_translate(MSG* m) {
         case VK_PRIOR: case VK_NEXT:                // a TIFF's pages
             if (inList || ctrl || !image_current(p) || p.img.pages < 2) return false;
             command(p, vk == VK_NEXT ? CMD_PAGE_NEXT : CMD_PAGE_PREV);
+            return true;
+        case VK_ADD: case VK_OEM_PLUS: case VK_SUBTRACT: case VK_OEM_MINUS:     // a picture's zoom
+        case '0': case VK_NUMPAD0: case '1': case VK_NUMPAD1:
+            if (inList || !image_current(p)) return false;
+            command(p, vk == VK_ADD || vk == VK_OEM_PLUS ? CMD_ZOOM_IN : vk == VK_SUBTRACT || vk == VK_OEM_MINUS ? CMD_ZOOM_OUT
+                       : vk == '0' || vk == VK_NUMPAD0 ? CMD_ZOOM_FIT : CMD_ZOOM_ACTUAL);
             return true;
         case VK_F11:
             if (!held) command(p, CMD_FULL);
