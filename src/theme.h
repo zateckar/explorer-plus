@@ -77,3 +77,4 @@ struct BufferedPaint {
 // apply light/dark to the standard controls (list, tree, header, scrollbars)
 void theme_apply_controls();
 void theme_style_list(HWND list);    // one list view: dark scrollbars, the palette's colours
+void theme_style_control(HWND h);    // a button (or other standard control): light or dark

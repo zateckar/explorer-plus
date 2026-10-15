@@ -21,6 +21,9 @@ struct ImageNote {
     int fullW = 0, fullH = 0;        // the picture's own size, turned upright
 };
 
+// the whole picture at its own size, upright (COM initialised on the calling thread)
+bool image_decode_full(const std::wstring& path, ImageNote& out);
+
 // decodes `path` (fitting maxW x maxH; never enlarged) and posts `msg` with lParam an
 // ImageNote* (the window deletes it); then decodes `next` ahead. A newer request replaces
 // one not started yet.

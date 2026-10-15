@@ -75,6 +75,27 @@ File Explorer while starting in well under 100 ms.
   play / pause, Left / Right ±5 s (Shift: 30 s), Ctrl+Left / Ctrl+Right previous / next,
   Up / Down volume, M mute, V / Shift+V next / previous visualization, F or F11 full
   screen, Ctrl+H shuffle, Ctrl+T repeat; the media keys too. One player for all windows; it stays open after the main window closes.
+- **Playlists** (`.m3u`, `.m3u8`): play one like a folder (its tracks in order, nested
+  playlists too; missing files and web addresses are skipped); "Create playlist..." in the
+  compact menu of media files and folders writes one, and the player's queue menu has
+  "Save queue as playlist..." (Ctrl+S). Paths inside the playlist's folder are written
+  relative, so the folder can move; `.m3u8` is UTF-8.
+- **Media file types** ("…" ▸ Media file types...): tick the music, video, picture and
+  playlist types Explorer Plus should open and press Apply. They are registered for your
+  account only; Windows lets only you pick a default app, so Apply opens Settings at
+  Explorer Plus' page (double-click a type to pick it for that type alone). Files opened
+  this way go to the one player; several opened together are queued.
+- **Screenshots** (Alt+Q anywhere while Explorer Plus runs, or "…" ▸ Take a screenshot):
+  drag a region or click for the whole screen (Enter: the screen under the mouse, Esc
+  cancels). It is copied to the clipboard and opens in the picture editor.
+- **Picture editor** (screenshots; "Edit picture" in the compact menu of a picture, or
+  Ctrl+E in the player's picture view): rectangles and ellipses (Shift: square, circle),
+  outlined or filled, and text, in any colour, line width and text size. Until saved every
+  object stays one: select it to move, resize, recolour or delete it, double-click a text
+  to change it; undo / redo. Save overwrites PNG, JPEG, BMP, GIF and TIFF files, Save as
+  writes PNG, JPEG, BMP, GIF or TIFF; Copy puts the picture on the clipboard. Keys: V select, R rectangle,
+  E ellipse, T text, F fill, Del delete, arrows nudge, Ctrl+Z / Ctrl+Y, Ctrl+C, Ctrl+S,
+  Ctrl+Shift+S.
 
 ## Requirements
 
@@ -97,7 +118,8 @@ Get-Content SHA256SUMS.txt | ForEach-Object {
 Unsigned builds trigger a SmartScreen prompt on first run ("More info" → "Run anyway").
 
 Command line: `explorer-plus.exe [--new-window] [folder or file]`; a file opens its folder
-with the file selected.
+with the file selected. `explorer-plus.exe --play <file>` plays a media file or playlist (or
+shows a picture) in the player, as the registered file types do.
 
 ## Settings
 
@@ -111,6 +133,10 @@ two sections are meant for hand editing:
 promote1=7-Zip
 promote2=NotepadNext
 promote3=Open in My Editor|%ProgramFiles%\MyEditor\editor.exe,0
+
+[prefs]
+; 0: Alt+Q is left to other programs (Take a screenshot stays in the "…" menu)
+screenshotHotkey=1
 ```
 
 `[tree]` caches the Quick access pins so they show instantly; it is rewritten
@@ -192,6 +218,8 @@ src/player, media, playlist   media player window, Media Foundation playback, pl
 src/mediainfo, mediadata, spectrum   player's cover and tags, their pure helpers, spectrogram
 src/visual             player's visualizations (Direct2D on Direct3D 11, a thread of their own)
 src/imageview, loudness   player's pictures (WIC), loudness levelling
+src/screenshot, imageedit, shapes   Alt+Q screenshots, picture editor, its objects' geometry
+src/assoc              media file type registration (Media file types)
 src/settings, ini, theme, perf, crash   settings.ini, colours and fonts, profiling, crash dumps
 src/cmdline            command line and typed-path text
 tests/                 unit tests (ctest)

@@ -35,6 +35,9 @@ using std::min;
 #include "foldersizes.h"
 #include "preview.h"
 #include "player.h"
+#include "imageedit.h"
+#include "screenshot.h"
+#include "assoc.h"
 #include <uxtheme.h>
 #include <dwmapi.h>
 #include <oleacc.h>
@@ -43,8 +46,27 @@ static WNDPROC s_searchProc = nullptr;
 static HBRUSH s_searchBrush = nullptr;
 static COLORREF s_searchBrushColor = CLR_INVALID;
 static DragKind s_dragKind = DragKind::None;
+static bool s_mainOpen = false;             // the main window is there (not: closed, or --play)
 
 void exit_app() { DestroyWindow(g_main); }
+
+void app_window_closed() {
+    if (!s_mainOpen && !player_window() && !imageedit_any()) PostQuitMessage(0);
+}
+
+// the windows that keep their keys (no main window shortcuts for them): the player, the
+// picture editors, the screenshot picker. True: the message was taken care of
+static bool tool_window_message(MSG& m) {
+    bool key = m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN;
+    if (player_owns(m.hwnd)) {
+        if (key && player_translate(&m)) return true;
+    } else if (!imageedit_owns(m.hwnd) && !screenshot_owns(m.hwnd)) {
+        return false;
+    }
+    TranslateMessage(&m);
+    DispatchMessageW(&m);
+    return true;
+}
 
 // ------------------------------------------------------------------
 // view mode plumbing (model lives in TabState::view)
@@ -468,6 +490,8 @@ static void on_command(WORD id) {
         case IDM_OPTIONS:
             ShellExecuteW(g_main, nullptr, L"rundll32.exe", L"shell32.dll,Options_RunDLL 0", nullptr, SW_SHOWNORMAL);
             break;
+        case IDM_SCREENSHOT: screenshot_start(300); break;     // (the menu's fade first)
+        case IDM_MEDIA_TYPES: assoc_dialog(g_main); break;
 
         case IDM_SORT_NAME: set_sort(0, -1); break;
         case IDM_SORT_DATE: set_sort(3, -1); break;
@@ -866,8 +890,9 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             dnd_unregister_all();
             for_each_pane(deregister_current_watch);
             if (s_searchBrush) { DeleteObject(s_searchBrush); s_searchBrush = nullptr; }
-            // (a media player still open keeps the process: it ends when that closes)
-            if (!player_main_closed()) PostQuitMessage(0);
+            // (a media player or picture editor still open keeps the process: it ends when they close)
+            s_mainOpen = false;
+            app_window_closed();
             return 0;
         }
     }
@@ -940,6 +965,22 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
             if (n && n < ARRAYSIZE(full) && PathFileExistsW(full)) openPath = full;   // (a file: its folder)
         }
     }
+    if (cl.play) {
+        // a media file opened by its type (assoc.cpp): the player alone, or the one running
+        int code = 0;
+        if (player_open_file(openPath)) {
+            screenshot_init();
+            MSG pm{};
+            while (GetMessageW(&pm, nullptr, 0, 0) > 0)
+                if (!tool_window_message(pm)) {
+                    TranslateMessage(&pm);
+                    DispatchMessageW(&pm);
+                }
+            code = (int)pm.wParam;
+        }
+        theme_shutdown();
+        std::_Exit(code);                   // (as below: detached workers may still run)
+    }
     perf_event("settings");
     // the system image list is set up here, once, before any worker asks for icons (those
     // asking while it is still being initialized get no index: the tree showed "unknown
@@ -1007,6 +1048,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
                                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                                wx, wy, ww, wh, nullptr, nullptr, g_hinst, nullptr);
     if (!wnd) return 2;
+    s_mainOpen = true;
     perf_event("window.created");
     enum_early_done();
     // the folder's listing is usually done by now (it started before the window): its rows
@@ -1035,17 +1077,14 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     DwmSetWindowAttribute(wnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
     perf_event("window.shown");
     dnd_register_sources();         // (~4 ms: once the window is on screen)
+    screenshot_init();              // Alt+Q
+    std::thread(assoc_follow_exe).detach();     // (the media types registered: by an exe since moved?)
 
     HACCEL acc = s_accel;
     MSG m{};
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
         bool key = m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN;
-        if (player_owns(m.hwnd)) {          // the media player's window: its keys, not the main window's
-            if (key && player_translate(&m)) continue;
-            TranslateMessage(&m);
-            DispatchMessageW(&m);
-            continue;
-        }
+        if (tool_window_message(m)) continue;  // the player's, an editor's: their keys, not the main window's
         if (key && preview_translate_accelerator(&m)) continue;     // (an in-process handler's keys)
         if (cycle_focus(m)) continue;
         if (key && !edit_owns_key(m) && (text_size_key(m) || TranslateAcceleratorW(g_main, acc, &m)))

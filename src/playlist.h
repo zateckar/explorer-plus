@@ -67,3 +67,29 @@ bool media_file_video(const std::wstring& path);     // its type is a video's (.
 // WM_COPYDATA payload between processes: paths separated by NUL
 std::wstring pack_paths(const std::vector<std::wstring>& paths);
 std::vector<std::wstring> unpack_paths(const wchar_t* data, size_t chars);
+
+// ------------------------------------------------------------------
+// M3U / M3U8 playlists
+// ------------------------------------------------------------------
+struct PlaylistEntry {
+    std::wstring path;              // absolute
+    std::wstring title;             // #EXTINF's, else empty
+    long long duration = -1;        // 100-ns units, -1: not given
+};
+
+bool playlist_file(const std::wstring& path);        // .m3u / .m3u8
+
+// the entries of a playlist's text: #EXTINF titles and durations; relative paths (also
+// "\Music\a.mp3", "../a.mp3", '/' for '\') resolved against `dir` (the playlist's folder),
+// file:/// URLs as paths; web addresses and other comments left out
+std::vector<PlaylistEntry> playlist_parse(const std::wstring& text, const std::wstring& dir);
+// a playlist's text (#EXTM3U, an #EXTINF where the title or duration is known, CRLF lines);
+// paths inside `dir` written relative to it (the folder can move with its playlist)
+std::wstring playlist_write(const std::vector<PlaylistEntry>& entries, const std::wstring& dir);
+// the file's bytes: .m3u8 as UTF-8; .m3u in the ANSI code page when that holds every
+// character (as players of old expect), else UTF-8 too
+std::string playlist_encode(const std::wstring& text, bool m3u8);
+
+// read / write a playlist file (false: couldn't)
+bool playlist_load(const std::wstring& file, std::vector<PlaylistEntry>& out);
+bool playlist_save(const std::wstring& file, const std::vector<PlaylistEntry>& entries);

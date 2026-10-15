@@ -1,4 +1,5 @@
 #include "playlist.h"
+#include "ini.h"
 #include <windows.h>
 #include <shlwapi.h>
 #include <algorithm>
@@ -185,4 +186,169 @@ std::vector<std::wstring> unpack_paths(const wchar_t* data, size_t chars) {
         start = i + 1;
     }
     return out;
+}
+
+// ------------------------------------------------------------------
+// M3U / M3U8 playlists
+// ------------------------------------------------------------------
+bool playlist_file(const std::wstring& path) {
+    const wchar_t* dot = PathFindExtensionW(path.c_str());
+    return lstrcmpiW(dot, L".m3u") == 0 || lstrcmpiW(dot, L".m3u8") == 0;
+}
+
+static std::wstring trim(const std::wstring& s) {
+    size_t b = 0, e = s.size();
+    while (b < e && iswspace(s[b])) ++b;
+    while (e > b && iswspace(s[e - 1])) --e;
+    return s.substr(b, e - b);
+}
+
+// "C:" or "\\server\share" of an absolute path
+static std::wstring path_root(const std::wstring& p) {
+    if (p.size() >= 2 && p[1] == L':') return p.substr(0, 2);
+    if (p.rfind(L"\\\\", 0) == 0) {
+        size_t server = p.find(L'\\', 2);
+        if (server == std::wstring::npos) return p;
+        size_t share = p.find(L'\\', server + 1);
+        return share == std::wstring::npos ? p : p.substr(0, share);
+    }
+    return {};
+}
+
+// "." and ".." taken out (never above the root)
+static std::wstring normalize(const std::wstring& p) {
+    std::wstring root = path_root(p);
+    std::vector<std::wstring> parts;
+    size_t i = root.size();
+    while (i <= p.size()) {
+        size_t s = p.find(L'\\', i);
+        if (s == std::wstring::npos) s = p.size();
+        std::wstring part = p.substr(i, s - i);
+        if (part == L"..") { if (!parts.empty()) parts.pop_back(); }
+        else if (!part.empty() && part != L".") parts.push_back(part);
+        i = s + 1;
+    }
+    std::wstring out = root;
+    for (auto& part : parts) out += L'\\' + part;
+    return out.empty() || out == root ? root + L'\\' : out;
+}
+
+std::vector<PlaylistEntry> playlist_parse(const std::wstring& text, const std::wstring& dir) {
+    std::vector<PlaylistEntry> out;
+    PlaylistEntry pending;                      // (an #EXTINF waits for its path)
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t nl = text.find_first_of(L"\r\n", pos);
+        std::wstring line = trim(text.substr(pos, nl == std::wstring::npos ? std::wstring::npos : nl - pos));
+        pos = nl == std::wstring::npos ? text.size() : nl + 1;
+        if (!line.empty() && line[0] == L'\xFEFF') line = trim(line.substr(1));    // (a BOM left in)
+        if (line.empty()) continue;
+        if (line[0] == L'#') {
+            // #EXTINF:<seconds>[ key="value" ...],<title>
+            if (line.size() > 8 && _wcsnicmp(line.c_str(), L"#EXTINF:", 8) == 0) {
+                pending = {};
+                size_t comma = line.find(L',', 8);
+                double secs = wcstod(line.c_str() + 8, nullptr);
+                if (secs > 0) pending.duration = (long long)(secs * 10000000.0 + 0.5);
+                if (comma != std::wstring::npos) pending.title = trim(line.substr(comma + 1));
+            }
+            continue;
+        }
+        std::wstring p = line;
+        size_t scheme = p.find(L"://");
+        if (scheme != std::wstring::npos && scheme > 1) {
+            if (_wcsnicmp(p.c_str(), L"file:", 5) != 0) { pending = {}; continue; }     // (a web address)
+            WCHAR buf[MAX_PATH * 4];
+            DWORD n = ARRAYSIZE(buf);
+            if (FAILED(PathCreateFromUrlW(p.c_str(), buf, &n, 0))) { pending = {}; continue; }
+            p = buf;
+        }
+        for (auto& c : p) if (c == L'/') c = L'\\';
+        if (p.rfind(L"\\\\", 0) == 0 || (p.size() >= 3 && p[1] == L':' && p[2] == L'\\')) {
+            // absolute already
+        } else if (p[0] == L'\\') {
+            p = path_root(dir) + p;             // (on the playlist's drive)
+        } else if (p.size() >= 2 && p[1] == L':') {
+            p = p.substr(0, 2) + L'\\' + p.substr(2);     // ("C:a.mp3": as near as it gets)
+        } else {
+            std::wstring base = dir;
+            if (!base.empty() && base.back() != L'\\') base += L'\\';
+            p = base + p;
+        }
+        pending.path = normalize(p);
+        out.push_back(std::move(pending));
+        pending = {};
+    }
+    return out;
+}
+
+std::wstring playlist_write(const std::vector<PlaylistEntry>& entries, const std::wstring& dir) {
+    std::wstring base = dir;
+    if (!base.empty() && base.back() != L'\\') base += L'\\';
+    std::wstring out = L"#EXTM3U\r\n";
+    for (auto& e : entries) {
+        if (e.path.empty()) continue;
+        if (!e.title.empty() || e.duration >= 0) {
+            long long secs = e.duration >= 0 ? (e.duration + 5000000) / 10000000 : -1;
+            std::wstring title = e.title;
+            for (auto& c : title) if (c == L'\r' || c == L'\n') c = L' ';
+            out += L"#EXTINF:" + std::to_wstring(secs) + L"," + title + L"\r\n";
+        }
+        bool inside = !base.empty() && e.path.size() > base.size() &&
+                      CompareStringOrdinal(e.path.c_str(), (int)base.size(), base.c_str(), (int)base.size(), TRUE) == CSTR_EQUAL;
+        out += (inside ? e.path.substr(base.size()) : e.path) + L"\r\n";
+    }
+    return out;
+}
+
+std::string playlist_encode(const std::wstring& text, bool m3u8) {
+    auto narrow = [&](UINT cp, DWORD flags, BOOL* lossy) {
+        std::string s;
+        int n = WideCharToMultiByte(cp, flags, text.data(), (int)text.size(), nullptr, 0, nullptr, lossy);
+        if (n <= 0) return s;
+        s.resize((size_t)n);
+        WideCharToMultiByte(cp, flags, text.data(), (int)text.size(), s.data(), n, nullptr, nullptr);
+        return s;
+    };
+    if (!m3u8 && GetACP() != CP_UTF8) {
+        BOOL lossy = FALSE;
+        std::string ansi = narrow(CP_ACP, WC_NO_BEST_FIT_CHARS, &lossy);
+        if (!lossy && (!ansi.empty() || text.empty())) return ansi;
+    }
+    return narrow(CP_UTF8, 0, nullptr);
+}
+
+bool playlist_load(const std::wstring& file, std::vector<PlaylistEntry>& out) {
+    HANDLE h = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size{};
+    bool ok = GetFileSizeEx(h, &size) && size.QuadPart < (16 << 20);     // (no playlist is bigger)
+    std::string raw;
+    if (ok) {
+        raw.resize((size_t)size.QuadPart);
+        DWORD got = 0;
+        ok = raw.empty() || (ReadFile(h, raw.data(), (DWORD)raw.size(), &got, nullptr) && got == raw.size());
+    }
+    CloseHandle(h);
+    if (!ok) return false;
+    std::wstring dir = file.substr(0, file.find_last_of(L"\\/") + 1);
+    out = playlist_parse(ini_decode(raw), dir);
+    return true;
+}
+
+bool playlist_save(const std::wstring& file, const std::vector<PlaylistEntry>& entries) {
+    std::wstring dir = file.substr(0, file.find_last_of(L"\\/") + 1);
+    bool m3u8 = lstrcmpiW(PathFindExtensionW(file.c_str()), L".m3u8") == 0;
+    std::string bytes = playlist_encode(playlist_write(entries, dir), m3u8);
+    // (written beside it, then put in its place: a failed write leaves the old one)
+    std::wstring tmp = file + L".tmp";
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD put = 0;
+    bool ok = WriteFile(h, bytes.data(), (DWORD)bytes.size(), &put, nullptr) && put == bytes.size();
+    CloseHandle(h);
+    if (ok) ok = MoveFileExW(tmp.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+    if (!ok) DeleteFileW(tmp.c_str());
+    return ok;
 }

@@ -184,4 +184,7 @@ std::wstring current_display_path();           // what the address bar shows
 void status_update();
 void search_update_cue();                     // "Search <folder>" placeholder
 void exit_app();
+// the process lives while one of its windows does (the main window, the media player, a
+// picture editor): one of them gone, the process ends when it was the last (main.cpp)
+void app_window_closed();
 HACCEL app_accelerators(UINT* count);         // the main window's shortcuts (count: entries; may be null)

@@ -4,6 +4,7 @@
 #include "cmdline.h"
 #include "playlist.h"
 #include "mediadata.h"
+#include "shapes.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -133,6 +134,10 @@ static void command_line() {
     CHECK(c.path.empty() && !c.newWindow);
     c = parse_command_line(L"");
     CHECK(c.path.empty());
+    // a media file opened by its file type's verb: the player alone
+    c = parse_command_line(L"explorer-plus.exe --play \"D:\\Music\\a b.mp3\"");
+    CHECK(c.play && !c.newWindow);
+    CHECK_EQ(c.path, L"D:\\Music\\a b.mp3");
 }
 
 static void command_line_round_trip() {
@@ -164,6 +169,122 @@ static void typed_text() {
 
 // ------------------------------------------------------------------
 // media player queue
+
+static void playlists() {
+    CHECK(playlist_file(L"C:\\a\\list.M3U") && playlist_file(L"x.m3u8") && !playlist_file(L"x.m3u8.txt"));
+    const std::wstring text =
+        L"\xFEFF#EXTM3U\r\n"
+        L"#EXTINF:183,Artist - Song\r\n"
+        L"Song.mp3\r\n"
+        L"\r\n"
+        L"# a comment\n"
+        L"sub/Other.flac\n"
+        L"#EXTINF:-1,Radio\r\n"
+        L"http://example.com/stream\r\n"
+        L"..\\Up\\Track.mp3\r"
+        L"\\Root\\R.mp3\r\n"
+        L"E:\\Abs\\A.wav\r\n"
+        L"file:///D:/Url%20Dir/U.mp3\r\n"
+        L"\\\\server\\share\\./x/../S.mp3\r\n"
+        L"#EXTINF:12.6 tvg-id=\"x\",Spaced title  \r\n"
+        L"  T.ogg  ";
+    auto e = playlist_parse(text, L"C:\\Music\\List");
+    CHECK(e.size() == 8);
+    if (e.size() == 8) {
+        CHECK_EQ(e[0].path, L"C:\\Music\\List\\Song.mp3");
+        CHECK_EQ(e[0].title, L"Artist - Song");
+        CHECK(e[0].duration == 1830000000LL);
+        CHECK_EQ(e[1].path, L"C:\\Music\\List\\sub\\Other.flac");
+        CHECK(e[1].title.empty() && e[1].duration == -1);          // (the comment isn't a title)
+        CHECK_EQ(e[2].path, L"C:\\Music\\Up\\Track.mp3");           // (the web address left out, its title with it)
+        CHECK(e[2].title.empty());
+        CHECK_EQ(e[3].path, L"C:\\Root\\R.mp3");
+        CHECK_EQ(e[4].path, L"E:\\Abs\\A.wav");
+        CHECK_EQ(e[5].path, L"D:\\Url Dir\\U.mp3");
+        CHECK_EQ(e[6].path, L"\\\\server\\share\\S.mp3");
+        CHECK_EQ(e[7].path, L"C:\\Music\\List\\T.ogg");
+        CHECK_EQ(e[7].title, L"Spaced title");
+        CHECK(e[7].duration == 126000000LL);
+    }
+    CHECK(playlist_parse(L"", L"C:\\").empty());
+    CHECK_EQ(playlist_parse(L"..\\..\\..\\x.mp3", L"C:\\a")[0].path, L"C:\\x.mp3");    // (not above the root)
+
+    // written: relative inside the playlist's folder, #EXTINF where something is known
+    std::vector<PlaylistEntry> w = {
+        { L"C:\\Music\\List\\Song.mp3", L"Artist - Song", 1830000000LL },
+        { L"c:\\music\\list\\Sub\\B.mp3", L"", -1 },
+        { L"D:\\Else\\C.mp3", L"", 1234567890LL },
+        { L"C:\\Music\\ListOther\\D.mp3", L"Two\nlines", -1 },
+    };
+    std::wstring out = playlist_write(w, L"C:\\Music\\List");
+    CHECK_EQ(out, L"#EXTM3U\r\n"
+                  L"#EXTINF:183,Artist - Song\r\nSong.mp3\r\n"
+                  L"Sub\\B.mp3\r\n"
+                  L"#EXTINF:123,\r\nD:\\Else\\C.mp3\r\n"
+                  L"#EXTINF:-1,Two lines\r\nC:\\Music\\ListOther\\D.mp3\r\n");
+    auto back = playlist_parse(out, L"C:\\Music\\List\\");
+    CHECK(back.size() == 4 && back[1].path == L"C:\\Music\\List\\Sub\\B.mp3" && back[3].path == w[3].path);
+
+    // bytes: .m3u8 UTF-8; .m3u ANSI where it can be
+    std::wstring accented = L"#EXTM3U\r\nCaf\xE9.mp3\r\n", cjk = L"#EXTM3U\r\n\x65E5\x672C.mp3\r\n";
+    CHECK(playlist_encode(accented, true) == "#EXTM3U\r\nCaf\xC3\xA9.mp3\r\n");
+    CHECK(playlist_encode(cjk, true) == "#EXTM3U\r\n\xE6\x97\xA5\xE6\x9C\xAC.mp3\r\n");
+    if (GetACP() == 1252) CHECK(playlist_encode(accented, false) == "#EXTM3U\r\nCaf\xE9.mp3\r\n");
+    CHECK(playlist_encode(cjk, false) == playlist_encode(cjk, true) || GetACP() == 932);    // (not in the code page: UTF-8)
+    CHECK_EQ(ini_decode(playlist_encode(accented, false)), accented);
+}
+
+// ------------------------------------------------------------------
+// picture editor objects
+
+static void shapes() {
+    Shape r;
+    r.kind = ShapeKind::Rect;
+    shape_span(r, 50, 40, 10, 20, false);                  // (dragged up and left)
+    CHECK(r.x0 == 10 && r.y0 == 20 && r.x1 == 50 && r.y1 == 40);
+    Shape sq;
+    shape_span(sq, 10, 10, 40, 20, true);                   // Shift: a square, towards the drag
+    CHECK(sq.x1 - sq.x0 == 30 && sq.y1 - sq.y0 == 30 && sq.y0 == 10);
+    shape_span(sq, 10, 10, -20, 5, true);
+    CHECK(sq.x0 == -20 && sq.x1 == 10 && sq.y0 == -20 && sq.y1 == 10);
+
+    double x, y;
+    shape_handle_pos(r, 3, x, y);
+    CHECK(x == 50 && y == 30);
+    CHECK(shape_handle_at(r, 11, 21, 3) == 0);
+    CHECK(shape_handle_at(r, 30, 41, 3) == 5);
+    CHECK(shape_handle_at(r, 30, 30, 3) == -1);
+    Shape t = r;
+    t.kind = ShapeKind::Text;
+    CHECK(shape_handle_at(t, 11, 21, 3) == -1);             // (text: sized by its text size)
+
+    // hits: inside, the outline's width and the tolerance around it
+    r.width = 4;
+    CHECK(shape_hit(r, 30, 30, 0) && shape_hit(r, 51.5, 30, 0) && !shape_hit(r, 53, 30, 0) && shape_hit(r, 53, 30, 2));
+    Shape e = r;
+    e.kind = ShapeKind::Ellipse;
+    e.width = 0;
+    CHECK(shape_hit(e, 30, 30, 0) && shape_hit(e, 10.5, 30, 0));
+    CHECK(!shape_hit(e, 11, 21, 0));                        // (the corner of its box isn't the ellipse)
+    std::vector<Shape> v = { r, e };
+    CHECK(shapes_hit(v, 30, 30, 0) == 1);                   // the topmost
+    CHECK(shapes_hit(v, 11, 21, 0) == 0);
+    CHECK(shapes_hit(v, 200, 200, 2) == -1);
+
+    shape_move(r, 5, -5);
+    CHECK(r.x0 == 15 && r.x1 == 55 && r.y0 == 15 && r.y1 == 35);
+
+    // resizing: the opposite side stays; past it, the other handle is held
+    Shape s;
+    shape_span(s, 0, 0, 100, 50, false);
+    CHECK(shape_resize(s, 4, 120, 60, false) == 4 && s.x1 == 120 && s.y1 == 60 && s.x0 == 0);
+    CHECK(shape_resize(s, 3, -20, 999, false) == 7 && s.x0 == -20 && s.x1 == 0 && s.y1 == 60);
+    CHECK(shape_resize(s, 1, 999, 80, false) == 5 && s.y0 == 60 && s.y1 == 80 && s.x0 == -20);
+    shape_span(s, 0, 0, 100, 50, false);
+    CHECK(shape_resize(s, 0, 150, 70, false) == 4 && s.x0 == 100 && s.x1 == 150 && s.y0 == 50 && s.y1 == 70);
+    shape_span(s, 0, 0, 100, 50, false);
+    CHECK(shape_resize(s, 4, 80, 20, true) == 4 && s.x1 == 80 && s.y1 == 80);
+}
 
 static std::vector<std::wstring> names(int n, int from = 0) {
     std::vector<std::wstring> v;
@@ -492,6 +613,8 @@ int wmain() {
     queue_order();
     queue_remove();
     queue_shuffle();
+    playlists();
+    shapes();
     media_text();
     cover_pick();
     spectrum_math();

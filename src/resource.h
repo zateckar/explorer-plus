@@ -99,6 +99,8 @@
 #define IDM_VIEW_CMDBAR      40157
 #define IDM_PERF_MARK        40158
 #define IDM_VIEW_FOLDERSIZES 40159
+#define IDM_SCREENSHOT       40106  // the region picker (Alt+Q from anywhere)
+#define IDM_MEDIA_TYPES      40107  // the media file types Explorer Plus opens
 // Sort by the folder's columns: IDM_SORT_COL_BASE + column (subitem) index
 #define IDM_SORT_COL_BASE 40160
 #define IDM_SORT_COL_LAST 40199

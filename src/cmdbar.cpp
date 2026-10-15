@@ -258,6 +258,9 @@ static HMENU build_more_menu() {
     AppendMenuW(m, MF_STRING | menu_flag(foldersizes_enabled()), IDM_VIEW_FOLDERSIZES, L"Folder sizes");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)build_text_size_menu(), L"Text size");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, IDM_SCREENSHOT, L"Take a screenshot\tAlt+Q");
+    AppendMenuW(m, MF_STRING, IDM_MEDIA_TYPES, L"Media file types...");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_VIEW_CMDBAR, L"Hide command bar");   // back into the nav row's "..."
     return m;
 }
@@ -339,6 +342,9 @@ void cmdbar_show_tools() {
     item(IDM_VIEW_FOLDERSIZES, L"Folder si&zes", 0, L"", foldersizes_enabled());
     sub(text, L"Te&xt size", L'\xE8D2');
     item(IDM_VIEW_CMDBAR, L"Show command &bar", 0, L"", g_cmdBarVisible);
+    sep();
+    item(IDM_SCREENSHOT, L"Take a &screenshot", L'\xE722', L"Alt+Q");
+    item(IDM_MEDIA_TYPES, L"&Media file types...", L'\xE8B9');
     UINT id = flyout_track(g_main, pt, row, list);
     DestroyMenu(sort);
     DestroyMenu(view);

@@ -417,6 +417,8 @@ static void dark_win(HWND h, const wchar_t* darkTheme, const wchar_t* lightTheme
     SendMessageW(h, WM_THEMECHANGED, 0, 0);
 }
 
+void theme_style_control(HWND h) { dark_win(h, L"DarkMode_Explorer", L"Explorer"); }
+
 void theme_style_list(HWND list) {
     const Palette& p = pal();
     dark_win(list, L"DarkMode_Explorer", L"Explorer");      // dark scrollbars

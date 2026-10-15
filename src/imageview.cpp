@@ -205,6 +205,15 @@ bool image_file(const std::wstring& path) {
     return std::find(s_exts.begin(), s_exts.end(), e) != s_exts.end();
 }
 
+bool image_decode_full(const std::wstring& path, ImageNote& out) {
+    IWICImagingFactory* wic = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic)))) return false;
+    bool ok = decode(wic, path, 1 << 15, 1 << 15, out);
+    wic->Release();
+    out.path = path;
+    return ok;
+}
+
 void image_request(HWND notify, UINT msg, unsigned id, const std::wstring& path, int maxW, int maxH,
                    const std::wstring& next) {
     std::lock_guard<std::mutex> lk(s_mx);

@@ -9,6 +9,7 @@ CommandLine parse_command_line(const wchar_t* cmdline) {
     LPWSTR* argv = cmdline && *cmdline ? CommandLineToArgvW(cmdline, &argc) : nullptr;
     for (int i = 1; argv && i < argc; ++i) {
         if (lstrcmpiW(argv[i], L"--new-window") == 0) { out.newWindow = true; continue; }
+        if (lstrcmpiW(argv[i], L"--play") == 0) { out.play = true; continue; }
         // a quoted path ending in a backslash ("D:\" from a "%1" verb) arrives as D:"
         std::wstring a = argv[i];
         if (!a.empty() && a.back() == L'"') { a.pop_back(); a += L'\\'; }

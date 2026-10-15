@@ -13,6 +13,8 @@
 #include "detailspane.h"
 #include "searchbox.h"
 #include "player.h"
+#include "imageview.h"
+#include "imageedit.h"
 #include <algorithm>
 #include <map>
 
@@ -170,7 +172,7 @@ static void invoke_id(HWND hwnd, IContextMenu* cm, UINT id, POINT pt, PCIDLIST_A
 // entries use ids above kIdLast and below the IDM_* range.
 // ------------------------------------------------------------------
 static const UINT kFlyMore = 0x8001, kFlyNewTab = 0x8002, kFlyNewWindow = 0x8003;
-static const UINT kFlyPlay = 0x8004, kFlyEnqueue = 0x8005;
+static const UINT kFlyPlay = 0x8004, kFlyEnqueue = 0x8005, kFlyPlaylist = 0x8006, kFlyEditPicture = 0x8007;
 
 struct ShellEntry {
     UINT id = 0;
@@ -339,7 +341,8 @@ static void fly_app_verbs(std::vector<FlyEntry>& list, const std::vector<ShellEn
             list.push_back(fly_from(e, L'\xE7EF'));
 }
 
-static UINT item_flyout(HWND hwnd, IContextMenu* cm, HMENU m, POINT pt, bool folder, PlayerOffer media) {
+// `picture`: one picture chosen (Edit picture)
+static UINT item_flyout(HWND hwnd, IContextMenu* cm, HMENU m, POINT pt, bool folder, PlayerOffer media, bool picture) {
     auto items = menu_entries(cm, m);
     std::vector<FlyButton> row;
     static const struct { const wchar_t* verb; wchar_t glyph; const wchar_t* tip; } kRow[] = {
@@ -372,7 +375,9 @@ static UINT item_flyout(HWND hwnd, IContextMenu* cm, HMENU m, POINT pt, bool fol
         if (media == PlayerOffer::View) list.push_back(fly_item(kFlyPlay, L"View in Explorer Plus", L'\xE8B9'));
         else list.push_back(fly_item(kFlyPlay, L"Play in Explorer Plus", L'\xE768'));
         list.push_back(fly_item(kFlyEnqueue, L"Queue in Explorer Plus", L'\xE710'));
+        if (media == PlayerOffer::Play) list.push_back(fly_item(kFlyPlaylist, L"Create playlist...", L'\xEA37'));
     }
+    if (picture) list.push_back(fly_item(kFlyEditPicture, L"Edit picture", L'\xE70F'));
     for (auto& e : items)
         if (e.sub && plain_text(lower(e.text)).rfind(L"open with", 0) == 0) {
             if (!taken(&e)) { list.push_back(fly_from(e, L'\xE7AC')); used.push_back(&e); }
@@ -488,11 +493,16 @@ static void show_cm(HWND hwnd, POINT pt, IShellFolder* parent, PCIDLIST_ABSOLUTE
             CoTaskMemFree(f);
         }
         offer = player_offer(media);
-        if (offer == PlayerOffer::None) media.clear();
     }
-    UINT id = track(hwnd, cm.get(), m, pt, [&] { return item_flyout(hwnd, cm.get(), m, pt, folder, offer); });
+    // (a picture: drawn on and written, by the picture editor)
+    bool picture = media.size() == 1 && cidl == 1 && !media[0].folder && image_file(media[0].path);
+    UINT id = track(hwnd, cm.get(), m, pt, [&] { return item_flyout(hwnd, cm.get(), m, pt, folder, offer, picture); });
     if (id == kFlyPlay || id == kFlyEnqueue) {
         player_open(media, id == kFlyEnqueue);
+    } else if (id == kFlyPlaylist) {
+        player_save_playlist(hwnd, media);
+    } else if (id == kFlyEditPicture) {
+        imageedit_open_file(media[0].path);
     } else if (id == kFlyNewTab) {
         PIDLIST_ABSOLUTE f = full();
         tabmodel_new_tab();

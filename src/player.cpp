@@ -11,6 +11,7 @@
 #include "spectrum.h"
 #include "visual.h"
 #include "playlist.h"
+#include "imageedit.h"
 #include "theme.h"
 #include "settings.h"
 #include "acc.h"
@@ -41,8 +42,12 @@ const UINT WM_MEDIA_INFO = WM_APP + 43;     // lParam: MediaInfoNote* (mediainfo
 const UINT WM_IMAGE = WM_APP + 44;          // lParam: ImageNote* (imageview.cpp)
 const UINT WM_LOUDNESS = WM_APP + 45;       // lParam: LoudnessNote* (loudness.cpp)
 const UINT WM_VIS_FAILED = WM_APP + 46;     // the visualizations can't be drawn (visual.cpp)
-// WM_COPYDATA: 'EPP1' play, 'EPP2' queue, 'EPP3' view (the first path: the picture to show)
-const ULONG_PTR kCopyPlay = 0x45505031, kCopyEnqueue = 0x45505032, kCopyView = 0x45505033;
+const UINT WM_PLAYLIST_FAILED = WM_APP + 47;    // to the message window, lParam: std::wstring* (the file)
+// WM_COPYDATA: 'EPP1' play, 'EPP2' queue, 'EPP3' view (the first path: the picture to show),
+// 'EPP4' opened by its file type (play; queued after one opened a moment before: Explorer
+// opens each of the files selected in a process of its own)
+const ULONG_PTR kCopyPlay = 0x45505031, kCopyEnqueue = 0x45505032, kCopyView = 0x45505033, kCopyOpen = 0x45505034;
+const ULONGLONG kOpenTogetherMs = 2500;     // files opened this close together: one queue
 const UINT_PTR TIMER_POSITION = 1, TIMER_SKIP = 2, TIMER_HIDE_BAR = 3, TIMER_SPECTRUM = 4, TIMER_LEVEL = 5;
 const wchar_t kAppId[] = L"RadimZatecka.ExplorerPlus.Player";   // its own taskbar button
 const UINT s_taskbarCreated = RegisterWindowMessageW(L"TaskbarButtonCreated");
@@ -51,7 +56,7 @@ const size_t kMaxFiles = 10000;             // a folder walk stops there
 enum Cmd : UINT {
     CMD_PLAYPAUSE = 100, CMD_PREV, CMD_NEXT, CMD_SHUFFLE, CMD_REPEAT, CMD_MUTE, CMD_QUEUE, CMD_FULL,
     CMD_CLEAR, CMD_PLAY_SELECTED, CMD_REMOVE_SELECTED, CMD_LEVEL, CMD_VIS_NEXT, CMD_VIS_PREV,
-    CMD_VIS_CYCLE,
+    CMD_VIS_CYCLE, CMD_SAVE_PLAYLIST, CMD_EDIT_PICTURE,
     CMD_SLIDE = 200,                // + seconds: the slide show's interval
     CMD_VIS = 300,                  // + VisStyle: the visualization
 };
@@ -77,7 +82,6 @@ struct Player {
     HFONT font = nullptr, fontSmall = nullptr, fontBold = nullptr, fontBig = nullptr;
     HFONT glyphs = nullptr, glyphsBig = nullptr, glyphsArt = nullptr;
     HIMAGELIST rowHeight = nullptr; // (sets the queue's row height)
-    bool mainClosed = false;        // the main window is gone: closing the player ends the process
     unsigned themeSeen = 0;
     std::wstring message;           // why the current entry doesn't play
     int failsInRow = 0;
@@ -133,6 +137,7 @@ struct Player {
 };
 Player* s_p = nullptr;
 HWND s_msg = nullptr;               // the module's message window (results of its threads)
+ULONGLONG s_lastOpen = 0;           // when a file was last opened by its type (kCopyOpen)
 
 int px(int v) { return MulDiv(v, s_p ? s_p->dpi : 96, 96); }
 
@@ -467,6 +472,7 @@ void set_volume(Player& p, int v) {
 
 void tags_read(Player& p, int from);
 void tags_forget();
+void save_queue(Player& p);
 
 void on_failed(Player& p);
 void spectrum_reset(Player& p);
@@ -772,6 +778,10 @@ void command(Player& p, UINT cmd) {
             break;
         case CMD_FULL: set_full(p, !p.full); break;
         case CMD_CLEAR: clear_queue(p); break;
+        case CMD_SAVE_PLAYLIST: save_queue(p); break;
+        case CMD_EDIT_PICTURE:
+            if (image_current(p)) imageedit_open_file(p.q.at(p.q.current()).path);
+            break;
         case CMD_PLAY_SELECTED: {
             int i = ListView_GetNextItem(p.list, -1, LVNI_SELECTED);
             if (i < 0) i = ListView_GetNextItem(p.list, -1, LVNI_FOCUSED);
@@ -875,6 +885,19 @@ std::deque<TagJob> s_tagJobs;
 std::vector<TagInfo> s_tagDone;     // read, not yet shown: one message for them all (a folder of
 bool s_tagBusy = false;             // thousands mustn't fill the queue the playback's notes use)
 
+// the file's title tag and duration (COM initialised on the calling thread)
+void read_tags(const std::wstring& path, std::wstring& title, long long& duration) {
+    IPropertyStore* ps = nullptr;
+    if (FAILED(SHGetPropertyStoreFromParsingName(path.c_str(), nullptr, GPS_DEFAULT, IID_PPV_ARGS(&ps))) || !ps) return;
+    PROPVARIANT v;
+    PropVariantInit(&v);
+    if (SUCCEEDED(ps->GetValue(PKEY_Title, &v)) && v.vt == VT_LPWSTR && v.pwszVal) title = v.pwszVal;
+    PropVariantClear(&v);
+    if (SUCCEEDED(ps->GetValue(PKEY_Media_Duration, &v)) && v.vt == VT_UI8) duration = (long long)v.uhVal.QuadPart;
+    PropVariantClear(&v);
+    ps->Release();
+}
+
 void tag_thread() {
     HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     for (;;) {
@@ -886,16 +909,7 @@ void tag_thread() {
             s_tagJobs.pop_front();
         }
         TagInfo info{ job.id, {}, -1 };
-        IPropertyStore* ps = nullptr;
-        if (SUCCEEDED(SHGetPropertyStoreFromParsingName(job.path.c_str(), nullptr, GPS_DEFAULT, IID_PPV_ARGS(&ps))) && ps) {
-            PROPVARIANT v;
-            PropVariantInit(&v);
-            if (SUCCEEDED(ps->GetValue(PKEY_Title, &v)) && v.vt == VT_LPWSTR && v.pwszVal) info.title = v.pwszVal;
-            PropVariantClear(&v);
-            if (SUCCEEDED(ps->GetValue(PKEY_Media_Duration, &v)) && v.vt == VT_UI8) info.duration = (long long)v.uhVal.QuadPart;
-            PropVariantClear(&v);
-            ps->Release();
-        }
+        read_tags(job.path, info.title, info.duration);
         std::lock_guard<std::mutex> lk(s_tagMx);
         s_tagDone.push_back(std::move(info));
         if (s_tagDone.size() == 1 && !PostMessageW(s_msg, WM_QUEUE_INFO, 0, 0)) s_tagDone.clear();
@@ -970,6 +984,17 @@ void walk(const std::wstring& dir, int depth, std::vector<std::wstring>& out) {
     for (auto& d : dirs) walk(base + d, depth + 1, out);
 }
 
+// a playlist's files that are there (one listed in it: its files, a few levels down)
+void expand_playlist(const std::wstring& file, int depth, std::vector<std::wstring>& out) {
+    std::vector<PlaylistEntry> entries;
+    if (depth > 3 || !playlist_load(file, entries)) return;
+    for (auto& e : entries) {
+        if (out.size() >= kMaxFiles) return;
+        if (playlist_file(e.path)) expand_playlist(e.path, depth + 1, out);
+        else if (player_file(e.path) && GetFileAttributesW(e.path.c_str()) != INVALID_FILE_ATTRIBUTES) out.push_back(e.path);
+    }
+}
+
 std::vector<std::wstring> expand(const std::vector<MediaItem>& items) {
     std::vector<std::wstring> out;
     for (auto& it : items) {
@@ -977,6 +1002,7 @@ std::vector<std::wstring> expand(const std::vector<MediaItem>& items) {
         DWORD a = GetFileAttributesW(it.path.c_str());
         if (a == INVALID_FILE_ATTRIBUTES) continue;
         if (a & FILE_ATTRIBUTE_DIRECTORY) walk(it.path, 0, out);     // (a folder: its sound and video only)
+        else if (playlist_file(it.path)) expand_playlist(it.path, 0, out);
         else if (player_file(it.path)) out.push_back(it.path);
     }
     return out;
@@ -1049,7 +1075,8 @@ struct OpenJob { std::vector<std::wstring> paths; bool enqueue = false; std::wst
 
 bool create_player(bool activate);
 
-bool hand_over(const std::vector<std::wstring>& paths, bool enqueue, const std::wstring& start) {
+// `opened`: a file opened by its type (kCopyOpen)
+bool hand_over(const std::vector<std::wstring>& paths, bool enqueue, const std::wstring& start, bool opened = false) {
     HWND other = FindWindowW(player_class().c_str(), nullptr);
     if (!other) return false;
     DWORD pid = 0;
@@ -1060,8 +1087,8 @@ bool hand_over(const std::vector<std::wstring>& paths, bool enqueue, const std::
     if (view) all.push_back(start);
     all.insert(all.end(), paths.begin(), paths.end());
     std::wstring data = pack_paths(all);
-    COPYDATASTRUCT cd{ view ? kCopyView : enqueue ? kCopyEnqueue : kCopyPlay, (DWORD)(data.size() * sizeof(wchar_t)),
-                       (void*)data.data() };
+    COPYDATASTRUCT cd{ view ? kCopyView : enqueue ? kCopyEnqueue : opened ? kCopyOpen : kCopyPlay,
+                       (DWORD)(data.size() * sizeof(wchar_t)), (void*)data.data() };
     DWORD_PTR ok = 0;
     if (!SendMessageTimeoutW(other, WM_COPYDATA, 0, (LPARAM)&cd, SMTO_ABORTIFHUNG | SMTO_BLOCK, 3000, &ok) || !ok)
         return false;
@@ -1092,6 +1119,13 @@ LRESULT CALLBACK msg_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == WM_QUEUE_INFO) { tags_apply(); return 0; }
+    if (msg == WM_PLAYLIST_FAILED) {
+        auto* file = reinterpret_cast<std::wstring*>(lp);
+        HWND owner = g_main && IsWindow(g_main) ? g_main : player_window();
+        MessageBoxW(owner, (L"The playlist couldn't be saved:\n" + *file).c_str(), L"Explorer Plus", MB_OK | MB_ICONWARNING);
+        delete file;
+        return 0;
+    }
     return DefWindowProcW(h, msg, wp, lp);
 }
 
@@ -1131,6 +1165,71 @@ void open_pictures(const std::wstring& file) {
         auto* job = new OpenJob{ folder_pictures(file), false, file };
         if (!PostMessageW(target, WM_PLAYER_OPEN, 0, (LPARAM)job)) delete job;
     }).detach();
+}
+
+// ------------------------------------------------------------------
+// playlists saved: the queue, or files and folders chosen in the file list
+// ------------------------------------------------------------------
+std::wstring parent_dir(const std::wstring& path) {
+    size_t s = path.find_last_of(L"\\/");
+    return s == std::wstring::npos ? std::wstring() : path.substr(0, s);
+}
+
+// the Save dialog for a playlist (opening in `dir`, suggesting `name`): the file chosen,
+// empty when cancelled
+std::wstring ask_playlist_file(HWND owner, const std::wstring& dir, const std::wstring& name) {
+    IFileSaveDialog* d = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return {};
+    const COMDLG_FILTERSPEC types[] = { { L"M3U8 playlist (UTF-8)", L"*.m3u8" }, { L"M3U playlist", L"*.m3u" } };
+    d->SetFileTypes(ARRAYSIZE(types), types);
+    d->SetFileTypeIndex(1);
+    d->SetDefaultExtension(L"m3u8");
+    d->SetTitle(L"Save playlist");
+    d->SetFileName(name.c_str());
+    FILEOPENDIALOGOPTIONS opts = 0;
+    d->GetOptions(&opts);
+    d->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_OVERWRITEPROMPT | FOS_PATHMUSTEXIST);
+    IShellItem* folder = nullptr;
+    if (!dir.empty() && SUCCEEDED(SHCreateItemFromParsingName(dir.c_str(), nullptr, IID_PPV_ARGS(&folder)))) {
+        d->SetFolder(folder);
+        folder->Release();
+    }
+    std::wstring out;
+    IShellItem* item = nullptr;
+    if (SUCCEEDED(d->Show(owner)) && SUCCEEDED(d->GetResult(&item))) {
+        PWSTR p = nullptr;
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &p)) && p) { out = p; CoTaskMemFree(p); }
+        item->Release();
+    }
+    d->Release();
+    return out;
+}
+
+// where a playlist of `paths` is suggested: their folder, named after it, when they share
+// one; else beside the first, "Playlist"
+void playlist_place(const std::vector<std::wstring>& paths, std::wstring& dir, std::wstring& name) {
+    dir = paths.empty() ? std::wstring() : parent_dir(paths[0]);
+    bool shared = !dir.empty() && std::all_of(paths.begin(), paths.end(), [&](const std::wstring& s) {
+        return lstrcmpiW(parent_dir(s).c_str(), dir.c_str()) == 0;
+    });
+    name = L"Playlist";
+    if (shared && !PathIsRootW((dir + L"\\").c_str())) name = PathFindFileNameW(dir.c_str());
+}
+
+void save_queue(Player& p) {
+    std::vector<PlaylistEntry> entries;
+    std::vector<std::wstring> paths;
+    for (auto& e : p.q.entries())
+        if (!image_file(e.path)) {          // (sound and video: a picture isn't a playlist's)
+            entries.push_back({ e.path, e.title, e.duration });
+            paths.push_back(e.path);
+        }
+    if (entries.empty()) { MessageBeep(MB_ICONASTERISK); return; }
+    std::wstring dir, name;
+    playlist_place(paths, dir, name);
+    std::wstring file = ask_playlist_file(p.wnd, dir, name);
+    if (!file.empty() && !playlist_save(file, entries))
+        MessageBoxW(p.wnd, (L"The playlist couldn't be saved:\n" + file).c_str(), L"Save playlist", MB_OK | MB_ICONWARNING);
 }
 
 // ------------------------------------------------------------------
@@ -2089,6 +2188,10 @@ void view_menu(Player& p, POINT pt) {
     AppendMenuW(m, MF_POPUP, (UINT_PTR)vis, L"Visualization");
     AppendMenuW(m, MF_STRING | (p.level ? MF_CHECKED : 0), CMD_LEVEL, L"Even out loudness between tracks");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)slides, L"Slide show interval");
+    if (image_current(p)) {
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING | (p.message.empty() ? 0 : MF_GRAYED), CMD_EDIT_PICTURE, L"Edit picture\tCtrl+E");
+    }
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, CMD_FULL, p.full ? L"Exit full screen\tEsc" : L"Full screen\tF");
     UINT id = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, p.wnd, nullptr);
@@ -2158,6 +2261,8 @@ void queue_menu(Player& p, POINT pt) {
     AppendMenuW(m, MF_STRING | (sel ? 0 : MF_GRAYED), CMD_PLAY_SELECTED, L"Play\tEnter");
     AppendMenuW(m, MF_STRING | (sel ? 0 : MF_GRAYED), CMD_REMOVE_SELECTED, L"Remove from queue\tDelete");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    bool sound = std::any_of(p.q.entries().begin(), p.q.entries().end(), [](const QueueEntry& e) { return !image_file(e.path); });
+    AppendMenuW(m, MF_STRING | (sound ? 0 : MF_GRAYED), CMD_SAVE_PLAYLIST, L"Save queue as playlist...\tCtrl+S");
     AppendMenuW(m, MF_STRING | (p.q.empty() ? MF_GRAYED : 0), CMD_CLEAR, L"Clear queue");
     UINT id = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, p.wnd, nullptr);
     DestroyMenu(m);
@@ -2468,11 +2573,17 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_COPYDATA: {
             // another Explorer Plus process hands over its files
             auto* cd = (COPYDATASTRUCT*)lp;
-            if (!cd || (cd->dwData != kCopyPlay && cd->dwData != kCopyEnqueue && cd->dwData != kCopyView) ||
+            if (!cd || (cd->dwData != kCopyPlay && cd->dwData != kCopyEnqueue && cd->dwData != kCopyView &&
+                        cd->dwData != kCopyOpen) ||
                 cd->cbData % sizeof(wchar_t) || cd->cbData > (64u << 20))
                 return FALSE;
             auto* job = new OpenJob;
             job->enqueue = cd->dwData == kCopyEnqueue;
+            if (cd->dwData == kCopyOpen) {          // (several files opened at once: queued after the first)
+                ULONGLONG now = GetTickCount64();
+                job->enqueue = s_lastOpen && now - s_lastOpen < kOpenTogetherMs;
+                s_lastOpen = now;
+            }
             bool view = cd->dwData == kCopyView;    // (the first path: the picture to begin with)
             // (one path at a time, up to the cap: a huge payload isn't all materialised)
             const wchar_t* c = (const wchar_t*)cd->lpData;
@@ -2596,11 +2707,10 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_DESTROY: {
             on_destroy(p);
-            bool quit = p.mainClosed;
             s_p = nullptr;
             delete pp;
             for (int attempt = 0; attempt < 3 && !settings_save_all(); ++attempt) Sleep(200);
-            if (quit) PostQuitMessage(0);     // (the main window has gone before)
+            app_window_closed();               // (the main window gone before: the process ends)
             return 0;
         }
     }
@@ -2648,7 +2758,7 @@ PlayerOffer player_offer(const std::vector<MediaItem>& items) {
     bool pictures = false;
     for (auto& it : items) {
         if (!it.folder) {
-            if (media_file_playable(it.path)) return PlayerOffer::Play;
+            if (media_file_playable(it.path) || playlist_file(it.path)) return PlayerOffer::Play;
             if (image_file(it.path)) pictures = true;
             continue;
         }
@@ -2663,8 +2773,68 @@ void player_open(const std::vector<MediaItem>& items, bool enqueue) {
         open_pictures(items[0].path);
         return;
     }
-    bool folders = std::any_of(items.begin(), items.end(), [](const MediaItem& it) { return it.folder; });
+    // (folders and playlists: what's in them, read on a thread)
+    bool folders = std::any_of(items.begin(), items.end(), [](const MediaItem& it) { return it.folder || playlist_file(it.path); });
     open_items(items, enqueue, folders);
+}
+
+void player_save_playlist(HWND owner, const std::vector<MediaItem>& items) {
+    if (items.empty()) return;
+    // (in the folder shown; named after the one folder chosen, else after the folder shown)
+    std::wstring dir = parent_dir(items[0].path), name;
+    if (items.size() == 1 && items[0].folder) name = PathFindFileNameW(items[0].path.c_str());
+    else if (!PathIsRootW((dir + L"\\").c_str())) name = PathFindFileNameW(dir.c_str());
+    if (name.empty()) name = L"Playlist";
+    std::wstring file = ask_playlist_file(owner, dir, name);
+    if (file.empty()) return;
+    HWND target = msg_window();
+    // (the files listed, and their titles read, on a thread: a big folder takes a while)
+    std::thread([items, file, target] {
+        HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        std::vector<PlaylistEntry> entries;
+        for (auto& path : expand(items)) {
+            if (image_file(path) || lstrcmpiW(path.c_str(), file.c_str()) == 0) continue;
+            PlaylistEntry e{ path };
+            if (entries.size() < 2000) read_tags(path, e.title, e.duration);     // (titles where it doesn't take long)
+            entries.push_back(std::move(e));
+        }
+        if (SUCCEEDED(co)) CoUninitialize();
+        if (!entries.empty() && playlist_save(file, entries)) return;
+        auto* what = new std::wstring(file);
+        if (!PostMessageW(target, WM_PLAYLIST_FAILED, 0, (LPARAM)what)) delete what;
+    }).detach();
+}
+
+bool player_open_file(const std::wstring& path) {
+    // Explorer opens each of several files selected in a process of its own, all at once:
+    // one at a time here, so the first one's player is there for the others to hand over to
+    std::wstring lockName = L"Local\\" + player_class() + L".open";
+    HANDLE mx = CreateMutexW(nullptr, FALSE, lockName.c_str());
+    if (mx) WaitForSingleObject(mx, 10000);
+    std::vector<std::wstring> paths;
+    std::wstring start;
+    if (image_file(path)) {
+        paths = folder_pictures(path);         // (its folder's pictures, from it)
+        start = path;
+    } else {
+        paths = expand({ { path, false } });
+    }
+    bool here = false;
+    if (paths.empty()) {
+        std::wstring why = GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES
+                         ? L"Explorer Plus can't find\n" : playlist_file(path) ? L"There is nothing to play in\n"
+                         : L"Explorer Plus can't play\n";
+        MessageBoxW(nullptr, (why + path).c_str(), L"Explorer Plus", MB_OK | MB_ICONINFORMATION);
+    } else if (!hand_over(paths, false, start, true) && create_player(true)) {
+        s_lastOpen = GetTickCount64();
+        add(*s_p, paths, false, start);
+        here = true;
+    }
+    if (mx) {
+        ReleaseMutex(mx);
+        CloseHandle(mx);
+    }
+    return here;
 }
 
 HWND player_window() { return s_p ? s_p->wnd : nullptr; }
@@ -2728,6 +2898,10 @@ bool player_translate(MSG* m) {
             if (!ctrl) return false;
             if (!held) command(p, vk == 'H' ? CMD_SHUFFLE : CMD_REPEAT);
             return true;
+        case 'S': case 'E':
+            if (!ctrl || shift) return false;
+            if (!held) command(p, vk == 'S' ? CMD_SAVE_PLAYLIST : CMD_EDIT_PICTURE);
+            return true;
         case VK_F11:
             if (!held) command(p, CMD_FULL);
             return true;
@@ -2753,10 +2927,4 @@ bool player_translate(MSG* m) {
 
 bool player_app_command(int cmd) {
     return s_p && s_p->mp && media_command(*s_p, cmd);
-}
-
-bool player_main_closed() {
-    if (!s_p) return false;
-    s_p->mainClosed = true;
-    return true;
 }
