@@ -672,6 +672,75 @@ static void opus_head() {
     CHECK(!opus_head_from_dops(none, sizeof(none), h));
 }
 
+static void subtitles() {
+    const long long S = 10000000;
+    // SubRip: a BOM, CRLF, markup, two lines, a cue out of order, one with no text
+    auto srt = subtitles_parse(L"\xFEFF" L"1\r\n00:00:01,000 --> 00:00:02,500\r\n<i>Hello</i> &amp; bye\r\n\r\n"
+                               L"3\r\n00:00:10,000 --> 00:00:12,000\r\n{\\an8}Top\r\nsecond line\r\n\r\n"
+                               L"2\r\n00:00:05,000 --> 00:00:06,000\r\n\r\n"
+                               L"4\r\n01:00:00,040 --> 01:00:01,000\r\nLate\r\n");
+    CHECK((int)srt.size() == 3);
+    if (srt.size() == 3) {
+        CHECK(srt[0].start == 1 * S);
+        CHECK(srt[0].end == 25 * S / 10);
+        CHECK_EQ(srt[0].text, L"Hello & bye");
+        CHECK_EQ(srt[1].text, L"Top\nsecond line");
+        CHECK(srt[2].start == 3600 * S + 400000);
+    }
+    CHECK_EQ(subtitle_at(srt, 2 * S), L"Hello & bye");
+    CHECK_EQ(subtitle_at(srt, 25 * S / 10), L"");                     // the end is not shown
+    CHECK_EQ(subtitle_at(srt, 11 * S), L"Top\nsecond line");
+    CHECK_EQ(subtitle_at(srt, 0), L"");
+
+    // WebVTT: a header, a NOTE, minutes-only times, cue settings, a cue id, voice tags
+    auto vtt = subtitles_parse(L"WEBVTT\n\nNOTE some note\n\nintro\n00:01.000 --> 00:03.000 align:start line:0\n"
+                               L"<v Roger>Hi</v> <c.yellow>there</c>\n\n00:02.000 --> 00:04.000\nOverlap\n");
+    CHECK((int)vtt.size() == 2);
+    if (vtt.size() == 2) {
+        CHECK(vtt[0].start == 1 * S);
+        CHECK(vtt[0].end == 3 * S);
+        CHECK_EQ(vtt[0].text, L"Hi there");
+    }
+    CHECK_EQ(subtitle_at(vtt, 25 * S / 10), L"Hi there\nOverlap");
+
+    // SubStation Alpha: its Format line, commas in the text, overrides, \N, drawings
+    auto ass = subtitles_parse(L"[Script Info]\nTitle: x\n\n[V4+ Styles]\nFormat: Name, Fontname\n\n[Events]\n"
+                               L"Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+                               L"Dialogue: 0,0:00:01.50,0:00:03.00,Default,,0,0,0,,{\\b1}Yes,{\\b0} no\\Nmaybe\n"
+                               L"Comment: 0,0:00:01.00,0:00:09.00,Default,,0,0,0,,not shown\n"
+                               L"Dialogue: 0,0:00:04.00,0:00:05.00,Default,,0,0,0,,{\\p1}m 0 0 l 10 10{\\p0}A\\hB\n");
+    CHECK((int)ass.size() == 2);
+    if (ass.size() == 2) {
+        CHECK(ass[0].start == 15 * S / 10);
+        CHECK(ass[0].end == 3 * S);
+        CHECK_EQ(ass[0].text, L"Yes, no\nmaybe");
+        CHECK_EQ(ass[1].text, L"A B");
+    }
+    // older SSA: a Marked field first, no Format line
+    auto ssa = subtitles_parse(L"[Events]\nDialogue: Marked=0,0:00:02.00,0:00:04.00,Default,,0000,0000,0000,,Old one\n");
+    CHECK((int)ssa.size() == 1);
+    if (ssa.size() == 1) CHECK_EQ(ssa[0].text, L"Old one");
+    CHECK(subtitles_parse(L"nothing here").empty());
+
+    CHECK(subtitle_file(L"a.SRT"));
+    CHECK(subtitle_file(L"a.ass"));
+    CHECK(!subtitle_file(L"a.sub"));
+    std::wstring label = L"x";
+    CHECK(subtitle_for(L"Film.mkv", L"film.srt", &label));
+    CHECK_EQ(label, L"");
+    CHECK(subtitle_for(L"Film.mkv", L"Film.en.srt", &label));
+    CHECK_EQ(label, L"en");
+    CHECK(subtitle_for(L"Film.mkv", L"Film.English.forced.vtt", &label));
+    CHECK_EQ(label, L"English.forced");
+    CHECK(subtitle_for(L"Film.mkv", L"Film.mkv.srt", &label));
+    CHECK_EQ(label, L"");
+    CHECK(subtitle_for(L"Film.mkv", L"Film.mkv.cs.srt", &label));
+    CHECK_EQ(label, L"cs");
+    CHECK(!subtitle_for(L"Film.mkv", L"Film2.srt"));
+    CHECK(!subtitle_for(L"Film.mkv", L"Film.nfo"));
+    CHECK(!subtitle_for(L"Film.mkv", L"Filmy.en.srt"));
+}
+
 int wmain() {
     queue_order();
     queue_remove();
@@ -686,6 +755,7 @@ int wmain() {
     beats();
     formats();
     opus_head();
+    subtitles();
     ini_round_trip();
     ini_values();
     ini_set_erase();

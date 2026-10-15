@@ -5,8 +5,8 @@
 #include <vector>
 
 // The media player's pure helpers (unit tested): which picture of a folder is the album
-// cover, the spectrogram's arithmetic, names of audio formats, and the OpusHead Windows'
-// Opus decoder wants made from an MP4 file's 'dOps' box.
+// cover, the spectrogram's arithmetic, names of audio formats, subtitle files read, and the
+// OpusHead Windows' Opus decoder wants made from an MP4 file's 'dOps' box.
 
 // --- album cover ---
 struct ImageFile {
@@ -107,6 +107,22 @@ std::wstring fmt_sample_rate(unsigned hz);           // "44.1 kHz", "48 kHz"
 std::wstring fmt_channels(unsigned n);               // "Mono", "Stereo", "5.1", "3 channels"
 std::wstring fmt_bitrate(unsigned bps);              // "320 kbps"
 std::wstring fmt_file_size(unsigned long long b);    // "4.2 MB"
+
+// --- subtitles ---
+struct SubtitleCue {
+    long long start = 0, end = 0;   // 100-ns units
+    std::wstring text;              // its lines joined by '\n', markup taken out
+};
+// SubRip (.srt), WebVTT (.vtt) and SubStation (.ssa / .ass: its Dialogue lines' text) by
+// their content; sorted by start
+std::vector<SubtitleCue> subtitles_parse(const std::wstring& text);
+// the text shown at `t`: every cue on then, in order ("" none)
+std::wstring subtitle_at(const std::vector<SubtitleCue>& cues, long long t);
+bool subtitle_file(const std::wstring& name);        // .srt .vtt .ass .ssa
+// `candidate` (a file name in the video's folder) is a subtitle of `video` (a file name):
+// "Film.srt", "Film.en.srt", "Film.English.forced.vtt" for "Film.mkv". `label`: what tells
+// it apart ("en", "English.forced"; empty for "Film.srt")
+bool subtitle_for(const std::wstring& video, const std::wstring& candidate, std::wstring* label = nullptr);
 
 // Opus in MP4: the 19-byte OpusHead (RFC 7845) from the sample description holding the
 // 'dOps' box (big-endian there, little-endian in OpusHead); false: no usable box (only

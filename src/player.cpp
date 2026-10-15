@@ -14,6 +14,7 @@
 #include "imageedit.h"
 #include "theme.h"
 #include "settings.h"
+#include "ini.h"
 #include "acc.h"
 #include "resource.h"
 #include <algorithm>
@@ -48,7 +49,7 @@ const UINT WM_PLAYLIST_FAILED = WM_APP + 47;    // to the message window, lParam
 // opens each of the files selected in a process of its own)
 const ULONG_PTR kCopyPlay = 0x45505031, kCopyEnqueue = 0x45505032, kCopyView = 0x45505033, kCopyOpen = 0x45505034;
 const ULONGLONG kOpenTogetherMs = 2500;     // files opened this close together: one queue
-const UINT_PTR TIMER_POSITION = 1, TIMER_SKIP = 2, TIMER_HIDE_BAR = 3, TIMER_SPECTRUM = 4, TIMER_LEVEL = 5;
+const UINT_PTR TIMER_POSITION = 1, TIMER_SKIP = 2, TIMER_HIDE_BAR = 3, TIMER_SPECTRUM = 4, TIMER_LEVEL = 5, TIMER_SUBS = 6;
 const wchar_t kAppId[] = L"RadimZatecka.ExplorerPlus.Player";   // its own taskbar button
 const UINT s_taskbarCreated = RegisterWindowMessageW(L"TaskbarButtonCreated");
 const size_t kMaxFiles = 10000;             // a folder walk stops there
@@ -56,9 +57,11 @@ const size_t kMaxFiles = 10000;             // a folder walk stops there
 enum Cmd : UINT {
     CMD_PLAYPAUSE = 100, CMD_PREV, CMD_NEXT, CMD_SHUFFLE, CMD_REPEAT, CMD_MUTE, CMD_QUEUE, CMD_FULL,
     CMD_CLEAR, CMD_PLAY_SELECTED, CMD_REMOVE_SELECTED, CMD_LEVEL, CMD_VIS_NEXT, CMD_VIS_PREV,
-    CMD_VIS_CYCLE, CMD_SAVE_PLAYLIST, CMD_EDIT_PICTURE,
+    CMD_VIS_CYCLE, CMD_SAVE_PLAYLIST, CMD_EDIT_PICTURE, CMD_SUBS_OFF, CMD_SUBS_CHOOSE, CMD_SUBS_NEXT, CMD_AUDIO_NEXT,
     CMD_SLIDE = 200,                // + seconds: the slide show's interval
     CMD_VIS = 300,                  // + VisStyle: the visualization
+    CMD_SUB = 400,                  // + index: the subtitles shown (Player::subs)
+    CMD_AUDIO = 500,                // + index: the audio track played
 };
 const int kSlideSecs[] = { 2, 3, 5, 10, 20, 30 };
 // the controls bar's parts (also its accessible children, in this order)
@@ -135,6 +138,16 @@ struct Player {
     bool visCycle = false;          // another one with each track
     Visualizer vis;
     std::wstring visCaption;        // (what the caption was last made of)
+    // video: subtitles (files beside it named after it, or one chosen), drawn over the picture
+    bool subsOn = true;             // the user's choice: shown when a video has some
+    std::wstring subsOf;            // the video subs were looked up for
+    std::vector<std::wstring> subs; // its subtitle files
+    int subPick = -1;               // the one shown; -1: none
+    std::vector<SubtitleCue> cues;  // its cues
+    std::wstring subShown;          // the text on screen
+    RECT subRect{};                 // (the picture it was drawn for, on the screen)
+    int subBarTop = -1;             // (and the controls bar's top over it)
+    HWND subWnd = nullptr;          // the window they show in
 };
 Player* s_p = nullptr;
 HWND s_msg = nullptr;               // the module's message window (results of its threads)
@@ -502,6 +515,9 @@ void set_volume(Player& p, int v) {
 void tags_read(Player& p, int from);
 void tags_forget();
 void save_queue(Player& p);
+void subs_open(Player& p);
+void subs_tick(Player& p);
+void subs_command(Player& p, UINT cmd);
 
 void on_failed(Player& p);
 void spectrum_reset(Player& p);
@@ -842,8 +858,16 @@ void command(Player& p, UINT cmd) {
             set_vis(p, ((p.visStyle % n) + (cmd == CMD_VIS_NEXT ? 1 : n - 1)) % n);
             break;
         }
+        case CMD_SUBS_OFF: case CMD_SUBS_CHOOSE: case CMD_SUBS_NEXT: subs_command(p, cmd); break;
+        case CMD_AUDIO_NEXT: {
+            int n = (int)p.mp->audio_tracks().size();
+            if (n > 1) p.mp->set_audio_track((p.mp->audio_track() + 1) % n);
+            break;
+        }
         default:
             if (cmd >= CMD_VIS && cmd < CMD_VIS + (UINT)VIS_COUNT) set_vis(p, (int)(cmd - CMD_VIS));
+            if (cmd >= CMD_SUB && cmd < CMD_SUB + 100) subs_command(p, cmd);
+            if (cmd >= CMD_AUDIO && cmd < CMD_AUDIO + 100) p.mp->set_audio_track((int)(cmd - CMD_AUDIO));
             if (cmd > CMD_SLIDE && cmd <= CMD_SLIDE + 60) {
                 p.slideSecs = (int)(cmd - CMD_SLIDE);
                 settings_set_pref(L"playerSlideSeconds", p.slideSecs);
@@ -895,6 +919,7 @@ void on_note(Player& p, LPARAM lp) {
                     }
                 }
             }
+            subs_open(p);
             InvalidateRect(p.video, nullptr, FALSE);
             update_title(p);
             break;
@@ -2236,6 +2261,274 @@ LRESULT CALLBACK bar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// ------------------------------------------------------------------
+// subtitles: SubRip / WebVTT / SubStation files named after the video beside it (or one
+// chosen), drawn over its picture by the video renderer
+// ------------------------------------------------------------------
+std::wstring name_of(const std::wstring& path) { return path.substr(path.find_last_of(L"\\/") + 1); }
+
+void subs_find(Player& p, const std::wstring& video) {
+    p.subsOf = video;
+    p.subs.clear();
+    size_t slash = video.find_last_of(L"\\/");
+    if (slash == std::wstring::npos || media_url(video)) return;
+    std::wstring dir = video.substr(0, slash + 1), name = video.substr(slash + 1);
+    size_t dot = name.rfind(L'.');
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileExW((dir + name.substr(0, dot) + L"*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch,
+                                nullptr, FIND_FIRST_EX_LARGE_FETCH);
+    if (h == INVALID_HANDLE_VALUE) return;
+    std::vector<std::pair<std::wstring, std::wstring>> found;      // label, path
+    do {
+        std::wstring label;
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && subtitle_for(name, fd.cFileName, &label))
+            found.push_back({ label, dir + fd.cFileName });
+    } while (found.size() < 99 && FindNextFileW(h, &fd));
+    FindClose(h);
+    std::sort(found.begin(), found.end());                          // (the one with no label first)
+    for (auto& f : found) p.subs.push_back(f.second);
+}
+
+// the file in the user's language, else the one named just as the video, else the first
+int subs_preferred(Player& p) {
+    std::vector<std::wstring> mine;
+    WCHAR loc[LOCALE_NAME_MAX_LENGTH]{}, s[128];
+    if (GetUserDefaultLocaleName(loc, ARRAYSIZE(loc))) {
+        for (LCTYPE t : { LOCALE_SISO639LANGNAME, LOCALE_SISO639LANGNAME2, LOCALE_SENGLISHLANGUAGENAME,
+                          LOCALE_SNATIVELANGUAGENAME, LOCALE_SLOCALIZEDLANGUAGENAME })
+            if (GetLocaleInfoEx(loc, t, s, ARRAYSIZE(s)) > 1) mine.push_back(s);
+    }
+    int plain = -1;
+    for (int i = 0; i < (int)p.subs.size(); ++i) {
+        std::wstring label;
+        subtitle_for(name_of(p.subsOf), name_of(p.subs[i]), &label);
+        if (label.empty() && plain < 0) plain = i;
+        for (size_t a = 0; a <= label.size();) {                   // its dot-separated parts
+            size_t b = label.find(L'.', a);
+            if (b == std::wstring::npos) b = label.size();
+            std::wstring part = label.substr(a, b - a);
+            for (auto& m : mine)
+                if (!part.empty() && _wcsicmp(part.c_str(), m.c_str()) == 0) return i;
+            a = b + 1;
+        }
+    }
+    return plain >= 0 ? plain : p.subs.empty() ? -1 : 0;
+}
+
+// shows p.subs[i]; false: nothing in it to show
+bool subs_load(Player& p, int i) {
+    p.cues.clear();
+    p.subPick = -1;
+    if (i < 0 || i >= (int)p.subs.size()) return false;
+    HANDLE h = CreateFileW(p.subs[i].c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size{};
+    std::string raw;
+    bool ok = GetFileSizeEx(h, &size) && size.QuadPart < (32 << 20);
+    if (ok) {
+        raw.resize((size_t)size.QuadPart);
+        DWORD got = 0;
+        ok = raw.empty() || (ReadFile(h, raw.data(), (DWORD)raw.size(), &got, nullptr) && got == raw.size());
+    }
+    CloseHandle(h);
+    if (ok) p.cues = subtitles_parse(ini_decode(raw));
+    if (p.cues.empty()) return false;
+    p.subPick = i;
+    p.subShown = L"\x1";                        // (drawn anew)
+    return true;
+}
+
+LRESULT CALLBACK subs_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_NCHITTEST) return HTTRANSPARENT;          // (the mouse goes to the video under it)
+    if (msg == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// the subtitles' window: a see-through popup of the player's over its video (the video
+// renderer's own overlay mixes them into the frames, and hangs some GPUs doing it)
+HWND subs_window(Player& p) {
+    if (p.subWnd) return p.subWnd;
+    static ATOM cls = [] {
+        WNDCLASSEXW wc{ sizeof(wc) };
+        wc.lpfnWndProc = subs_proc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"ExplorerPlusSubtitles";
+        return RegisterClassExW(&wc);
+    }();
+    if (!cls) return nullptr;
+    p.subWnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                               L"ExplorerPlusSubtitles", L"", WS_POPUP, 0, 0, 0, 0, p.wnd, nullptr,
+                               GetModuleHandleW(nullptr), nullptr);
+    return p.subWnd;
+}
+
+void subs_hide(Player& p) {
+    if (p.subWnd && IsWindowVisible(p.subWnd)) ShowWindow(p.subWnd, SW_HIDE);
+}
+
+// the text over the picture (`pic`, screen coordinates): white with a black outline,
+// centred near its bottom (above the controls bar where that's over the video), its size
+// after the picture's height
+void subs_draw(Player& p, const std::wstring& text, const RECT& pic, int barTop) {
+    int pw = pic.right - pic.left, ph = pic.bottom - pic.top;
+    if (text.empty() || pw < 32 || ph < 32) { subs_hide(p); return; }
+    using namespace Gdiplus;
+    float em = std::max((float)px(13), ph * 0.055f);
+    FontFamily family(L"Segoe UI");
+    StringFormat sf;
+    sf.SetAlignment(StringAlignmentCenter);
+    GraphicsPath path;
+    RectF layout(0, 0, pw * 0.9f, (REAL)ph);
+    path.AddString(text.c_str(), -1, &family, FontStyleBold, em, layout, &sf);
+    Pen pen(Color(255, 0, 0, 0), std::max(2.0f, em * 0.16f));
+    pen.SetLineJoin(LineJoinRound);
+    RectF b;
+    path.GetBounds(&b, nullptr, &pen);
+    if (b.Width <= 0 || b.Height <= 0) { subs_hide(p); return; }
+    int bw = std::min(pw, (int)std::ceil(b.Width) + 4), bh = std::min(ph, (int)std::ceil(b.Height) + 4);
+    BITMAPINFO bi{};
+    bi.bmiHeader = { sizeof(BITMAPINFOHEADER), bw, -bh, 1, 32, BI_RGB };
+    void* bits = nullptr;
+    HDC mem = CreateCompatibleDC(nullptr);
+    HBITMAP bmp = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bmp) { DeleteDC(mem); return; }
+    {
+        Bitmap canvas(bw, bh, bw * 4, PixelFormat32bppPARGB, (BYTE*)bits);
+        Graphics g(&canvas);
+        g.Clear(Color(0, 0, 0, 0));
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        g.TranslateTransform(2 - b.X, 2 - b.Y);
+        g.DrawPath(&pen, &path);
+        SolidBrush white(Color(255, 255, 255, 255));
+        g.FillPath(&white, &path);
+    }
+    int bottom = pic.top + (int)(ph * 0.955f);
+    if (barTop >= 0 && barTop - px(8) < bottom) bottom = barTop - px(8);
+    POINT at{ pic.left + (pw - bw) / 2, std::max<int>(pic.top, bottom - bh) };
+    SIZE size{ bw, bh };
+    POINT zero{};
+    BLENDFUNCTION blend{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    HGDIOBJ old = SelectObject(mem, bmp);
+    if (HWND w = subs_window(p)) {
+        UpdateLayeredWindow(w, nullptr, &at, &size, mem, &zero, 0, &blend, ULW_ALPHA);
+        if (!IsWindowVisible(w)) ShowWindow(w, SW_SHOWNOACTIVATE);
+    }
+    SelectObject(mem, old);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+}
+
+// the text of the moment on screen (the timer's: while a video with subtitles is open;
+// also as the window moves)
+void subs_tick(Player& p) {
+    int i = p.q.current();
+    if (p.cues.empty() || !p.mp->has_video() || !p.message.empty() || i < 0 || p.q.at(i).path != p.subsOf) {
+        subs_hide(p);
+        p.subShown.clear();
+        KillTimer(p.wnd, TIMER_SUBS);
+        return;
+    }
+    SetTimer(p.wnd, TIMER_SUBS, 100, nullptr);
+    RECT pic{};
+    // (opened: the renderer comes a moment later)
+    if (IsIconic(p.wnd) || !IsWindowVisible(p.video) || !p.mp->video_rect(&pic)) {
+        subs_hide(p);
+        p.subShown = L"\x1";
+        return;
+    }
+    MapWindowPoints(p.video, nullptr, (POINT*)&pic, 2);
+    int barTop = -1;                            // the bar, where it's over the video (full screen)
+    RECT br{};
+    if (IsWindowVisible(p.bar) && GetWindowRect(p.bar, &br) && br.top < pic.bottom && br.bottom > pic.top) barTop = br.top;
+    std::wstring t = subtitle_at(p.cues, p.mp->position());
+    if (t == p.subShown && EqualRect(&pic, &p.subRect) && barTop == p.subBarTop) return;
+    p.subShown = t;
+    p.subRect = pic;
+    p.subBarTop = barTop;
+    subs_draw(p, t, pic, barTop);
+}
+// a file opened (Opened): a video's subtitles looked up (once per video) and shown
+void subs_open(Player& p) {
+    int i = p.q.current();
+    if (i >= 0 && p.mp->has_video()) {
+        const std::wstring& path = p.q.at(i).path;
+        if (p.subsOf != path) {
+            subs_find(p, path);
+            p.cues.clear();
+            p.subPick = -1;
+            if (p.subsOn) subs_load(p, subs_preferred(p));
+        }
+    } else {
+        p.subsOf.clear();
+        p.subs.clear();
+        p.cues.clear();
+        p.subPick = -1;
+    }
+    p.subShown = L"\x1";                        // (a new renderer: drawn anew)
+    subs_tick(p);
+}
+
+std::wstring ask_subtitle_file(HWND owner, const std::wstring& dir) {
+    IFileOpenDialog* d = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return {};
+    const COMDLG_FILTERSPEC types[] = { { L"Subtitles (*.srt, *.vtt, *.ass, *.ssa)", L"*.srt;*.vtt;*.ass;*.ssa" },
+                                        { L"All files", L"*.*" } };
+    d->SetFileTypes(ARRAYSIZE(types), types);
+    d->SetTitle(L"Choose subtitles");
+    FILEOPENDIALOGOPTIONS opts = 0;
+    d->GetOptions(&opts);
+    d->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+    IShellItem* folder = nullptr;
+    if (!dir.empty() && SUCCEEDED(SHCreateItemFromParsingName(dir.c_str(), nullptr, IID_PPV_ARGS(&folder)))) {
+        d->SetFolder(folder);
+        folder->Release();
+    }
+    std::wstring out;
+    IShellItem* item = nullptr;
+    if (SUCCEEDED(d->Show(owner)) && SUCCEEDED(d->GetResult(&item))) {
+        PWSTR s = nullptr;
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &s)) && s) { out = s; CoTaskMemFree(s); }
+        item->Release();
+    }
+    d->Release();
+    return out;
+}
+
+void subs_command(Player& p, UINT cmd) {
+    if (!p.mp->has_video()) return;
+    int pick = -2;                              // -2: as it is
+    if (cmd == CMD_SUBS_OFF) pick = -1;
+    else if (cmd == CMD_SUBS_NEXT) pick = p.subs.empty() ? -2 : p.subPick + 1 < (int)p.subs.size() ? p.subPick + 1 : -1;
+    else if (cmd >= CMD_SUB && cmd < CMD_SUB + 100) pick = (int)(cmd - CMD_SUB);
+    else if (cmd == CMD_SUBS_CHOOSE) {
+        std::wstring file = ask_subtitle_file(p.wnd, p.subsOf.substr(0, p.subsOf.find_last_of(L"\\/") + 1));
+        if (file.empty()) return;
+        auto it = std::find_if(p.subs.begin(), p.subs.end(), [&](const std::wstring& s) { return _wcsicmp(s.c_str(), file.c_str()) == 0; });
+        if (it == p.subs.end()) it = p.subs.insert(p.subs.end(), file);
+        pick = (int)(it - p.subs.begin());
+    }
+    if (pick == -2) return;
+    if (pick == -1) {
+        p.cues.clear();
+        p.subPick = -1;
+        p.subsOn = false;
+    } else if (subs_load(p, pick)) {
+        p.subsOn = true;
+    } else {
+        MessageBoxW(p.wnd, (L"No subtitles could be read from this file:\n" + p.subs[pick]).c_str(), L"Subtitles",
+                    MB_OK | MB_ICONWARNING);
+        return;
+    }
+    settings_set_pref(L"playerSubtitles", p.subsOn);
+    subs_tick(p);
+}
+
+std::wstring menu_text(std::wstring s) {
+    for (size_t i = 0; (i = s.find(L'&', i)) != std::wstring::npos; i += 2) s.insert(i, 1, L'&');
+    return s;
+}
+
 // the video area's menu: the visualization, levelling, the slide show's interval, full screen
 void view_menu(Player& p, POINT pt) {
     if (pt.x == -1 && pt.y == -1) {             // (keyboard: the area's middle)
@@ -2256,6 +2549,26 @@ void view_menu(Player& p, POINT pt) {
     HMENU slides = CreatePopupMenu();
     for (int s : kSlideSecs)
         AppendMenuW(slides, MF_STRING | (s == p.slideSecs ? MF_CHECKED : 0), CMD_SLIDE + s, (std::to_wstring(s) + L" seconds").c_str());
+    if (p.mp->has_video() && !image_current(p)) {
+        HMENU subs = CreatePopupMenu();
+        AppendMenuW(subs, MF_STRING | (p.subPick < 0 ? MF_CHECKED : 0), CMD_SUBS_OFF, L"Off");
+        for (int i = 0; i < (int)p.subs.size(); ++i)
+            AppendMenuW(subs, MF_STRING | (i == p.subPick ? MF_CHECKED : 0), CMD_SUB + i, menu_text(name_of(p.subs[i])).c_str());
+        AppendMenuW(subs, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(subs, MF_STRING, CMD_SUBS_NEXT, L"Next subtitles\tS");
+        AppendMenuW(subs, MF_STRING, CMD_SUBS_CHOOSE, L"Choose a file...");
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)subs, L"Subtitles");
+    }
+    if (p.mp->audio_tracks().size() > 1) {
+        HMENU tracks = CreatePopupMenu();
+        const auto& names = p.mp->audio_tracks();
+        for (int i = 0; i < (int)names.size() && i < 100; ++i)
+            AppendMenuW(tracks, MF_STRING | (i == p.mp->audio_track() ? MF_CHECKED : 0), CMD_AUDIO + i, menu_text(names[i]).c_str());
+        AppendMenuW(tracks, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(tracks, MF_STRING, CMD_AUDIO_NEXT, L"Next audio track\tA");
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)tracks, L"Audio track");
+    }
+    if (p.mp->has_video() || p.mp->audio_tracks().size() > 1) AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_POPUP, (UINT_PTR)vis, L"Visualization");
     AppendMenuW(m, MF_STRING | (p.level ? MF_CHECKED : 0), CMD_LEVEL, L"Even out loudness between tracks");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)slides, L"Slide show interval");
@@ -2303,6 +2616,7 @@ LRESULT CALLBACK video_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_SIZE:
             p.mp->video_resized();
+            subs_tick(p);
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         case WM_LBUTTONDOWN: SetFocus(p.wnd); return 0;
@@ -2556,6 +2870,8 @@ void on_destroy(Player& p) {
     KillTimer(p.wnd, TIMER_POSITION);
     KillTimer(p.wnd, TIMER_SKIP);
     KillTimer(p.wnd, TIMER_HIDE_BAR);
+    KillTimer(p.wnd, TIMER_SUBS);
+    if (p.subWnd) { DestroyWindow(p.subWnd); p.subWnd = nullptr; }
     save_place(p);
     tags_forget();
     p.mp->close();
@@ -2618,6 +2934,7 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == TIMER_POSITION) { slide_tick(p); refresh_bar(p); }
             else if (wp == TIMER_SPECTRUM) spectrum_tick(p);
             else if (wp == TIMER_LEVEL) level_start(p);
+            else if (wp == TIMER_SUBS) subs_tick(p);
             else if (wp == TIMER_SKIP) { KillTimer(hwnd, TIMER_SKIP); next(p); }
             else if (wp == TIMER_HIDE_BAR) {
                 POINT c{};
@@ -2693,7 +3010,8 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: paint_main(p); return 0;
-        case WM_SIZE: layout(p); return 0;
+        case WM_SIZE: layout(p); subs_tick(p); return 0;
+        case WM_MOVE: subs_tick(p); return 0;      // (the subtitles' window goes along)
         case WM_GETMINMAXINFO: {
             auto* mm = (MINMAXINFO*)lp;
             mm->ptMinTrackSize = { px(500), px(320) };
@@ -2808,6 +3126,7 @@ bool create_player(bool activate) {
     p.slideSecs = std::clamp(settings_pref(L"playerSlideSeconds", 5), 1, 60);
     p.visStyle = std::clamp(settings_pref(L"playerVisual", VIS_SPECTROGRAM), 0, VIS_COUNT - 1);
     p.visCycle = settings_pref(L"playerVisualCycle", 0) != 0;
+    p.subsOn = settings_pref(L"playerSubtitles", 1) != 0;
     bool maximized = false;
     RECT r = initial_rect(maximized);
     HWND w = CreateWindowExW(0, player_class().c_str(), L"Player", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
@@ -2974,7 +3293,12 @@ bool player_translate(MSG* m) {
             if (!ctrl) return false;
             if (!held) command(p, vk == 'H' ? CMD_SHUFFLE : CMD_REPEAT);
             return true;
+        case 'A':
+            if (ctrl || inList) return false;
+            if (!held) command(p, CMD_AUDIO_NEXT);
+            return true;
         case 'S': case 'E':
+            if (vk == 'S' && !ctrl && !inList) { if (!held) command(p, CMD_SUBS_NEXT); return true; }
             if (!ctrl || shift) return false;
             if (!held) command(p, vk == 'S' ? CMD_SAVE_PLAYLIST : CMD_EDIT_PICTURE);
             return true;

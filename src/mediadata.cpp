@@ -363,6 +363,261 @@ std::wstring fmt_file_size(unsigned long long b) {
     return s;
 }
 
+// ------------------------------------------------------------------
+// subtitles
+// ------------------------------------------------------------------
+static std::wstring trim(const std::wstring& s) {
+    size_t a = s.find_first_not_of(L" \t\r\n\xFEFF");
+    if (a == std::wstring::npos) return {};
+    size_t b = s.find_last_not_of(L" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+static std::vector<std::wstring> split_lines(const std::wstring& text) {
+    std::vector<std::wstring> lines;
+    size_t i = 0;
+    while (i <= text.size()) {
+        size_t e = text.find(L'\n', i);
+        if (e == std::wstring::npos) e = text.size();
+        std::wstring l = text.substr(i, e - i);
+        if (!l.empty() && l.back() == L'\r') l.pop_back();
+        lines.push_back(std::move(l));
+        i = e + 1;
+    }
+    return lines;
+}
+
+// "01:02:03,456", "02:03.456", "1:02:03.45" (hundredths) -> 100-ns units; -1: not a time
+static long long sub_time(const std::wstring& s) {
+    std::wstring t = trim(s);
+    long long parts[3] = {}, frac = 0;
+    int n = 0, fracDigits = 0, digits = 0;
+    bool inFrac = false;
+    for (wchar_t c : t) {
+        if (c >= L'0' && c <= L'9') {
+            if (inFrac) {
+                if (fracDigits < 7) { frac = frac * 10 + (c - L'0'); ++fracDigits; }
+            } else {
+                parts[n] = parts[n] * 10 + (c - L'0');
+                ++digits;
+            }
+        } else if (c == L':' && !inFrac && digits && n < 2) {
+            ++n;
+            digits = 0;
+        } else if ((c == L',' || c == L'.') && !inFrac && digits) {
+            inFrac = true;
+        } else {
+            return -1;
+        }
+    }
+    if (!digits || n < 1) return -1;
+    long long sec = n == 2 ? parts[0] * 3600 + parts[1] * 60 + parts[2] : parts[0] * 60 + parts[1];
+    for (int i = fracDigits; i < 7; ++i) frac *= 10;
+    return sec * 10000000 + frac;
+}
+
+static void put_entity(std::wstring& out, const std::wstring& name) {
+    if (name == L"amp") out += L'&';
+    else if (name == L"lt") out += L'<';
+    else if (name == L"gt") out += L'>';
+    else if (name == L"quot") out += L'"';
+    else if (name == L"apos") out += L'\'';
+    else if (name == L"nbsp") out += L' ';
+    else if (name.size() > 1 && name[0] == L'#') {
+        unsigned long v = name[1] == L'x' || name[1] == L'X' ? wcstoul(name.c_str() + 2, nullptr, 16)
+                                                            : wcstoul(name.c_str() + 1, nullptr, 10);
+        if (v && v < 0x10000) out += (wchar_t)v;
+    } else {
+        out += L'&' + name + L';';
+    }
+}
+
+// a SubRip / WebVTT cue's line: <i>, <font ...>, <c.yellow>, {\an8} taken out, entities read
+static std::wstring srt_clean(const std::wstring& s) {
+    std::wstring out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        wchar_t c = s[i];
+        if (c == L'<') {
+            size_t e = s.find(L'>', i);
+            if (e != std::wstring::npos) { i = e; continue; }
+        } else if (c == L'{' && i + 1 < s.size() && s[i + 1] == L'\\') {
+            size_t e = s.find(L'}', i);
+            if (e != std::wstring::npos) { i = e; continue; }
+        } else if (c == L'&') {
+            size_t e = s.find(L';', i);
+            if (e != std::wstring::npos && e - i <= 8) {
+                put_entity(out, s.substr(i + 1, e - i - 1));
+                i = e;
+                continue;
+            }
+        }
+        out += c;
+    }
+    return out;
+}
+
+// a SubStation line's text: {override blocks} and drawings ({\p1} .. {\p0}) taken out, \N
+// and \n line breaks, \h a space
+static std::wstring ass_clean(const std::wstring& s) {
+    std::wstring out;
+    bool drawing = false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        wchar_t c = s[i];
+        if (c == L'{') {
+            size_t e = s.find(L'}', i);
+            if (e != std::wstring::npos) {
+                std::wstring block = s.substr(i, e - i);
+                for (size_t p = block.find(L"\\p"); p != std::wstring::npos; p = block.find(L"\\p", p + 2))
+                    if (p + 2 < block.size() && iswdigit(block[p + 2])) drawing = block[p + 2] != L'0';
+                i = e;
+                continue;
+            }
+        }
+        if (drawing) continue;
+        if (c == L'\\' && i + 1 < s.size()) {
+            wchar_t d = s[i + 1];
+            if (d == L'N' || d == L'n') { out += L'\n'; ++i; continue; }
+            if (d == L'h') { out += L' '; ++i; continue; }
+        }
+        out += c;
+    }
+    return out;
+}
+
+static void add_cue(std::vector<SubtitleCue>& cues, long long start, long long end, std::wstring text) {
+    // no empty lines, no blanks around them
+    std::wstring joined;
+    for (auto& l : split_lines(text)) {
+        std::wstring t = trim(l);
+        if (t.empty()) continue;
+        if (!joined.empty()) joined += L'\n';
+        joined += t;
+    }
+    if (joined.empty() || end <= start) return;
+    cues.push_back({ start, end, std::move(joined) });
+}
+
+static void parse_ass(const std::vector<std::wstring>& lines, std::vector<SubtitleCue>& cues) {
+    int fStart = 1, fEnd = 2, fields = 10;                 // the usual ASS Format
+    bool events = false;
+    for (auto& raw : lines) {
+        std::wstring l = trim(raw);
+        if (!l.empty() && l[0] == L'[') { events = lower(l) == L"[events]"; continue; }
+        size_t colon = l.find(L':');
+        if (colon == std::wstring::npos) continue;
+        std::wstring key = lower(trim(l.substr(0, colon)));
+        std::wstring rest = l.substr(colon + 1);
+        if (key == L"format" && events) {
+            int i = 0;
+            fStart = fEnd = -1;
+            size_t a = 0;
+            while (true) {
+                size_t e = rest.find(L',', a);
+                std::wstring f = lower(trim(rest.substr(a, e == std::wstring::npos ? e : e - a)));
+                if (f == L"start") fStart = i;
+                else if (f == L"end") fEnd = i;
+                ++i;
+                if (e == std::wstring::npos) break;
+                a = e + 1;
+            }
+            fields = i;
+            if (fStart < 0 || fEnd < 0) { fStart = 1; fEnd = 2; fields = 10; }
+        } else if (key == L"dialogue") {
+            // the text is the last field and may hold commas itself
+            std::vector<std::wstring> f;
+            size_t a = 0;
+            while ((int)f.size() < fields - 1) {
+                size_t e = rest.find(L',', a);
+                if (e == std::wstring::npos) break;
+                f.push_back(rest.substr(a, e - a));
+                a = e + 1;
+            }
+            if ((int)f.size() < fields - 1 || fStart >= (int)f.size() || fEnd >= (int)f.size()) continue;
+            long long s = sub_time(f[fStart]), e = sub_time(f[fEnd]);
+            if (s < 0 || e < 0) continue;
+            add_cue(cues, s, e, ass_clean(rest.substr(a)));
+        }
+    }
+}
+
+static void parse_srt(const std::vector<std::wstring>& lines, std::vector<SubtitleCue>& cues) {
+    for (size_t i = 0; i < lines.size(); ++i) {
+        size_t arrow = lines[i].find(L"-->");
+        if (arrow == std::wstring::npos) continue;
+        long long s = sub_time(lines[i].substr(0, arrow));
+        // WebVTT puts the cue's settings after the end time
+        std::wstring after = trim(lines[i].substr(arrow + 3));
+        size_t sp = after.find_first_of(L" \t");
+        long long e = sub_time(sp == std::wstring::npos ? after : after.substr(0, sp));
+        std::wstring text;
+        size_t j = i + 1;
+        for (; j < lines.size() && !trim(lines[j]).empty(); ++j) {
+            if (lines[j].find(L"-->") != std::wstring::npos) break;    // a cue with no text
+            text += srt_clean(lines[j]) + L'\n';
+        }
+        if (s >= 0 && e >= 0) add_cue(cues, s, e, text);
+        i = j - 1;
+    }
+}
+
+std::vector<SubtitleCue> subtitles_parse(const std::wstring& text) {
+    std::vector<SubtitleCue> cues;
+    std::vector<std::wstring> lines = split_lines(text);
+    bool ass = false;
+    for (auto& l : lines) {
+        std::wstring t = lower(trim(l));
+        if (t == L"[script info]" || t == L"[events]" || t.rfind(L"dialogue:", 0) == 0) { ass = true; break; }
+        if (t.find(L"-->") != std::wstring::npos) break;
+    }
+    if (ass) parse_ass(lines, cues);
+    else parse_srt(lines, cues);
+    std::stable_sort(cues.begin(), cues.end(), [](const SubtitleCue& a, const SubtitleCue& b) { return a.start < b.start; });
+    return cues;
+}
+
+std::wstring subtitle_at(const std::vector<SubtitleCue>& cues, long long t) {
+    std::wstring out;
+    for (auto& c : cues) {
+        if (c.start > t) break;
+        if (t >= c.end) continue;
+        if (!out.empty()) out += L'\n';
+        out += c.text;
+    }
+    return out;
+}
+
+static std::wstring sub_ext(const std::wstring& name) {
+    size_t dot = name.rfind(L'.');
+    return dot == std::wstring::npos ? std::wstring() : lower(name.substr(dot + 1));
+}
+
+bool subtitle_file(const std::wstring& name) {
+    std::wstring ext = sub_ext(name);
+    return ext == L"srt" || ext == L"vtt" || ext == L"ass" || ext == L"ssa";
+}
+
+bool subtitle_for(const std::wstring& video, const std::wstring& candidate, std::wstring* label) {
+    if (!subtitle_file(candidate)) return false;
+    size_t vd = video.rfind(L'.'), cd = candidate.rfind(L'.');
+    std::wstring stem = lower(vd == std::wstring::npos ? video : video.substr(0, vd));
+    std::wstring cstem = candidate.substr(0, cd);
+    std::wstring cl = lower(cstem);
+    std::wstring rest;
+    if (cl == stem || cl == lower(video)) {
+        rest.clear();                                       // Film.srt, Film.mkv.srt
+    } else if (cl.size() > stem.size() + 1 && cl.compare(0, stem.size(), stem) == 0 && cl[stem.size()] == L'.') {
+        rest = cstem.substr(stem.size() + 1);               // Film.en.srt
+        if (vd != std::wstring::npos) {                     // Film.mkv.en.srt
+            std::wstring vext = lower(video.substr(vd + 1)) + L'.';
+            if (lower(rest).rfind(vext, 0) == 0) rest = rest.substr(vext.size());
+        }
+    } else {
+        return false;
+    }
+    if (label) *label = rest;
+    return true;
+}
+
 bool opus_head_from_dops(const uint8_t* desc, size_t size, uint8_t head[19]) {
     for (size_t i = 4; i + 4 + 11 <= size; ++i) {
         if (std::memcmp(desc + i, "dOps", 4) != 0) continue;

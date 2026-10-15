@@ -25,7 +25,10 @@
 
 // (not in MinGW's headers / libmfuuid)
 static const GUID kVideoRenderService = { 0x1092a86c, 0xab1a, 0x459a, { 0xa3, 0x36, 0x83, 0x1f, 0xbc, 0x4d, 0x11, 0xff } };
-static const DWORD kStandardQueue = 0x00000001;     // MFASYNC_CALLBACK_QUEUE_STANDARD
+// MFASYNC_CALLBACK_QUEUE_LONG_FUNCTION: opening reads the tags, which mustn't block the
+// standard queue (one thread): Windows' MKV property handler waits for work of its own
+// there (five seconds, until it gives up)
+static const DWORD kLongQueue = 0x00000007;
 
 static struct {
     HRESULT (WINAPI* Startup)(ULONG, DWORD);
@@ -398,6 +401,8 @@ struct MediaPlayer::Impl {
     LONGLONG queuedSeek = -1;       // asked for while `pending`
     LONGLONG shownPos = -1;         // a seek's target until the session has got there
     float amplitude = 1.0f;
+    std::wstring path;              // the file open (or last open)
+    int prefAudio = -1;             // its audio stream chosen (among its audio streams); -1: the file's
     // MCI instead of the session (MIDI, a CD track)
     MCIDEVICEID mci = 0;
     MciLink link;
@@ -467,6 +472,8 @@ void MediaPlayer::close() {
     m_error = S_OK;
     m_title.clear(); m_artist.clear(); m_album.clear();
     m_audio = {};
+    m_tracks.clear();
+    m_track = -1;
     if (d->video) InvalidateRect(d->video, nullptr, TRUE);
 }
 
@@ -478,6 +485,7 @@ void MediaPlayer::fail(HRESULT hr) {
 
 bool MediaPlayer::open(const std::wstring& path, bool play, LONGLONG startAt) {
     close();
+    if (path != d->path) { d->path = path; d->prefAudio = -1; }
     if (midi_file(path) || cd_track_file(path)) return open_mci(path, play, startAt);
     if (!media_available()) { fail(MF_E_PLATFORM_NOT_INITIALIZED); return false; }
     UINT gen = d->gen;
@@ -490,7 +498,7 @@ bool MediaPlayer::open(const std::wstring& path, bool play, LONGLONG startAt) {
     if (SUCCEEDED(hr)) hr = s_mf.CreateSourceResolver(&resolver);
     if (SUCCEEDED(hr)) {
         auto* cb = new OpenCallback(d->notify, d->msg, gen, resolver, path);
-        hr = s_mf.PutWorkItem(kStandardQueue, cb, nullptr);
+        hr = s_mf.PutWorkItem(kLongQueue, cb, nullptr);
         cb->Release();
     }
     release(resolver);
@@ -638,6 +646,28 @@ static AudioInfo audio_info_of(IMFMediaTypeHandler* th) {
     return a;
 }
 
+// an audio stream's name for the menu: the file's name for it, its language, its format
+static std::wstring track_name(IMFStreamDescriptor* sd, IMFMediaTypeHandler* th, int n) {
+    std::wstring name, lang;
+    WCHAR* s = nullptr;
+    UINT32 len = 0;
+    if (SUCCEEDED(sd->GetAllocatedString(MF_SD_STREAM_NAME, &s, &len)) && s) { name = s; CoTaskMemFree(s); }
+    s = nullptr;
+    if (SUCCEEDED(sd->GetAllocatedString(MF_SD_LANGUAGE, &s, &len)) && s) { lang = s; CoTaskMemFree(s); }
+    if (lang == L"und") lang.clear();
+    WCHAR full[128]{};
+    if (!lang.empty() && GetLocaleInfoEx(lang.c_str(), LOCALE_SLOCALIZEDLANGUAGENAME, full, ARRAYSIZE(full)) > 1)
+        lang = full;
+    std::wstring t = name;
+    if (!lang.empty() && _wcsicmp(name.c_str(), lang.c_str()) != 0) t += (t.empty() ? L"" : L" · ") + lang;
+    if (t.empty()) t = L"Track " + std::to_wstring(n);
+    AudioInfo a = audio_info_of(th);
+    std::wstring tail = audio_format_name(a.format), ch = fmt_channels(a.channels);
+    if (!ch.empty()) tail += (tail.empty() ? L"" : L", ") + ch;
+    if (!tail.empty()) t += L" · " + tail;
+    return t;
+}
+
 static bool audio_output_present() {
     IMMDeviceEnumerator* en = nullptr;
     if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&en))))
@@ -664,6 +694,29 @@ void MediaPlayer::source_ready(IUnknown* obj, HRESULT hr) {
     bool audioOut = audio_output_present(), audio = false, video = false, audioOnly = true;
     DWORD count = 0;
     if (SUCCEEDED(hr)) hr = pd->GetStreamDescriptorCount(&count);
+    // the audio streams, named for the menu: the one chosen plays, else the file's first
+    std::vector<DWORD> audioAt;
+    int firstSelected = -1;
+    for (DWORD i = 0; SUCCEEDED(hr) && i < count; ++i) {
+        BOOL selected = FALSE;
+        IMFStreamDescriptor* sd = nullptr;
+        if (FAILED(pd->GetStreamDescriptorByIndex(i, &selected, &sd))) continue;
+        IMFMediaTypeHandler* th = nullptr;
+        GUID major = GUID_NULL;
+        if (SUCCEEDED(sd->GetMediaTypeHandler(&th))) {
+            th->GetMajorType(&major);
+            if (major == MFMediaType_Audio) {
+                fix_opus_type(th);
+                if (selected && firstSelected < 0) firstSelected = (int)audioAt.size();
+                audioAt.push_back(i);
+                m_tracks.push_back(track_name(sd, th, (int)m_tracks.size() + 1));
+            }
+            th->Release();
+        }
+        sd->Release();
+    }
+    m_track = d->prefAudio >= 0 && d->prefAudio < (int)audioAt.size() ? d->prefAudio : firstSelected;
+    DWORD audioStream = m_track >= 0 ? audioAt[m_track] : MAXDWORD;
     for (DWORD i = 0; SUCCEEDED(hr) && i < count; ++i) {
         BOOL selected = FALSE;
         IMFStreamDescriptor* sd = nullptr;
@@ -672,9 +725,10 @@ void MediaPlayer::source_ready(IUnknown* obj, HRESULT hr) {
         IMFMediaTypeHandler* th = nullptr;
         if (SUCCEEDED(sd->GetMediaTypeHandler(&th))) {
             th->GetMajorType(&major);
-            if (selected && major == MFMediaType_Audio) {
-                fix_opus_type(th);
-                if (!m_audio.format) m_audio = audio_info_of(th);
+            if (major == MFMediaType_Audio) {
+                if (i == audioStream && !selected) pd->SelectStream(i);
+                selected = i == audioStream;
+                if (selected) m_audio = audio_info_of(th);
             }
             th->Release();
         }
@@ -858,6 +912,32 @@ void MediaPlayer::video_resized() {
 
 bool MediaPlayer::video_paint() {
     return d->display && SUCCEEDED(d->display->RepaintVideo());
+}
+
+bool MediaPlayer::video_rect(RECT* r) {
+    SIZE native{}, shape{};
+    RECT rc{};
+    if (!d->display || !d->video || FAILED(d->display->GetNativeVideoSize(&native, &shape))) return false;
+    if (shape.cx <= 0 || shape.cy <= 0) shape = native;
+    GetClientRect(d->video, &rc);
+    if (shape.cx <= 0 || shape.cy <= 0 || rc.right <= 0 || rc.bottom <= 0) return false;
+    // (as the renderer letterboxes it: MFVideoARMode_PreservePicture)
+    LONG w = rc.right, h = MulDiv(rc.right, shape.cy, shape.cx);
+    if (h > rc.bottom) { h = rc.bottom; w = MulDiv(rc.bottom, shape.cx, shape.cy); }
+    r->left = (rc.right - w) / 2;
+    r->top = (rc.bottom - h) / 2;
+    r->right = r->left + w;
+    r->bottom = r->top + h;
+    return true;
+}
+
+void MediaPlayer::set_audio_track(int k) {
+    if (k < 0 || k >= (int)m_tracks.size() || k == m_track || d->mci || d->path.empty()) return;
+    bool play = will_play();
+    LONGLONG at = position();
+    std::wstring path = d->path;
+    d->prefAudio = k;
+    open(path, play, at);
 }
 
 MediaPlayer::Change MediaPlayer::handle(MediaNote* n) {

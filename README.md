@@ -74,9 +74,20 @@ File Explorer while starting in well under 100 ms.
   the Media Feature Pack), nothing to install. Keys: Space
   play / pause, Left / Right ±5 s (Shift: 30 s), Ctrl+Left / Ctrl+Right previous / next,
   Up / Down volume, M mute, V / Shift+V next / previous visualization, F or F11 full
-  screen, Ctrl+H shuffle, Ctrl+T repeat; the media keys too. One player for all windows; it stays open after the main window closes.
-- **Playlists** (`.m3u`, `.m3u8`): play one like a folder (its tracks in order, nested
-  playlists too; missing files and web addresses are skipped); "Create playlist..." in the
+  screen, Ctrl+H shuffle, Ctrl+T repeat, S next subtitles, A next audio track; the media
+  keys too. One player for all windows; it stays open after the main window closes.
+- **Subtitles and audio tracks**: a video's subtitle files beside it (`Film.srt`,
+  `Film.en.srt`, `Film.English.vtt`; SubRip, WebVTT, SubStation `.ass` / `.ssa`) show over
+  it, the one in your language first; right-click ▸ Subtitles picks another, turns them off
+  or chooses a file elsewhere. Files with several audio streams (films' languages,
+  commentary) list them under right-click ▸ Audio track by name, language and format.
+- **MIDI and CDs**: `.mid` / `.midi` / `.rmi` / `.kar` play through Windows' own
+  synthesizer (its volume is the player's, in the Windows volume mixer), and an audio CD's
+  tracks (`Track01.cda`) from the drive.
+- **Playlists** (`.m3u`, `.m3u8`, `.pls`, `.wpl` / `.zpl`, `.asx` / `.wax` / `.wvx`, `.xspf`):
+  play one like a folder (its tracks in order, with their titles, nested playlists too;
+  missing files are skipped). Web addresses in them are internet radio and other streams:
+  they play live (tried once more if the connection drops). "Create playlist..." in the
   compact menu of media files and folders writes one, and the player's queue menu has
   "Save queue as playlist..." (Ctrl+S). Paths inside the playlist's folder are written
   relative, so the folder can move; `.m3u8` is UTF-8.

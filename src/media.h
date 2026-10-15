@@ -62,6 +62,16 @@ public:
     void set_volume(float amplitude);   // 0..1 (0 also for muted)
     void video_resized();               // the video window changed size
     bool video_paint();                 // WM_PAINT of the video window (after BeginPaint); false: paint it yourself
+    // the video's picture as shown, in the video window's client coordinates (letterboxed
+    // to its shape); false: no video shown
+    bool video_rect(RECT* r);
+
+    // the file's audio streams (once Opened): a name for each ("English · AAC, Stereo",
+    // "Track 2 · AC-3, 5.1"); which of them plays
+    const std::vector<std::wstring>& audio_tracks() const { return m_tracks; }
+    int audio_track() const { return m_track; }
+    // another of them: the file opened again with it, at the same place (Opened again)
+    void set_audio_track(int k);
 
     Change handle(MediaNote* note);     // the window's `msg`: takes the note
 
@@ -75,6 +85,8 @@ private:
     HRESULT m_error = S_OK;
     std::wstring m_title, m_artist, m_album;
     AudioInfo m_audio;
+    std::vector<std::wstring> m_tracks;
+    int m_track = -1;
     void start_at(LONGLONG hns, bool keepPosition);
     bool open_mci(const std::wstring& path, bool play, LONGLONG startAt);
     void mci_start(LONGLONG hns, bool resume);
