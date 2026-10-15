@@ -38,6 +38,7 @@ using std::min;
 #include "imageedit.h"
 #include "screenshot.h"
 #include "assoc.h"
+#include "notepad.h"
 #include <uxtheme.h>
 #include <dwmapi.h>
 #include <oleacc.h>
@@ -51,15 +52,17 @@ static bool s_mainOpen = false;             // the main window is there (not: cl
 void exit_app() { DestroyWindow(g_main); }
 
 void app_window_closed() {
-    if (!s_mainOpen && !player_window() && !imageedit_any()) PostQuitMessage(0);
+    if (!s_mainOpen && !player_window() && !imageedit_any() && !notepad_window()) PostQuitMessage(0);
 }
 
 // the windows that keep their keys (no main window shortcuts for them): the player, the
-// picture editors, the screenshot picker. True: the message was taken care of
+// picture editors, the Notepad, the screenshot picker. True: the message was taken care of
 static bool tool_window_message(MSG& m) {
     bool key = m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN;
     if (player_owns(m.hwnd)) {
         if (key && player_translate(&m)) return true;
+    } else if (notepad_owns(m.hwnd)) {
+        if (notepad_translate(&m)) return true;
     } else if (!imageedit_owns(m.hwnd) && !screenshot_owns(m.hwnd)) {
         return false;
     }
@@ -492,6 +495,7 @@ static void on_command(WORD id) {
             break;
         case IDM_SCREENSHOT: screenshot_start(300); break;     // (the menu's fade first)
         case IDM_MEDIA_TYPES: assoc_dialog(g_main); break;
+        case IDM_NOTEPAD: notepad_open({}); break;
 
         case IDM_SORT_NAME: set_sort(0, -1); break;
         case IDM_SORT_DATE: set_sort(3, -1); break;
@@ -965,10 +969,11 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
             if (n && n < ARRAYSIZE(full) && PathFileExistsW(full)) openPath = full;   // (a file: its folder)
         }
     }
-    if (cl.play) {
-        // a media file opened by its type (assoc.cpp): the player alone, or the one running
+    if (cl.play || cl.notepad) {
+        // a media file opened by its type (assoc.cpp): the player alone, or the one running;
+        // --notepad: the Notepad alone, or the one running
         int code = 0;
-        if (player_open_file(openPath)) {
+        if (cl.notepad ? notepad_open_file(openPath) : player_open_file(openPath)) {
             screenshot_init();
             MSG pm{};
             while (GetMessageW(&pm, nullptr, 0, 0) > 0)

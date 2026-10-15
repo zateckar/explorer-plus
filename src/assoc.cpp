@@ -1,9 +1,12 @@
 #include "assoc.h"
 #include "imageview.h"
+#include "notepad.h"
 #include "player.h"
 #include "playlist.h"
 #include "theme.h"
+#include "userchoice.h"
 #include <dwmapi.h>
+#include <sddl.h>
 #include <windowsx.h>
 #include <algorithm>
 #include <string>
@@ -87,6 +90,7 @@ void register_app() {
 void unregister_app() {
     std::wstring exe = exe_path();
     RegDeleteTreeW(HKEY_CURRENT_USER, kCaps);
+    RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\ExplorerPlus\\PreviousApps");   // (each given back with its type)
     RegDeleteKeyW(HKEY_CURRENT_USER, kAppKey);              // (when nothing else is in it)
     RegDeleteKeyValueW(HKEY_CURRENT_USER, kRegApps, kApp);
     RegDeleteTreeW(HKEY_CURRENT_USER, (L"Software\\Classes\\Applications\\" + std::wstring(PathFindFileNameW(exe.c_str()))).c_str());
@@ -118,7 +122,81 @@ void register_type(const std::wstring& ext, Kind kind) {
     reg_set(std::wstring(kCaps) + L"\\FileAssociations", ext.c_str(), progid(ext));
 }
 
+std::wstring user_sid() {
+    std::wstring out;
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return out;
+    BYTE buf[256];
+    DWORD n = 0;
+    LPWSTR s = nullptr;
+    if (GetTokenInformation(tok, TokenUser, buf, sizeof(buf), &n) && ConvertSidToStringSidW(((TOKEN_USER*)buf)->User.Sid, &s)) {
+        out = s;
+        LocalFree(s);
+    }
+    CloseHandle(tok);
+    return out;
+}
+
+std::wstring choice_key(const std::wstring& ext, const wchar_t* name = L"UserChoice") {
+    return L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\" + ext + L"\\" + name;
+}
+
+FILETIME key_written(HKEY k) {
+    FILETIME ft{};
+    RegQueryInfoKeyW(k, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &ft);
+    return ft;
+}
+
+// The type's default app chosen here as Settings would: the UserChoice key with the hash
+// Windows checks it by (userchoice.cpp). The key is made anew: Windows denies the user setting
+// its values, not deleting it. True when written (`verify`: and Windows now opens the type
+// with `prog`).
+bool write_choice(const std::wstring& ext, const std::wstring& prog, bool verify = true) {
+    std::wstring sid = user_sid(), key = choice_key(ext);
+    if (sid.empty()) return false;
+    RegDeleteTreeW(HKEY_CURRENT_USER, choice_key(ext, L"UserChoiceLatest").c_str());   // (newer Windows: before UserChoice)
+    // the hash goes by the minute the key was last written: written again should that turn over
+    for (int tries = 0; tries < 3; ++tries) {
+        RegDeleteTreeW(HKEY_CURRENT_USER, key.c_str());
+        HKEY k = nullptr;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, nullptr, 0, KEY_READ | KEY_WRITE, nullptr, &k, nullptr) != ERROR_SUCCESS)
+            return false;
+        bool ok = RegSetValueExW(k, L"ProgId", 0, REG_SZ, (const BYTE*)prog.c_str(), (DWORD)((prog.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
+        FILETIME t = key_written(k);
+        std::wstring hash = user_choice_hash(ext, sid, prog, t);
+        ok = ok && !hash.empty() &&
+             RegSetValueExW(k, L"Hash", 0, REG_SZ, (const BYTE*)hash.c_str(), (DWORD)((hash.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
+        FILETIME after = key_written(k);
+        RegCloseKey(k);
+        if (!ok) break;
+        auto minute = [](const FILETIME& f) { return ((ULONGLONG)f.dwHighDateTime << 32 | f.dwLowDateTime) / 600000000ull; };
+        if (minute(t) == minute(after)) return !verify || assoc_text(ASSOCSTR_PROGID, ext) == prog;
+    }
+    RegDeleteTreeW(HKEY_CURRENT_USER, key.c_str());
+    return false;
+}
+
+// the app each type had before Explorer Plus (given back when the type is unticked)
+const wchar_t kPrevious[] = L"Software\\ExplorerPlus\\PreviousApps";
+
+bool make_default(const std::wstring& ext) {
+    std::wstring now = reg_get(choice_key(ext), L"ProgId");
+    if (!now.empty() && now != progid(ext)) reg_set(kPrevious, ext.c_str(), now);
+    if (write_choice(ext, progid(ext))) return true;
+    if (!now.empty() && now != progid(ext)) write_choice(ext, now, false);     // (refused: as it was)
+    return false;
+}
+
 void unregister_type(const std::wstring& ext) {
+    if (reg_get(choice_key(ext), L"ProgId") == progid(ext)) {
+        // the app it had, where that is still there; else Windows' own choice (or it asks)
+        std::wstring prev = reg_get(kPrevious, ext.c_str());
+        HKEY k = nullptr;
+        bool there = !prev.empty() && RegOpenKeyExW(HKEY_CLASSES_ROOT, prev.c_str(), 0, KEY_READ, &k) == ERROR_SUCCESS;
+        if (k) RegCloseKey(k);
+        if (!there || !write_choice(ext, prev, false)) RegDeleteTreeW(HKEY_CURRENT_USER, choice_key(ext).c_str());
+    }
+    RegDeleteKeyValueW(HKEY_CURRENT_USER, kPrevious, ext.c_str());
     RegDeleteTreeW(HKEY_CURRENT_USER, (L"Software\\Classes\\" + progid(ext)).c_str());
     RegDeleteKeyValueW(HKEY_CURRENT_USER, (L"Software\\Classes\\" + ext + L"\\OpenWithProgids").c_str(), progid(ext).c_str());
     RegDeleteKeyValueW(HKEY_CURRENT_USER, (std::wstring(kCaps) + L"\\FileAssociations").c_str(), ext.c_str());
@@ -169,9 +247,9 @@ int px(const Dlg& d, int v) { return MulDiv(v, d.dpi, 96); }
 const wchar_t kHeading[] = L"Open media files with Explorer Plus";
 const wchar_t kExplain[] =
     L"Tick the file types Explorer Plus should open - music, video and playlists in its player, pictures in "
-    L"its viewer - and press Apply.\n"
-    L"Windows lets only you change a default app: Apply then opens Settings at Explorer Plus' page, where you "
-    L"pick it for each type. To pick it for one type alone, double-click that type.";
+    L"its viewer - and press Apply: Explorer Plus becomes their default app. Unticked types go back to the "
+    L"app they had.\n"
+    L"To pick an app for one type in Windows' own list, double-click that type.";
 
 void fill_list(Dlg& d) {
     ListView_DeleteAllItems(d.list);
@@ -224,9 +302,22 @@ void apply(Dlg& d) {
     }
     if (any) register_app();
     else unregister_app();
+    // Explorer Plus their default app at once; a type Windows keeps to itself (a newer Windows
+    // may guard more of them) is left to Settings
+    std::wstring refused;
+    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    for (const Row& row : d.rows)
+        if (row.registered && assoc_text(ASSOCSTR_PROGID, row.ext) != progid(row.ext) && !make_default(row.ext))
+            refused += (refused.empty() ? L"" : L", ") + row.ext;
+    SetCursor(old);
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
     refresh_apps(d);
-    if (any) ShellExecuteW(d.wnd, nullptr, kSettingsPage, nullptr, nullptr, SW_SHOWNORMAL);
+    if (!refused.empty()) {
+        std::wstring msg = L"Windows didn't let Explorer Plus become the app for " + refused +
+                           L".\n\nSettings opens at Explorer Plus' page: pick it there for these types.";
+        MessageBoxW(d.wnd, msg.c_str(), L"Media file types", MB_OK | MB_ICONINFORMATION);
+        ShellExecuteW(d.wnd, nullptr, kSettingsPage, nullptr, nullptr, SW_SHOWNORMAL);
+    }
 }
 
 // one type: registered (else it isn't among the choices), then Windows' "Open with" asks
@@ -527,6 +618,8 @@ void assoc_dialog(HWND owner) {
         if (GetMessageW(&m, nullptr, 0, 0) <= 0) { quit = true; break; }
         if (player_owns(m.hwnd)) {
             if ((m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN) && player_translate(&m)) continue;
+        } else if (notepad_owns(m.hwnd)) {
+            if (notepad_translate(&m)) continue;
         } else if (IsDialogMessageW(wnd, &m)) {
             continue;
         }

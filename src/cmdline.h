@@ -6,10 +6,12 @@
 
 // explorer-plus.exe [--new-window] [folder or file]
 // explorer-plus.exe --play <media file, picture or playlist>   (the media player alone)
+// explorer-plus.exe --notepad [text file]                      (the Notepad alone)
 struct CommandLine {
     std::wstring path;             // as given (relative paths: resolved by the caller)
     bool newWindow = false;
     bool play = false;
+    bool notepad = false;
 };
 CommandLine parse_command_line(const wchar_t* cmdline);   // the whole line, the exe first
 

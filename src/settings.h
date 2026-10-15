@@ -14,6 +14,7 @@ struct SplitMode {
 int  view_to_int(const View& v);        // persisted form (settings + tab lines)
 View int_to_view(int x);
 
+std::wstring settings_file_path();      // settings.ini (or EXPLORERPLUS_SETTINGS'); empty: none
 void settings_load_all();
 bool settings_save_all();               // false: the file couldn't be written (changes kept for a retry)
 View settings_default_view();

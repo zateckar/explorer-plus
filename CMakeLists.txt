@@ -72,6 +72,9 @@ add_executable(explorer-plus WIN32
     src/imageedit.cpp
     src/screenshot.cpp
     src/assoc.cpp
+    src/userchoice.cpp
+    src/textfile.cpp
+    src/notepad.cpp
     res/resource.rc
 )
 
@@ -128,7 +131,7 @@ target_link_libraries(explorer-plus PRIVATE
 option(EXPLORERPLUS_TESTS "Build the unit tests" ON)
 if(EXPLORERPLUS_TESTS)
     enable_testing()
-    add_executable(explorer-plus-tests tests/unit_tests.cpp src/ini.cpp src/cmdline.cpp src/playlist.cpp src/mediadata.cpp src/shapes.cpp src/imageformats.cpp)
+    add_executable(explorer-plus-tests tests/unit_tests.cpp src/ini.cpp src/cmdline.cpp src/playlist.cpp src/mediadata.cpp src/shapes.cpp src/imageformats.cpp src/userchoice.cpp src/textfile.cpp)
     target_include_directories(explorer-plus-tests PRIVATE src)
     target_compile_options(explorer-plus-tests PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
     target_compile_definitions(explorer-plus-tests PRIVATE UNICODE _UNICODE)

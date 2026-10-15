@@ -45,6 +45,8 @@ static std::wstring ini_path() {
     return s_iniPath;
 }
 
+std::wstring settings_file_path() { return ini_path(); }
+
 // ------------------------------------------------------------------
 // the file (the INI document itself: ini.h)
 

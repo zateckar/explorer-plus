@@ -6,6 +6,8 @@
 #include "mediadata.h"
 #include "imageformats.h"
 #include "shapes.h"
+#include "userchoice.h"
+#include "textfile.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -137,8 +139,95 @@ static void command_line() {
     CHECK(c.path.empty());
     // a media file opened by its file type's verb: the player alone
     c = parse_command_line(L"explorer-plus.exe --play \"D:\\Music\\a b.mp3\"");
-    CHECK(c.play && !c.newWindow);
+    CHECK(c.play && !c.newWindow && !c.notepad);
     CHECK_EQ(c.path, L"D:\\Music\\a b.mp3");
+    c = parse_command_line(L"explorer-plus.exe --notepad \"D:\\Notes\\to do.txt\"");
+    CHECK(c.notepad && !c.play);
+    CHECK_EQ(c.path, L"D:\\Notes\\to do.txt");
+    c = parse_command_line(L"explorer-plus.exe --notepad");
+    CHECK(c.notepad && c.path.empty());
+}
+
+// ------------------------------------------------------------------
+// the Notepad's files and remembered tabs
+
+static void text_files() {
+    // encodings: by the BOM, by zero bytes (UTF-16 without one), UTF-8 where valid, else ANSI
+    TextFile f = text_decode("\xEF\xBB\xBFh\xC3\xA9llo");
+    CHECK(f.enc == TextEncoding::Utf8Bom && f.text == L"h\u00E9llo" && !f.binary);
+    f = text_decode(std::string("\xFF\xFEh\0i\0", 6));
+    CHECK(f.enc == TextEncoding::Utf16Le && f.text == L"hi");
+    f = text_decode(std::string("\xFE\xFF\0h\0i", 6));
+    CHECK(f.enc == TextEncoding::Utf16Be && f.text == L"hi");
+    f = text_decode(std::string("a\0b\0c\0\r\0\n\0", 10));
+    CHECK(f.enc == TextEncoding::Utf16Le && f.text == L"abc\r\n");
+    f = text_decode("plain");
+    CHECK(f.enc == TextEncoding::Utf8 && f.text == L"plain");
+    f = text_decode("\xC5\xA1koda");                          // (UTF-8 without a BOM)
+    CHECK(f.enc == TextEncoding::Utf8 && f.text == L"\u0161koda");
+    f = text_decode("caf\xE9 \x80");                          // (not UTF-8)
+    CHECK(f.enc == TextEncoding::Ansi && !f.text.empty());
+    f = text_decode(std::string("MZ\0\x90", 4));
+    CHECK(f.binary);
+    f = text_decode("");
+    CHECK(f.enc == TextEncoding::Utf8 && f.text.empty() && f.eol == LineEnding::CrLf);
+    // line endings: the most used one; the text always with CRLF
+    f = text_decode("a\nb\nc\r\nd");
+    CHECK(f.eol == LineEnding::Lf && f.text == L"a\r\nb\r\nc\r\nd");
+    f = text_decode("a\rb\rc");
+    CHECK(f.eol == LineEnding::Cr && f.text == L"a\r\nb\r\nc");
+    f = text_decode("a\r\nb\nc\r\n");
+    CHECK(f.eol == LineEnding::CrLf);
+    // written back: in the file's line endings and encoding
+    CHECK(text_encode(L"a\r\nb\rc\nd", TextEncoding::Utf8, LineEnding::Lf) == "a\nb\nc\nd");
+    CHECK(text_encode(L"a\nb", TextEncoding::Utf8, LineEnding::CrLf) == "a\r\nb");
+    CHECK(text_encode(L"a\r\nb", TextEncoding::Utf8, LineEnding::Cr) == "a\rb");
+    CHECK(text_encode(L"\u00E9", TextEncoding::Utf8Bom, LineEnding::CrLf) == "\xEF\xBB\xBF\xC3\xA9");
+    CHECK(text_encode(L"hi", TextEncoding::Utf16Le, LineEnding::CrLf) == std::string("\xFF\xFEh\0i\0", 6));
+    CHECK(text_encode(L"hi", TextEncoding::Utf16Be, LineEnding::CrLf) == std::string("\xFE\xFF\0h\0i", 6));
+    bool lossy = true;
+    CHECK(text_encode(L"abc", TextEncoding::Ansi, LineEnding::CrLf, &lossy) == "abc" && !lossy);
+    text_encode(L"\u4E2D", TextEncoding::Ansi, LineEnding::CrLf, &lossy);
+    CHECK(lossy);
+    // a round trip keeps the bytes
+    std::string utf16 = text_encode(L"x\r\ny", TextEncoding::Utf16Le, LineEnding::Lf);
+    f = text_decode(utf16);
+    CHECK(f.enc == TextEncoding::Utf16Le && f.eol == LineEnding::Lf && text_encode(f.text, f.enc, f.eol) == utf16);
+}
+
+static void note_sessions() {
+    NoteSession s;
+    s.active = 1;
+    s.wrap = false;
+    s.zoom = 150;
+    s.x = -8; s.y = 20; s.w = 900; s.h = 600; s.maximized = true;
+    NoteTabState a;
+    a.path = L"C:\\Users\\me\\to do = list.txt";
+    a.enc = TextEncoding::Utf16Be;
+    a.eol = LineEnding::Lf;
+    a.selStart = 3; a.selEnd = 7; a.top = 12;
+    a.fileTime = 0x01DB1F0A5C1A2B3Full;
+    NoteTabState b;
+    b.untitled = 1;
+    b.dirty = true;
+    b.cache = L"note-1.txt";
+    s.tabs = { a, b };
+    NoteSession r = note_session_parse(note_session_serialize(s));
+    CHECK(r.active == 1 && !r.wrap && r.statusBar && r.zoom == 150);
+    CHECK(r.x == -8 && r.y == 20 && r.w == 900 && r.h == 600 && r.maximized);
+    CHECK(r.tabs.size() == 2);
+    if (r.tabs.size() == 2) {
+        CHECK_EQ(r.tabs[0].path, a.path);
+        CHECK(r.tabs[0].enc == TextEncoding::Utf16Be && r.tabs[0].eol == LineEnding::Lf && !r.tabs[0].dirty);
+        CHECK(r.tabs[0].selStart == 3 && r.tabs[0].selEnd == 7 && r.tabs[0].top == 12 && r.tabs[0].fileTime == a.fileTime);
+        CHECK(r.tabs[1].untitled == 1 && r.tabs[1].dirty && r.tabs[1].path.empty());
+        CHECK_EQ(r.tabs[1].cache, L"note-1.txt");
+    }
+    // nothing, or nonsense: defaults
+    r = note_session_parse(L"");
+    CHECK(r.tabs.empty() && r.wrap && r.statusBar && r.zoom == 100 && r.w == 0);
+    r = note_session_parse(L"[notepad]\r\nactive=9\r\nzoom=9999\r\n[tab1]\r\nencoding=77\r\n[tab2]\r\npath=a.txt\r\n");
+    CHECK(r.tabs.size() == 1 && r.active == 0 && r.zoom == 500);
 }
 
 static void command_line_round_trip() {
@@ -923,7 +1012,25 @@ static void image_formats() {
     CHECK(!svg_size("<html><svgx/></html>", w, h));
 }
 
+// ------------------------------------------------------------------
+// the default app's check value (checked against hashes Windows itself wrote)
+
+static void user_choice() {
+    const std::wstring sid = L"S-1-5-21-1111111111-2222222222-3333333333-1001";
+    FILETIME t{ 0x5C1A2B3Fu, 0x01DB1F0Au };
+    CHECK_EQ(user_choice_hash(L".mp3", sid, L"ExplorerPlus.mp3", t), L"atetQeeExhM=");
+    // case doesn't count, nor the seconds
+    FILETIME later{ t.dwLowDateTime + 10000000u, t.dwHighDateTime };
+    CHECK_EQ(user_choice_hash(L".MP3", sid, L"explorerplus.mp3", later), L"atetQeeExhM=");
+    FILETIME nextMinute{ t.dwLowDateTime + 600000000u, t.dwHighDateTime };
+    CHECK(user_choice_hash(L".mp3", sid, L"ExplorerPlus.mp3", nextMinute) != L"atetQeeExhM=");
+    CHECK(user_choice_hash(L".mp4", sid, L"ExplorerPlus.mp3", t) != L"atetQeeExhM=");
+}
+
 int wmain() {
+    user_choice();
+    text_files();
+    note_sessions();
     queue_order();
     queue_remove();
     queue_shuffle();

@@ -98,10 +98,22 @@ File Explorer while starting in well under 100 ms.
   "Save queue as playlist..." (Ctrl+S). Paths inside the playlist's folder are written
   relative, so the folder can move; `.m3u8` is UTF-8.
 - **Media file types** ("…" ▸ Media file types...): tick the music, video, picture and
-  playlist types Explorer Plus should open and press Apply. They are registered for your
-  account only; Windows lets only you pick a default app, so Apply opens Settings at
-  Explorer Plus' page (double-click a type to pick it for that type alone). Files opened
-  this way go to the one player; several opened together are queued.
+  playlist types Explorer Plus should open and press Apply: Explorer Plus becomes their
+  default app at once, for your account only (no administrator needed). Unticked types go
+  back to the app they had before. A type Windows keeps to itself is left to Settings,
+  which then opens at Explorer Plus' page; double-click a type for Windows' own "Open with"
+  list. Files opened this way go to the one player; several opened together are queued.
+- **Notepad** ("…" ▸ Notepad, or "Edit in Explorer Plus" in the compact menu of text
+  files): text files in tabs, as in Windows 11's Notepad. Its tabs stay as you leave them,
+  unsaved text included (kept a second after each change, so a crash loses nothing): closing
+  the window asks nothing, and it opens again with them. Files keep their encoding (UTF-8,
+  with or without BOM, UTF-16 LE / BE, ANSI) and line endings (CRLF, LF, CR), both shown in
+  the status bar and changeable there or in File; Save as offers the encoding too. Find,
+  replace (Replace all is one step to undo), go to line, word wrap, zoom, time / date; a file
+  changed by another program is read again unless you changed it too; drop files on it to
+  open them; drag tabs to reorder them. Keys: Ctrl+N / Ctrl+T new tab, Ctrl+O, Ctrl+S,
+  Ctrl+Shift+S, Ctrl+W, Ctrl+Shift+W close window, Ctrl+Tab / Ctrl+1..9, Ctrl+F, F3 /
+  Shift+F3, Ctrl+H, Ctrl+G, F5, Ctrl+Plus / Minus / 0 (or Ctrl+wheel), Alt+F / E / V menus.
 - **Screenshots** (Alt+Q anywhere while Explorer Plus runs, or "…" ▸ Take a screenshot):
   drag a region or click for the whole screen (Enter: the screen under the mouse, Esc
   cancels). It is copied to the clipboard and opens in the picture editor.
@@ -136,7 +148,8 @@ Unsigned builds trigger a SmartScreen prompt on first run ("More info" → "Run 
 
 Command line: `explorer-plus.exe [--new-window] [folder or file]`; a file opens its folder
 with the file selected. `explorer-plus.exe --play <file>` plays a media file or playlist (or
-shows a picture) in the player, as the registered file types do.
+shows a picture) in the player, as the registered file types do. `explorer-plus.exe --notepad
+[file]` opens the Notepad (with the file in a tab); a Notepad already open takes it.
 
 ## Settings
 
@@ -157,7 +170,8 @@ screenshotHotkey=1
 ```
 
 `[tree]` caches the Quick access pins so they show instantly; it is rewritten
-automatically.
+automatically. The Notepad keeps its tabs in `Notepad\session.ini` beside the settings file,
+and each tab's unsaved text in a `note-*.txt` (UTF-16) there.
 
 Environment variables (diagnostics and tests):
 
@@ -193,7 +207,7 @@ pwsh tools/package.ps1 -Version 1.2.0     # -> dist/explorer-plus-1.2.0-win-x64.
 ## Tests and profiling
 
 ```powershell
-ctest --test-dir build --output-on-failure                          # unit tests (INI, command line, play queue)
+ctest --test-dir build --output-on-failure                          # unit tests (INI, command line, play queue, text files)
 python -I tools/smoke_test.py build\explorer-plus.exe build\smoke   # GUI smoke test
 python -I tools/perf.py build\explorer-plus.exe build\perf 5         # startup / 30k files / scroll / sort / views / resize
 ```
@@ -237,7 +251,8 @@ src/visual             player's visualizations (Direct2D on Direct3D 11, a threa
 src/imageview, loudness   player's pictures (WIC, Direct2D SVG, GDI+ metafiles), loudness levelling
 src/imageformats       TGA, QOI, HDR, PSD, PCX decoders; APNG frames; SVG size
 src/screenshot, imageedit, shapes   Alt+Q screenshots, picture editor, its objects' geometry
-src/assoc              media file type registration (Media file types)
+src/assoc, userchoice  media file type registration (Media file types), the default-app hash
+src/notepad, textfile  the Notepad window; text encodings, line endings, its kept tabs
 src/settings, ini, theme, perf, crash   settings.ini, colours and fonts, profiling, crash dumps
 src/cmdline            command line and typed-path text
 tests/                 unit tests (ctest)

@@ -15,6 +15,7 @@
 #include "player.h"
 #include "imageview.h"
 #include "imageedit.h"
+#include "notepad.h"
 #include <algorithm>
 #include <map>
 
@@ -173,6 +174,7 @@ static void invoke_id(HWND hwnd, IContextMenu* cm, UINT id, POINT pt, PCIDLIST_A
 // ------------------------------------------------------------------
 static const UINT kFlyMore = 0x8001, kFlyNewTab = 0x8002, kFlyNewWindow = 0x8003;
 static const UINT kFlyPlay = 0x8004, kFlyEnqueue = 0x8005, kFlyPlaylist = 0x8006, kFlyEditPicture = 0x8007;
+static const UINT kFlyNotepad = 0x8008;
 
 struct ShellEntry {
     UINT id = 0;
@@ -341,8 +343,9 @@ static void fly_app_verbs(std::vector<FlyEntry>& list, const std::vector<ShellEn
             list.push_back(fly_from(e, L'\xE7EF'));
 }
 
-// `picture`: one picture chosen (Edit picture)
-static UINT item_flyout(HWND hwnd, IContextMenu* cm, HMENU m, POINT pt, bool folder, PlayerOffer media, bool picture) {
+// `picture`: one picture chosen (Edit picture); `text`: text files (Edit in Explorer Plus)
+static UINT item_flyout(HWND hwnd, IContextMenu* cm, HMENU m, POINT pt, bool folder, PlayerOffer media, bool picture,
+                        bool text) {
     auto items = menu_entries(cm, m);
     std::vector<FlyButton> row;
     static const struct { const wchar_t* verb; wchar_t glyph; const wchar_t* tip; } kRow[] = {
@@ -378,6 +381,7 @@ static UINT item_flyout(HWND hwnd, IContextMenu* cm, HMENU m, POINT pt, bool fol
         if (media == PlayerOffer::Play) list.push_back(fly_item(kFlyPlaylist, L"Create playlist...", L'\xEA37'));
     }
     if (picture) list.push_back(fly_item(kFlyEditPicture, L"Edit picture", L'\xE70F'));
+    if (text) list.push_back(fly_item(kFlyNotepad, L"Edit in Explorer Plus", L'\xE70B'));
     for (auto& e : items)
         if (e.sub && plain_text(lower(e.text)).rfind(L"open with", 0) == 0) {
             if (!taken(&e)) { list.push_back(fly_from(e, L'\xE7AC')); used.push_back(&e); }
@@ -496,8 +500,15 @@ static void show_cm(HWND hwnd, POINT pt, IShellFolder* parent, PCIDLIST_ABSOLUTE
     }
     // (a picture: drawn on and written, by the picture editor)
     bool picture = media.size() == 1 && cidl == 1 && !media[0].folder && image_file(media[0].path);
-    UINT id = track(hwnd, cm.get(), m, pt, [&] { return item_flyout(hwnd, cm.get(), m, pt, folder, offer, picture); });
-    if (id == kFlyPlay || id == kFlyEnqueue) {
+    // (text files, all of them: each in a tab of the Notepad)
+    bool text = !media.empty() && media.size() == cidl && media.size() <= 100 &&
+                std::all_of(media.begin(), media.end(), [](const MediaItem& i) { return !i.folder && notepad_text_file(i.path); });
+    UINT id = track(hwnd, cm.get(), m, pt, [&] { return item_flyout(hwnd, cm.get(), m, pt, folder, offer, picture, text); });
+    if (id == kFlyNotepad) {
+        std::vector<std::wstring> files;
+        for (auto& i : media) files.push_back(i.path);
+        notepad_open(files);
+    } else if (id == kFlyPlay || id == kFlyEnqueue) {
         player_open(media, id == kFlyEnqueue);
     } else if (id == kFlyPlaylist) {
         player_save_playlist(hwnd, media);
