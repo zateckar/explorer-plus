@@ -49,7 +49,7 @@ const UINT WM_PLAYLIST_FAILED = WM_APP + 47;    // to the message window, lParam
 // opens each of the files selected in a process of its own)
 const ULONG_PTR kCopyPlay = 0x45505031, kCopyEnqueue = 0x45505032, kCopyView = 0x45505033, kCopyOpen = 0x45505034;
 const ULONGLONG kOpenTogetherMs = 2500;     // files opened this close together: one queue
-const UINT_PTR TIMER_POSITION = 1, TIMER_SKIP = 2, TIMER_HIDE_BAR = 3, TIMER_SPECTRUM = 4, TIMER_LEVEL = 5, TIMER_SUBS = 6;
+const UINT_PTR TIMER_POSITION = 1, TIMER_SKIP = 2, TIMER_HIDE_BAR = 3, TIMER_SPECTRUM = 4, TIMER_LEVEL = 5, TIMER_SUBS = 6, TIMER_ANIM = 7;
 const wchar_t kAppId[] = L"RadimZatecka.ExplorerPlus.Player";   // its own taskbar button
 const UINT s_taskbarCreated = RegisterWindowMessageW(L"TaskbarButtonCreated");
 const size_t kMaxFiles = 10000;             // a folder walk stops there
@@ -58,6 +58,7 @@ enum Cmd : UINT {
     CMD_PLAYPAUSE = 100, CMD_PREV, CMD_NEXT, CMD_SHUFFLE, CMD_REPEAT, CMD_MUTE, CMD_QUEUE, CMD_FULL,
     CMD_CLEAR, CMD_PLAY_SELECTED, CMD_REMOVE_SELECTED, CMD_LEVEL, CMD_VIS_NEXT, CMD_VIS_PREV,
     CMD_VIS_CYCLE, CMD_SAVE_PLAYLIST, CMD_EDIT_PICTURE, CMD_SUBS_OFF, CMD_SUBS_CHOOSE, CMD_SUBS_NEXT, CMD_AUDIO_NEXT,
+    CMD_PAGE_PREV, CMD_PAGE_NEXT,
     CMD_SLIDE = 200,                // + seconds: the slide show's interval
     CMD_VIS = 300,                  // + VisStyle: the visualization
     CMD_SUB = 400,                  // + index: the subtitles shown (Player::subs)
@@ -128,6 +129,7 @@ struct Player {
     int slideSecs = 5;
     ULONGLONG slideStart = 0;       // when the picture came on screen (0: not yet)
     ULONGLONG slideDone = 0;        // ms of it shown before a pause
+    size_t animFrame = 0;           // an animation's frame on screen (img.frames)
     // loudness levelling: tracks brought to about the same loudness
     bool level = true;
     double gainDb = 0;              // the current track's
@@ -291,7 +293,8 @@ std::wstring current_detail(Player& p) {
     if (image_current(p)) {                 // "4032 × 3024 · 3 of 120"
         std::wstring s;
         if (p.img.id == p.q.at(p.q.current()).id && p.img.fullW > 0)
-            s = std::to_wstring(p.img.fullW) + L" \x00D7 " + std::to_wstring(p.img.fullH) + L" \x00B7 ";
+            s = std::to_wstring(p.img.fullW) + L" \x00D7 " + std::to_wstring(p.img.fullH) + L" \x00B7 " +
+                (p.img.pages > 1 ? L"page " + std::to_wstring(p.img.page + 1) + L" of " + std::to_wstring(p.img.pages) + L" \x00B7 " : L"");
         return s + std::to_wstring(p.q.current() + 1) + L" of " + std::to_wstring(p.q.size());
     }
     std::wstring a = p.mp->artist(), b = p.mp->album();
@@ -524,6 +527,7 @@ void spectrum_reset(Player& p);
 void set_vis(Player& p, int style);
 
 void image_forget(Player& p) {
+    KillTimer(p.wnd, TIMER_ANIM);
     p.img = {};
     if (p.imgBmp) DeleteObject(p.imgBmp);
     p.imgBmp = nullptr;
@@ -536,6 +540,36 @@ void image_box(Player& p, int& w, int& h) {
     GetMonitorInfoW(MonitorFromWindow(p.wnd, MONITOR_DEFAULTTONEAREST), &mi);
     w = std::max(320, (int)(mi.rcMonitor.right - mi.rcMonitor.left));
     h = std::max(240, (int)(mi.rcMonitor.bottom - mi.rcMonitor.top));
+}
+
+// an animation: its frames in turn, each for its time (a still picture: none)
+void anim_start(Player& p) {
+    p.animFrame = 0;
+    KillTimer(p.wnd, TIMER_ANIM);
+    if (p.img.frames.size() > 1 && p.img.delays.size() == p.img.frames.size())
+        SetTimer(p.wnd, TIMER_ANIM, (UINT)p.img.delays[0], nullptr);
+}
+
+void anim_tick(Player& p) {
+    if (!image_current(p) || p.img.frames.size() < 2 || p.img.delays.size() != p.img.frames.size()) {
+        KillTimer(p.wnd, TIMER_ANIM);
+        return;
+    }
+    p.animFrame = (p.animFrame + 1) % p.img.frames.size();
+    p.img.pixels = p.img.frames[p.animFrame];
+    InvalidateRect(p.video, nullptr, FALSE);
+    SetTimer(p.wnd, TIMER_ANIM, (UINT)p.img.delays[p.animFrame], nullptr);
+}
+
+// a TIFF's page before / after the one shown
+void image_page(Player& p, int step) {
+    int i = p.q.current();
+    if (!image_current(p) || p.img.id != p.q.at(i).id || p.img.pages < 2) return;
+    int page = p.img.page + step;
+    if (page < 0 || page >= p.img.pages) { MessageBeep(MB_OK); return; }
+    int w = 0, h = 0;
+    image_box(p, w, h);
+    image_request(p.wnd, WM_IMAGE, p.img.id, p.q.at(i).path, w, h, std::wstring(), page);
 }
 
 // a picture: shown (decoded on a thread; the one before stays meanwhile), the next one
@@ -684,6 +718,7 @@ void on_image(Player& p, ImageNote* n) {
         QueueEntry& e = p.q.at(i);
         if (n->pixels) {
             p.img = std::move(*n);
+            anim_start(p);
             p.message.clear();
             e.failed = false;
             p.slideStart = GetTickCount64();
@@ -859,6 +894,7 @@ void command(Player& p, UINT cmd) {
             break;
         }
         case CMD_SUBS_OFF: case CMD_SUBS_CHOOSE: case CMD_SUBS_NEXT: subs_command(p, cmd); break;
+        case CMD_PAGE_PREV: case CMD_PAGE_NEXT: image_page(p, cmd == CMD_PAGE_NEXT ? 1 : -1); break;
         case CMD_AUDIO_NEXT: {
             int n = (int)p.mp->audio_tracks().size();
             if (n > 1) p.mp->set_audio_track((p.mp->audio_track() + 1) % n);
@@ -2575,6 +2611,10 @@ void view_menu(Player& p, POINT pt) {
     if (image_current(p)) {
         AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(m, MF_STRING | (p.message.empty() ? 0 : MF_GRAYED), CMD_EDIT_PICTURE, L"Edit picture\tCtrl+E");
+        if (p.img.pages > 1) {
+            AppendMenuW(m, MF_STRING | (p.img.page > 0 ? 0 : MF_GRAYED), CMD_PAGE_PREV, L"Previous page\tPage Up");
+            AppendMenuW(m, MF_STRING | (p.img.page + 1 < p.img.pages ? 0 : MF_GRAYED), CMD_PAGE_NEXT, L"Next page\tPage Down");
+        }
     }
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, CMD_FULL, p.full ? L"Exit full screen\tEsc" : L"Full screen\tF");
@@ -2935,6 +2975,7 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (wp == TIMER_SPECTRUM) spectrum_tick(p);
             else if (wp == TIMER_LEVEL) level_start(p);
             else if (wp == TIMER_SUBS) subs_tick(p);
+            else if (wp == TIMER_ANIM) anim_tick(p);
             else if (wp == TIMER_SKIP) { KillTimer(hwnd, TIMER_SKIP); next(p); }
             else if (wp == TIMER_HIDE_BAR) {
                 POINT c{};
@@ -3301,6 +3342,10 @@ bool player_translate(MSG* m) {
             if (vk == 'S' && !ctrl && !inList) { if (!held) command(p, CMD_SUBS_NEXT); return true; }
             if (!ctrl || shift) return false;
             if (!held) command(p, vk == 'S' ? CMD_SAVE_PLAYLIST : CMD_EDIT_PICTURE);
+            return true;
+        case VK_PRIOR: case VK_NEXT:                // a TIFF's pages
+            if (inList || ctrl || !image_current(p) || p.img.pages < 2) return false;
+            command(p, vk == VK_NEXT ? CMD_PAGE_NEXT : CMD_PAGE_PREV);
             return true;
         case VK_F11:
             if (!held) command(p, CMD_FULL);

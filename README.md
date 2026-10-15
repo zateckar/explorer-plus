@@ -68,7 +68,11 @@ File Explorer while starting in well under 100 ms.
   turn it off). "View in Explorer Plus" on a picture shows its folder's pictures in the
   player: Left / Right or the mouse wheel step through them, Play runs a slide show (its
   interval in the right-click menu), full screen as for video; photos are turned upright
-  as the camera recorded. Its own taskbar button, with
+  as the camera recorded. Whatever Windows has codecs for (JPEG, PNG, GIF, BMP, TIFF,
+  icons, HEIC / WebP / AVIF / camera raw with their Store extensions) and SVG, EMF / WMF,
+  TGA, QOI, Radiance HDR, Photoshop PSD / PSB (the saved composite) and PCX; GIF and APNG
+  animations play, a TIFF's pages turn with Page Up / Page Down, drawings are drawn sharp
+  at the size shown. Its own taskbar button, with
   the track's progress and Previous / Play / Next in the thumbnail. Windows' own Media
   Foundation plays (the formats and codecs Windows has, Opus in MP4 too; Windows N needs
   the Media Feature Pack), nothing to install. Keys: Space
@@ -228,7 +232,8 @@ src/detailspane, preview   details / preview pane
 src/player, media, playlist   media player window, Media Foundation playback, play queue
 src/mediainfo, mediadata, spectrum   player's cover and tags, their pure helpers, spectrogram
 src/visual             player's visualizations (Direct2D on Direct3D 11, a thread of their own)
-src/imageview, loudness   player's pictures (WIC), loudness levelling
+src/imageview, loudness   player's pictures (WIC, Direct2D SVG, GDI+ metafiles), loudness levelling
+src/imageformats       TGA, QOI, HDR, PSD, PCX decoders; APNG frames; SVG size
 src/screenshot, imageedit, shapes   Alt+Q screenshots, picture editor, its objects' geometry
 src/assoc              media file type registration (Media file types)
 src/settings, ini, theme, perf, crash   settings.ini, colours and fonts, profiling, crash dumps

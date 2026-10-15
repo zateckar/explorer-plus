@@ -4,6 +4,7 @@
 #include "cmdline.h"
 #include "playlist.h"
 #include "mediadata.h"
+#include "imageformats.h"
 #include "shapes.h"
 #include <algorithm>
 #include <cmath>
@@ -741,6 +742,187 @@ static void subtitles() {
     CHECK(!subtitle_for(L"Film.mkv", L"Filmy.en.srt"));
 }
 
+static void image_formats() {
+    using V = std::vector<uint8_t>;
+    auto u16 = [](V& v, unsigned x) { v.push_back((uint8_t)x); v.push_back((uint8_t)(x >> 8)); };
+    auto b16 = [](V& v, unsigned x) { v.push_back((uint8_t)(x >> 8)); v.push_back((uint8_t)x); };
+    auto b32 = [](V& v, uint32_t x) { for (int s = 24; s >= 0; s -= 8) v.push_back((uint8_t)(x >> s)); };
+    RawImage im;
+
+    // TGA: 24-bit, bottom-up
+    V tga = { 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    u16(tga, 2); u16(tga, 2);
+    tga.push_back(24); tga.push_back(0);
+    for (uint8_t b : { 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255 }) tga.push_back(b);   // red green / blue white
+    CHECK(tga_decode(tga.data(), tga.size(), im) && im.w == 2 && im.h == 2);
+    if (im.px.size() == 4) {
+        CHECK(im.px[0] == 0xFF0000FFu && im.px[1] == 0xFFFFFFFFu);          // (top row: blue, white)
+        CHECK(im.px[2] == 0xFFFF0000u && im.px[3] == 0xFF00FF00u);
+    }
+    CHECK(!tga_decode(tga.data(), tga.size() - 1, im));                    // cut short
+    // TGA: run-length 32-bit, top-down, half see-through (premultiplied out)
+    V rle = { 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    u16(rle, 3); u16(rle, 1);
+    rle.push_back(32); rle.push_back(0x28);
+    for (uint8_t b : { 0x82, 10, 20, 30, 128 }) rle.push_back(b);
+    CHECK(tga_decode(rle.data(), rle.size(), im) && im.w == 3 && im.px.size() == 3);
+    if (im.px.size() == 3) CHECK(im.px[2] == 0x800F0A05u);
+    // TGA: 32-bit that says nothing of alpha and has none: opaque
+    rle[17] = 0x20;
+    rle[rle.size() - 1] = 0;
+    CHECK(tga_decode(rle.data(), rle.size(), im) && im.px.size() == 3 && im.px[0] == 0xFF1E140Au);
+
+    // QOI: RGB, run, diff, luma, index
+    V qoi = { 'q', 'o', 'i', 'f' };
+    b32(qoi, 5); b32(qoi, 1);
+    qoi.push_back(4); qoi.push_back(0);
+    for (uint8_t b : { 0xFE, 255, 0, 0, 0xC0, 0x5B, 0xA5, 0x88, 0x32, 0, 0, 0, 0, 0, 0, 0, 1 }) qoi.push_back(b);
+    CHECK(qoi_decode(qoi.data(), qoi.size(), im) && im.w == 5 && im.h == 1);
+    if (im.px.size() == 5) {
+        CHECK(im.px[0] == 0xFFFF0000u && im.px[1] == 0xFFFF0000u);
+        CHECK(im.px[2] == 0xFFFE0001u);
+        CHECK(im.px[3] == 0xFF030506u);
+        CHECK(im.px[4] == 0xFFFF0000u);
+    }
+    qoi[4] = 0x7F;                                                          // (an absurd width)
+    CHECK(!qoi_decode(qoi.data(), qoi.size(), im));
+
+    // Radiance HDR: flat, and run-length coded
+    std::string hs = "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 2\n";
+    V hdr(hs.begin(), hs.end());
+    for (uint8_t b : { 128, 128, 128, 129, 0, 0, 0, 0 }) hdr.push_back(b);
+    CHECK(hdr_decode(hdr.data(), hdr.size(), im) && im.w == 2 && im.h == 1);
+    if (im.px.size() == 2) {
+        unsigned r = (im.px[0] >> 16) & 255, g = (im.px[0] >> 8) & 255, b = im.px[0] & 255;
+        CHECK(r == g && g == b && r == 255);        // (within the screen's range: as it is)
+        CHECK(im.px[1] == 0xFF000000u);
+    }
+    hs = "#?RADIANCE\n\n-Y 1 +X 8\n";
+    V hdr2(hs.begin(), hs.end());
+    for (uint8_t b : { 2, 2, 0, 8 }) hdr2.push_back(b);
+    for (int c = 0; c < 4; ++c) { hdr2.push_back(128 + 8); hdr2.push_back(128); }
+    CHECK(hdr_decode(hdr2.data(), hdr2.size(), im) && im.w == 8 && im.px.size() == 8);
+    if (im.px.size() == 8) CHECK(std::all_of(im.px.begin(), im.px.end(), [&](uint32_t v) { return v == im.px[0]; }));
+    hs = "#?RADIANCE\nFORMAT=32-bit_rle_xyze\n\n-Y 1 +X 1\n";
+    V xyz(hs.begin(), hs.end());
+    for (int k = 0; k < 4; ++k) xyz.push_back(1);
+    CHECK(!hdr_decode(xyz.data(), xyz.size(), im));
+
+    // PSD: raw RGB, and PackBits RGB
+    auto psd_head = [&](unsigned ch, uint32_t h, uint32_t w, unsigned comp) {
+        V v = { '8', 'B', 'P', 'S', 0, 1, 0, 0, 0, 0, 0, 0 };
+        b16(v, ch); b32(v, h); b32(v, w); b16(v, 8); b16(v, 3);
+        b32(v, 0); b32(v, 0); b32(v, 0);                                   // mode data, resources, layers
+        b16(v, comp);
+        return v;
+    };
+    V psd = psd_head(3, 1, 2, 0);
+    for (uint8_t b : { 255, 0, 0, 255, 0, 0 }) psd.push_back(b);
+    CHECK(psd_decode(psd.data(), psd.size(), im) && im.w == 2 && im.px.size() == 2);
+    if (im.px.size() == 2) CHECK(im.px[0] == 0xFFFF0000u && im.px[1] == 0xFF00FF00u);
+    V psdr = psd_head(3, 1, 4, 1);
+    b16(psdr, 2); b16(psdr, 5); b16(psdr, 2);
+    for (uint8_t b : { 0xFD, 10, 0x03, 1, 2, 3, 4, 0xFD, 7 }) psdr.push_back(b);
+    CHECK(psd_decode(psdr.data(), psdr.size(), im) && im.w == 4 && im.px.size() == 4);
+    if (im.px.size() == 4) CHECK(im.px[0] == 0xFF0A0107u && im.px[3] == 0xFF0A0407u);
+    psdr.resize(psdr.size() - 3);
+    CHECK(!psd_decode(psdr.data(), psdr.size(), im));
+
+    // PCX: 256 colours run-length coded with the palette after; 24-bit planes
+    V pcx(128, 0);
+    pcx[0] = 0x0A; pcx[1] = 5; pcx[2] = 1; pcx[3] = 8;
+    pcx[8] = 1; pcx[10] = 1; pcx[65] = 1; pcx[66] = 2;
+    for (uint8_t b : { 0xC2, 1, 2, 0xC1, 3 }) pcx.push_back(b);
+    pcx.push_back(0x0C);
+    V pal(768, 0);
+    pal[3] = 255; pal[7] = 255; pal[11] = 255;                              // 1 red, 2 green, 3 blue
+    pcx.insert(pcx.end(), pal.begin(), pal.end());
+    CHECK(pcx_decode(pcx.data(), pcx.size(), im) && im.w == 2 && im.h == 2);
+    if (im.px.size() == 4)
+        CHECK(im.px[0] == 0xFFFF0000u && im.px[1] == 0xFFFF0000u && im.px[2] == 0xFF00FF00u && im.px[3] == 0xFF0000FFu);
+    V pcx24(128, 0);
+    pcx24[0] = 0x0A; pcx24[3] = 8; pcx24[65] = 3; pcx24[66] = 1;
+    for (uint8_t b : { 1, 2, 3 }) pcx24.push_back(b);
+    CHECK(pcx_decode(pcx24.data(), pcx24.size(), im) && im.px.size() == 1 && im.px[0] == 0xFF010203u);
+
+    CHECK(own_image_ext(L".TGA") && own_image_ext(L".psb") && own_image_ext(L".pic") && !own_image_ext(L".png"));
+    CHECK(own_image_decode(L".Qoi", qoi.data(), 0, im) == false);
+
+    // animation frames: kept, restored, cleared, drawn over
+    AnimCanvas cv(2, 1);
+    const uint32_t red[2] = { 0xFFFF0000u, 0xFFFF0000u }, blue = 0xFF0000FFu, half = 0x80808080u;
+    AnimFrame a; a.w = 2; a.h = 1; a.px = red;
+    CHECK(cv.add(a)[1] == 0xFFFF0000u);
+    AnimFrame b; b.x = 1; b.w = 1; b.h = 1; b.px = &blue; b.dispose = AnimFrame::Restore;
+    CHECK(cv.add(b)[1] == blue);
+    AnimFrame c; c.w = 1; c.h = 1; c.px = &half; c.dispose = AnimFrame::Clear;
+    const auto& afterC = cv.add(c);
+    CHECK(afterC[0] == 0xFFFF8080u && afterC[1] == 0xFFFF0000u);           // (blue undone, half white over red)
+    AnimFrame none;
+    const auto& afterD = cv.add(none);
+    CHECK(afterD[0] == 0 && afterD[1] == 0xFFFF0000u);
+
+    // APNG: its frames as PNGs of their own
+    auto chunk = [&](V& v, const char* t, const V& data) {
+        b32(v, (uint32_t)data.size());
+        v.insert(v.end(), t, t + 4);
+        v.insert(v.end(), data.begin(), data.end());
+        b32(v, 0);                                                          // (the CRC isn't checked)
+    };
+    auto fctl = [&](uint32_t seq, uint32_t w, uint32_t h, uint32_t x, uint32_t y, unsigned num, unsigned den, uint8_t disp, uint8_t blend) {
+        V v;
+        b32(v, seq); b32(v, w); b32(v, h); b32(v, x); b32(v, y); b16(v, num); b16(v, den);
+        v.push_back(disp); v.push_back(blend);
+        return v;
+    };
+    V png = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n' };
+    V ihdr;
+    b32(ihdr, 2); b32(ihdr, 2);
+    for (uint8_t b2 : { 8, 6, 0, 0, 0 }) ihdr.push_back(b2);
+    chunk(png, "IHDR", ihdr);
+    V still = png;
+    chunk(png, "acTL", { 0, 0, 0, 2, 0, 0, 0, 0 });
+    chunk(png, "PLTE", { 1, 2, 3 });
+    chunk(png, "fcTL", fctl(0, 2, 2, 0, 0, 1, 10, 0, 0));
+    chunk(png, "IDAT", { 'a', 'b', 'c' });
+    chunk(png, "fcTL", fctl(1, 1, 1, 1, 1, 0, 0, 1, 1));
+    chunk(png, "fdAT", { 0, 0, 0, 2, 'x', 'y' });
+    chunk(png, "IEND", {});
+    int cw = 0, ch = 0;
+    std::vector<ApngFrame> frames;
+    CHECK(apng_split(png.data(), png.size(), cw, ch, frames) && cw == 2 && ch == 2 && frames.size() == 2);
+    if (frames.size() == 2) {
+        CHECK(frames[0].delayMs == 100 && frames[0].dispose == AnimFrame::Keep && !frames[0].over);
+        CHECK(frames[1].x == 1 && frames[1].y == 1 && frames[1].w == 1 && frames[1].delayMs == 0);
+        CHECK(frames[1].dispose == AnimFrame::Clear && frames[1].over);
+        const V& f = frames[1].png;
+        // signature, IHDR (1 x 1), PLTE, IDAT "xy", IEND
+        CHECK(f.size() == 8 + 25 + 15 + 14 + 12);
+        if (f.size() == 8 + 25 + 15 + 14 + 12) {
+            CHECK(f[16 + 3] == 1 && f[20 + 3] == 1);
+            CHECK(std::string(f.begin() + 8 + 25 + 4, f.begin() + 8 + 25 + 8) == "PLTE");
+            CHECK(std::string(f.begin() + 8 + 25 + 15 + 4, f.begin() + 8 + 25 + 15 + 10) == "IDATxy");
+            const uint8_t crc[4] = { f[8 + 25 + 15 + 10], f[8 + 25 + 15 + 11], f[8 + 25 + 15 + 12], f[8 + 25 + 15 + 13] };
+            CHECK(crc[0] == 0xB2 && crc[1] == 0xC4 && crc[2] == 0x87 && crc[3] == 0xDC);   // crc32("IDATxy")
+        }
+    }
+    chunk(still, "IDAT", { 'a' });
+    chunk(still, "IEND", {});
+    CHECK(!apng_split(still.data(), still.size(), cw, ch, frames));
+    CHECK(anim_delay(0) == 100 && anim_delay(10) == 100 && anim_delay(40) == 40);
+
+    // SVG sizes
+    double w = 0, h = 0;
+    CHECK(svg_size("<?xml version='1.0'?><svg xmlns='http://www.w3.org/2000/svg' width='100' height='50'>", w, h) && w == 100 && h == 50);
+    CHECK(svg_size("<svg viewBox=\"0 0 24 12\"/>", w, h) && w == 24 && h == 12);
+    CHECK(svg_size("<svg width=\"48\" viewBox=\"0 0 24 12\">", w, h) && w == 48 && h == 24);
+    CHECK(svg_size("<svg width=\"100%\" height=\"100%\" viewBox=\"0,0,10,20\">", w, h) && w == 10 && h == 20);
+    CHECK(svg_size("<svg width=\"1in\" height=\"72pt\">", w, h) && w == 96 && h == 96);
+    CHECK(svg_size("<!-- <svg width=\"1\" height=\"1\"> --><svg>", w, h) && w == 300 && h == 150);
+    CHECK(svg_size("<svg stroke-width=\"5\" height=\"10\">", w, h) && w == 300 && h == 10);
+    CHECK(!svg_size("<html><svgx/></html>", w, h));
+}
+
 int wmain() {
     queue_order();
     queue_remove();
@@ -756,6 +938,7 @@ int wmain() {
     formats();
     opus_head();
     subtitles();
+    image_formats();
     ini_round_trip();
     ini_values();
     ini_set_erase();
