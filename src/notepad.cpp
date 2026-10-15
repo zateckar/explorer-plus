@@ -4,10 +4,15 @@
 #include "playlist.h"
 #include "resource.h"
 #include "settings.h"
+#include "syntax.h"
 #include "textfile.h"
+#include "textops.h"
 #include "theme.h"
+#include <commctrl.h>
 #include <commdlg.h>
 #include <dwmapi.h>
+#include <propkey.h>
+#include <propvarutil.h>
 #include <richedit.h>
 #include <richole.h>
 #include <tom.h>
@@ -16,17 +21,26 @@
 #include <shellapi.h>
 #include <windowsx.h>
 #include <algorithm>
+#include <climits>
 #include <memory>
 
 namespace {
 
 const ULONG_PTR kCopyOpen = 0x45504E31;     // WM_COPYDATA 'EPN1': files to open (paths, NUL separated)
 const UINT WM_NOTEPAD_OPEN = WM_APP + 70;   // lParam: std::vector<std::wstring>* (from WM_COPYDATA)
+const UINT WM_NOTEPAD_COLOUR = WM_APP + 71; // the part shown to colour (before it is painted)
+const UINT WM_NOTEPAD_WORK = WM_APP + 72;   // a step of the work done between the user's input
 const UINT_PTR TIMER_KEEP = 1;              // the tabs kept a moment after a change
+const UINT_PTR TIMER_WORK = 2;              // (the next step, after the input and painting waiting)
+const size_t kHead = 1 << 18;               // a big text: this many characters go in at once,
+const size_t kPiece = 1 << 16;              // then this many at a time (some 4 ms each)
+const long kLexChunk = 1 << 16;             // lexed this many at a time; a lexer state kept every 32K
+const long kFar = 1 << 20;                  // a part shown further than this past the known states: lexed from a guess
 const UINT kKeepDelayMs = 1000;
 const ULONGLONG kMaxBytes = 64ull << 20;    // bigger files aren't opened
 const int kTipPlus = 10000;                 // the tooltip of "+" (tabs: their index + 1)
 const UINT s_findMsg = RegisterWindowMessageW(FINDMSGSTRINGW);
+const wchar_t kAppId[] = L"RadimZatecka.ExplorerPlus.Notepad";     // its own taskbar button
 // (declared by tom.h, defined in no import library MinGW has)
 const GUID kIID_ITextDocument = { 0x8CC497C0, 0xA1DF, 0x11CE, { 0x80, 0x98, 0x00, 0xAA, 0x00, 0x47, 0xBE, 0x5D } };
 
@@ -36,12 +50,16 @@ enum Cmd : UINT {
     CMD_FIND, CMD_FINDNEXT, CMD_FINDPREV, CMD_REPLACE, CMD_GOTO, CMD_SELALL, CMD_TIMEDATE,
     CMD_ZOOMIN, CMD_ZOOMOUT, CMD_ZOOMRESET, CMD_STATUSBAR, CMD_WRAP,
     CMD_CLOSEOTHERS, CMD_CLOSERIGHT, CMD_COPYPATH, CMD_SHOWFILE,
+    CMD_DUPLINE, CMD_DELLINE, CMD_LINEUP, CMD_LINEDOWN, CMD_SORTASC, CMD_SORTDESC, CMD_REVERSE, CMD_UNIQUE,
+    CMD_NOEMPTY, CMD_TRIM, CMD_JOIN, CMD_UPPER, CMD_LOWER, CMD_TITLE, CMD_B64ENC, CMD_B64DEC, CMD_URLENC, CMD_URLDEC,
+    CMD_FORMAT, CMD_COMPACT,
     CMD_ENC = 200,                          // + TextEncoding
     CMD_EOL = 220,                          // + LineEnding
+    CMD_LANGAUTO = 239, CMD_LANG = 240,     // + Lang
 };
 
 const wchar_t* const kMenuNames[] = { L"File", L"Edit", L"View" };
-enum StatusPart { SP_CARET, SP_CHARS, SP_ZOOM, SP_EOL, SP_ENC, SP_COUNT };
+enum StatusPart { SP_CARET, SP_CHARS, SP_ZOOM, SP_LANG, SP_EOL, SP_ENC, SP_COUNT };
 
 struct Tab {
     HWND edit = nullptr;
@@ -54,7 +72,25 @@ struct Tab {
     bool cacheStale = false;                // changed since that was written
     ULONGLONG fileTime = 0;                 // its file's write time when read or saved
     int pendingTop = -1;                    // (restored: the first line to show, once it is shown)
+    CHARRANGE pendingSel{ -1, -1 };         // (restored: the selection, once its text is in)
     bool loading = false;                   // (text or look set here: no change of the user's)
+    // a big text: its first part goes in at once, the rest a piece at a time between the user's
+    // input (and all at once before anything that needs the whole text)
+    std::wstring rest;
+    size_t restAt = 0;
+    long lineCp = -1, lineNo = 0;           // a known line: the one at lineCp (the caret's, last shown)
+    // the colours: only of the part shown (and a screen around it), lexed from the nearest
+    // line start whose lexer state is known
+    Lang lang = Lang::None;
+    bool langChosen = false;                // (in View > Syntax; else by the file's name)
+    std::vector<std::pair<long, int>> states;   // (position, the lexer's state there), ascending
+    long changedFrom = 0;                   // the text changed from here since coloured (LONG_MAX: not)
+    long selLow = 0;                        // the lowest selection start since then (where a change began)
+    long hlA = 0, hlB = -1;                 // the part coloured as it is now (hlB < hlA: none)
+    bool guessed = false;                   // that from a guessed state: coloured again once lexed to there
+    std::wstring word;                      // double-clicked: it and all others like it marked
+    CHARRANGE wordSel{ -1, -1 };
+    long wordCount = 0, countAt = -1;       // (counted up to countAt; -1: all)
 };
 
 struct Notepad {
@@ -76,6 +112,10 @@ struct Notepad {
     bool hotPlus = false, tracking = false;
     int dragTab = -1, dragX = 0;
     bool dragging = false;
+    // the title bar is the tab row: its minimize / maximize / close buttons (0, 1, 2)
+    bool activeWnd = true;
+    int capHot = -1, capPressed = -1;
+    bool colourPosted = false, workPosted = false;
     // find and replace
     FINDREPLACEW fr{};
     bool replacing = false;
@@ -136,11 +176,15 @@ Read read_bytes(const std::wstring& path, std::string& out) {
     return r;
 }
 
-bool write_new(const std::wstring& path, const std::string& data) {
+// (the bytes: in parts, as they are held)
+bool write_new(const std::wstring& path, std::string_view data, std::string_view more = {}) {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
-    DWORD done = 0;
-    bool ok = data.empty() || (WriteFile(h, data.data(), (DWORD)data.size(), &done, nullptr) && done == data.size());
+    bool ok = true;
+    for (std::string_view part : { data, more }) {
+        DWORD done = 0;
+        ok = ok && (part.empty() || (WriteFile(h, part.data(), (DWORD)part.size(), &done, nullptr) && done == part.size()));
+    }
     CloseHandle(h);
     if (!ok) DeleteFileW(path.c_str());
     return ok;
@@ -168,9 +212,9 @@ bool write_file(const std::wstring& path, const std::string& data) {
 }
 
 // ours (the session, kept text): written beside, then moved over
-bool write_own(const std::wstring& path, const std::string& data) {
+bool write_own(const std::wstring& path, std::string_view data, std::string_view more = {}) {
     std::wstring tmp = path + L".tmp";
-    return write_new(tmp, data) && MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+    return write_new(tmp, data, more) && MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
 
 // next to the settings file (tests: theirs)
@@ -197,22 +241,8 @@ std::wstring grouped(long long v) {
 }
 
 // ------------------------------------------------------------------
-// the text box (RichEdit, plain text)
+// the text box (RichEdit: rich text, all of it put in, pasted and read as plain)
 // ------------------------------------------------------------------
-std::wstring edit_text(HWND e, bool crlf = true) {
-    GETTEXTLENGTHEX gl{ (DWORD)(GTL_NUMCHARS | GTL_PRECISE | (crlf ? GTL_USECRLF : 0)), 1200 };
-    LRESULT len = SendMessageW(e, EM_GETTEXTLENGTHEX, (WPARAM)&gl, 0);
-    if (len <= 0) return {};
-    std::wstring s((size_t)len + 1, L'\0');
-    GETTEXTEX gt{};
-    gt.cb = (DWORD)(s.size() * sizeof(wchar_t));
-    gt.flags = crlf ? GT_USECRLF : GT_DEFAULT;
-    gt.codepage = 1200;
-    LRESULT got = SendMessageW(e, EM_GETTEXTEX, (WPARAM)&gt, (LPARAM)s.data());
-    s.resize(got > 0 ? (size_t)got : 0);
-    return s;
-}
-
 long text_length(HWND e) {
     GETTEXTLENGTHEX gl{ GTL_NUMCHARS | GTL_PRECISE, 1200 };
     return (long)SendMessageW(e, EM_GETTEXTLENGTHEX, (WPARAM)&gl, 0);
@@ -253,19 +283,86 @@ void style_edit(Notepad& n, Tab& t) {
     theme_style_control(t.edit);
     if (t.doc) t.doc->Undo(tomResume, nullptr);
     t.loading = false;
+    t.hlA = 0;
+    t.hlB = -1;                             // (SCF_ALL took the colours)
 }
 
-void set_text(Notepad& n, Tab& t, const std::wstring& text) {
+void schedule_work(Notepad& n);
+
+// The text (taken: `text` is left empty). A big one's first part only: the box takes some 60 ms
+// a megabyte, so the rest follows a piece at a time, between the user's input.
+void set_text(Notepad& n, Tab& t, std::wstring& text) {
+    t.states.clear();
+    t.changedFrom = 0;
+    t.guessed = false;
+    t.word.clear();
+    t.wordSel = { -1, -1 };
+    t.countAt = -1;
+    t.lineCp = -1;
+    t.pendingSel = { -1, -1 };
+    t.rest.clear();
+    t.restAt = 0;
+    size_t head = text.size();
+    if (head > kHead) {
+        head = kHead;
+        if (IS_HIGH_SURROGATE(text[head - 1])) ++head;
+        t.rest.swap(text);
+        t.restAt = head;
+    }
+    std::wstring& s = t.rest.empty() ? text : t.rest;
+    wchar_t cut = head < s.size() ? s[head] : 0;
+    if (cut) s[head] = 0;
     t.loading = true;
-    SETTEXTEX st{ ST_DEFAULT, 1200 };
-    SendMessageW(t.edit, EM_SETTEXTEX, (WPARAM)&st, (LPARAM)text.c_str());
+    SETTEXTEX st{ ST_DEFAULT | 0x20 /*ST_PLAINTEXTONLY: a file starting {\rtf is text too*/, 1200 };
+    SendMessageW(t.edit, EM_SETTEXTEX, (WPARAM)&st, (LPARAM)s.c_str());
     SendMessageW(t.edit, EM_EMPTYUNDOBUFFER, 0, 0);
     t.loading = false;
+    if (cut) s[head] = cut;
+    text.clear();
     style_edit(n, t);
+    if (!t.rest.empty()) schedule_work(n);
 }
 
-// the caret's line and column, by the file's lines (not as wrapped)
-void caret_place(Tab& t, long& line, long& col) {
+// [a, b) replaced by s: as text (EM_REPLACESEL would read "{\rtf..." as RTF), one step to undo
+void put_text(Tab& t, long a, long b, const std::wstring& s) {
+    ITextRange* r = nullptr;
+    if (!t.doc || FAILED(t.doc->Range(a, b, &r)) || !r) return;
+    BSTR bs = SysAllocStringLen(s.data(), (UINT)s.size());
+    r->SetText(bs);
+    SysFreeString(bs);
+    r->Release();
+}
+
+std::wstring text_range(HWND e, long a, long b) {
+    if (b <= a) return {};
+    std::wstring s((size_t)(b - a) + 1, L'\0');
+    TEXTRANGEW tr{ { a, b }, s.data() };
+    LRESULT got = SendMessageW(e, EM_GETTEXTRANGE, 0, (LPARAM)&tr);
+    s.resize(got > 0 ? (size_t)got : 0);
+    return s;
+}
+
+// [a, b) through the text object model (b -1: to the end): five times quicker than the box's
+// own messages for much of it (20 ms for 50 MB)
+std::wstring doc_text(Tab& t, long a, long b) {
+    std::wstring s;
+    if (b < 0) b = text_length(t.edit);
+    ITextRange* r = nullptr;
+    if (b > a && t.doc && SUCCEEDED(t.doc->Range(a, b, &r)) && r) {
+        BSTR bs = nullptr;
+        if (SUCCEEDED(r->GetText(&bs)) && bs) {
+            s.assign(bs, SysStringLen(bs));
+            SysFreeString(bs);
+        }
+        r->Release();
+    }
+    return s;
+}
+
+// The caret's line and column, by the file's lines (not as wrapped). Unwrapped, they are the
+// box's own lines; wrapped, counted from the line last asked for (the text object counts from
+// the top: 70 ms at the end of 50 MB).
+void caret_place(const Notepad& n, Tab& t, long& line, long& col) {
     CHARRANGE cr = selection(t.edit);
     long cp = cr.cpMax;
     line = 1;
@@ -280,10 +377,352 @@ void caret_place(Tab& t, long& line, long& col) {
     ITextRange* r = nullptr;
     if (FAILED(t.doc->Range(cp, cp, &r)) || !r) return;
     long start = 0;
-    if (SUCCEEDED(r->GetIndex(tomParagraph, &line)) && SUCCEEDED(r->StartOf(tomParagraph, tomMove, nullptr)) &&
-        SUCCEEDED(r->GetStart(&start)))
-        col = cp - start + 1;
+    if (SUCCEEDED(r->StartOf(tomParagraph, tomMove, nullptr)) && SUCCEEDED(r->GetStart(&start))) col = cp - start + 1;
     r->Release();
+    if (!n.wrap) {
+        line = (long)SendMessageW(t.edit, EM_EXLINEFROMCHAR, 0, cp) + 1;
+        return;
+    }
+    if (t.lineCp >= 0 && std::abs(cp - t.lineCp) <= (4 << 20)) {
+        std::wstring s = doc_text(t, std::min(cp, t.lineCp), std::max(cp, t.lineCp));
+        long k = (long)std::count(s.begin(), s.end(), L'\r');
+        t.lineNo += cp >= t.lineCp ? k : -k;
+    } else if (SUCCEEDED(t.doc->Range(cp, cp, &r)) && r) {
+        if (FAILED(r->GetIndex(tomParagraph, &t.lineNo))) t.lineNo = 1;
+        r->Release();
+    }
+    t.lineCp = cp;
+    line = t.lineNo;
+}
+
+// ------------------------------------------------------------------
+// the colours: the part shown and a screen around it, set through the text object model (not
+// undoable, not a change). Lexed from the nearest line start before it
+// whose lexer state is known: the states are kept, every 32K characters, up to a change.
+// ------------------------------------------------------------------
+COLORREF tok_colour(Tok t) {
+    // (as Visual Studio Code's Dark+ and Light+)
+    static const COLORREF dark[] = {
+        0, RGB(106, 153, 85), RGB(206, 145, 120), RGB(181, 206, 168), RGB(86, 156, 214), RGB(78, 201, 176),
+        RGB(220, 220, 170), RGB(197, 134, 192), RGB(86, 156, 214), RGB(156, 220, 254), RGB(156, 220, 254),
+        RGB(86, 156, 214), RGB(156, 220, 254), RGB(86, 156, 214), RGB(215, 186, 125), RGB(78, 201, 176),
+        RGB(129, 184, 139), RGB(244, 135, 113),
+    };
+    static const COLORREF light[] = {
+        0, RGB(0, 128, 0), RGB(163, 21, 21), RGB(9, 134, 88), RGB(0, 0, 255), RGB(38, 127, 153),
+        RGB(121, 94, 38), RGB(175, 0, 219), RGB(128, 0, 0), RGB(229, 0, 0), RGB(4, 81, 165),
+        RGB(128, 0, 0), RGB(0, 16, 128), RGB(0, 0, 255), RGB(128, 0, 128), RGB(0, 102, 204),
+        RGB(9, 134, 88), RGB(163, 21, 21),
+    };
+    static_assert(ARRAYSIZE(dark) == (size_t)Tok::Count && ARRAYSIZE(light) == (size_t)Tok::Count);
+    return t == Tok::Plain || t >= Tok::Count ? pal().text : (g_dark ? dark : light)[(size_t)t];
+}
+
+COLORREF mark_colour() { return g_dark ? RGB(98, 82, 28) : RGB(255, 226, 140); }
+
+void request_colour(Notepad& n) {
+    if (n.colourPosted || !n.wnd) return;
+    n.colourPosted = true;
+    PostMessageW(n.wnd, WM_NOTEPAD_COLOUR, 0, 0);
+}
+
+// to colour again; `relex`: from the start (a new text or language)
+void recolour(Notepad& n, Tab& t, bool relex) {
+    if (relex) {
+        t.states.clear();
+        t.changedFrom = 0;
+    }
+    t.hlA = 0;
+    t.hlB = -1;
+    request_colour(n);
+}
+
+bool word_char(wchar_t c) { return iswalnum(c) || c == L'_'; }
+long line_start(Tab& t, long cp);
+
+void colour(Tab& t) {
+    if (!t.doc || !IsWindowVisible(t.edit)) return;
+    RECT rc{};
+    GetClientRect(t.edit, &rc);
+    POINTL tl{ 0, 0 }, br{ rc.right, rc.bottom };
+    long a = (long)SendMessageW(t.edit, EM_CHARFROMPOS, 0, (LPARAM)&tl);
+    long b = (long)SendMessageW(t.edit, EM_CHARFROMPOS, 0, (LPARAM)&br);
+    long len = text_length(t.edit);
+    long more = std::max(b - a, 2000L);
+    a = std::max(0L, a - more);
+    b = std::min(len, b + more);
+    bool changed = t.changedFrom != LONG_MAX;
+    if (!changed && a >= t.hlA && b <= t.hlB) return;
+    if (changed) {
+        while (!t.states.empty() && t.states.back().first > t.changedFrom) t.states.pop_back();
+        t.changedFrom = LONG_MAX;
+    }
+    t.selLow = selection(t.edit).cpMin;
+    if (t.states.empty()) t.states.push_back({ 0, 0 });
+    std::vector<SyntaxSpan> spans, piece;
+    t.guessed = false;
+    if (t.lang != Lang::None) {
+        auto it = std::upper_bound(t.states.begin(), t.states.end(), std::make_pair(a, INT_MAX)) - 1;
+        long from = it->first;
+        int state = it->second;
+        if (a - from > kFar) {                      // (from a line a little before, as if nothing were open there)
+            from = line_start(t, std::max(0L, a - 4096));
+            state = 0;
+            t.guessed = true;
+        }
+        const long kChunk = kLexChunk;
+        while (from < b) {
+            std::wstring s = doc_text(t, from, std::min(len, from + kChunk));
+            if (s.empty()) break;
+            if (from + (long)s.size() < len) {              // (whole lines)
+                size_t cut = s.find_last_of(L'\r');
+                if (cut != std::wstring::npos && cut > 0) s.resize(cut + 1);
+            }
+            bool wanted = from + (long)s.size() > a;
+            piece.clear();
+            state = syntax_lex(t.lang, s.c_str(), s.size(), state, wanted ? &piece : nullptr);
+            for (const SyntaxSpan& p : piece) {
+                long pa = std::max(a, from + (long)p.start), pb = std::min(b, from + (long)(p.start + p.len));
+                if (pb > pa) spans.push_back({ (uint32_t)pa, (uint32_t)(pb - pa), p.tok });
+            }
+            from += (long)s.size();
+            if (!t.guessed && s.back() == L'\r' && from >= t.states.back().first + kChunk / 2) t.states.push_back({ from, state });
+        }
+    }
+    // the double-clicked word's others
+    std::vector<std::pair<long, long>> found;
+    if (!t.word.empty()) {
+        long base = std::max(0L, a - 1);
+        std::wstring s = text_range(t.edit, base, std::min(len, b + 1));
+        bool whole = std::all_of(t.word.begin(), t.word.end(), word_char);
+        for (size_t p = s.find(t.word); p != std::wstring::npos; p = s.find(t.word, p + 1)) {
+            size_t q = p + t.word.size();
+            if (whole && ((p > 0 && word_char(s[p - 1])) || (q < s.size() && word_char(s[q])))) continue;
+            found.push_back({ base + (long)p, base + (long)q });
+        }
+    }
+    t.loading = true;
+    t.doc->Undo(tomSuspend, nullptr);
+    long frozen = 0;
+    t.doc->Freeze(&frozen);
+    ITextRange* r = nullptr;
+    if (SUCCEEDED(t.doc->Range(a, b, &r)) && r) {
+        auto paint = [&](long x, long y, long fore, long back) {
+            r->SetRange(x, y);
+            ITextFont* f = nullptr;
+            if (SUCCEEDED(r->GetFont(&f)) && f) {
+                if (fore != -1) f->SetForeColor(fore);
+                if (back != -1) f->SetBackColor(back);
+                f->Release();
+            }
+        };
+        paint(a, b, (long)pal().text, tomAutoColor);
+        for (const SyntaxSpan& sp : spans) paint((long)sp.start, (long)(sp.start + sp.len), (long)tok_colour(sp.tok), -1);
+        for (auto& f : found) paint(f.first, f.second, -1, (long)mark_colour());
+        r->Release();
+    }
+    t.doc->Unfreeze(&frozen);
+    t.doc->Undo(tomResume, nullptr);
+    t.loading = false;
+    t.hlA = a;
+    t.hlB = b;
+}
+
+void invalidate_status(Notepad& n);
+
+void clear_word(Notepad& n, Tab& t) {
+    if (t.word.empty()) return;
+    t.word.clear();
+    t.wordSel = { -1, -1 };
+    t.wordCount = 0;
+    t.countAt = -1;
+    recolour(n, t, false);
+    invalidate_status(n);
+}
+
+// a double-click: the word (without the space after it), and every other one like it marked
+void mark_word(Notepad& n, Tab& t) {
+    CHARRANGE cr = selection(t.edit);
+    std::wstring w = text_range(t.edit, cr.cpMin, cr.cpMax);
+    size_t e = w.size();
+    while (e && (w[e - 1] == L' ' || w[e - 1] == L'\t')) --e;
+    w.resize(e);
+    if (w.empty() || w.size() > 256 || w.find(L'\r') != std::wstring::npos) { clear_word(n, t); return; }
+    if ((long)e < cr.cpMax - cr.cpMin) select(t.edit, cr.cpMin, cr.cpMin + (long)e);
+    t.word = w;
+    t.wordSel = { cr.cpMin, cr.cpMin + (long)e };
+    t.wordCount = 0;                        // (counted a piece at a time: a big text has a million)
+    t.countAt = 0;
+    schedule_work(n);
+    recolour(n, t, false);
+    invalidate_status(n);
+}
+
+// the file's lines (not as wrapped): where the one at cp starts, where it ends (at its '\r')
+long line_start(Tab& t, long cp) {
+    long s = cp;
+    ITextRange* r = nullptr;
+    if (t.doc && SUCCEEDED(t.doc->Range(cp, cp, &r)) && r) {
+        r->StartOf(tomParagraph, tomMove, nullptr);
+        r->GetStart(&s);
+        r->Release();
+    }
+    return s;
+}
+
+long line_end(Tab& t, long cp) {
+    long len = text_length(t.edit), e = len;
+    ITextRange* r = nullptr;
+    if (t.doc && SUCCEEDED(t.doc->Range(cp, cp, &r)) && r) {
+        r->EndOf(tomParagraph, tomMove, nullptr);
+        r->GetStart(&e);
+        r->Release();
+    }
+    if (e > len) e = len;
+    else if (e > cp && text_range(t.edit, e - 1, e) == L"\r") --e;
+    return std::max(e, cp);
+}
+
+// ------------------------------------------------------------------
+// the work between the user's input: a big text going in, the double-clicked word's others
+// counted, the text lexed ahead (its states kept: a jump far down is coloured at once). A step
+// of some 12 ms at a time; the next one posted, or after the input and painting waiting.
+// ------------------------------------------------------------------
+double now_ms() {
+    static const double freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return (double)f.QuadPart; }();
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return (double)t.QuadPart * 1000.0 / freq;
+}
+
+void schedule_work(Notepad& n) {
+    if (n.workPosted || !n.wnd) return;
+    n.workPosted = true;
+    PostMessageW(n.wnd, WM_NOTEPAD_WORK, 0, 0);
+}
+
+// the restored selection and first line, once their text is in
+void apply_pending(Notepad& n, Tab& t) {
+    bool all = t.rest.empty();
+    if (t.pendingSel.cpMin >= 0 && (all || std::max(t.pendingSel.cpMin, t.pendingSel.cpMax) <= text_length(t.edit))) {
+        CHARRANGE cr = t.pendingSel;
+        t.pendingSel = { -1, -1 };
+        select(t.edit, cr.cpMin, cr.cpMax);
+    }
+    if (t.pendingTop >= 0 && &t == cur(n) && (all || SendMessageW(t.edit, EM_GETLINECOUNT, 0, 0) > t.pendingTop + 200)) {
+        int now = (int)SendMessageW(t.edit, EM_GETFIRSTVISIBLELINE, 0, 0);
+        SendMessageW(t.edit, EM_LINESCROLL, 0, t.pendingTop - now);
+        t.pendingTop = -1;
+    }
+}
+
+// more of a big text in, a piece at a time till `until` (at least one); true: more to come
+bool load_more(Notepad& n, Tab& t, double until) {
+    if (t.rest.empty() || !t.doc) return false;
+    t.loading = true;
+    t.doc->Undo(tomSuspend, nullptr);
+    do {
+        size_t end = std::min(t.rest.size(), t.restAt + kPiece);
+        if (end < t.rest.size() && IS_HIGH_SURROGATE(t.rest[end - 1])) ++end;
+        long len = text_length(t.edit);
+        ITextRange* r = nullptr;
+        if (SUCCEEDED(t.doc->Range(len, len, &r)) && r) {
+            BSTR bs = SysAllocStringLen(t.rest.data() + t.restAt, (UINT)(end - t.restAt));
+            r->SetText(bs);
+            SysFreeString(bs);
+            ITextFont* f = nullptr;             // (the text's colour, not the last character's: a keyword's)
+            if (SUCCEEDED(r->GetFont(&f)) && f) {
+                f->SetForeColor((long)pal().text);
+                f->SetBackColor(tomAutoColor);
+                f->Release();
+            }
+            r->Release();
+        }
+        t.restAt = end;
+    } while (t.restAt < t.rest.size() && now_ms() < until);
+    t.doc->Undo(tomResume, nullptr);
+    t.loading = false;
+    if (t.restAt >= t.rest.size()) {
+        std::wstring().swap(t.rest);
+        t.restAt = 0;
+    }
+    apply_pending(n, t);
+    if (&t == cur(n)) {
+        request_colour(n);
+        invalidate_status(n);
+    }
+    return !t.rest.empty();
+}
+
+// all of a big text in, before what needs all of it (saving, searching, editing)
+void finish_loading(Notepad& n, Tab& t) {
+    if (t.rest.empty()) return;
+    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    load_more(n, t, 1e300);
+    SetCursor(old);
+}
+
+// the double-clicked word's others counted on (as the marks take them: whole words, _ in one)
+bool count_more(Notepad& n, Tab& t, double until) {
+    if (t.countAt < 0 || t.word.empty()) return false;
+    long len = text_length(t.edit), wl = (long)t.word.size();
+    bool whole = std::all_of(t.word.begin(), t.word.end(), word_char);
+    while (t.countAt < len) {
+        long end = std::min(len, t.countAt + (1L << 20)), base = std::max(0L, t.countAt - 1);
+        std::wstring s = doc_text(t, base, std::min(len, end + wl));
+        for (size_t p = s.find(t.word, (size_t)(t.countAt - base)); p != std::wstring::npos && base + (long)p < end;
+             p = s.find(t.word, p + (size_t)wl)) {
+            size_t q = p + (size_t)wl;
+            if (!whole || ((p == 0 || !word_char(s[p - 1])) && (q >= s.size() || !word_char(s[q])))) ++t.wordCount;
+        }
+        t.countAt = end;
+        if (now_ms() >= until) break;
+    }
+    if (t.countAt >= len && t.rest.empty()) t.countAt = -1;
+    invalidate_status(n);
+    return t.countAt >= 0 && t.countAt < len;
+}
+
+// lexed on from the last state known, its states kept; a part coloured from a guess, again
+bool lex_ahead(Notepad& n, Tab& t, double until) {
+    if (t.lang == Lang::None || !t.doc) return false;
+    while (!t.states.empty() && t.states.back().first > t.changedFrom) t.states.pop_back();
+    if (t.states.empty()) t.states.push_back({ 0, 0 });
+    long len = text_length(t.edit);
+    bool more = true;
+    while (more) {
+        long from = t.states.back().first;
+        std::wstring s = len - from >= kLexChunk ? doc_text(t, from, from + kLexChunk) : L"";
+        size_t cut = s.find_last_of(L'\r');
+        if (cut == std::wstring::npos) { more = false; break; }    // (the end; or a line of 64K: lexed when shown)
+        s.resize(cut + 1);
+        t.states.push_back({ from + (long)s.size(), syntax_lex(t.lang, s.c_str(), s.size(), t.states.back().second, nullptr) });
+        if (now_ms() >= until) break;
+    }
+    if (t.guessed && t.states.back().first + kFar >= t.hlA) recolour(n, t, false);
+    return more;
+}
+
+// a step: the active tab's text in, its word counted, it lexed ahead; else another's text in
+bool do_work(Notepad& n) {
+    double until = now_ms() + 12;
+    Tab* t = cur(n);
+    if (t && (load_more(n, *t, until) || count_more(n, *t, until) || lex_ahead(n, *t, until))) return true;
+    for (auto& x : n.tabs)
+        if (!x->rest.empty()) {
+            load_more(n, *x, until);
+            return true;
+        }
+    return false;
+}
+
+void work_step(Notepad& n) {
+    KillTimer(n.wnd, TIMER_WORK);
+    n.workPosted = false;
+    if (!do_work(n)) return;
+    n.workPosted = true;
+    if (HIWORD(GetQueueStatus(QS_INPUT | QS_PAINT))) SetTimer(n.wnd, TIMER_WORK, USER_TIMER_MINIMUM, nullptr);
+    else PostMessageW(n.wnd, WM_NOTEPAD_WORK, 0, 0);
 }
 
 // ------------------------------------------------------------------
@@ -319,6 +758,55 @@ void set_dirty(Notepad& n, Tab& t, bool on) {
     invalidate_row(n);
 }
 
+// The text box, as it scrolls, changes or is double-clicked: the part to show coloured before
+// it is painted (the colouring is posted: it comes before the paint), the word to mark.
+LRESULT CALLBACK edit_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR ref) {
+    Notepad& n = *(Notepad*)ref;
+    // (an edit, or a jump to the end, while a big text goes in: all of it in first)
+    if (Tab* t = cur(n); t && t->edit == h && !t->rest.empty()) {
+        bool ctrl = GetKeyState(VK_CONTROL) < 0;
+        bool all = msg == WM_CHAR || msg == WM_PASTE || msg == WM_CUT || msg == WM_CLEAR || msg == WM_UNDO || msg == EM_UNDO ||
+                   msg == EM_REDO || msg == EM_REPLACESEL || msg == WM_IME_STARTCOMPOSITION;
+        if (msg == WM_KEYDOWN)
+            all = wp == VK_BACK || wp == VK_DELETE || wp == VK_RETURN || wp == VK_TAB || (wp == VK_END && ctrl) ||
+                  (wp == VK_INSERT && GetKeyState(VK_SHIFT) < 0) || (ctrl && (wp == 'A' || wp == 'V' || wp == 'X' || wp == 'Y' || wp == 'Z'));
+        if (all) finish_loading(n, *t);
+    }
+    switch (msg) {
+        case WM_LBUTTONDBLCLK: {
+            LRESULT r = DefSubclassProc(h, msg, wp, lp);
+            if (Tab* t = cur(n); t && t->edit == h) mark_word(n, *t);
+            return r;
+        }
+        case WM_PASTE:
+            return SendMessageW(h, EM_PASTESPECIAL, CF_UNICODETEXT, 0);    // (text only: no other's formatting)
+        case WM_KEYDOWN:
+            if ((wp == 'V' && GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_MENU) >= 0) ||
+                (wp == VK_INSERT && GetKeyState(VK_SHIFT) < 0 && GetKeyState(VK_CONTROL) >= 0)) {
+                SendMessageW(h, EM_PASTESPECIAL, CF_UNICODETEXT, 0);
+                request_colour(n);
+                return 0;
+            }
+            if (wp == VK_ESCAPE) {
+                if (Tab* t = cur(n); t && t->edit == h && !t->word.empty()) { clear_word(n, *t); return 0; }
+            }
+            [[fallthrough]];
+        case WM_VSCROLL: case WM_MOUSEWHEEL: case WM_SIZE: case WM_TIMER: case WM_LBUTTONUP:
+        case EM_LINESCROLL: case EM_SCROLLCARET: case EM_EXSETSEL: case EM_SETSEL: case EM_SETZOOM: case EM_SETTARGETDEVICE: {
+            LRESULT r = DefSubclassProc(h, msg, wp, lp);
+            request_colour(n);
+            return r;
+        }
+        case WM_MOUSEMOVE:
+            if (wp & MK_LBUTTON) request_colour(n);     // (selecting past the edge scrolls)
+            break;
+        case WM_NCDESTROY:
+            RemoveWindowSubclass(h, edit_proc, 1);
+            break;
+    }
+    return DefSubclassProc(h, msg, wp, lp);
+}
+
 Tab* add_tab(Notepad& n, int at) {
     auto t = std::make_unique<Tab>();
     t->edit = CreateWindowExW(0, MSFTEDIT_CLASS, L"",
@@ -326,10 +814,13 @@ Tab* add_tab(Notepad& n, int at) {
                                   ES_NOHIDESEL | ES_NOOLEDRAGDROP,
                               0, 0, 0, 0, n.wnd, nullptr, g_hinst, nullptr);
     if (!t->edit) return nullptr;
-    SendMessageW(t->edit, EM_SETTEXTMODE, TM_PLAINTEXT | TM_MULTILEVELUNDO | TM_MULTICODEPAGE, 0);
+    // (rich text: only its runs of colour show reliably; all the same is plain - pasted, read and
+    // put in as text)
+    SendMessageW(t->edit, EM_SETTEXTMODE, TM_RICHTEXT | TM_MULTILEVELUNDO | TM_MULTICODEPAGE, 0);
     SendMessageW(t->edit, EM_EXLIMITTEXT, 0, 0x7FFFFFFE);
     SendMessageW(t->edit, EM_SETUNDOLIMIT, 1000, 0);
     SendMessageW(t->edit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE);
+    SetWindowSubclass(t->edit, edit_proc, 1, (DWORD_PTR)&n);
     IRichEditOle* ole = nullptr;
     if (SendMessageW(t->edit, EM_GETOLEINTERFACE, 0, (LPARAM)&ole) && ole) {
         ole->QueryInterface(kIID_ITextDocument, (void**)&t->doc);
@@ -351,14 +842,11 @@ void activate(Notepad& n, int i) {
     layout(n);
     ShowWindow(t.edit, SW_SHOW);
     if (old && old != &t) ShowWindow(old->edit, SW_HIDE);
-    if (t.pendingTop >= 0) {
-        int now = (int)SendMessageW(t.edit, EM_GETFIRSTVISIBLELINE, 0, 0);
-        SendMessageW(t.edit, EM_LINESCROLL, 0, t.pendingTop - now);
-        t.pendingTop = -1;
-    }
+    apply_pending(n, t);
     if (GetActiveWindow() == n.wnd) SetFocus(t.edit);
     update_title(n);
     InvalidateRect(n.wnd, nullptr, FALSE);
+    request_colour(n);
     keep_soon(n);
 }
 
@@ -448,6 +936,8 @@ bool open_path(Notepad& n, const std::wstring& path) {
     t->enc = f.enc;
     t->eol = f.eol;
     t->fileTime = write_time(path);
+    t->langChosen = false;
+    t->lang = lang_for_file(path);
     set_text(n, *t, f.text);
     set_dirty(n, *t, false);
     t->cacheStale = false;
@@ -533,13 +1023,14 @@ std::wstring ask_save(Notepad& n, Tab& t, TextEncoding& enc) {
 }
 
 bool save(Notepad& n, Tab& t, bool as) {
+    finish_loading(n, t);
     std::wstring file = t.path;
     TextEncoding enc = t.enc;
     if (as || file.empty()) {
         file = ask_save(n, t, enc);
         if (file.empty()) return false;
     }
-    std::wstring text = edit_text(t.edit);
+    std::wstring text = doc_text(t, 0, -1);
     bool lossy = false;
     std::string bytes = text_encode(text, enc, t.eol, &lossy);
     if (lossy) {
@@ -561,6 +1052,10 @@ bool save(Notepad& n, Tab& t, bool as) {
     t.path = file;
     t.enc = enc;
     t.fileTime = write_time(file);
+    if (!t.langChosen && t.lang != lang_for_file(file)) {   // (saved under another name: its language)
+        t.lang = lang_for_file(file);
+        recolour(n, t, true);
+    }
     t.dirty = true;                         // (the name may have changed either way)
     set_dirty(n, t, false);
     t.cacheStale = false;
@@ -581,14 +1076,15 @@ void check_files(Notepad& n) {
         if (read_bytes(t.path, bytes) != Read::Ok) continue;
         TextFile f = text_decode(bytes);
         if (f.binary) continue;
-        CHARRANGE cr = selection(t.edit);
-        int top = (int)SendMessageW(t.edit, EM_GETFIRSTVISIBLELINE, 0, 0);
+        CHARRANGE cr = t.pendingSel.cpMin >= 0 ? t.pendingSel : selection(t.edit);
+        int top = t.pendingTop >= 0 ? t.pendingTop : (int)SendMessageW(t.edit, EM_GETFIRSTVISIBLELINE, 0, 0);
         t.enc = f.enc;
         t.eol = f.eol;
         t.fileTime = now;
         set_text(n, t, f.text);
-        select(t.edit, cr.cpMin, cr.cpMax);
-        SendMessageW(t.edit, EM_LINESCROLL, 0, top - (int)SendMessageW(t.edit, EM_GETFIRSTVISIBLELINE, 0, 0));
+        t.pendingSel = cr;
+        t.pendingTop = top;
+        apply_pending(n, t);
     }
     invalidate_status(n);
 }
@@ -597,6 +1093,19 @@ void check_files(Notepad& n) {
 // keeping the tabs (the session, and each unsaved text) in the notes folder
 // ------------------------------------------------------------------
 void keep_soon(Notepad& n) { if (n.wnd) SetTimer(n.wnd, TIMER_KEEP, kKeepDelayMs, nullptr); }
+
+// an unsaved text, as the box holds it (UTF-16, lines ended with CR: read back as any file is):
+// not converted, not copied (50 MB in 70 ms)
+bool keep_text(Tab& t, const std::wstring& path) {
+    ITextRange* r = nullptr;
+    if (!t.doc || FAILED(t.doc->Range(0, text_length(t.edit), &r)) || !r) return false;
+    BSTR bs = nullptr;
+    bool ok = SUCCEEDED(r->GetText(&bs)) &&
+              write_own(path, std::string_view("\xFF\xFE", 2), std::string_view((const char*)bs, bs ? SysStringByteLen(bs) : 0));
+    SysFreeString(bs);
+    r->Release();
+    return ok;
+}
 
 std::wstring new_cache_name(const std::wstring& dir) {
     static unsigned counter = 0;
@@ -635,7 +1144,8 @@ bool keep_now(Notepad& n) {
         st.enc = t.enc;
         st.eol = t.eol;
         st.fileTime = t.fileTime;
-        CHARRANGE cr = selection(t.edit);
+        if (t.langChosen) st.syntax = lang_key(t.lang);
+        CHARRANGE cr = t.pendingSel.cpMin >= 0 ? t.pendingSel : selection(t.edit);
         st.selStart = cr.cpMin;
         st.selEnd = cr.cpMax;
         st.top = t.pendingTop >= 0 ? t.pendingTop : (int)SendMessageW(t.edit, EM_GETFIRSTVISIBLELINE, 0, 0);
@@ -645,7 +1155,8 @@ bool keep_now(Notepad& n) {
                 t.cacheStale = true;
             }
             if (t.cacheStale) {
-                if (write_own(dir + L"\\" + t.cache, text_encode(edit_text(t.edit), TextEncoding::Utf16Le, LineEnding::CrLf))) t.cacheStale = false;
+                finish_loading(n, t);
+                if (keep_text(t, dir + L"\\" + t.cache)) t.cacheStale = false;
                 else ok = false;
             }
             st.cache = t.cache;
@@ -692,6 +1203,8 @@ void restore(Notepad& n, NoteSession& s) {
         t->path = st.path;
         t->enc = f.enc;
         t->eol = f.eol;
+        t->langChosen = !st.syntax.empty();
+        t->lang = t->langChosen ? lang_from_key(st.syntax) : lang_for_file(st.path);
         set_text(n, *t, f.text);
         if (kept) {
             t->dirty = true;
@@ -701,8 +1214,9 @@ void restore(Notepad& n, NoteSession& s) {
         } else {
             t->fileTime = st.path.empty() ? 0 : write_time(st.path);
         }
-        select(t->edit, st.selStart, st.selEnd);
+        t->pendingSel = { st.selStart, st.selEnd };
         t->pendingTop = st.top;
+        apply_pending(n, *t);
         if (i <= s.active) active = (int)n.tabs.size() - 1;
     }
     // text kept for tabs no longer there
@@ -800,7 +1314,12 @@ bool selection_is_found(Notepad& n, Tab& t) {
 void replace_one(Notepad& n) {
     Tab* t = cur(n);
     if (!t || !n.findText[0]) return;
-    if (selection_is_found(n, *t)) SendMessageW(t->edit, EM_REPLACESEL, TRUE, (LPARAM)n.replaceText);
+    if (selection_is_found(n, *t)) {
+        CHARRANGE cr = selection(t->edit);
+        std::wstring with = n.replaceText;
+        put_text(*t, cr.cpMin, cr.cpMax, with);
+        select(t->edit, cr.cpMin + (long)with.size(), cr.cpMin + (long)with.size());
+    }
     find_next(n, true);
 }
 
@@ -808,7 +1327,7 @@ void replace_one(Notepad& n) {
 void replace_all(Notepad& n) {
     Tab* t = cur(n);
     if (!t || !n.findText[0]) return;
-    std::wstring text = edit_text(t->edit, false);          // (positions as the control counts them)
+    std::wstring text = doc_text(*t, 0, -1);                // (positions as the control counts them)
     std::vector<CHARRANGE> hits;
     FINDTEXTEXW ft{};
     ft.lpstrText = n.findText;
@@ -829,8 +1348,8 @@ void replace_all(Notepad& n) {
     }
     out.append(text, std::min(pos, text.size()), std::wstring::npos);
     SendMessageW(t->edit, WM_SETREDRAW, FALSE, 0);
-    select(t->edit, 0, -1);
-    SendMessageW(t->edit, EM_REPLACESEL, TRUE, (LPARAM)out.c_str());
+    select(t->edit, 0, 0);
+    put_text(*t, 0, (long)text.size(), out);
     select(t->edit, 0, 0);
     SendMessageW(t->edit, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(t->edit, nullptr, TRUE);
@@ -891,7 +1410,7 @@ void go_to(Notepad& n) {
     if (!t || !t->doc) return;
     GotoData d{};
     long col = 0;
-    caret_place(*t, d.line, col);
+    caret_place(n, *t, d.line, col);
     ITextRange* all = nullptr;
     if (FAILED(t->doc->Range(0, 0, &all)) || !all) return;
     all->EndOf(tomStory, tomMove, nullptr);
@@ -941,7 +1460,9 @@ void insert_time(Tab& t) {
     GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, nullptr, nullptr, tm, ARRAYSIZE(tm));
     GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, nullptr, nullptr, dt, ARRAYSIZE(dt), nullptr);
     std::wstring s = std::wstring(tm) + L" " + dt;
-    SendMessageW(t.edit, EM_REPLACESEL, TRUE, (LPARAM)s.c_str());
+    CHARRANGE cr = selection(t.edit);
+    put_text(t, cr.cpMin, cr.cpMax, s);
+    select(t.edit, cr.cpMin + (long)s.size(), cr.cpMin + (long)s.size());
 }
 
 void set_zoom(Notepad& n, int z) {
@@ -949,6 +1470,176 @@ void set_zoom(Notepad& n, int z) {
     for (auto& t : n.tabs) SendMessageW(t->edit, EM_SETZOOM, n.zoom, 100);
     invalidate_status(n);
     keep_soon(n);
+}
+
+// ------------------------------------------------------------------
+// lines, conversions, formatting: each one step to undo
+// ------------------------------------------------------------------
+void replace_range(Tab& t, long a, long b, const std::wstring& s, long selA, long selB) {
+    select(t.edit, a, a);
+    put_text(t, a, b, s);
+    select(t.edit, selA, selB);
+    SendMessageW(t.edit, EM_SCROLLCARET, 0, 0);
+}
+
+// the whole lines the selection is on: [a, b), b at the last one's '\r'
+std::pair<long, long> selected_lines(Tab& t) {
+    CHARRANGE cr = selection(t.edit);
+    long last = cr.cpMax;
+    if (cr.cpMax > cr.cpMin && line_start(t, cr.cpMax) == cr.cpMax) --last;   // (ending at a line's start: not that line)
+    return { line_start(t, cr.cpMin), line_end(t, std::max(last, cr.cpMin)) };
+}
+
+void line_command(Tab& t, UINT id) {
+    if (!t.doc) return;
+    CHARRANGE cr = selection(t.edit);
+    auto [a, b] = selected_lines(t);
+    long len = text_length(t.edit);
+    std::wstring block = text_range(t.edit, a, b);
+    switch (id) {
+        case CMD_DUPLINE: {
+            long d = (long)block.size() + 1;
+            replace_range(t, b, b, L"\r" + block, cr.cpMin + d, cr.cpMax + d);
+            return;
+        }
+        case CMD_DELLINE:
+            if (b < len) replace_range(t, a, b + 1, L"", a, a);
+            else if (a > 0) replace_range(t, a - 1, b, L"", line_start(t, a - 1), line_start(t, a - 1));
+            else replace_range(t, 0, b, L"", 0, 0);
+            return;
+        case CMD_LINEUP: {
+            if (a == 0) return;
+            long pa = line_start(t, a - 1), d = a - pa;
+            replace_range(t, pa, b, block + L"\r" + text_range(t.edit, pa, a - 1), cr.cpMin - d, cr.cpMax - d);
+            return;
+        }
+        case CMD_LINEDOWN: {
+            if (b >= len) return;
+            long nb = line_end(t, b + 1), d = nb - b;
+            replace_range(t, a, nb, text_range(t.edit, b + 1, nb) + L"\r" + block, cr.cpMin + d, cr.cpMax + d);
+            return;
+        }
+    }
+    // the others: on the lines selected (more than one), else on all of them
+    bool all = block.find(L'\r') == std::wstring::npos;
+    if (all) {
+        a = 0;
+        b = len;
+        block = text_range(t.edit, 0, len);
+    }
+    LineOp op = id == CMD_SORTASC ? LineOp::SortAsc : id == CMD_SORTDESC ? LineOp::SortDesc : id == CMD_REVERSE ? LineOp::Reverse
+              : id == CMD_UNIQUE ? LineOp::Unique : id == CMD_NOEMPTY ? LineOp::RemoveEmpty : id == CMD_TRIM ? LineOp::TrimTrailing
+              : LineOp::Join;
+    if (op == LineOp::Join && all) {                // (one line: it and the next)
+        if (b >= len) return;
+        a = line_start(t, cr.cpMin);
+        b = line_end(t, line_end(t, cr.cpMin) + 1);
+        block = text_range(t.edit, a, b);
+    }
+    std::wstring out = line_op(op, block);
+    if (out == block) return;
+    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    if (all && op != LineOp::Join) replace_range(t, a, b, out, 0, 0);
+    else replace_range(t, a, b, out, a, a + (long)out.size());
+    SetCursor(old);
+}
+
+// case: the selection, else the word at the caret; coding: the selection, else the line
+void convert_command(Notepad& n, Tab& t, UINT id) {
+    if (!t.doc) return;
+    CHARRANGE cr = selection(t.edit);
+    bool casing = id == CMD_UPPER || id == CMD_LOWER || id == CMD_TITLE;
+    if (cr.cpMax == cr.cpMin) {
+        if (casing) {
+            ITextRange* r = nullptr;
+            if (SUCCEEDED(t.doc->Range(cr.cpMin, cr.cpMin, &r)) && r) {
+                r->Expand(tomWord, nullptr);
+                r->GetStart(&cr.cpMin);
+                r->GetEnd(&cr.cpMax);
+                r->Release();
+            }
+            std::wstring w = text_range(t.edit, cr.cpMin, cr.cpMax);
+            while (!w.empty() && (w.back() == L' ' || w.back() == L'\t' || w.back() == L'\r')) { w.pop_back(); --cr.cpMax; }
+        } else {
+            auto [a, b] = selected_lines(t);
+            cr = { a, b };
+        }
+        if (cr.cpMax <= cr.cpMin) return;
+    }
+    std::wstring s = text_range(t.edit, cr.cpMin, cr.cpMax), out;
+    // (line breaks coded as the file has them; decoded ones as the box has them)
+    const wchar_t* eol = t.eol == LineEnding::CrLf ? L"\r\n" : t.eol == LineEnding::Lf ? L"\n" : L"\r";
+    auto file_lines = [&](const std::wstring& x) {
+        std::wstring y;
+        for (wchar_t c : x) {
+            if (c == L'\r') y += eol;
+            else y += c;
+        }
+        return y;
+    };
+    bool ok = true;
+    switch (id) {
+        case CMD_UPPER: out = change_case(CaseOp::Upper, s); break;
+        case CMD_LOWER: out = change_case(CaseOp::Lower, s); break;
+        case CMD_TITLE: out = change_case(CaseOp::Title, s); break;
+        case CMD_B64ENC: out = base64_encode(file_lines(s)); break;
+        case CMD_URLENC: out = url_encode(file_lines(s)); break;
+        case CMD_B64DEC: ok = base64_decode(s, out); break;
+        case CMD_URLDEC: ok = url_decode(s, out); break;
+    }
+    if (!ok) {
+        MessageBoxW(n.wnd, id == CMD_B64DEC ? L"This isn't text coded in Base64." : L"This isn't URL-coded text (UTF-8).", L"Notepad",
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    std::wstring box;
+    for (size_t i = 0; i < out.size(); ++i) {
+        if (out[i] == L'\r' && i + 1 < out.size() && out[i + 1] == L'\n') continue;
+        box += out[i] == L'\n' ? L'\r' : out[i];
+    }
+    if (box == s) return;
+    replace_range(t, cr.cpMin, cr.cpMax, box, cr.cpMin, cr.cpMin + (long)box.size());
+}
+
+bool formattable(const Tab& t) { return t.lang == Lang::Json || t.lang == Lang::Xml || t.lang == Lang::None; }
+
+// JSON or XML (plain text: whichever it looks like), indented; or JSON on one line
+void format_document(Notepad& n, Tab& t, bool compact) {
+    std::wstring text = text_range(t.edit, 0, text_length(t.edit));
+    Lang l = t.lang;
+    if (l == Lang::None) {
+        size_t k = text.find_first_not_of(L" \t\r\n\xFEFF");
+        l = k != std::wstring::npos && text[k] == L'<' ? Lang::Xml : Lang::Json;
+    }
+    if (l != Lang::Json && l != Lang::Xml) return;
+    if (compact && l != Lang::Json) return;
+    std::wstring out;
+    size_t err = 0;
+    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    bool ok = l == Lang::Json ? format_json(text, compact, out, &err) : format_xml(text, out, &err);
+    SetCursor(old);
+    if (!ok) {
+        long line = 1 + (long)std::count(text.begin(), text.begin() + (long)std::min(err, text.size()), L'\r');
+        select(t.edit, (long)err, (long)err);
+        SendMessageW(t.edit, EM_SCROLLCARET, 0, 0);
+        std::wstring msg = std::wstring(l == Lang::Json ? L"This isn't valid JSON" : L"This isn't valid XML") +
+                           L": see line " + std::to_wstring(line) + L".";
+        MessageBoxW(n.wnd, msg.c_str(), L"Notepad", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    out.erase(std::remove(out.begin(), out.end(), L'\n'), out.end());
+    if (!text.empty() && text.back() == L'\r') out += L'\r';
+    if (out == text) return;
+    replace_range(t, 0, (long)text.size(), out, 0, 0);
+}
+
+HMENU syntax_menu(Tab* t) {
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING | (t && !t->langChosen ? MF_CHECKED : 0), CMD_LANGAUTO, L"By file type");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    for (int l = 0; l < (int)Lang::Count; ++l)
+        AppendMenuW(m, MF_STRING | (t && (int)t->lang == l ? MF_CHECKED : 0), CMD_LANG + l, lang_name((Lang)l));
+    return m;
 }
 
 // ------------------------------------------------------------------
@@ -998,6 +1689,33 @@ HMENU build_menu(Notepad& n, int which) {
         sep();
         add(CMD_SELALL, L"Select all\tCtrl+A", e != nullptr);
         add(CMD_TIMEDATE, L"Time/Date\tF5", e != nullptr);
+        sep();
+        HMENU lines = CreatePopupMenu(), conv = CreatePopupMenu();
+        auto item = [](HMENU s, UINT id, const wchar_t* text) { AppendMenuW(s, id ? MF_STRING : MF_SEPARATOR, id, text); };
+        item(lines, CMD_DUPLINE, L"Duplicate line\tCtrl+D");
+        item(lines, CMD_DELLINE, L"Delete line\tCtrl+Shift+K");
+        item(lines, CMD_LINEUP, L"Move line up\tAlt+Up");
+        item(lines, CMD_LINEDOWN, L"Move line down\tAlt+Down");
+        item(lines, CMD_JOIN, L"Join lines\tCtrl+J");
+        item(lines, 0, nullptr);
+        item(lines, CMD_SORTASC, L"Sort ascending");
+        item(lines, CMD_SORTDESC, L"Sort descending");
+        item(lines, CMD_REVERSE, L"Reverse order");
+        item(lines, CMD_UNIQUE, L"Remove duplicate lines");
+        item(lines, CMD_NOEMPTY, L"Remove empty lines");
+        item(lines, CMD_TRIM, L"Trim trailing spaces");
+        item(conv, CMD_UPPER, L"UPPER CASE\tCtrl+Shift+U");
+        item(conv, CMD_LOWER, L"lower case\tCtrl+U");
+        item(conv, CMD_TITLE, L"Title Case");
+        item(conv, 0, nullptr);
+        item(conv, CMD_B64ENC, L"Base64 encode");
+        item(conv, CMD_B64DEC, L"Base64 decode");
+        item(conv, CMD_URLENC, L"URL encode");
+        item(conv, CMD_URLDEC, L"URL decode");
+        AppendMenuW(m, MF_POPUP | (e ? 0 : MF_GRAYED), (UINT_PTR)lines, L"Lines");
+        AppendMenuW(m, MF_POPUP | (e ? 0 : MF_GRAYED), (UINT_PTR)conv, L"Convert");
+        add(CMD_FORMAT, L"Format document\tAlt+Shift+F", t && formattable(*t));
+        add(CMD_COMPACT, L"Compact JSON", t && (t->lang == Lang::Json || t->lang == Lang::None));
     } else {
         HMENU zoom = CreatePopupMenu();
         AppendMenuW(zoom, MF_STRING, CMD_ZOOMIN, L"Zoom in\tCtrl+Plus");
@@ -1006,6 +1724,8 @@ HMENU build_menu(Notepad& n, int which) {
         AppendMenuW(m, MF_POPUP, (UINT_PTR)zoom, L"Zoom");
         add(CMD_STATUSBAR, L"Status bar", true, n.statusBar);
         add(CMD_WRAP, L"Word wrap", true, n.wrap);
+        sep();
+        AppendMenuW(m, MF_POPUP | (t ? 0 : MF_GRAYED), (UINT_PTR)syntax_menu(t), L"Syntax");
     }
     return m;
 }
@@ -1093,8 +1813,41 @@ void command(Notepad& n, UINT id) {
         }
         return;
     }
+    // (a big text still going in: all of it first, but for what only changes the window)
+    if (t && !t->rest.empty() && id < CMD_ENC) {
+        switch (id) {
+            case CMD_NEW: case CMD_OPEN: case CMD_CLOSETAB: case CMD_CLOSEWINDOW: case CMD_COPY: case CMD_ZOOMIN:
+            case CMD_ZOOMOUT: case CMD_ZOOMRESET: case CMD_STATUSBAR: case CMD_WRAP: case CMD_CLOSEOTHERS:
+            case CMD_CLOSERIGHT: case CMD_COPYPATH: case CMD_SHOWFILE:
+                break;
+            default:
+                finish_loading(n, *t);
+        }
+    }
+    if (id == CMD_LANGAUTO || (id >= CMD_LANG && id < CMD_LANG + (UINT)Lang::Count)) {
+        if (!t) return;
+        Lang l = id == CMD_LANGAUTO ? lang_for_file(t->path) : (Lang)(id - CMD_LANG);
+        t->langChosen = id != CMD_LANGAUTO;
+        if (l != t->lang) {
+            t->lang = l;
+            recolour(n, *t, true);
+        }
+        invalidate_status(n);
+        keep_soon(n);
+        return;
+    }
     switch (id) {
         case CMD_NEW: new_untitled(n); break;
+        case CMD_DUPLINE: case CMD_DELLINE: case CMD_LINEUP: case CMD_LINEDOWN: case CMD_SORTASC: case CMD_SORTDESC:
+        case CMD_REVERSE: case CMD_UNIQUE: case CMD_NOEMPTY: case CMD_TRIM: case CMD_JOIN:
+            if (t) line_command(*t, id);
+            break;
+        case CMD_UPPER: case CMD_LOWER: case CMD_TITLE: case CMD_B64ENC: case CMD_B64DEC: case CMD_URLENC: case CMD_URLDEC:
+            if (t) convert_command(n, *t, id);
+            break;
+        case CMD_FORMAT: case CMD_COMPACT:
+            if (t) format_document(n, *t, id == CMD_COMPACT);
+            break;
         case CMD_OPEN: open_dialog(n); break;
         case CMD_SAVE: if (t) save(n, *t, false); break;
         case CMD_SAVEAS: if (t) save(n, *t, true); break;
@@ -1145,7 +1898,10 @@ bool key(Notepad& n, const MSG& m) {
     UINT vk = (UINT)m.wParam;
     bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0, alt = GetKeyState(VK_MENU) < 0;
     if (alt && !ctrl) {
-        if (m.message != WM_SYSKEYDOWN || shift) return false;
+        if (m.message != WM_SYSKEYDOWN) return false;
+        if ((vk == VK_UP || vk == VK_DOWN) && !shift) { command(n, vk == VK_UP ? CMD_LINEUP : CMD_LINEDOWN); return true; }
+        if (vk == 'F' && shift) { command(n, CMD_FORMAT); return true; }
+        if (shift) return false;
         for (int i = 0; i < 3; ++i)
             if (vk == (UINT)kMenuNames[i][0]) { show_menu(n, i); return true; }
         return false;
@@ -1167,6 +1923,10 @@ bool key(Notepad& n, const MSG& m) {
         case 'F': command(n, CMD_FIND); return true;
         case 'H': command(n, CMD_REPLACE); return true;
         case 'G': command(n, CMD_GOTO); return true;
+        case 'D': command(n, CMD_DUPLINE); return true;
+        case 'J': command(n, CMD_JOIN); return true;
+        case 'U': command(n, shift ? CMD_UPPER : CMD_LOWER); return true;
+        case 'K': if (shift) command(n, CMD_DELLINE); return true;
         case VK_OEM_PLUS: case VK_ADD: command(n, CMD_ZOOMIN); return true;
         case VK_OEM_MINUS: case VK_SUBTRACT: command(n, CMD_ZOOMOUT); return true;
         case '0': case VK_NUMPAD0: command(n, CMD_ZOOMRESET); return true;
@@ -1239,10 +1999,10 @@ void layout(Notepad& n) {
     n.editArea = { 0, n.rowH + n.menuH + 1, rc.right, std::max(n.rowH + n.menuH + 1, (int)rc.bottom - n.statusH) };
     if (Tab* t = cur(n))
         MoveWindow(t->edit, n.editArea.left, n.editArea.top, n.editArea.right - n.editArea.left, n.editArea.bottom - n.editArea.top, TRUE);
-    // the tabs share the row (each between a minimum and a maximum width); more than fit scroll,
-    // the active one in view
+    // the tabs share the row (each between a minimum and a maximum width) with the window's
+    // buttons and some room to drag it by; more than fit scroll, the active one in view
     int count = (int)n.tabs.size(), plusW = px(n, 36);
-    int left = px(n, 8), avail = std::max(px(n, 80), (int)rc.right - left - plusW - px(n, 16));
+    int left = px(n, 8), avail = std::max(px(n, 80), (int)rc.right - left - plusW - 3 * px(n, 46) - px(n, 48));
     n.tabW = count ? std::clamp(avail / count, px(n, 90), px(n, 240)) : 0;
     int total = count * n.tabW;
     if (total <= avail) {
@@ -1298,14 +2058,18 @@ void paint_status(Notepad& n, HDC dc, const RECT& rc) {
     Tab* t = cur(n);
     if (!t) return;
     long line = 1, col = 1;
-    caret_place(*t, line, col);
+    caret_place(n, *t, line, col);
     CHARRANGE cr = selection(t->edit);
     long chars = text_length(t->edit);
     std::wstring text[SP_COUNT] = {
         L"Ln " + grouped(line) + L", Col " + grouped(col),
-        cr.cpMax > cr.cpMin ? grouped(cr.cpMax - cr.cpMin) + L" of " + grouped(chars) + L" characters"
-                            : grouped(chars) + (chars == 1 ? L" character" : L" characters"),
+        !t->rest.empty()         ? L"Loading… " + std::to_wstring(t->restAt * 100 / t->rest.size()) + L"%"
+        : !t->word.empty()       ? grouped(t->wordCount) + (t->wordCount == 1 ? L" occurrence" : L" occurrences") +
+                                       (t->countAt >= 0 ? L"…" : L"")
+        : cr.cpMax > cr.cpMin    ? grouped(cr.cpMax - cr.cpMin) + L" of " + grouped(chars) + L" characters"
+                                 : grouped(chars) + (chars == 1 ? L" character" : L" characters"),
         std::to_wstring(n.zoom) + L"%",
+        lang_name(t->lang),
         line_ending_name(t->eol),
         encoding_name(t->enc),
     };
@@ -1332,14 +2096,41 @@ void paint_status(Notepad& n, HDC dc, const RECT& rc) {
     }
 }
 
+// the window's buttons, at the tab row's right end: minimize, maximize, close
+RECT cap_button(const Notepad& n, int i) {
+    RECT rc{};
+    GetClientRect(n.wnd, &rc);
+    int w = px(n, 46), right = rc.right - (2 - i) * w;
+    return { right - w, 0, right, n.rowH };
+}
+
+void paint_cap_buttons(Notepad& n, HDC dc, COLORREF bg) {
+    const Palette& c = pal();
+    static const wchar_t kGlyph[3] = { L'\xE921', L'\xE922', L'\xE8BB' };
+    for (int i = 0; i < 3; ++i) {
+        RECT r = cap_button(n, i);
+        COLORREF fg = n.activeWnd ? c.text : c.textDisabled;
+        bool on = n.capHot == i || n.capPressed == i;
+        if (i == 2 && on) {
+            fill_rect(dc, r, n.capPressed == 2 ? blend(c.closeHover, RGB(0, 0, 0), 0.1) : c.closeHover);
+            fg = RGB(255, 255, 255);
+        } else if (on) {
+            fill_rect(dc, r, blend(bg, g_dark ? RGB(255, 255, 255) : RGB(0, 0, 0), n.capPressed == i ? 0.04 : 0.07));
+        }
+        glyph(n, dc, i == 1 && IsZoomed(n.wnd) ? L'\xE923' : kGlyph[i], r, fg, true);
+    }
+}
+
 void paint(Notepad& n) {
     BufferedPaint bp(n.wnd);
     HDC dc = bp.dc;
     const Palette& c = pal();
     RECT rc = bp.rc;
-    fill_rect(dc, RECT{ 0, 0, rc.right, n.rowH }, c.caption);
+    COLORREF capBg = n.activeWnd ? c.caption : c.captionInactive;
+    fill_rect(dc, RECT{ 0, 0, rc.right, n.rowH }, capBg);
     SetBkMode(dc, TRANSPARENT);
     HGDIOBJ of = SelectObject(dc, n.font);
+    paint_cap_buttons(n, dc, capBg);
     // the tabs (scrolled: cut at the strip's ends)
     int saved = SaveDC(dc);
     if (n.scroll || (int)n.tabs.size() * n.tabW > n.strip.right - n.strip.left)
@@ -1438,7 +2229,7 @@ void on_move(Notepad& n, POINT pt) {
     set_hot(n, tab, close, menu, PtInRect(&n.plus, pt) != FALSE);
 }
 
-void on_down(Notepad& n, POINT pt, bool dbl) {
+void on_down(Notepad& n, POINT pt) {
     int tab = tab_at(n, pt);
     if (tab >= 0) {
         RECT cr = close_rect(n, tab);
@@ -1450,12 +2241,20 @@ void on_down(Notepad& n, POINT pt, bool dbl) {
         SetCapture(n.wnd);
         return;
     }
-    if (PtInRect(&n.plus, pt) || (dbl && pt.y < n.rowH)) { command(n, CMD_NEW); return; }
+    if (PtInRect(&n.plus, pt)) { command(n, CMD_NEW); return; }
     for (int i = 0; i < 3; ++i)
         if (PtInRect(&n.menus[i], pt)) { show_menu(n, i); return; }
     if (Tab* t = cur(n)) {
         HMENU m = nullptr;
-        if (PtInRect(&n.parts[SP_EOL], pt) || PtInRect(&n.parts[SP_ENC], pt)) {
+        if (PtInRect(&n.parts[SP_LANG], pt)) {
+            RECT r = n.parts[SP_LANG];
+            POINT at{ r.left, r.top };
+            ClientToScreen(n.wnd, &at);
+            HMENU sm = syntax_menu(t);
+            UINT id = TrackPopupMenuEx(sm, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_BOTTOMALIGN, at.x, at.y, n.wnd, nullptr);
+            DestroyMenu(sm);
+            if (id) command(n, id);
+        } else if (PtInRect(&n.parts[SP_EOL], pt) || PtInRect(&n.parts[SP_ENC], pt)) {
             bool enc = PtInRect(&n.parts[SP_ENC], pt) != FALSE;
             m = CreatePopupMenu();
             if (enc) {
@@ -1483,6 +2282,7 @@ void apply_theme(Notepad& n) {
     BOOL dark = g_dark;
     DwmSetWindowAttribute(n.wnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof(dark));
     for (auto& t : n.tabs) style_edit(n, *t);
+    request_colour(n);
     if (n.find) DwmSetWindowAttribute(n.find, 20, &dark, sizeof(dark));
     RedrawWindow(n.wnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
 }
@@ -1499,10 +2299,107 @@ void on_close(Notepad& n) {
     DestroyWindow(n.wnd);
 }
 
+// The frame, as the main window's (chrome.cpp): no title bar, the tab row in its place. Its
+// empty part moves the window (and snaps it, maximizes on a double-click), its buttons are the
+// system's to Windows (snap layouts over maximize).
+int frame_y(const Notepad& n) {
+    return GetSystemMetricsForDpi(SM_CYFRAME, n.dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, n.dpi);
+}
+
+void invalidate_cap_buttons(Notepad& n) {
+    RECT r = cap_button(n, 0);
+    r.right = cap_button(n, 2).right;
+    InvalidateRect(n.wnd, &r, FALSE);
+}
+
+int cap_button_of(WPARAM ht) { return ht == HTMINBUTTON ? 0 : ht == HTMAXBUTTON ? 1 : ht == HTCLOSE ? 2 : -1; }
+
+LRESULT hit_test(Notepad& n, LPARAM lp) {
+    LRESULT def = DefWindowProcW(n.wnd, WM_NCHITTEST, 0, lp);   // (the side and bottom borders)
+    if (def != HTCLIENT) return def;
+    POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+    ScreenToClient(n.wnd, &pt);
+    if (pt.y >= n.rowH) return HTCLIENT;
+    int b = -1;
+    for (int i = 0; i < 3; ++i) {
+        RECT r = cap_button(n, i);
+        if (PtInRect(&r, pt)) b = i;
+    }
+    if (b >= 0) return b == 0 ? HTMINBUTTON : b == 1 ? HTMAXBUTTON : HTCLOSE;
+    int fy = frame_y(n);
+    if (!IsZoomed(n.wnd) && pt.y < fy) {        // (the top border is in the client area)
+        RECT rc{};
+        GetClientRect(n.wnd, &rc);
+        return pt.x < fy * 2 ? HTTOPLEFT : pt.x >= rc.right - fy * 2 ? HTTOPRIGHT : HTTOP;
+    }
+    if (n.dragTab >= 0 || tab_at(n, pt) >= 0 || PtInRect(&n.plus, pt)) return HTCLIENT;
+    return HTCAPTION;
+}
+
+bool frame_message(Notepad& n, UINT msg, WPARAM wp, LPARAM lp, LRESULT* result) {
+    switch (msg) {
+        case WM_NCCALCSIZE: {
+            if (!wp) return false;
+            auto* p = (NCCALCSIZE_PARAMS*)lp;
+            LONG top = p->rgrc[0].top;
+            DefWindowProcW(n.wnd, msg, wp, lp);
+            p->rgrc[0].top = top + (IsZoomed(n.wnd) ? frame_y(n) : 0);    // (maximized: the frame is off the screen)
+            *result = 0;
+            return true;
+        }
+        case WM_NCHITTEST:
+            *result = hit_test(n, lp);
+            return true;
+        case WM_NCACTIVATE:
+            n.activeWnd = wp != FALSE;
+            invalidate_row(n);
+            *result = DefWindowProcW(n.wnd, msg, wp, -1);   // (-1: no classic frame painted)
+            return true;
+        case WM_NCMOUSEMOVE: {
+            int b = cap_button_of(wp);
+            if (b != n.capHot) { n.capHot = b; invalidate_cap_buttons(n); }
+            TRACKMOUSEEVENT te{ sizeof(te), TME_LEAVE | TME_NONCLIENT, n.wnd, 0 };
+            TrackMouseEvent(&te);
+            if (b < 0) return false;
+            *result = 0;
+            return true;
+        }
+        case WM_NCMOUSELEAVE:
+        case WM_MOUSEMOVE:                          // (into the client area: a press there is let go)
+            if (n.capHot >= 0 || n.capPressed >= 0) { n.capHot = n.capPressed = -1; invalidate_cap_buttons(n); }
+            return false;
+        case WM_NCLBUTTONDOWN:
+        case WM_NCLBUTTONDBLCLK: {
+            int b = cap_button_of(wp);
+            if (b < 0) return false;
+            n.capPressed = b;
+            invalidate_cap_buttons(n);
+            *result = 0;
+            return true;
+        }
+        case WM_NCLBUTTONUP: {
+            int b = cap_button_of(wp);
+            bool fire = b >= 0 && b == n.capPressed;
+            if (n.capPressed >= 0) { n.capPressed = -1; invalidate_cap_buttons(n); }
+            if (b < 0) return false;
+            if (fire) {
+                n.capHot = -1;
+                PostMessageW(n.wnd, WM_SYSCOMMAND, b == 0 ? SC_MINIMIZE : b == 2 ? SC_CLOSE : IsZoomed(n.wnd) ? SC_RESTORE : SC_MAXIMIZE, 0);
+            }
+            *result = 0;
+            return true;
+        }
+    }
+    return false;
+}
+
+void set_app_id(HWND hwnd, bool on);
+
 LRESULT CALLBACK notepad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_NCCREATE) {
         auto* np = static_cast<Notepad*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
         np->wnd = hwnd;
+        np->dpi = (int)GetDpiForWindow(hwnd);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)np);
     }
     auto* pn = reinterpret_cast<Notepad*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -1512,11 +2409,13 @@ LRESULT CALLBACK notepad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         auto* fr = (FINDREPLACEW*)lp;
         if (fr->Flags & FR_DIALOGTERM) { n.find = nullptr; return 0; }
         n.findFlags = (fr->Flags & (FR_MATCHCASE | FR_WHOLEWORD)) | (n.replacing || (fr->Flags & FR_DOWN) ? FR_DOWN : 0);
+        if (Tab* t = cur(n)) finish_loading(n, *t);
         if (fr->Flags & FR_FINDNEXT) find_next(n, (n.findFlags & FR_DOWN) != 0);
         else if (fr->Flags & FR_REPLACE) replace_one(n);
         else if (fr->Flags & FR_REPLACEALL) replace_all(n);
         return 0;
     }
+    if (LRESULT r = 0; frame_message(n, msg, wp, lp, &r)) return r;
     switch (msg) {
         case WM_CREATE:
             n.dpi = (int)GetDpiForWindow(hwnd);
@@ -1539,7 +2438,7 @@ LRESULT CALLBACK notepad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: paint(n); return 0;
         case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK:
-            on_down(n, POINT{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }, msg == WM_LBUTTONDBLCLK);
+            on_down(n, POINT{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
             return 0;
         case WM_LBUTTONUP:
             if (n.dragTab >= 0) {
@@ -1586,7 +2485,17 @@ LRESULT CALLBACK notepad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case WM_NOTIFY: {
             auto* hdr = (NMHDR*)lp;
-            if (hdr->code == EN_SELCHANGE) { invalidate_status(n); return 0; }
+            if (hdr->code == EN_SELCHANGE) {
+                auto* sc = (SELCHANGE*)lp;
+                for (auto& t : n.tabs) {
+                    if (t->edit != hdr->hwndFrom) continue;
+                    if (!t->loading) t->pendingSel = { -1, -1 };    // (the user's own: not the restored one)
+                    t->selLow = std::min(t->selLow, sc->chrg.cpMin);
+                    if (!t->word.empty() && (sc->chrg.cpMin != t->wordSel.cpMin || sc->chrg.cpMax != t->wordSel.cpMax)) clear_word(n, *t);
+                }
+                invalidate_status(n);
+                return 0;
+            }
             if (hdr->hwndFrom == n.tip && hdr->code == TTN_GETDISPINFOW) {
                 auto* di = (NMTTDISPINFOW*)lp;
                 static std::wstring text;
@@ -1604,12 +2513,29 @@ LRESULT CALLBACK notepad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (t->edit == (HWND)lp && !t->loading) {
                         set_dirty(n, *t, true);
                         keep_soon(n);
+                        // (where it changed: from before the selection, now or since the last colouring)
+                        long at = std::min(t->selLow, selection(t->edit).cpMin), from = std::min(t->changedFrom, at);
+                        t->changedFrom = std::max(0L, from - 1);
+                        if (at < t->lineCp) t->lineCp = -1;     // (the lines before the known one changed)
+                        clear_word(n, *t);
+                        request_colour(n);
                     }
                 invalidate_status(n);
             }
             return 0;
         case WM_TIMER:
             if (wp == TIMER_KEEP) keep_now(n);
+            if (wp == TIMER_WORK) work_step(n);
+            return 0;
+        case WM_NOTEPAD_WORK:
+            work_step(n);
+            return 0;
+        case WM_NOTEPAD_COLOUR:
+            n.colourPosted = false;
+            if (Tab* t = cur(n)) {
+                colour(*t);
+                schedule_work(n);                   // (lexed ahead: a jump down is coloured at once)
+            }
             return 0;
         case WM_DROPFILES: {
             HDROP drop = (HDROP)wp;
@@ -1660,6 +2586,7 @@ LRESULT CALLBACK notepad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             n.dpi = HIWORD(wp);
             make_fonts(n);
             for (auto& t : n.tabs) style_edit(n, *t);
+            request_colour(n);
             const RECT* r = (const RECT*)lp;
             SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
             layout(n);
@@ -1675,6 +2602,7 @@ LRESULT CALLBACK notepad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CLOSE: on_close(n); return 0;
         case WM_DESTROY:
             KillTimer(hwnd, TIMER_KEEP);
+            set_app_id(hwnd, false);
             if (n.find) DestroyWindow(n.find);
             for (auto& t : n.tabs)
                 if (t->doc) t->doc->Release();
@@ -1689,6 +2617,22 @@ LRESULT CALLBACK notepad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// its own taskbar button, with its own icon, not grouped with the file windows' (as the
+// player's); not pinnable (a pin would start the file manager)
+void set_app_id(HWND hwnd, bool on) {
+    IPropertyStore* ps = nullptr;
+    if (FAILED(SHGetPropertyStoreForWindow(hwnd, IID_PPV_ARGS(&ps))) || !ps) return;
+    PROPVARIANT v;
+    if (on) InitPropVariantFromBoolean(TRUE, &v); else PropVariantInit(&v);
+    ps->SetValue(PKEY_AppUserModel_PreventPinning, v);
+    PropVariantClear(&v);
+    if (on) InitPropVariantFromString(kAppId, &v); else PropVariantInit(&v);
+    ps->SetValue(PKEY_AppUserModel_ID, v);
+    PropVariantClear(&v);
+    ps->Commit();
+    ps->Release();
+}
+
 bool create_window() {
     static bool registered = false;
     if (!registered) {
@@ -1700,8 +2644,8 @@ bool create_window() {
         wc.lpszClassName = notepad_class().c_str();
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         wc.style = CS_DBLCLKS;
-        LoadIconMetric(g_hinst, MAKEINTRESOURCEW(IDI_APP), LIM_LARGE, &wc.hIcon);
-        LoadIconMetric(g_hinst, MAKEINTRESOURCEW(IDI_APP), LIM_SMALL, &wc.hIconSm);
+        LoadIconMetric(g_hinst, MAKEINTRESOURCEW(IDI_NOTEPAD), LIM_LARGE, &wc.hIcon);
+        LoadIconMetric(g_hinst, MAKEINTRESOURCEW(IDI_NOTEPAD), LIM_SMALL, &wc.hIconSm);
         RegisterClassExW(&wc);
     }
     auto* n = new Notepad;
@@ -1713,6 +2657,8 @@ bool create_window() {
         delete n;
         return false;
     }
+    SetWindowPos(w, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    set_app_id(w, true);                    // (before it's shown: the button is made then)
     NoteSession s;
     restore(*n, s);
     // where it was; else on the monitor with the mouse, centred

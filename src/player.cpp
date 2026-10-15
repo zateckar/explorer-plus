@@ -3442,6 +3442,16 @@ bool player_open_file(const std::wstring& path) {
     return here;
 }
 
+void player_show() {
+    HWND w = s_p ? s_p->wnd : FindWindowW(player_class().c_str(), nullptr);
+    if (!w) {
+        create_player(true);
+        return;
+    }
+    if (IsIconic(w)) ShowWindowAsync(w, SW_RESTORE);
+    SetForegroundWindow(w);                 // (this process is the foreground one: it may hand that on)
+}
+
 HWND player_window() { return s_p ? s_p->wnd : nullptr; }
 
 bool player_owns(HWND h) {

@@ -8,7 +8,8 @@ File Explorer while starting in well under 100 ms.
 ## Features
 
 - **Win11 layout**: tabs in the title bar, one navigation row (Back / Forward / Up /
-  Refresh, breadcrumb address bar, search, "…" menu with the command bar's commands),
+  Refresh, the Notepad and the player, breadcrumb address bar, search, "…" menu with the
+  command bar's commands),
   navigation pane, details / preview pane, status bar with view toggles. Dark and light
   mode follow Windows, Per-Monitor DPI v2.
 - **Pinned tabs** (right-click a tab ▸ Pin tab) stay first, can't be closed, and keep
@@ -53,7 +54,8 @@ File Explorer while starting in well under 100 ms.
   complete in under 0.2 s.
 - **Media player**: "Play in Explorer Plus" / "Queue in Explorer Plus" in the compact menu
   of audio and video files (and of folders with some: their files by name, subfolders
-  after) open a player window — the video, or for sound the album cover (cover.jpg,
+  after) open a player window (its button beside Refresh, or "…" ▸ Player, brings it up,
+  empty to drop files on when none is open) — the video, or for sound the album cover (cover.jpg,
   folder.jpg, … in the track's folder, else its biggest picture, else the art in the
   file), the tags (album, year, genre, track, …) with the format, bitrate and sample
   rate, and a scrolling spectrogram or a visualization (mirrored bars, waveform, circle,
@@ -103,8 +105,9 @@ File Explorer while starting in well under 100 ms.
   back to the app they had before. A type Windows keeps to itself is left to Settings,
   which then opens at Explorer Plus' page; double-click a type for Windows' own "Open with"
   list. Files opened this way go to the one player; several opened together are queued.
-- **Notepad** ("…" ▸ Notepad, or "Edit in Explorer Plus" in the compact menu of text
-  files): text files in tabs, as in Windows 11's Notepad. Its tabs stay as you leave them,
+- **Notepad** (its button beside Refresh, "…" ▸ Notepad, or "Edit in Explorer Plus" in the
+  compact menu of text files): text files in tabs in its title bar, as in Windows 11's
+  Notepad, with a taskbar button and icon of its own. Its tabs stay as you leave them,
   unsaved text included (kept a second after each change, so a crash loses nothing): closing
   the window asks nothing, and it opens again with them. Files keep their encoding (UTF-8,
   with or without BOM, UTF-16 LE / BE, ANSI) and line endings (CRLF, LF, CR), both shown in
@@ -114,6 +117,21 @@ File Explorer while starting in well under 100 ms.
   open them; drag tabs to reorder them. Keys: Ctrl+N / Ctrl+T new tab, Ctrl+O, Ctrl+S,
   Ctrl+Shift+S, Ctrl+W, Ctrl+Shift+W close window, Ctrl+Tab / Ctrl+1..9, Ctrl+F, F3 /
   Shift+F3, Ctrl+H, Ctrl+G, F5, Ctrl+Plus / Minus / 0 (or Ctrl+wheel), Alt+F / E / V menus.
+  - Syntax colours (as Visual Studio Code's Dark+ / Light+) by the file's name, or chosen in
+    View ▸ Syntax or the status bar: C / C++, C#, Java, JavaScript, TypeScript, Go, Rust,
+    Python, Ruby, Lua, PowerShell, batch files, shell scripts, SQL, CSS, JSON, XML, HTML
+    (its scripts and styles too), Markdown, INI, TOML, YAML and diffs. Edit ▸ Format document
+    (Alt+Shift+F) indents JSON and XML (an error: its line); Compact JSON puts it on one line.
+  - Double-click a word: it and every other one like it are marked (the status bar counts
+    them); Esc clears the marks.
+  - Edit ▸ Lines: duplicate (Ctrl+D), delete (Ctrl+Shift+K), move up / down (Alt+Up /
+    Down), sort ascending / descending (numbers by value), reverse, remove duplicates or
+    empty lines, trim trailing spaces, join (Ctrl+J); on the lines selected, else all.
+    Edit ▸ Convert: UPPER / lower / Title case (Ctrl+Shift+U / Ctrl+U), Base64 and URL
+    encode / decode, on the selection (else the word or the line).
+  - Big files (up to 64 MB) open at once: the first screen shows in a fraction of a second
+    and the rest goes in while you read (the status bar counts it in). Only the part shown
+    is coloured, so scrolling a 50 MB file stays smooth.
 - **Screenshots** (Alt+Q anywhere while Explorer Plus runs, or "…" ▸ Take a screenshot):
   drag a region or click for the whole screen (Enter: the screen under the mouse, Esc
   cancels). It is copied to the clipboard and opens in the picture editor.
@@ -253,6 +271,7 @@ src/imageformats       TGA, QOI, HDR, PSD, PCX decoders; APNG frames; SVG size
 src/screenshot, imageedit, shapes   Alt+Q screenshots, picture editor, its objects' geometry
 src/assoc, userchoice  media file type registration (Media file types), the default-app hash
 src/notepad, textfile  the Notepad window; text encodings, line endings, its kept tabs
+src/syntax, textops    the Notepad's lexers, JSON / XML formatting; line, case, Base64, URL operations
 src/settings, ini, theme, perf, crash   settings.ini, colours and fonts, profiling, crash dumps
 src/cmdline            command line and typed-path text
 tests/                 unit tests (ctest)

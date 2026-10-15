@@ -1,9 +1,11 @@
 """Draw the app icon (the familiar yellow file folder with a green plus badge) at every
 size Windows asks for. The folder fills the canvas, so the icon reads at taskbar sizes.
-With --player: the media player's icon, the same folder with an orange play badge.
+With --player: the media player's icon, the same folder with an orange play badge; with
+--notepad: the Notepad's, a blue badge with lines of text.
 
 Usage: python -I tools/make_icon.py res/app.ico [preview-dir]
        python -I tools/make_icon.py --player res/player.ico [preview-dir]
+       python -I tools/make_icon.py --notepad res/notepad.ico [preview-dir]
 
 No dependencies: shapes are sampled 4x4 per pixel and every size is stored as a PNG
 entry in the .ico (supported since Windows Vista). With a preview dir, each size is
@@ -23,7 +25,9 @@ FRONT_LIP = (255, 234, 166)                           # light top edge of the fr
 BADGE_A, BADGE_B = (84, 200, 84), (16, 124, 16)        # top -> bottom (Windows' success green)
 PLUS = (255, 255, 255)
 PLAY_A, PLAY_B = (255, 146, 48), (214, 70, 0)         # the player's badge, top -> bottom
+NOTE_A, NOTE_B = (76, 160, 255), (0, 92, 196)         # the Notepad's badge, top -> bottom
 PLAYER = False                                        # --player: a play badge instead of the plus
+NOTEPAD = False                                       # --notepad: lines of text instead
 
 
 def mix(a, b, t):
@@ -65,6 +69,15 @@ def shade(x, y, size):
             if in_tri(x, y, (bx - br * 0.36, by - br * 0.52), (bx - br * 0.36, by + br * 0.52), (bx + br * 0.56, by)):
                 return PLUS
             return mix(PLAY_A, PLAY_B, (y - by + br) / (2 * br))
+        if NOTEPAD:                         # three lines, the last one short; whole pixels thick
+            lh = max(1, round(br * 0.2 / k)) * k
+            y0 = snap(by - 2.5 * lh)
+            w = br * 0.56
+            for i in range(3):
+                top = y0 + 2 * i * lh
+                if top <= y < top + lh and bx - w <= x <= bx + (w if i < 2 else w * 0.15):
+                    return PLUS
+            return mix(NOTE_A, NOTE_B, (y - by + br) / (2 * br))
         half, arm = bar * k / 2, snap(br * 0.74)
         if (abs(x - bx) <= half and abs(y - by) <= arm) or (abs(y - by) <= half and abs(x - bx) <= arm):
             return PLUS
@@ -117,12 +130,15 @@ def png(size, raw):
 
 
 def main():
-    global PLAYER
+    global PLAYER, NOTEPAD
     args = sys.argv[1:]
     if args[:1] == ['--player']:
         PLAYER = True
         args = args[1:]
-    out = args[0] if args else ('res/player.ico' if PLAYER else 'res/app.ico')
+    elif args[:1] == ['--notepad']:
+        NOTEPAD = True
+        args = args[1:]
+    out = args[0] if args else ('res/player.ico' if PLAYER else 'res/notepad.ico' if NOTEPAD else 'res/app.ico')
     preview = args[1] if len(args) > 1 else None
     images = [render(s) for s in SIZES]
     header = struct.pack('<HHH', 0, 1, len(images))

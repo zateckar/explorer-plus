@@ -259,6 +259,7 @@ static HMENU build_more_menu() {
     AppendMenuW(m, MF_POPUP, (UINT_PTR)build_text_size_menu(), L"Text size");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_NOTEPAD, L"Notepad");
+    AppendMenuW(m, MF_STRING, IDM_PLAYER, L"Player");
     AppendMenuW(m, MF_STRING, IDM_SCREENSHOT, L"Take a screenshot\tAlt+Q");
     AppendMenuW(m, MF_STRING, IDM_MEDIA_TYPES, L"Media file types...");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -345,6 +346,7 @@ void cmdbar_show_tools() {
     item(IDM_VIEW_CMDBAR, L"Show command &bar", 0, L"", g_cmdBarVisible);
     sep();
     item(IDM_NOTEPAD, L"&Notepad", L'\xE70B');
+    item(IDM_PLAYER, L"Pla&yer", L'\xE768');
     item(IDM_SCREENSHOT, L"Take a &screenshot", L'\xE722', L"Alt+Q");
     item(IDM_MEDIA_TYPES, L"&Media file types...", L'\xE8B9');
     UINT id = flyout_track(g_main, pt, row, list);

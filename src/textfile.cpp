@@ -2,6 +2,7 @@
 #include "ini.h"
 #include <windows.h>
 #include <algorithm>
+#include <cstring>
 #include <cwchar>
 
 namespace {
@@ -10,13 +11,14 @@ std::wstring from_codepage(UINT cp, const char* p, size_t n, bool strict, bool* 
     if (ok) *ok = true;
     if (!n) return {};
     DWORD flags = strict ? MB_ERR_INVALID_CHARS : 0;
-    int len = MultiByteToWideChar(cp, flags, p, (int)n, nullptr, 0);
+    std::wstring w(n, L'\0');                   // (a byte makes a character at most: converted in one go)
+    int len = MultiByteToWideChar(cp, flags, p, (int)n, w.data(), (int)n);
     if (len <= 0) {
         if (ok) *ok = false;
-        return {};
+        w.clear();
+    } else {
+        w.resize((size_t)len);
     }
-    std::wstring w((size_t)len, L'\0');
-    MultiByteToWideChar(cp, flags, p, (int)n, w.data(), len);
     return w;
 }
 
@@ -25,21 +27,6 @@ std::wstring from_utf16(const unsigned char* p, size_t n, bool bigEndian) {
     for (size_t i = 0; i < w.size(); ++i)
         w[i] = bigEndian ? (wchar_t)(p[2 * i] << 8 | p[2 * i + 1]) : (wchar_t)(p[2 * i] | p[2 * i + 1] << 8);
     return w;
-}
-
-LineEnding most_used_eol(const std::wstring& s) {
-    size_t crlf = 0, lf = 0, cr = 0;
-    for (size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == L'\r') {
-            if (i + 1 < s.size() && s[i + 1] == L'\n') { ++crlf; ++i; }
-            else ++cr;
-        } else if (s[i] == L'\n') {
-            ++lf;
-        }
-    }
-    if (lf > crlf && lf >= cr) return LineEnding::Lf;
-    if (cr > crlf && cr > lf) return LineEnding::Cr;
-    return LineEnding::CrLf;
 }
 
 } // namespace
@@ -64,22 +51,57 @@ const wchar_t* line_ending_name(LineEnding e) {
     }
 }
 
-std::wstring text_to_crlf(const std::wstring& s) {
-    std::wstring out;
-    out.reserve(s.size() + s.size() / 32);
-    for (size_t i = 0; i < s.size(); ++i) {
-        wchar_t c = s[i];
-        if (c == L'\r') {
-            if (i + 1 < s.size() && s[i + 1] == L'\n') ++i;
-            out += L"\r\n";
-        } else if (c == L'\n') {
-            out += L"\r\n";
-        } else {
-            out += c;
+namespace {
+
+struct LineEnds {
+    size_t crs = 0, lfs = 0, pairs = 0;     // lone CRs, lone LFs, CRLFs
+};
+
+LineEnds count_line_ends(const std::wstring& s) {
+    LineEnds c;
+    const wchar_t* p = s.data();
+    for (size_t i = 0, n = s.size(); i < n; ++i) {
+        if (p[i] == L'\r') {
+            if (i + 1 < n && p[i + 1] == L'\n') { ++c.pairs; ++i; }
+            else ++c.crs;
+        } else if (p[i] == L'\n') {
+            ++c.lfs;
         }
     }
-    return out;
+    return c;
 }
+
+// those all nl already (one or two characters)
+bool all_line_ends(const LineEnds& c, const wchar_t* nl) {
+    return nl[1] ? !c.crs && !c.lfs : !c.pairs && (nl[0] == L'\r' ? !c.lfs : !c.crs);
+}
+
+// s's line endings made nl: in place when that makes it no longer (CRLF to CR, say), the lines
+// moved whole (a big file's millions of them)
+void set_line_ends(std::wstring& s, const LineEnds& c, const wchar_t* nl) {
+    if (all_line_ends(c, nl)) return;
+    size_t nlLen = nl[1] ? 2 : 1, n = s.size(), breaks = c.crs + c.lfs + c.pairs;
+    size_t size = n - breaks - c.pairs + breaks * nlLen;
+    std::wstring grown;
+    if (size > n) grown.assign(size, L'\0');
+    const wchar_t* p = s.data();
+    wchar_t* o = size > n ? grown.data() : s.data();
+    for (size_t i = 0; i < n;) {
+        size_t j = i;
+        while (j < n && p[j] != L'\r' && p[j] != L'\n') ++j;
+        memmove(o, p + i, (j - i) * sizeof(wchar_t));
+        o += j - i;
+        if (j == n) break;
+        if (p[j] == L'\r' && j + 1 < n && p[j + 1] == L'\n') ++j;
+        *o++ = nl[0];
+        if (nlLen == 2) *o++ = nl[1];
+        i = j + 1;
+    }
+    if (size > n) s.swap(grown);
+    else s.resize(size);
+}
+
+} // namespace
 
 TextFile text_decode(const std::string& bytes) {
     TextFile f;
@@ -117,38 +139,40 @@ TextFile text_decode(const std::string& bytes) {
         }
     }
     f.binary = w.find(L'\0') != std::wstring::npos;
-    f.eol = most_used_eol(w);
-    f.text = text_to_crlf(w);
+    // (the most used line ending; CRLF when none)
+    LineEnds c = count_line_ends(w);
+    f.eol = c.lfs > c.pairs && c.lfs >= c.crs ? LineEnding::Lf : c.crs > c.pairs && c.crs > c.lfs ? LineEnding::Cr : LineEnding::CrLf;
+    set_line_ends(w, c, L"\r");
+    f.text.swap(w);
     return f;
 }
 
 std::string text_encode(const std::wstring& text, TextEncoding enc, LineEnding eol, bool* lossy) {
     if (lossy) *lossy = false;
     const wchar_t* nl = eol == LineEnding::Lf ? L"\n" : eol == LineEnding::Cr ? L"\r" : L"\r\n";
-    std::wstring t;
-    t.reserve(text.size());
-    for (size_t i = 0; i < text.size(); ++i) {
-        wchar_t c = text[i];
-        if (c == L'\r') {
-            if (i + 1 < text.size() && text[i + 1] == L'\n') ++i;
-            t += nl;
-        } else if (c == L'\n') {
-            t += nl;
-        } else {
-            t += c;
-        }
+    LineEnds c = count_line_ends(text);
+    std::wstring converted;
+    if (!all_line_ends(c, nl)) {
+        converted = text;
+        set_line_ends(converted, c, nl);
     }
+    const std::wstring& t = all_line_ends(c, nl) ? text : converted;
     std::string out;
     switch (enc) {
         case TextEncoding::Utf16Le:
         case TextEncoding::Utf16Be: {
             bool be = enc == TextEncoding::Utf16Be;
-            out.reserve(2 + t.size() * 2);
-            out += be ? "\xFE\xFF" : "\xFF\xFE";
+            out.assign(2 + t.size() * 2, '\0');
+            char* o = out.data();
+            *o++ = be ? '\xFE' : '\xFF';
+            *o++ = be ? '\xFF' : '\xFE';
+            if (!be) {
+                memcpy(o, t.data(), t.size() * 2);  // (as wchar_t is held)
+                return out;
+            }
             for (wchar_t c : t) {
-                char lo = (char)(c & 0xFF), hi = (char)(c >> 8);
-                out += be ? hi : lo;
-                out += be ? lo : hi;
+                *o++ = (char)(c >> 8);
+                *o++ = (char)(c & 0xFF);
             }
             return out;
         }
@@ -205,6 +229,7 @@ std::wstring note_session_serialize(const NoteSession& s) {
             swprintf(b, 24, L"%llx", t.fileTime);
             d.set(sec, L"fileTime", b);
         }
+        if (!t.syntax.empty()) d.set(sec, L"syntax", t.syntax);
     }
     return ini_serialize(d);
 }
@@ -245,6 +270,7 @@ NoteSession note_session_parse(const std::wstring& text) {
         }
         t.top = std::max(0, num(sec, L"top", 0));
         t.fileTime = wcstoull(str(sec, L"fileTime").c_str(), nullptr, 16);
+        t.syntax = str(sec, L"syntax");
         // (a tab with neither a file nor kept text has nothing to show)
         if (t.path.empty() && t.cache.empty() && !t.untitled) continue;
         s.tabs.push_back(std::move(t));

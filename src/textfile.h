@@ -11,7 +11,7 @@ const wchar_t* encoding_name(TextEncoding e);      // "UTF-8", "UTF-16 LE", ...
 const wchar_t* line_ending_name(LineEnding e);     // "Windows (CRLF)", ...
 
 struct TextFile {
-    std::wstring text;              // its lines ended by CRLF (whatever the file has)
+    std::wstring text;              // its lines ended by CR, as the Notepad's text box has them (whatever the file has)
     TextEncoding enc = TextEncoding::Utf8;
     LineEnding eol = LineEnding::CrLf;   // the file's own (the most used, CRLF when none)
     bool binary = false;            // NUL characters: not a text file
@@ -22,7 +22,6 @@ TextFile text_decode(const std::string& bytes);
 // the text (any of CR, LF, CRLF ending its lines) as a file's bytes; `lossy`: the encoding
 // (ANSI) can't hold some of its characters
 std::string text_encode(const std::wstring& text, TextEncoding enc, LineEnding eol, bool* lossy = nullptr);
-std::wstring text_to_crlf(const std::wstring& s);
 
 // the tabs the Notepad had, with what wasn't saved (kept in its own folder)
 struct NoteTabState {
@@ -35,6 +34,7 @@ struct NoteTabState {
     int selStart = 0, selEnd = 0;   // the caret and selection
     int top = 0;                    // the first line shown
     unsigned long long fileTime = 0;     // its file's last write time when read or saved
+    std::wstring syntax;            // its colours' language when chosen (syntax.h's key); empty: by its name
 };
 struct NoteSession {
     std::vector<NoteTabState> tabs;

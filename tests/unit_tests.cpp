@@ -8,6 +8,8 @@
 #include "shapes.h"
 #include "userchoice.h"
 #include "textfile.h"
+#include "syntax.h"
+#include "textops.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -160,7 +162,7 @@ static void text_files() {
     f = text_decode(std::string("\xFE\xFF\0h\0i", 6));
     CHECK(f.enc == TextEncoding::Utf16Be && f.text == L"hi");
     f = text_decode(std::string("a\0b\0c\0\r\0\n\0", 10));
-    CHECK(f.enc == TextEncoding::Utf16Le && f.text == L"abc\r\n");
+    CHECK(f.enc == TextEncoding::Utf16Le && f.text == L"abc\r");
     f = text_decode("plain");
     CHECK(f.enc == TextEncoding::Utf8 && f.text == L"plain");
     f = text_decode("\xC5\xA1koda");                          // (UTF-8 without a BOM)
@@ -171,17 +173,19 @@ static void text_files() {
     CHECK(f.binary);
     f = text_decode("");
     CHECK(f.enc == TextEncoding::Utf8 && f.text.empty() && f.eol == LineEnding::CrLf);
-    // line endings: the most used one; the text always with CRLF
+    // line endings: the most used one; the text always with CR (as the text box has it)
     f = text_decode("a\nb\nc\r\nd");
-    CHECK(f.eol == LineEnding::Lf && f.text == L"a\r\nb\r\nc\r\nd");
+    CHECK(f.eol == LineEnding::Lf && f.text == L"a\rb\rc\rd");
     f = text_decode("a\rb\rc");
-    CHECK(f.eol == LineEnding::Cr && f.text == L"a\r\nb\r\nc");
+    CHECK(f.eol == LineEnding::Cr && f.text == L"a\rb\rc");
     f = text_decode("a\r\nb\nc\r\n");
-    CHECK(f.eol == LineEnding::CrLf);
+    CHECK(f.eol == LineEnding::CrLf && f.text == L"a\rb\rc\r");
     // written back: in the file's line endings and encoding
     CHECK(text_encode(L"a\r\nb\rc\nd", TextEncoding::Utf8, LineEnding::Lf) == "a\nb\nc\nd");
     CHECK(text_encode(L"a\nb", TextEncoding::Utf8, LineEnding::CrLf) == "a\r\nb");
     CHECK(text_encode(L"a\r\nb", TextEncoding::Utf8, LineEnding::Cr) == "a\rb");
+    CHECK(text_encode(L"a\rb\r", TextEncoding::Utf8, LineEnding::CrLf) == "a\r\nb\r\n");
+    CHECK(text_encode(L"a\rb", TextEncoding::Utf8, LineEnding::Cr) == "a\rb");
     CHECK(text_encode(L"\u00E9", TextEncoding::Utf8Bom, LineEnding::CrLf) == "\xEF\xBB\xBF\xC3\xA9");
     CHECK(text_encode(L"hi", TextEncoding::Utf16Le, LineEnding::CrLf) == std::string("\xFF\xFEh\0i\0", 6));
     CHECK(text_encode(L"hi", TextEncoding::Utf16Be, LineEnding::CrLf) == std::string("\xFE\xFF\0h\0i", 6));
@@ -207,6 +211,7 @@ static void note_sessions() {
     a.eol = LineEnding::Lf;
     a.selStart = 3; a.selEnd = 7; a.top = 12;
     a.fileTime = 0x01DB1F0A5C1A2B3Full;
+    a.syntax = L"json";
     NoteTabState b;
     b.untitled = 1;
     b.dirty = true;
@@ -220,6 +225,7 @@ static void note_sessions() {
         CHECK_EQ(r.tabs[0].path, a.path);
         CHECK(r.tabs[0].enc == TextEncoding::Utf16Be && r.tabs[0].eol == LineEnding::Lf && !r.tabs[0].dirty);
         CHECK(r.tabs[0].selStart == 3 && r.tabs[0].selEnd == 7 && r.tabs[0].top == 12 && r.tabs[0].fileTime == a.fileTime);
+        CHECK(r.tabs[0].syntax == L"json" && r.tabs[1].syntax.empty());
         CHECK(r.tabs[1].untitled == 1 && r.tabs[1].dirty && r.tabs[1].path.empty());
         CHECK_EQ(r.tabs[1].cache, L"note-1.txt");
     }
@@ -1027,10 +1033,193 @@ static void user_choice() {
     CHECK(user_choice_hash(L".mp4", sid, L"ExplorerPlus.mp3", t) != L"atetQeeExhM=");
 }
 
+// the colour of the first span that is exactly `piece` (Tok::Count: none is)
+static Tok tok_of(Lang l, const std::wstring& text, const std::wstring& piece, int state = 0) {
+    std::vector<SyntaxSpan> spans;
+    syntax_lex(l, text.c_str(), text.size(), state, &spans);
+    for (auto& s : spans)
+        if (text.compare(s.start, s.len, piece) == 0) return s.tok;
+    return Tok::Count;
+}
+
+static void syntax_colours() {
+    CHECK(lang_for_file(L"C:\\x\\main.CPP") == Lang::C);
+    CHECK(lang_for_file(L"a.json") == Lang::Json && lang_for_file(L"b.yml") == Lang::Yaml);
+    CHECK(lang_for_file(L"Dockerfile") == Lang::Shell && lang_for_file(L"notes.txt") == Lang::None);
+    CHECK(lang_from_key(lang_key(Lang::PowerShell)) == Lang::PowerShell && lang_from_key(L"nonsense") == Lang::None);
+
+    std::wstring c = L"#include <x.h>\r// note\rint main() { return f(0x1F, 2.5e-3) + 'c'; } /* a\rb */ \"s\\\"q\"";
+    CHECK(tok_of(Lang::C, c, L"#include <x.h>") == Tok::Preproc);
+    CHECK(tok_of(Lang::C, c, L"// note") == Tok::Comment);
+    CHECK(tok_of(Lang::C, c, L"int") == Tok::Type);
+    CHECK(tok_of(Lang::C, c, L"return") == Tok::Keyword);
+    CHECK(tok_of(Lang::C, c, L"main") == Tok::Function && tok_of(Lang::C, c, L"f") == Tok::Function);
+    CHECK(tok_of(Lang::C, c, L"0x1F") == Tok::Number && tok_of(Lang::C, c, L"2.5e-3") == Tok::Number);
+    CHECK(tok_of(Lang::C, c, L"'c'") == Tok::String && tok_of(Lang::C, c, L"\"s\\\"q\"") == Tok::String);
+    CHECK(tok_of(Lang::C, c, L"/* a\rb */") == Tok::Comment);
+
+    // resumable: a block comment, a multi-line string go on into the next piece
+    std::vector<SyntaxSpan> spans;
+    std::wstring a = L"x = 1 /* open\r", b = L"still */ y\r";
+    int st = syntax_lex(Lang::C, a.c_str(), a.size(), 0, &spans);
+    CHECK(st != 0);
+    CHECK(tok_of(Lang::C, b, L"still */", st) == Tok::Comment);
+    std::wstring p1 = L"s = \"\"\"doc\r", p2 = L"end\"\"\" + x\r";
+    st = syntax_lex(Lang::Python, p1.c_str(), p1.size(), 0, nullptr);
+    CHECK(st != 0 && tok_of(Lang::Python, p2, L"end\"\"\"", st) == Tok::String);
+    CHECK(syntax_lex(Lang::Python, p2.c_str(), p2.size(), st, nullptr) == 0);
+    std::wstring js = L"const t = `a\r";
+    CHECK(syntax_lex(Lang::JavaScript, js.c_str(), js.size(), 0, nullptr) != 0);
+    std::wstring cs = L"var p = @\"C:\\dir\r";
+    st = syntax_lex(Lang::CSharp, cs.c_str(), cs.size(), 0, nullptr);
+    CHECK(st != 0 && tok_of(Lang::CSharp, L"x\"\"y\" z", L"x\"\"y\"", st) == Tok::String);
+
+    CHECK(tok_of(Lang::Python, L"@dec\rdef f(self): return None", L"@dec") == Tok::Preproc);
+    CHECK(tok_of(Lang::Python, L"x = r'\\d' # c", L"r'\\d'") == Tok::String);
+    CHECK(tok_of(Lang::Python, L"x = r'\\d' # c", L"# c") == Tok::Comment);
+    CHECK(tok_of(Lang::PowerShell, L"$x = Get-Item -Path $env:TEMP -eq $true", L"Get-Item") == Tok::Function);
+    CHECK(tok_of(Lang::PowerShell, L"$x = Get-Item -Path $env:TEMP -eq $true", L"-Path") == Tok::Attr);
+    CHECK(tok_of(Lang::PowerShell, L"$x = Get-Item -Path $env:TEMP -eq $true", L"$env:TEMP") == Tok::Variable);
+    CHECK(tok_of(Lang::PowerShell, L"$x = Get-Item -Path $env:TEMP -EQ $True", L"-EQ") == Tok::Keyword);
+    CHECK(tok_of(Lang::PowerShell, L"$x = Get-Item -Path $env:TEMP -EQ $True", L"$True") == Tok::Literal);
+    CHECK(tok_of(Lang::Shell, L"echo $HOME a#b # c", L"$HOME") == Tok::Variable);
+    CHECK(tok_of(Lang::Shell, L"echo $HOME a#b # c", L"# c") == Tok::Comment);
+    CHECK(tok_of(Lang::Shell, L"echo $HOME a#b # c", L"#b # c") == Tok::Count);
+    CHECK(tok_of(Lang::Sql, L"SELECT name FROM t WHERE x = 'it''s' -- c", L"SELECT") == Tok::Keyword);
+    CHECK(tok_of(Lang::Sql, L"SELECT name FROM t WHERE x = 'it''s' -- c", L"'it''s'") == Tok::String);
+    CHECK(tok_of(Lang::Rust, L"fn f<'a>(c: char) { 'x' }", L"'a") == Tok::Variable);
+    CHECK(tok_of(Lang::Rust, L"fn f<'a>(c: char) { 'x' }", L"'x'") == Tok::String);
+    CHECK(tok_of(Lang::Batch, L"@echo off\rrem note\r:label\rset X=%~dp0 & echo %X% !Y! %%i", L"rem note") == Tok::Comment);
+    CHECK(tok_of(Lang::Batch, L"@echo off\rrem note\r:label\rset X=%~dp0 & echo %X% !Y! %%i", L":label") == Tok::Tag);
+    CHECK(tok_of(Lang::Batch, L"@echo off\rrem note\r:label\rset X=%~dp0 & echo %X% !Y! %%i", L"%~dp0") == Tok::Variable);
+    CHECK(tok_of(Lang::Batch, L"@echo off\rrem note\r:label\rset X=%~dp0 & echo %X% !Y! %%i", L"%X%") == Tok::Variable);
+    CHECK(tok_of(Lang::Batch, L"@echo off\rrem note\r:label\rset X=%~dp0 & echo %X% !Y! %%i", L"!Y!") == Tok::Variable);
+
+    std::wstring json = L"{ \"key\" : \"value\", \"n\": -1.5e3, \"ok\": true, \"z\": null }";
+    CHECK(tok_of(Lang::Json, json, L"\"key\"") == Tok::Key);
+    CHECK(tok_of(Lang::Json, json, L"\"value\"") == Tok::String);
+    CHECK(tok_of(Lang::Json, json, L"1.5e3") == Tok::Number);
+    CHECK(tok_of(Lang::Json, json, L"true") == Tok::Literal && tok_of(Lang::Json, json, L"null") == Tok::Literal);
+
+    std::wstring xml = L"<?xml version=\"1.0\"?>\r<a x=\"1\" y='2'><!-- c --><b>t &amp; u</b><![CDATA[<raw>]]></a>";
+    CHECK(tok_of(Lang::Xml, xml, L"<?xml version=\"1.0\"?>") == Tok::Preproc);
+    CHECK(tok_of(Lang::Xml, xml, L"<a") == Tok::Tag && tok_of(Lang::Xml, xml, L"</b") == Tok::Tag);
+    CHECK(tok_of(Lang::Xml, xml, L"x") == Tok::Attr && tok_of(Lang::Xml, xml, L"\"1\"") == Tok::String);
+    CHECK(tok_of(Lang::Xml, xml, L"<!-- c -->") == Tok::Comment);
+    CHECK(tok_of(Lang::Xml, xml, L"&amp;") == Tok::Literal);
+    CHECK(tok_of(Lang::Xml, xml, L"<![CDATA[<raw>]]>") == Tok::String);
+    std::wstring xa = L"<a>\r<!-- open\r";
+    st = syntax_lex(Lang::Xml, xa.c_str(), xa.size(), 0, nullptr);
+    CHECK(st != 0 && tok_of(Lang::Xml, L"close --> <b>", L"close -->", st) == Tok::Comment);
+    std::wstring html = L"<script>if (a<b) x = \"s\";</script><p class=\"c\">";
+    CHECK(tok_of(Lang::Html, html, L"\"s\"") == Tok::String);
+    CHECK(tok_of(Lang::Html, html, L"if") == Tok::Keyword);
+    CHECK(tok_of(Lang::Html, html, L"</script") == Tok::Tag && tok_of(Lang::Html, html, L"class") == Tok::Attr);
+
+    std::wstring css = L"a.btn:hover, #id { color: #fff; margin: 0 2px !important; --v: 1; }\r@media (x) {}";
+    CHECK(tok_of(Lang::Css, css, L"a") == Tok::Tag && tok_of(Lang::Css, css, L".btn") == Tok::Attr);
+    CHECK(tok_of(Lang::Css, css, L":hover") == Tok::Keyword && tok_of(Lang::Css, css, L"#id") == Tok::Attr);
+    CHECK(tok_of(Lang::Css, css, L"color") == Tok::Key && tok_of(Lang::Css, css, L"#fff") == Tok::Number);
+    CHECK(tok_of(Lang::Css, css, L"2px") == Tok::Number && tok_of(Lang::Css, css, L"!important") == Tok::Keyword);
+    CHECK(tok_of(Lang::Css, css, L"--v") == Tok::Variable && tok_of(Lang::Css, css, L"@media") == Tok::Keyword);
+
+    std::wstring md = L"# Title\r- item with `code` and **bold** and [link](http://x)\r```\rint x;\r```\r> quote";
+    CHECK(tok_of(Lang::Markdown, md, L"# Title") == Tok::Heading);
+    CHECK(tok_of(Lang::Markdown, md, L"-") == Tok::Keyword && tok_of(Lang::Markdown, md, L"`code`") == Tok::String);
+    CHECK(tok_of(Lang::Markdown, md, L"**bold**") == Tok::Emphasis && tok_of(Lang::Markdown, md, L"[link]") == Tok::Link);
+    CHECK(tok_of(Lang::Markdown, md, L"int x;") == Tok::String && tok_of(Lang::Markdown, md, L"> quote") == Tok::Comment);
+    CHECK(tok_of(Lang::Markdown, L"snake_case_name", L"_case_") == Tok::Count);
+
+    std::wstring ini = L"; c\r[section]\rkey = value 1\rn=42\rflag=true\r\"Reg\"=dword:1";
+    CHECK(tok_of(Lang::Ini, ini, L"; c") == Tok::Comment && tok_of(Lang::Ini, ini, L"[section]") == Tok::Heading);
+    CHECK(tok_of(Lang::Ini, ini, L"key") == Tok::Key && tok_of(Lang::Ini, ini, L"42") == Tok::Number);
+    CHECK(tok_of(Lang::Ini, ini, L"true") == Tok::Literal && tok_of(Lang::Ini, ini, L"\"Reg\"") == Tok::Key);
+    std::wstring toml = L"[[bin]]\rname = \"x\" # c\rlist = [1, 2]\rd = 1979-05-27T07:32:00Z\rt = { a = 1 }";
+    CHECK(tok_of(Lang::Toml, toml, L"[[bin]]") == Tok::Heading && tok_of(Lang::Toml, toml, L"\"x\"") == Tok::String);
+    CHECK(tok_of(Lang::Toml, toml, L"# c") == Tok::Comment && tok_of(Lang::Toml, toml, L"2") == Tok::Number);
+    CHECK(tok_of(Lang::Toml, toml, L"1979-05-27T07:32:00Z") == Tok::Number && tok_of(Lang::Toml, toml, L"a") == Tok::Key);
+
+    std::wstring yaml = L"---\rkey: value # c\rlist:\r  - 1\r  - \"two\"\rok: yes\rref: *anchor\rtext: |\r  block\r  more\rnext: 2";
+    CHECK(tok_of(Lang::Yaml, yaml, L"---") == Tok::Preproc && tok_of(Lang::Yaml, yaml, L"key") == Tok::Key);
+    CHECK(tok_of(Lang::Yaml, yaml, L"value") == Tok::String && tok_of(Lang::Yaml, yaml, L"# c") == Tok::Comment);
+    CHECK(tok_of(Lang::Yaml, yaml, L"1") == Tok::Number && tok_of(Lang::Yaml, yaml, L"\"two\"") == Tok::String);
+    CHECK(tok_of(Lang::Yaml, yaml, L"yes") == Tok::Literal && tok_of(Lang::Yaml, yaml, L"*anchor") == Tok::Variable);
+    CHECK(tok_of(Lang::Yaml, yaml, L"block") == Tok::String && tok_of(Lang::Yaml, yaml, L"next") == Tok::Key);
+
+    std::wstring diff = L"--- a\r+++ b\r@@ -1 +1 @@\r-old\r+new\r same";
+    CHECK(tok_of(Lang::Diff, diff, L"--- a") == Tok::Heading && tok_of(Lang::Diff, diff, L"@@ -1 +1 @@") == Tok::Preproc);
+    CHECK(tok_of(Lang::Diff, diff, L"-old") == Tok::Removed && tok_of(Lang::Diff, diff, L"+new") == Tok::Added);
+
+    // spans come in order and stay inside the text, whatever it holds
+    std::wstring junk = L"\"unterminated\r/* x\r<a b='\r`\r#\r[\r-\r";
+    for (int l = 0; l < (int)Lang::Count; ++l) {
+        std::vector<SyntaxSpan> v;
+        syntax_lex((Lang)l, junk.c_str(), junk.size(), 0, &v);
+        uint32_t last = 0;
+        for (auto& s : v) {
+            CHECK(s.start >= last && s.start + s.len <= junk.size());
+            last = s.start;
+        }
+    }
+}
+
+static void formatting() {
+    std::wstring out;
+    size_t err = 0;
+    CHECK(format_json(L"{\"a\":1,\"b\":[1,2,{}],\"c\":{\"d\":\"x,y\"}}", false, out, &err));
+    CHECK_EQ(out, L"{\r\n    \"a\": 1,\r\n    \"b\": [\r\n        1,\r\n        2,\r\n        {}\r\n    ],\r\n    \"c\": {\r\n        \"d\": \"x,y\"\r\n    }\r\n}");
+    CHECK(format_json(L"{ \"a\" : [ 1 , 2 ] }", true, out, &err));
+    CHECK_EQ(out, L"{\"a\":[1,2]}");
+    CHECK(format_json(L"{\"a\": 1, // one\n\"b\": 2}", false, out, &err));
+    CHECK_EQ(out, L"{\r\n    \"a\": 1, // one\r\n    \"b\": 2\r\n}");
+    CHECK(!format_json(L"{\"a\": [1, 2}", false, out, &err) && err == 11);
+    CHECK(!format_json(L"{\"a\": 1", false, out, &err) && err == 7);
+    CHECK(!format_json(L"{\"a\": \"open}", false, out, &err) && err == 6);
+
+    CHECK(format_xml(L"<?xml version=\"1.0\"?><a x=\"1>\"><b>text</b><c/><d></d><e><f/></e><!-- c --></a>", out, &err));
+    CHECK_EQ(out, L"<?xml version=\"1.0\"?>\r\n<a x=\"1>\">\r\n    <b>text</b>\r\n    <c/>\r\n    <d></d>\r\n    <e>\r\n        <f/>\r\n    </e>\r\n    <!-- c -->\r\n</a>");
+    CHECK(format_xml(L"<a>\n  <b>  x  </b>\n</a>", out, &err));
+    CHECK_EQ(out, L"<a>\r\n    <b>x</b>\r\n</a>");
+    CHECK(!format_xml(L"<a><b></a>", out, &err) && err == 6);
+    CHECK(!format_xml(L"<a><b>", out, &err) && err == 3);
+}
+
+static void text_operations() {
+    CHECK_EQ(line_op(LineOp::SortAsc, L"b\rA\rfile10\rfile2\ra"), L"A\ra\rb\rfile2\rfile10");
+    CHECK_EQ(line_op(LineOp::SortDesc, L"b\ra\rc"), L"c\rb\ra");
+    CHECK_EQ(line_op(LineOp::Unique, L"a\rb\ra\r\rb\r"), L"a\rb\r");
+    CHECK_EQ(line_op(LineOp::RemoveEmpty, L"a\r\r  \rb\r\n\nc"), L"a\rb\rc");
+    CHECK_EQ(line_op(LineOp::TrimTrailing, L"a  \rb\t\r c "), L"a\rb\r c");
+    CHECK_EQ(line_op(LineOp::Reverse, L"1\r2\r3"), L"3\r2\r1");
+    CHECK_EQ(line_op(LineOp::Join, L"a \r  b\r\r c"), L"a b c");
+    CHECK_EQ(change_case(CaseOp::Upper, L"\u0161koda x"), L"\u0160KODA X");
+    CHECK_EQ(change_case(CaseOp::Lower, L"ABC"), L"abc");
+    CHECK_EQ(change_case(CaseOp::Title, L"hello wORLD"), L"Hello World");
+
+    CHECK_EQ(base64_encode(L""), L"");
+    CHECK_EQ(base64_encode(L"f"), L"Zg==");
+    CHECK_EQ(base64_encode(L"fo"), L"Zm8=");
+    CHECK_EQ(base64_encode(L"foo"), L"Zm9v");
+    CHECK_EQ(base64_encode(L"\u0161"), L"xaE=");
+    std::wstring t;
+    CHECK(base64_decode(L"Zm9v\r\nYmFy", t) && t == L"foobar");
+    CHECK(base64_decode(L"Zg", t) && t == L"f");                    // (no padding)
+    CHECK(base64_decode(L"xaE=", t) && t == L"\u0161");
+    CHECK(base64_decode(L"-_8", t) == false);                      // (bytes, not UTF-8)
+    CHECK(!base64_decode(L"Zm9v!", t) && !base64_decode(L"Z", t) && !base64_decode(L"Zg==Zg", t));
+    CHECK_EQ(url_encode(L"a b&c=\u0161/~"), L"a%20b%26c%3D%C5%A1%2F~");
+    CHECK(url_decode(L"a%20b%26c%3D%C5%A1%2F~+%zz%", t) && t == L"a b&c=\u0161/~+%zz%");
+    CHECK(url_decode(L"\U0001F600%20", t) && t == L"\U0001F600 ");
+    CHECK(!url_decode(L"%C5", t));
+}
+
 int wmain() {
     user_choice();
     text_files();
     note_sessions();
+    syntax_colours();
+    formatting();
+    text_operations();
     queue_order();
     queue_remove();
     queue_shuffle();

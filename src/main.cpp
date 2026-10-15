@@ -496,6 +496,7 @@ static void on_command(WORD id) {
         case IDM_SCREENSHOT: screenshot_start(300); break;     // (the menu's fade first)
         case IDM_MEDIA_TYPES: assoc_dialog(g_main); break;
         case IDM_NOTEPAD: notepad_open({}); break;
+        case IDM_PLAYER: player_show(); break;
 
         case IDM_SORT_NAME: set_sort(0, -1); break;
         case IDM_SORT_DATE: set_sort(3, -1); break;

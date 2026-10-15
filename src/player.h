@@ -25,6 +25,8 @@ void player_save_playlist(HWND owner, const std::vector<MediaItem>& items);
 // to a player already running, else to one of this process. True: this process has the
 // player (it ends when the player closes); false: nothing more to do here
 bool player_open_file(const std::wstring& path);
+// the player brought forward (this process's or another's); an empty one when there is none
+void player_show();
 
 HWND player_window();                       // this process's player, or nullptr
 bool player_owns(HWND h);                   // h is the player or one of its windows
