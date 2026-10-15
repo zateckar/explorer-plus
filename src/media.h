@@ -3,9 +3,11 @@
 #include <vector>
 
 // Media Foundation playback of one file at a time (Media Session, the enhanced video
-// renderer into a window, the streaming audio renderer). Used on the UI thread; Media
-// Foundation's own threads report through MediaNotes posted to the `notify` window as
-// `msg` (lParam = MediaNote*, handed to MediaPlayer::handle, which frees it).
+// renderer into a window, the streaming audio renderer); web streams through its network
+// sources; MIDI files (Windows' own synthesizer) and audio CD tracks through MCI. Used on
+// the UI thread; Media Foundation's own threads report through MediaNotes posted to the
+// `notify` window as `msg` (lParam = MediaNote*, handed to MediaPlayer::handle, which frees
+// it).
 //
 // mf.dll / mfplat.dll load on first use, not at startup; where they are missing
 // (Windows N without the Media Feature Pack, a bare Windows Server) nothing plays and
@@ -74,6 +76,8 @@ private:
     std::wstring m_title, m_artist, m_album;
     AudioInfo m_audio;
     void start_at(LONGLONG hns, bool keepPosition);
+    bool open_mci(const std::wstring& path, bool play, LONGLONG startAt);
+    void mci_start(LONGLONG hns, bool resume);
     void topology_ready();
     void source_ready(struct IUnknown* obj, HRESULT hr);
     void fail(HRESULT hr);

@@ -58,9 +58,11 @@ private:
 // "3:07", "1:02:03"; empty for an unknown duration (< 0)
 std::wstring fmt_duration(long long hns);
 
-// files the player offers to play: audio and video by their perceived type, except
-// playlists and MIDI (Media Foundation plays neither)
+// files the player offers to play: audio and video by their perceived type (playlists
+// aside), MIDI (Windows' synthesizer plays it) and CD tracks
 bool media_extension_excluded(const std::wstring& ext);
+bool midi_file(const std::wstring& path);            // .mid .midi .rmi .kar
+bool cd_track_file(const std::wstring& path);        // .cda
 bool media_file_playable(const std::wstring& path);
 bool media_file_video(const std::wstring& path);     // its type is a video's (.mp4 too: may hold only sound)
 
@@ -68,21 +70,31 @@ bool media_file_video(const std::wstring& path);     // its type is a video's (.
 std::wstring pack_paths(const std::vector<std::wstring>& paths);
 std::vector<std::wstring> unpack_paths(const wchar_t* data, size_t chars);
 
+// a web address the player streams (http, https, mms, rtsp): internet radio, a playlist's
+bool media_url(const std::wstring& s);
+
 // ------------------------------------------------------------------
-// M3U / M3U8 playlists
+// playlists: M3U / M3U8 (read and written), PLS, WPL / ZPL, ASX / WAX / WVX, XSPF (read)
 // ------------------------------------------------------------------
 struct PlaylistEntry {
-    std::wstring path;              // absolute
-    std::wstring title;             // #EXTINF's, else empty
+    std::wstring path;              // absolute, or a web address (media_url)
+    std::wstring title;             // the playlist's, else empty
     long long duration = -1;        // 100-ns units, -1: not given
 };
 
-bool playlist_file(const std::wstring& path);        // .m3u / .m3u8
+enum class PlaylistKind { None, M3U, PLS, XML };
+PlaylistKind playlist_kind(const std::wstring& path);   // by the extension
+bool playlist_file(const std::wstring& path);
 
-// the entries of a playlist's text: #EXTINF titles and durations; relative paths (also
+// the entries of an M3U's text: #EXTINF titles and durations; relative paths (also
 // "\Music\a.mp3", "../a.mp3", '/' for '\') resolved against `dir` (the playlist's folder),
-// file:/// URLs as paths; web addresses and other comments left out
+// file:/// URLs as paths, web addresses as they are; other comments and schemes left out
 std::vector<PlaylistEntry> playlist_parse(const std::wstring& text, const std::wstring& dir);
+std::vector<PlaylistEntry> playlist_parse_pls(const std::wstring& text, const std::wstring& dir);
+// WPL, ZPL, ASX and XSPF: one tolerant reading of their XML
+std::vector<PlaylistEntry> playlist_parse_xml(const std::wstring& text, const std::wstring& dir);
+// by `kind`, unless the text says otherwise ("[playlist]": PLS, '<': XML)
+std::vector<PlaylistEntry> playlist_parse_any(const std::wstring& text, const std::wstring& dir, PlaylistKind kind);
 // a playlist's text (#EXTM3U, an #EXTINF where the title or duration is known, CRLF lines);
 // paths inside `dir` written relative to it (the folder can move with its playlist)
 std::wstring playlist_write(const std::vector<PlaylistEntry>& entries, const std::wstring& dir);

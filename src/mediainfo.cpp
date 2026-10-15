@@ -1,5 +1,6 @@
 #include "mediainfo.h"
 #include "mediadata.h"
+#include "playlist.h"
 #include <propkey.h>
 #include <propvarutil.h>
 #include <wincodec.h>
@@ -204,8 +205,10 @@ void worker() {
             job = std::move(s_job);
         }
         auto* note = new MediaInfoNote{ job->id, {} };
-        read_tags(job->path, note->info);
-        read_cover(wic, job->path, job->maxPx, note->info);
+        if (!media_url(job->path)) {          // (a stream: no tags, no folder, nothing to fetch)
+            read_tags(job->path, note->info);
+            read_cover(wic, job->path, job->maxPx, note->info);
+        }
         if (!PostMessageW(job->notify, job->msg, 0, (LPARAM)note)) delete note;
     }
     (void)co;                               // (the thread lives as long as the process)

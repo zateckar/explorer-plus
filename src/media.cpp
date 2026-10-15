@@ -1,9 +1,13 @@
 #include "media.h"
 #include "mediadata.h"
+#include "playlist.h"
+#include <mmsystem.h>
+#include <audiopolicy.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <mferror.h>
+#include <nserror.h>
 #include <evr.h>
 #include <mmdeviceapi.h>
 #include <audiosessiontypes.h>
@@ -62,7 +66,7 @@ bool media_available(std::wstring* why) {
             !proc(mf, "MFCreateVideoRendererActivate", s_mf.CreateVideoRendererActivate) ||
             !proc(mf, "MFGetService", s_mf.GetService)) {
             s_why = L"Media playback isn't installed on this computer (Windows N editions: add the Media Feature Pack).";
-        } else if (HRESULT hr = s_mf.Startup(MF_VERSION, MFSTARTUP_LITE); FAILED(hr)) {    // (no network sources)
+        } else if (HRESULT hr = s_mf.Startup(MF_VERSION, MFSTARTUP_FULL); FAILED(hr)) {    // (FULL: web streams too)
             WCHAR b[96];
             swprintf_s(b, L"Media playback couldn't start (error 0x%08lX).", (unsigned long)hr);
             s_why = b;
@@ -97,6 +101,15 @@ std::wstring media_error_text(HRESULT hr) {
             return L"The file isn't there anymore.";
         case HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED): case HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION):
             return L"The file can't be opened.";
+        case HRESULT_FROM_WIN32(ERROR_NOT_READY):
+            return L"There is no audio CD in the drive.";
+        case HRESULT_FROM_WIN32(ERROR_DEVICE_IN_USE):
+            return L"Another program is using the MIDI synthesizer or the CD drive.";
+        case NS_E_SERVER_NOT_FOUND: case NS_E_CONNECTION_FAILURE: case NS_E_CANNOTCONNECT:
+        case HRESULT_FROM_WIN32(12002): case HRESULT_FROM_WIN32(12007): case HRESULT_FROM_WIN32(12029):    // (WinINet: timeout, name, connect)
+            return L"The stream's server can't be reached.";
+        case MF_E_NET_NOCONNECTION: case MF_E_NET_REDIRECT: case MF_E_NET_READ:
+            return L"The stream can't be received.";
     }
     if (hr == E_FAIL || hr == S_OK) return L"This file can't be played.";
     WCHAR b[96];
@@ -108,7 +121,7 @@ std::wstring media_error_text(HRESULT hr) {
 // notes from Media Foundation's threads to the window
 // ------------------------------------------------------------------
 struct MediaNote {
-    enum Kind { Source, Event } kind = Event;
+    enum Kind { Source, Event, Ready } kind = Event;    // Ready: an MCI device opened
     UINT gen = 0;                   // the open it belongs to (stale ones are dropped)
     HRESULT hr = S_OK;              // the event's status / the resolver's result
     MediaEventType type = MEUnknown;
@@ -128,6 +141,14 @@ static void release_note(MediaNote* n) {
 
 static void post_note(HWND hwnd, UINT msg, MediaNote* n) {
     if (!PostMessageW(hwnd, msg, 0, (LPARAM)n)) release_note(n);    // (the window is gone)
+}
+
+static void post_event(HWND hwnd, UINT msg, UINT gen, MediaEventType type, MediaNote::Kind kind = MediaNote::Event) {
+    auto* n = new MediaNote;
+    n->kind = kind;
+    n->gen = gen;
+    n->type = type;
+    post_note(hwnd, msg, n);
 }
 
 struct CallbackBase : IMFAsyncCallback {
@@ -195,11 +216,12 @@ static std::wstring prop_text(IPropertyStore* ps, const PROPERTYKEY& key) {
 // manager can still rename, move or delete a file that is playing; then the source
 // resolver makes the media source from it (the path tells it the file type). The tags
 // come from the shell's property store, as Explorer shows them (a source made from a
-// stream has no property handler of its own).
+// stream has no property handler of its own). A web address: the resolver's network
+// source (no tags).
 struct OpenCallback : CallbackBase {
     std::wstring path, title, artist, album;
     IMFSourceResolver* resolver;
-    bool resolving = false;
+    bool resolving = false, url = false;
     OpenCallback(HWND h, UINT m, UINT g, IMFSourceResolver* r, std::wstring p)
         : CallbackBase(h, m, g), path(std::move(p)), resolver(r) { resolver->AddRef(); }
     ~OpenCallback() override { resolver->Release(); }
@@ -228,8 +250,15 @@ struct OpenCallback : CallbackBase {
         if (resolving) {
             MF_OBJECT_TYPE type = MF_OBJECT_INVALID;
             IUnknown* source = nullptr;
-            HRESULT hr = resolver->EndCreateObjectFromByteStream(result, &type, &source);
+            HRESULT hr = url ? resolver->EndCreateObjectFromURL(result, &type, &source)
+                             : resolver->EndCreateObjectFromByteStream(result, &type, &source);
             answer(hr, source);
+            return S_OK;
+        }
+        if (media_url(path)) {
+            url = resolving = true;
+            HRESULT hr = resolver->BeginCreateObjectFromURL(path.c_str(), kFlags, nullptr, nullptr, this, nullptr);
+            if (FAILED(hr)) answer(hr, nullptr);
             return S_OK;
         }
         read_tags();
@@ -248,6 +277,104 @@ struct OpenCallback : CallbackBase {
         return S_OK;
     }
 };
+
+// ------------------------------------------------------------------
+// MIDI (Windows' own synthesizer, the Microsoft GS Wavetable Synth) and audio CD tracks:
+// MCI's sequencer and cdaudio devices (Media Foundation plays neither). winmm.dll loads on
+// first use, as Media Foundation does.
+// ------------------------------------------------------------------
+static MCIERROR (WINAPI* s_mciSend)(MCIDEVICEID, UINT, DWORD_PTR, DWORD_PTR) = nullptr;
+
+static bool mci_available() {
+    static int loaded = 0;
+    if (!loaded) {
+        loaded = -1;
+        if (HMODULE w = LoadLibraryExW(L"winmm.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32))
+            if (proc(w, "mciSendCommandW", s_mciSend)) loaded = 1;
+    }
+    return loaded > 0;
+}
+
+// what the MCI window passes on: the device's end, as the session's MESessionEnded
+struct MciLink { HWND notify = nullptr; UINT msg = 0, gen = 0; MCIDEVICEID dev = 0; };
+
+static LRESULT CALLBACK mci_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == MM_MCINOTIFY) {
+        // (superseded / aborted: a seek, a pause, a stop; only a play that ran out is the end)
+        auto* link = reinterpret_cast<MciLink*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+        if (link && link->dev && (MCIDEVICEID)lp == link->dev && wp == MCI_NOTIFY_SUCCESSFUL)
+            post_event(link->notify, link->msg, link->gen, MESessionEnded);
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+static HWND mci_window(MciLink* link) {
+    static bool registered = false;
+    if (!registered) {
+        registered = true;
+        WNDCLASSEXW wc{ sizeof(wc) };
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpfnWndProc = mci_proc;
+        wc.lpszClassName = L"ExplorerPlusMci";
+        RegisterClassExW(&wc);
+    }
+    HWND h = CreateWindowExW(0, L"ExplorerPlusMci", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (h) SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)link);
+    return h;
+}
+
+// a .cda file's track number: its RIFF 'CDDA' header (else the "Track07.cda" name)
+static int cda_track(const std::wstring& path) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        unsigned char b[44]{};
+        DWORD got = 0;
+        bool ok = ReadFile(f, b, sizeof(b), &got, nullptr) && got >= 24 && memcmp(b, "RIFF", 4) == 0 && memcmp(b + 8, "CDDA", 4) == 0;
+        CloseHandle(f);
+        if (ok) return b[22] | (b[23] << 8);
+    }
+    const wchar_t* name = PathFindFileNameW(path.c_str());
+    while (*name && !iswdigit(*name)) ++name;
+    return (int)wcstol(name, nullptr, 10);
+}
+
+// The process's own audio session on the default output, where Windows' MIDI synthesizer
+// plays: its volume is the player's while a MIDI file plays (the sequencer has none of its
+// own), and what it was before after that.
+static float s_sessionWas = -1;
+
+static ISimpleAudioVolume* session_volume() {
+    IMMDeviceEnumerator* en = nullptr;
+    IMMDevice* dev = nullptr;
+    IAudioSessionManager* sm = nullptr;
+    ISimpleAudioVolume* v = nullptr;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&en))) &&
+        SUCCEEDED(en->GetDefaultAudioEndpoint(eRender, eConsole, &dev)) &&
+        SUCCEEDED(dev->Activate(__uuidof(IAudioSessionManager), CLSCTX_INPROC_SERVER, nullptr, (void**)&sm)))
+        sm->GetSimpleAudioVolume(nullptr, FALSE, &v);
+    if (sm) sm->Release();
+    if (dev) dev->Release();
+    if (en) en->Release();
+    return v;
+}
+
+static void set_session_volume(float level) {
+    ISimpleAudioVolume* v = session_volume();
+    if (!v) return;
+    if (s_sessionWas < 0) v->GetMasterVolume(&s_sessionWas);
+    v->SetMasterVolume(level, nullptr);
+    v->Release();
+}
+
+static void restore_session_volume() {
+    if (s_sessionWas < 0) return;
+    if (ISimpleAudioVolume* v = session_volume()) {
+        v->SetMasterVolume(s_sessionWas, nullptr);
+        v->Release();
+    }
+    s_sessionWas = -1;
+}
 
 // ------------------------------------------------------------------
 // player
@@ -271,6 +398,14 @@ struct MediaPlayer::Impl {
     LONGLONG queuedSeek = -1;       // asked for while `pending`
     LONGLONG shownPos = -1;         // a seek's target until the session has got there
     float amplitude = 1.0f;
+    // MCI instead of the session (MIDI, a CD track)
+    MCIDEVICEID mci = 0;
+    MciLink link;
+    HWND mciWnd = nullptr;
+    DWORD cdFrom = 0, cdTo = 0;     // a CD track's place on the disc (ms); 0, 0: a MIDI file
+    MCIERROR mci_send(UINT cmd, DWORD_PTR flags, void* params) {
+        return mci ? s_mciSend(mci, cmd, flags, (DWORD_PTR)params) : MCIERR_INVALID_DEVICE_ID;
+    }
 };
 
 MediaPlayer::MediaPlayer(HWND notify, UINT msg, HWND video) : d(new Impl) {
@@ -281,6 +416,7 @@ MediaPlayer::MediaPlayer(HWND notify, UINT msg, HWND video) : d(new Impl) {
 
 MediaPlayer::~MediaPlayer() {
     close();
+    if (d->mciWnd) DestroyWindow(d->mciWnd);
     delete d;
 }
 
@@ -300,6 +436,14 @@ static void wait_closed(HANDLE ev, DWORD ms) {
 
 void MediaPlayer::close() {
     ++d->gen;                                        // whatever is still on its way is stale
+    if (d->mci) {
+        d->mci_send(MCI_STOP, 0, nullptr);
+        d->mci_send(MCI_CLOSE, 0, nullptr);
+        d->mci = 0;
+        d->cdFrom = d->cdTo = 0;
+        restore_session_volume();
+    }
+    d->link.dev = 0;
     release(d->display);
     release(d->volume);
     release(d->clock);
@@ -334,6 +478,7 @@ void MediaPlayer::fail(HRESULT hr) {
 
 bool MediaPlayer::open(const std::wstring& path, bool play, LONGLONG startAt) {
     close();
+    if (midi_file(path) || cd_track_file(path)) return open_mci(path, play, startAt);
     if (!media_available()) { fail(MF_E_PLATFORM_NOT_INITIALIZED); return false; }
     UINT gen = d->gen;
     IMFSourceResolver* resolver = nullptr;
@@ -355,6 +500,95 @@ bool MediaPlayer::open(const std::wstring& path, bool play, LONGLONG startAt) {
     d->startAt = startAt > 0 ? startAt : 0;
     d->wantPaused = !play && d->startAt > 0;         // (shown paused there)
     return true;
+}
+
+// MIDI and CD tracks: the device opened here (it's quick), Opened reported as a note as
+// Media Foundation's is
+bool MediaPlayer::open_mci(const std::wstring& path, bool play, LONGLONG startAt) {
+    if (!mci_available()) { fail(MF_E_PLATFORM_NOT_INITIALIZED); return false; }
+    bool cd = cd_track_file(path);
+    int track = cd ? cda_track(path) : 0;
+    if (cd && (track <= 0 || track > 99 || path.size() < 3 || path[1] != L':')) { fail(MF_E_INVALID_FILE_FORMAT); return false; }
+    std::wstring element = cd ? path.substr(0, 2) : path;
+    if (!cd && element.size() >= MAX_PATH) {        // (MCI's paths are MAX_PATH at most)
+        WCHAR s[MAX_PATH];
+        if (GetShortPathNameW(path.c_str(), s, MAX_PATH)) element = s;
+    }
+    MCI_OPEN_PARMSW op{};
+    op.lpstrDeviceType = cd ? L"cdaudio" : L"sequencer";
+    op.lpstrElementName = element.c_str();
+    MCIERROR err = s_mciSend(0, MCI_OPEN, MCI_OPEN_TYPE | MCI_OPEN_ELEMENT | (cd ? MCI_OPEN_SHAREABLE : 0), (DWORD_PTR)&op);
+    if (err) {
+        fail(err == MCIERR_DEVICE_OPEN || err == MCIERR_DEVICE_LOCKED ? HRESULT_FROM_WIN32(ERROR_DEVICE_IN_USE)
+             : cd ? HRESULT_FROM_WIN32(ERROR_NOT_READY)
+             : GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES ? HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
+             : MF_E_INVALID_FILE_FORMAT);
+        return false;
+    }
+    d->mci = op.wDeviceID;
+    MCI_SET_PARMS sp{};
+    sp.dwTimeFormat = MCI_FORMAT_MILLISECONDS;
+    d->mci_send(MCI_SET, MCI_SET_TIME_FORMAT, &sp);
+    MCI_STATUS_PARMS st{};
+    if (cd) {
+        st.dwItem = MCI_STATUS_POSITION;
+        st.dwTrack = (DWORD)track;
+        MCIERROR e1 = d->mci_send(MCI_STATUS, MCI_STATUS_ITEM | MCI_TRACK, &st);
+        d->cdFrom = (DWORD)st.dwReturn;
+        st.dwItem = MCI_STATUS_LENGTH;
+        MCIERROR e2 = d->mci_send(MCI_STATUS, MCI_STATUS_ITEM | MCI_TRACK, &st);
+        if (e1 || e2 || !st.dwReturn) { close(); fail(HRESULT_FROM_WIN32(ERROR_NOT_READY)); return false; }
+        d->cdTo = d->cdFrom + (DWORD)st.dwReturn;
+        m_duration = (LONGLONG)st.dwReturn * 10000;
+        m_audio.format = 0x43444441;                 // 'CDDA': 44.1 kHz, 16-bit stereo
+        m_audio.rate = 44100;
+        m_audio.channels = 2;
+        m_audio.bits = 16;
+        m_audio.bitrate = 1411200;
+    } else {
+        st.dwItem = MCI_STATUS_LENGTH;
+        if (!d->mci_send(MCI_STATUS, MCI_STATUS_ITEM, &st)) m_duration = (LONGLONG)st.dwReturn * 10000;
+        m_audio.format = 0x4D494449;                 // 'MIDI'
+    }
+    if (!d->mciWnd) d->mciWnd = mci_window(&d->link);
+    d->link = { d->notify, d->msg, d->gen, d->mci };
+    set_volume(d->amplitude);
+    m_state = State::Opening;
+    d->playWhenReady = play;
+    d->startAt = startAt > 0 ? startAt : 0;
+    d->wantPaused = !play && d->startAt > 0;
+    post_event(d->notify, d->msg, d->gen, MEUnknown, MediaNote::Ready);
+    return true;
+}
+
+// MCI: plays from `hns` (resume: from where it was), or (wantPaused) stays there; the
+// state reported as notes, as the session's
+void MediaPlayer::mci_start(LONGLONG hns, bool resume) {
+    DWORD at = d->cdFrom + (DWORD)(std::max<LONGLONG>(0, hns) / 10000);
+    if (d->cdTo && at >= d->cdTo) at = d->cdTo - 1;
+    if (d->wantPaused) {
+        if (!resume) {
+            MCI_SEEK_PARMS sk{};
+            sk.dwTo = at;
+            d->mci_send(MCI_SEEK, MCI_TO, &sk);
+        }
+        post_event(d->notify, d->msg, d->gen, MESessionPaused);
+        return;
+    }
+    MCI_PLAY_PARMS pp{};
+    pp.dwCallback = (DWORD_PTR)d->mciWnd;
+    DWORD flags = MCI_NOTIFY;
+    if (!resume) { pp.dwFrom = at; flags |= MCI_FROM; }
+    if (d->cdTo) { pp.dwTo = d->cdTo; flags |= MCI_TO; }
+    if (d->mci_send(MCI_PLAY, flags, &pp)) {
+        auto* n = new MediaNote;
+        n->gen = d->gen;
+        n->type = MEError;
+        n->hr = d->cdTo ? HRESULT_FROM_WIN32(ERROR_NOT_READY) : MF_E_INVALID_FILE_FORMAT;
+        post_note(d->notify, d->msg, n);
+        return;
+    }
+    post_event(d->notify, d->msg, d->gen, MESessionStarted);
 }
 
 // Opus in MP4: Windows' MP4 source labels the stream with the sample entry's box type
@@ -512,6 +746,7 @@ void MediaPlayer::topology_ready() {
 }
 
 void MediaPlayer::start_at(LONGLONG hns, bool resume) {
+    if (d->mci) { mci_start(hns, resume); return; }
     if (!d->session) return;
     PROPVARIANT v;
     PropVariantInit(&v);
@@ -540,6 +775,11 @@ void MediaPlayer::play() {
 void MediaPlayer::pause() {
     d->wantPaused = true;
     if (m_state == State::Opening) { d->playWhenReady = false; return; }
+    if (m_state == State::Playing && d->mci) {
+        d->mci_send(MCI_PAUSE, 0, nullptr);
+        post_event(d->notify, d->msg, d->gen, MESessionPaused);
+        return;
+    }
     if (m_state != State::Playing || !d->session) return;
     if (d->pending) { d->queuedSeek = position(); return; }
     if (SUCCEEDED(d->session->Pause())) ++d->pending;
@@ -548,6 +788,14 @@ void MediaPlayer::pause() {
 void MediaPlayer::stop() {
     d->playWhenReady = d->wantPaused = false;
     d->queuedSeek = d->shownPos = -1;
+    if (d->mci && (m_state == State::Playing || m_state == State::Paused)) {
+        d->mci_send(MCI_STOP, 0, nullptr);
+        MCI_SEEK_PARMS sk{};
+        sk.dwTo = d->cdFrom;
+        d->mci_send(MCI_SEEK, MCI_TO, &sk);
+        post_event(d->notify, d->msg, d->gen, MESessionStopped);
+        return;
+    }
     if (!d->session || (m_state != State::Playing && m_state != State::Paused)) return;
     if (SUCCEEDED(d->session->Stop())) ++d->pending;
 }
@@ -575,6 +823,13 @@ LONGLONG MediaPlayer::position() {
     if (d->shownPos >= 0) return d->shownPos;
     if (m_state == State::Ended) return m_duration;
     if (m_state != State::Playing && m_state != State::Paused) return 0;
+    if (d->mci) {
+        MCI_STATUS_PARMS st{};
+        st.dwItem = MCI_STATUS_POSITION;
+        if (d->mci_send(MCI_STATUS, MCI_STATUS_ITEM, &st)) return 0;
+        DWORD ms = (DWORD)st.dwReturn;
+        return ms > d->cdFrom ? (LONGLONG)(ms - d->cdFrom) * 10000 : 0;
+    }
     MFTIME t = 0;
     if (d->clock && SUCCEEDED(d->clock->GetTime(&t))) return t;
     return 0;
@@ -582,6 +837,10 @@ LONGLONG MediaPlayer::position() {
 
 void MediaPlayer::set_volume(float amplitude) {
     d->amplitude = amplitude < 0 ? 0 : amplitude > 1 ? 1 : amplitude;
+    if (d->mci) {
+        if (!d->cdTo) set_session_volume(d->amplitude);     // (MIDI; a CD drive plays as it does)
+        return;
+    }
     if (!d->volume) return;
     UINT32 n = 0;
     if (FAILED(d->volume->GetChannelCount(&n)) || !n || n > 32) return;
@@ -604,6 +863,16 @@ bool MediaPlayer::video_paint() {
 MediaPlayer::Change MediaPlayer::handle(MediaNote* n) {
     if (!n) return Change::None;
     if (n->gen != d->gen) { release_note(n); return Change::None; }    // an earlier file's
+    if (n->kind == MediaNote::Ready) {                // (MCI: open)
+        delete n;
+        if (m_state != State::Opening) return Change::None;
+        m_state = State::Stopped;
+        if (d->playWhenReady || d->startAt > 0) {
+            d->shownPos = d->startAt > 0 ? d->startAt : -1;
+            start_at(d->startAt, false);
+        }
+        return Change::Opened;
+    }
     if (n->kind == MediaNote::Source) {
         IUnknown* src = n->source;
         n->source = nullptr;

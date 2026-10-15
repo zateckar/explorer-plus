@@ -197,6 +197,7 @@ void worker() {
 } // namespace
 
 bool image_file(const std::wstring& path) {
+    if (path.find(L"://") != std::wstring::npos) return false;     // (a web address: a stream's)
     const wchar_t* dot = wcsrchr(path.c_str(), L'.');
     if (!dot || wcschr(dot, L'\\')) return false;
     std::call_once(s_extOnce, load_extensions);

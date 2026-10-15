@@ -129,18 +129,31 @@ bool media_extension_excluded(const std::wstring& ext) {
     std::wstring e = ext;
     for (auto& c : e) c = (wchar_t)towlower(c);
     static const wchar_t* const kNot[] = {
-        L".m3u", L".m3u8", L".pls", L".wpl", L".zpl", L".asx", L".wax", L".wvx",     // playlists
-        L".mid", L".midi", L".rmi", L".kar",                                        // MIDI
-        L".cda",                                                                    // CD track stubs
+        L".m3u", L".m3u8", L".pls", L".wpl", L".zpl", L".asx", L".wax", L".wvx", L".xspf",    // playlists
     };
     for (auto k : kNot)
         if (e == k) return true;
     return false;
 }
 
+static bool ext_in(const std::wstring& path, std::initializer_list<const wchar_t*> exts) {
+    const wchar_t* dot = PathFindExtensionW(path.c_str());
+    for (auto e : exts)
+        if (lstrcmpiW(dot, e) == 0) return true;
+    return false;
+}
+
+bool midi_file(const std::wstring& path) {
+    return !media_url(path) && ext_in(path, { L".mid", L".midi", L".rmi", L".kar" });
+}
+
+bool cd_track_file(const std::wstring& path) { return !media_url(path) && ext_in(path, { L".cda" }); }
+
 // 0: not media, 1: audio, 2: video, by the extension's perceived type (asked for every file
 // of a folder walk, on any thread: the answer is kept per extension)
 static int media_kind(const std::wstring& path) {
+    if (media_url(path)) return 1;              // (a stream: sound as far as anyone knows yet)
+    if (midi_file(path) || cd_track_file(path)) return 1;
     const wchar_t* dot = PathFindExtensionW(path.c_str());
     if (!*dot) return 0;
     std::wstring ext = dot;
@@ -189,11 +202,29 @@ std::vector<std::wstring> unpack_paths(const wchar_t* data, size_t chars) {
 }
 
 // ------------------------------------------------------------------
-// M3U / M3U8 playlists
+// playlists
 // ------------------------------------------------------------------
-bool playlist_file(const std::wstring& path) {
+PlaylistKind playlist_kind(const std::wstring& path) {
+    if (media_url(path)) return PlaylistKind::None;
     const wchar_t* dot = PathFindExtensionW(path.c_str());
-    return lstrcmpiW(dot, L".m3u") == 0 || lstrcmpiW(dot, L".m3u8") == 0;
+    static const struct { const wchar_t* ext; PlaylistKind kind; } kExts[] = {
+        { L".m3u", PlaylistKind::M3U }, { L".m3u8", PlaylistKind::M3U }, { L".pls", PlaylistKind::PLS },
+        { L".wpl", PlaylistKind::XML }, { L".zpl", PlaylistKind::XML }, { L".asx", PlaylistKind::XML },
+        { L".wax", PlaylistKind::XML }, { L".wvx", PlaylistKind::XML }, { L".xspf", PlaylistKind::XML },
+    };
+    for (auto& k : kExts)
+        if (lstrcmpiW(dot, k.ext) == 0) return k.kind;
+    return PlaylistKind::None;
+}
+
+bool playlist_file(const std::wstring& path) { return playlist_kind(path) != PlaylistKind::None; }
+
+bool media_url(const std::wstring& s) {
+    for (const wchar_t* scheme : { L"http://", L"https://", L"mms://", L"mmsh://", L"rtsp://" }) {
+        size_t n = wcslen(scheme);
+        if (s.size() > n && _wcsnicmp(s.c_str(), scheme, n) == 0) return true;
+    }
+    return false;
 }
 
 static std::wstring trim(const std::wstring& s) {
@@ -233,6 +264,61 @@ static std::wstring normalize(const std::wstring& p) {
     return out.empty() || out == root ? root + L'\\' : out;
 }
 
+// "%20" and the like decoded (UTF-8 bytes): a relative URI's path
+static std::wstring percent_decode(const std::wstring& s) {
+    if (s.find(L'%') == std::wstring::npos) return s;
+    std::string bytes;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == L'%' && i + 2 < s.size() && iswxdigit(s[i + 1]) && iswxdigit(s[i + 2])) {
+            bytes += (char)std::stoi(s.substr(i + 1, 2), nullptr, 16);
+            i += 2;
+        } else {
+            WCHAR w[2] = { s[i], 0 };
+            char b[8];
+            int n = WideCharToMultiByte(CP_UTF8, 0, w, 1, b, sizeof(b), nullptr, nullptr);
+            bytes.append(b, (size_t)std::max(0, n));
+        }
+    }
+    int n = MultiByteToWideChar(CP_UTF8, 0, bytes.data(), (int)bytes.size(), nullptr, 0);
+    std::wstring out((size_t)std::max(0, n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, bytes.data(), (int)bytes.size(), out.data(), n);
+    return out;
+}
+
+// what a playlist lists, as a path or web address: absolute paths as they are, relative
+// ones from `dir`, file:/// URLs as paths, web addresses (streams) as they are; false: not
+// something to play (another scheme, an empty line). `uri`: a relative one is percent-encoded
+// (XSPF)
+static bool resolve(std::wstring p, const std::wstring& dir, bool uri, std::wstring& out) {
+    p = trim(p);
+    if (p.empty()) return false;
+    if (media_url(p)) { out = p; return true; }
+    size_t colon = p.find(L':');
+    if (colon != std::wstring::npos && colon > 1) {             // (a scheme, not a drive letter)
+        if (_wcsnicmp(p.c_str(), L"file:", 5) != 0) return false;
+        WCHAR buf[MAX_PATH * 4];
+        DWORD n = ARRAYSIZE(buf);
+        if (FAILED(PathCreateFromUrlW(p.c_str(), buf, &n, 0))) return false;
+        p = buf;
+    } else if (uri) {
+        p = percent_decode(p);
+    }
+    for (auto& c : p) if (c == L'/') c = L'\\';
+    if (p.rfind(L"\\\\", 0) == 0 || (p.size() >= 3 && p[1] == L':' && p[2] == L'\\')) {
+        // absolute already
+    } else if (p[0] == L'\\') {
+        p = path_root(dir) + p;                 // (on the playlist's drive)
+    } else if (p.size() >= 2 && p[1] == L':') {
+        p = p.substr(0, 2) + L'\\' + p.substr(2);     // ("C:a.mp3": as near as it gets)
+    } else {
+        std::wstring base = dir;
+        if (!base.empty() && base.back() != L'\\') base += L'\\';
+        p = base + p;
+    }
+    out = normalize(p);
+    return true;
+}
+
 std::vector<PlaylistEntry> playlist_parse(const std::wstring& text, const std::wstring& dir) {
     std::vector<PlaylistEntry> out;
     PlaylistEntry pending;                      // (an #EXTINF waits for its path)
@@ -254,32 +340,188 @@ std::vector<PlaylistEntry> playlist_parse(const std::wstring& text, const std::w
             }
             continue;
         }
-        std::wstring p = line;
-        size_t scheme = p.find(L"://");
-        if (scheme != std::wstring::npos && scheme > 1) {
-            if (_wcsnicmp(p.c_str(), L"file:", 5) != 0) { pending = {}; continue; }     // (a web address)
-            WCHAR buf[MAX_PATH * 4];
-            DWORD n = ARRAYSIZE(buf);
-            if (FAILED(PathCreateFromUrlW(p.c_str(), buf, &n, 0))) { pending = {}; continue; }
-            p = buf;
-        }
-        for (auto& c : p) if (c == L'/') c = L'\\';
-        if (p.rfind(L"\\\\", 0) == 0 || (p.size() >= 3 && p[1] == L':' && p[2] == L'\\')) {
-            // absolute already
-        } else if (p[0] == L'\\') {
-            p = path_root(dir) + p;             // (on the playlist's drive)
-        } else if (p.size() >= 2 && p[1] == L':') {
-            p = p.substr(0, 2) + L'\\' + p.substr(2);     // ("C:a.mp3": as near as it gets)
-        } else {
-            std::wstring base = dir;
-            if (!base.empty() && base.back() != L'\\') base += L'\\';
-            p = base + p;
-        }
-        pending.path = normalize(p);
-        out.push_back(std::move(pending));
+        if (resolve(line, dir, false, pending.path)) out.push_back(std::move(pending));
         pending = {};
     }
     return out;
+}
+
+// [playlist] File1=..., Title1=..., Length1=<seconds, -1: a stream>, in the order of their
+// numbers
+std::vector<PlaylistEntry> playlist_parse_pls(const std::wstring& text, const std::wstring& dir) {
+    std::map<long, PlaylistEntry> byNumber;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t nl = text.find_first_of(L"\r\n", pos);
+        std::wstring line = trim(text.substr(pos, nl == std::wstring::npos ? std::wstring::npos : nl - pos));
+        pos = nl == std::wstring::npos ? text.size() : nl + 1;
+        size_t eq = line.find(L'=');
+        if (eq == std::wstring::npos) continue;
+        std::wstring key = trim(line.substr(0, eq)), value = trim(line.substr(eq + 1));
+        size_t digits = key.find_first_of(L"0123456789");
+        if (digits == std::wstring::npos) continue;
+        long n = wcstol(key.c_str() + digits, nullptr, 10);
+        std::wstring name = key.substr(0, digits);
+        PlaylistEntry& e = byNumber[n];
+        if (_wcsicmp(name.c_str(), L"File") == 0) {
+            if (!resolve(value, dir, false, e.path)) e.path.clear();
+        } else if (_wcsicmp(name.c_str(), L"Title") == 0) {
+            e.title = value;
+        } else if (_wcsicmp(name.c_str(), L"Length") == 0) {
+            double secs = wcstod(value.c_str(), nullptr);
+            if (secs > 0) e.duration = (long long)(secs * 10000000.0 + 0.5);
+        }
+    }
+    std::vector<PlaylistEntry> out;
+    for (auto& [n, e] : byNumber)
+        if (!e.path.empty()) out.push_back(std::move(e));
+    return out;
+}
+
+// &amp; &lt; &#233; &#xE9; ...
+static std::wstring xml_unescape(const std::wstring& s) {
+    std::wstring out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        size_t semi = s[i] == L'&' ? s.find(L';', i) : std::wstring::npos;
+        if (semi == std::wstring::npos || semi - i > 10) { out += s[i]; continue; }
+        std::wstring ent = s.substr(i + 1, semi - i - 1);
+        unsigned long cp = 0;
+        if (ent == L"amp") cp = L'&';
+        else if (ent == L"lt") cp = L'<';
+        else if (ent == L"gt") cp = L'>';
+        else if (ent == L"quot") cp = L'"';
+        else if (ent == L"apos") cp = L'\'';
+        else if (ent.size() > 1 && ent[0] == L'#')
+            cp = ent[1] == L'x' || ent[1] == L'X' ? wcstoul(ent.c_str() + 2, nullptr, 16) : wcstoul(ent.c_str() + 1, nullptr, 10);
+        if (!cp || cp > 0x10FFFF) { out += s[i]; continue; }
+        if (cp >= 0x10000) {
+            cp -= 0x10000;
+            out += (wchar_t)(0xD800 + (cp >> 10));
+            out += (wchar_t)(0xDC00 + (cp & 0x3FF));
+        } else {
+            out += (wchar_t)cp;
+        }
+        i = semi;
+    }
+    return out;
+}
+
+// an attribute's value in a tag's text (`name` matched without regard to case)
+static std::wstring xml_attr(const std::wstring& tag, const wchar_t* name) {
+    size_t n = wcslen(name);
+    for (size_t i = 0; i + n < tag.size(); ++i) {
+        if (_wcsnicmp(tag.c_str() + i, name, n) != 0 || (i && !iswspace(tag[i - 1]))) continue;
+        size_t j = i + n;
+        while (j < tag.size() && iswspace(tag[j])) ++j;
+        if (j >= tag.size() || tag[j] != L'=') continue;
+        ++j;
+        while (j < tag.size() && iswspace(tag[j])) ++j;
+        if (j >= tag.size() || (tag[j] != L'"' && tag[j] != L'\'')) continue;
+        size_t end = tag.find(tag[j], j + 1);
+        if (end == std::wstring::npos) return {};
+        return xml_unescape(tag.substr(j + 1, end - j - 1));
+    }
+    return {};
+}
+
+// Windows Media Player's .wpl and Zune's .zpl (<media src=...>), .asx / .wax / .wvx
+// (<entry><title/><ref href=...></entry>, <entryref href=...>), XSPF (<track><location/>
+// <title/><duration>ms</duration></track>): read as one tolerant tag scan
+std::vector<PlaylistEntry> playlist_parse_xml(const std::wstring& text, const std::wstring& dir) {
+    std::vector<PlaylistEntry> out;
+    PlaylistEntry cur;
+    bool inEntry = false, xspf = false;
+    std::wstring field;                         // the element whose text is being read
+    std::wstring chars;
+    auto element = [](const std::wstring& tag) {
+        size_t e = 0;
+        while (e < tag.size() && !iswspace(tag[e]) && tag[e] != L'/' && tag[e] != L'>') ++e;
+        std::wstring name = tag.substr(0, e);
+        size_t colon = name.find(L':');         // (a namespace prefix)
+        if (colon != std::wstring::npos) name = name.substr(colon + 1);
+        for (auto& c : name) c = (wchar_t)towlower(c);
+        return name;
+    };
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t lt = text.find(L'<', pos);
+        if (lt == std::wstring::npos) break;
+        chars += text.substr(pos, lt - pos);
+        if (text.compare(lt, 4, L"<!--") == 0) {
+            size_t end = text.find(L"-->", lt + 4);
+            pos = end == std::wstring::npos ? text.size() : end + 3;
+            continue;
+        }
+        if (text.compare(lt, 9, L"<![CDATA[") == 0) {
+            size_t end = text.find(L"]]>", lt + 9);
+            size_t stop = end == std::wstring::npos ? text.size() : end;
+            chars += text.substr(lt + 9, stop - lt - 9);
+            pos = end == std::wstring::npos ? text.size() : end + 3;
+            continue;
+        }
+        size_t gt = text.find(L'>', lt);
+        if (gt == std::wstring::npos) break;
+        std::wstring tag = text.substr(lt + 1, gt - lt - 1);
+        pos = gt + 1;
+        if (tag.empty() || tag[0] == L'?' || tag[0] == L'!') continue;
+        bool closing = tag[0] == L'/';
+        std::wstring name = element(closing ? tag.substr(1) : tag);
+        if (closing) {
+            if (name == field) {
+                std::wstring value = trim(xml_unescape(chars));
+                if (name == L"title" && inEntry) cur.title = value;
+                else if (name == L"location" && inEntry && cur.path.empty()) {
+                    if (!resolve(value, dir, true, cur.path)) cur.path.clear();
+                } else if (name == L"duration" && inEntry && xspf) {
+                    double ms = wcstod(value.c_str(), nullptr);
+                    if (ms > 0) cur.duration = (long long)(ms * 10000.0 + 0.5);
+                }
+                field.clear();
+            }
+            if ((name == L"entry" || name == L"track") && inEntry) {
+                if (!cur.path.empty()) out.push_back(std::move(cur));
+                cur = {};
+                inEntry = false;
+            }
+            continue;
+        }
+        chars.clear();
+        bool selfClosing = tag.back() == L'/';
+        if (name == L"playlist" && !xml_attr(tag, L"xmlns").empty()) xspf = true;
+        if (name == L"media") {                         // (WPL, ZPL)
+            PlaylistEntry e;
+            if (resolve(xml_attr(tag, L"src"), dir, false, e.path)) out.push_back(std::move(e));
+        } else if (name == L"entryref") {               // (ASX: another playlist)
+            PlaylistEntry e;
+            if (resolve(xml_attr(tag, L"href"), dir, false, e.path)) out.push_back(std::move(e));
+        } else if (name == L"entry" || name == L"track") {
+            cur = {};
+            inEntry = !selfClosing;
+            if (name == L"track") xspf = true;
+        } else if (name == L"ref" && inEntry && cur.path.empty()) {     // (the first of its alternatives)
+            if (!resolve(xml_attr(tag, L"href"), dir, false, cur.path)) cur.path.clear();
+        } else if (!selfClosing && (name == L"title" || name == L"location" || name == L"duration")) {
+            field = name;
+        }
+    }
+    return out;
+}
+
+std::vector<PlaylistEntry> playlist_parse_any(const std::wstring& text, const std::wstring& dir, PlaylistKind kind) {
+    // (the content decides where the extension misleads: an .m3u that is really a .pls)
+    size_t start = 0;
+    while (start < text.size() && (iswspace(text[start]) || text[start] == L'\xFEFF')) ++start;
+    if (start + 10 <= text.size() && _wcsnicmp(text.c_str() + start, L"[playlist]", 10) == 0)
+        kind = PlaylistKind::PLS;
+    else if (start < text.size() && text[start] == L'<')
+        kind = PlaylistKind::XML;
+    else if (kind != PlaylistKind::PLS)
+        kind = PlaylistKind::M3U;
+    switch (kind) {
+        case PlaylistKind::PLS: return playlist_parse_pls(text, dir);
+        case PlaylistKind::XML: return playlist_parse_xml(text, dir);
+        default: return playlist_parse(text, dir);
+    }
 }
 
 std::wstring playlist_write(const std::vector<PlaylistEntry>& entries, const std::wstring& dir) {
@@ -333,7 +575,7 @@ bool playlist_load(const std::wstring& file, std::vector<PlaylistEntry>& out) {
     CloseHandle(h);
     if (!ok) return false;
     std::wstring dir = file.substr(0, file.find_last_of(L"\\/") + 1);
-    out = playlist_parse(ini_decode(raw), dir);
+    out = playlist_parse_any(ini_decode(raw), dir, playlist_kind(file));
     return true;
 }
 

@@ -324,6 +324,8 @@ std::wstring audio_format_name(unsigned long subtype) {
         case 0x6C61: case 0x63616C61: return L"ALAC";
         case 0x8D2FD10B: return L"Vorbis";
         case 0x7361: case 0x73616D72: return L"AMR";
+        case 0x4D494449: return L"MIDI";                // (media.cpp's own labels, MCI's devices)
+        case 0x43444441: return L"CD audio";
     }
     return {};
 }

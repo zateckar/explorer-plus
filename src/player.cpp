@@ -85,6 +85,7 @@ struct Player {
     unsigned themeSeen = 0;
     std::wstring message;           // why the current entry doesn't play
     int failsInRow = 0;
+    unsigned streamRetry = 0;       // the stream (entry id) opened again after it failed
     HWND lastFocus = nullptr;
     // the window's parts
     int splitX = 0;                 // the gap between the video and the queue
@@ -227,7 +228,16 @@ COLORREF on_accent() {
 // ------------------------------------------------------------------
 // what is shown
 // ------------------------------------------------------------------
+std::wstring url_host(const std::wstring& url);
+
 std::wstring file_title(const std::wstring& path) {
+    if (media_url(path)) {                  // (a stream: the address's last part, else its server)
+        std::wstring s = path.substr(0, path.find_first_of(L"?#"));
+        while (!s.empty() && s.back() == L'/') s.pop_back();
+        size_t slash = s.find_last_of(L'/');
+        std::wstring last = slash == std::wstring::npos ? s : s.substr(slash + 1);
+        return slash == std::wstring::npos || slash < path.find(L"://") + 3 || last.empty() ? url_host(path) : last;
+    }
     std::wstring s = PathFindFileNameW(path.c_str());
     size_t dot = s.rfind(L'.');
     if (dot != std::wstring::npos && dot > 0) s.resize(dot);
@@ -241,6 +251,21 @@ bool player_file(const std::wstring& path) { return media_file_playable(path) ||
 
 bool image_entry(Player& p, int i) { return i >= 0 && i < p.q.size() && image_file(p.q.at(i).path); }
 bool image_current(Player& p) { return image_entry(p, p.q.current()); }
+
+// sound Media Foundation decodes from a file: measured for levelling, analysed for the
+// spectrogram (not a stream, nor MIDI or a CD track, which other devices play)
+bool decodable(const std::wstring& path) { return !media_url(path) && !midi_file(path) && !cd_track_file(path); }
+
+bool stream_current(Player& p) { int i = p.q.current(); return i >= 0 && media_url(p.q.at(i).path); }
+
+// "radio.example.com" of a web address
+std::wstring url_host(const std::wstring& url) {
+    size_t s = url.find(L"://");
+    if (s == std::wstring::npos) return url;
+    s += 3;
+    size_t e = url.find_first_of(L"/:?#", s);
+    return url.substr(s, e == std::wstring::npos ? std::wstring::npos : e - s);
+}
 
 std::wstring current_title(Player& p) {
     int i = p.q.current();
@@ -258,6 +283,7 @@ std::wstring current_detail(Player& p) {
     }
     std::wstring a = p.mp->artist(), b = p.mp->album();
     if (!a.empty() && !b.empty()) return a + L" \x2014 " + b;
+    if (a.empty() && b.empty() && stream_current(p)) return L"Stream \x00B7 " + url_host(p.q.at(p.q.current()).path);
     return a.empty() ? b : a;
 }
 
@@ -287,6 +313,8 @@ std::wstring state_text(Player& p) {
     }
     if (p.mp->duration() > 0)
         s += L" \x00B7 " + fmt_duration(p.mp->position()) + L" / " + fmt_duration(p.mp->duration());
+    else if (stream_current(p) && (st == State::Playing || st == State::Paused))
+        s += L" \x00B7 " + fmt_duration(p.mp->position()) + L" (stream)";
     return s;
 }
 
@@ -431,10 +459,11 @@ const double* loudness_of(Player& p, const std::wstring& path) {
 void level_track(Player& p, int i) {
     if (!p.level || image_entry(p, i)) return;
     const std::wstring& path = p.q.at(i).path;
-    if (const double* l = loudness_of(p, path)) p.gainDb = loudness_gain_db(*l);
+    if (!decodable(path)) p.gainDb = 0;                 // (a stream, MIDI, a CD: as they are)
+    else if (const double* l = loudness_of(p, path)) p.gainDb = loudness_gain_db(*l);
     else loudness_request(p.wnd, WM_LOUDNESS, path, true);
     int n = p.q.next(false);
-    if (n >= 0 && n != i && !image_entry(p, n) && !loudness_of(p, p.q.at(n).path))
+    if (n >= 0 && n != i && !image_entry(p, n) && decodable(p.q.at(n).path) && !loudness_of(p, p.q.at(n).path))
         loudness_request(p.wnd, WM_LOUDNESS, p.q.at(n).path, false);
 }
 
@@ -515,6 +544,7 @@ void play_index(Player& p, int i, bool play) {
     KillTimer(p.wnd, TIMER_SKIP);
     KillTimer(p.wnd, TIMER_LEVEL);
     p.levelWait = 0;
+    p.streamRetry = 0;
     p.q.set_current(i);
     p.message.clear();
     spectrum_reset(p);
@@ -533,7 +563,7 @@ void play_index(Player& p, int i, bool play) {
         if (p.infoFor != e.id) media_info_request(p.wnd, WM_MEDIA_INFO, e.id, e.path, std::max(400, px(400)));
         // not measured yet (the first track, one jumped to): its start waits for that a
         // moment, rather than its volume changing once it's playing
-        bool wait = play && p.level && !loudness_of(p, e.path);
+        bool wait = play && p.level && decodable(e.path) && !loudness_of(p, e.path);
         p.mp->open(e.path, play && !wait);
         // (after the open: Media Foundation is loaded then, the measuring needs it; the
         // volume takes effect as the playback starts)
@@ -552,6 +582,12 @@ void play_index(Player& p, int i, bool play) {
 void on_failed(Player& p) {
     int i = p.q.current();
     if (i < 0) return;
+    // a stream: once more before giving up on it (a server or connection hiccup)
+    if (stream_current(p) && p.streamRetry != p.q.at(i).id) {
+        p.streamRetry = p.q.at(i).id;
+        p.mp->open(p.q.at(i).path, true);
+        if (p.mp->state() != State::Failed) { refresh_all(p); return; }
+    }
     p.levelWait = 0;
     KillTimer(p.wnd, TIMER_LEVEL);
     p.q.at(i).failed = true;
@@ -849,7 +885,7 @@ void on_note(Player& p, LPARAM lp) {
                 e.failed = false;
                 ListView_RedrawItems(p.list, i, i);
                 // sound: its spectrogram, from a decoding of its own
-                if (!p.mp->has_video()) {
+                if (!p.mp->has_video() && decodable(e.path)) {
                     p.feed.start(e.path, p.mp->position(), std::max(30, MulDiv(60, p.dpi, 96)));
                     p.vis.set_source(p.feed.tap());
                     if (p.visCycle && !p.vis.failed()) {    // (another visualization, by chance)
@@ -884,9 +920,27 @@ std::mutex s_tagMx;
 std::deque<TagJob> s_tagJobs;
 std::vector<TagInfo> s_tagDone;     // read, not yet shown: one message for them all (a folder of
 bool s_tagBusy = false;             // thousands mustn't fill the queue the playback's notes use)
+// the titles playlists gave their entries (a stream's name; a file's when it has no title tag)
+std::mutex s_listMx;
+std::map<std::wstring, std::wstring> s_listTitles;
 
-// the file's title tag and duration (COM initialised on the calling thread)
+void list_title_put(const std::wstring& path, const std::wstring& title) {
+    if (title.empty()) return;
+    std::lock_guard<std::mutex> lk(s_listMx);
+    if (s_listTitles.size() > 20000) s_listTitles.clear();
+    s_listTitles[path] = title;
+}
+
+std::wstring list_title(const std::wstring& path) {
+    std::lock_guard<std::mutex> lk(s_listMx);
+    auto it = s_listTitles.find(path);
+    return it == s_listTitles.end() ? std::wstring() : it->second;
+}
+
+// the file's title tag and duration (COM initialised on the calling thread); a stream: the
+// playlist's name for it
 void read_tags(const std::wstring& path, std::wstring& title, long long& duration) {
+    if (media_url(path)) { title = list_title(path); return; }
     IPropertyStore* ps = nullptr;
     if (FAILED(SHGetPropertyStoreFromParsingName(path.c_str(), nullptr, GPS_DEFAULT, IID_PPV_ARGS(&ps))) || !ps) return;
     PROPVARIANT v;
@@ -910,6 +964,7 @@ void tag_thread() {
         }
         TagInfo info{ job.id, {}, -1 };
         read_tags(job.path, info.title, info.duration);
+        if (info.title.empty()) info.title = list_title(job.path);
         std::lock_guard<std::mutex> lk(s_tagMx);
         s_tagDone.push_back(std::move(info));
         if (s_tagDone.size() == 1 && !PostMessageW(s_msg, WM_QUEUE_INFO, 0, 0)) s_tagDone.clear();
@@ -984,14 +1039,18 @@ void walk(const std::wstring& dir, int depth, std::vector<std::wstring>& out) {
     for (auto& d : dirs) walk(base + d, depth + 1, out);
 }
 
-// a playlist's files that are there (one listed in it: its files, a few levels down)
+// a playlist's files that are there, and its streams (one listed in it: its files, a few
+// levels down); the titles it gives, kept for the queue
 void expand_playlist(const std::wstring& file, int depth, std::vector<std::wstring>& out) {
     std::vector<PlaylistEntry> entries;
     if (depth > 3 || !playlist_load(file, entries)) return;
     for (auto& e : entries) {
         if (out.size() >= kMaxFiles) return;
-        if (playlist_file(e.path)) expand_playlist(e.path, depth + 1, out);
-        else if (player_file(e.path) && GetFileAttributesW(e.path.c_str()) != INVALID_FILE_ATTRIBUTES) out.push_back(e.path);
+        if (playlist_file(e.path)) { expand_playlist(e.path, depth + 1, out); continue; }
+        bool there = media_url(e.path) || (player_file(e.path) && GetFileAttributesW(e.path.c_str()) != INVALID_FILE_ATTRIBUTES);
+        if (!there) continue;
+        list_title_put(e.path, e.title);
+        out.push_back(e.path);
     }
 }
 
@@ -1085,7 +1144,12 @@ bool hand_over(const std::vector<std::wstring>& paths, bool enqueue, const std::
     bool view = !enqueue && !start.empty();
     std::vector<std::wstring> all;
     if (view) all.push_back(start);
-    all.insert(all.end(), paths.begin(), paths.end());
+    // (a playlist's title for an entry after a tab: no path or web address has one)
+    for (auto& path : paths) {
+        std::wstring t = list_title(path);
+        for (auto& c : t) if (c == L'\t' || c == L'\0') c = L' ';
+        all.push_back(t.empty() ? path : path + L'\t' + t);
+    }
     std::wstring data = pack_paths(all);
     COPYDATASTRUCT cd{ view ? kCopyView : enqueue ? kCopyEnqueue : opened ? kCopyOpen : kCopyPlay,
                        (DWORD)(data.size() * sizeof(wchar_t)), (void*)data.data() };
@@ -1337,6 +1401,11 @@ void paint_bar(Player& p) {
             done.right = done.left + (int)((done.right - done.left) * f);
             if (done.right > done.left) fill_rrect(dc, done, px(2), c.accent);
         }
+    } else if (dur <= 0 && stream_current(p) && (p.mp->state() == State::Playing || p.mp->state() == State::Paused)) {
+        // a stream: how long it has played; no end, no seeking
+        text_at(dc, fmt_duration(pos), tl, c.textSecondary, p.fontSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        text_at(dc, L"Live", tr, c.textSecondary, p.fontSmall, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        fill_rrect(dc, p.seekRail, px(2), blend(c.layer, c.text, 0.2));
     } else {
         text_at(dc, canSeek ? fmt_duration(pos) : L"0:00", tl, timeColor, p.fontSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         text_at(dc, dur > 0 ? fmt_duration(dur) : L"0:00", tr, timeColor, p.fontSmall, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
@@ -1417,12 +1486,12 @@ std::vector<std::pair<std::wstring, std::wstring>> now_details(Player& p) {
     const AudioInfo& a = p.mp->audio();
     int i = p.q.current();
     std::wstring fmt = audio_format_name(a.format);
-    if (fmt.empty() && i >= 0) {                        // (unknown: the file type)
+    if (fmt.empty() && i >= 0 && !media_url(p.q.at(i).path)) {     // (unknown: the file type)
         const wchar_t* ext = PathFindExtensionW(p.q.at(i).path.c_str());
         if (*ext) { fmt = ext + 1; for (auto& ch : fmt) ch = (wchar_t)towupper(ch); }
     }
     unsigned bitrate = info && info->bitrate ? info->bitrate : a.bitrate;
-    if (!bitrate && info && info->size && p.mp->duration() > 0)      // (the average: size / duration)
+    if (!bitrate && info && info->size && p.mp->duration() > 0 && a.format != 0x4D494449)   // (the average: size / duration; MIDI's notes aren't sound)
         bitrate = (unsigned)(info->size * 8 * 10000000.0 / (double)p.mp->duration());
     std::wstring b = fmt_bitrate(bitrate);
     if (!fmt.empty()) out.push_back({ L"Format", b.empty() ? fmt : fmt + L", " + b });
@@ -1430,7 +1499,7 @@ std::vector<std::pair<std::wstring, std::wstring>> now_details(Player& p) {
     std::wstring ch = fmt_channels(a.channels);
     if (!ch.empty()) audio += (audio.empty() ? L"" : L", ") + ch;
     bool lossless = a.format == 1 || a.format == 3 || a.format == 0xF1AC || a.format == 0x6C61 ||
-                    a.format == 0x63616C61 || a.format == 0x0163;
+                    a.format == 0x63616C61 || a.format == 0x0163 || a.format == 0x43444441;
     if (lossless && a.bits) audio += (audio.empty() ? L"" : L", ") + std::to_wstring(a.bits) + L"-bit";
     if (!audio.empty()) out.push_back({ L"Audio", audio });
     // its loudness; levelled: by how much
@@ -1454,7 +1523,9 @@ NowRects now_rects(Player& p, const RECT& rc) {
     NowRects r;
     int w = rc.right - rc.left, h = rc.bottom - rc.top, pad = px(24);
     // (a visualization: a little more room than the spectrogram)
-    int specH = h < px(300) ? 0 : vis_on(p) ? std::clamp(h * 36 / 100, px(100), px(300)) : std::clamp(h * 30 / 100, px(80), px(220));
+    int i = p.q.current();
+    bool analysed = i >= 0 && decodable(p.q.at(i).path);     // (a stream, MIDI, a CD track: nothing to show there)
+    int specH = h < px(300) || !analysed ? 0 : vis_on(p) ? std::clamp(h * 36 / 100, px(100), px(300)) : std::clamp(h * 30 / 100, px(80), px(220));
     if (specH) r.spec = { rc.left + pad, rc.bottom - pad - specH, rc.right - pad, rc.bottom - pad };
     int top = rc.top + pad, bottom = (specH ? r.spec.top - px(8) : rc.bottom - pad);
     int availH = bottom - top, availW = w - 2 * pad;
@@ -2592,7 +2663,12 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 const wchar_t* z = std::find(c, end, L'\0');
                 if (z - c > 0 && z - c < 32768) {
                     std::wstring s(c, z);
-                    if (!PathIsRelativeW(s.c_str()) && player_file(s)) {
+                    size_t tab = s.find(L'\t');
+                    if (tab != std::wstring::npos) {
+                        list_title_put(s.substr(0, tab), s.substr(tab + 1));
+                        s.resize(tab);
+                    }
+                    if ((media_url(s) || !PathIsRelativeW(s.c_str())) && player_file(s)) {
                         if (view && job->start.empty()) job->start = std::move(s);
                         else job->paths.push_back(std::move(s));
                     }

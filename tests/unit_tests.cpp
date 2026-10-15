@@ -189,24 +189,87 @@ static void playlists() {
         L"#EXTINF:12.6 tvg-id=\"x\",Spaced title  \r\n"
         L"  T.ogg  ";
     auto e = playlist_parse(text, L"C:\\Music\\List");
-    CHECK(e.size() == 8);
-    if (e.size() == 8) {
+    CHECK(e.size() == 9);
+    if (e.size() == 9) {
         CHECK_EQ(e[0].path, L"C:\\Music\\List\\Song.mp3");
         CHECK_EQ(e[0].title, L"Artist - Song");
         CHECK(e[0].duration == 1830000000LL);
         CHECK_EQ(e[1].path, L"C:\\Music\\List\\sub\\Other.flac");
         CHECK(e[1].title.empty() && e[1].duration == -1);          // (the comment isn't a title)
-        CHECK_EQ(e[2].path, L"C:\\Music\\Up\\Track.mp3");           // (the web address left out, its title with it)
-        CHECK(e[2].title.empty());
-        CHECK_EQ(e[3].path, L"C:\\Root\\R.mp3");
-        CHECK_EQ(e[4].path, L"E:\\Abs\\A.wav");
-        CHECK_EQ(e[5].path, L"D:\\Url Dir\\U.mp3");
-        CHECK_EQ(e[6].path, L"\\\\server\\share\\S.mp3");
-        CHECK_EQ(e[7].path, L"C:\\Music\\List\\T.ogg");
-        CHECK_EQ(e[7].title, L"Spaced title");
-        CHECK(e[7].duration == 126000000LL);
+        CHECK_EQ(e[2].path, L"http://example.com/stream");          // (a stream: as it is, with its title)
+        CHECK_EQ(e[2].title, L"Radio");
+        CHECK(e[2].duration == -1);
+        CHECK_EQ(e[3].path, L"C:\\Music\\Up\\Track.mp3");
+        CHECK(e[3].title.empty());
+        CHECK_EQ(e[4].path, L"C:\\Root\\R.mp3");
+        CHECK_EQ(e[5].path, L"E:\\Abs\\A.wav");
+        CHECK_EQ(e[6].path, L"D:\\Url Dir\\U.mp3");
+        CHECK_EQ(e[7].path, L"\\\\server\\share\\S.mp3");
+        CHECK_EQ(e[8].path, L"C:\\Music\\List\\T.ogg");
+        CHECK_EQ(e[8].title, L"Spaced title");
+        CHECK(e[8].duration == 126000000LL);
     }
     CHECK(playlist_parse(L"", L"C:\\").empty());
+    CHECK(playlist_parse(L"spotify:track:123\r\nftp://x/y.mp3\r\n", L"C:\\").empty());     // (other schemes)
+    CHECK(media_url(L"HTTPS://x/y") && media_url(L"mms://x") && !media_url(L"http://") && !media_url(L"C:\\a.mp3"));
+    CHECK(playlist_file(L"a.PLS") && playlist_file(L"a.wpl") && playlist_file(L"a.zpl") && playlist_file(L"a.asx") &&
+          playlist_file(L"a.wax") && playlist_file(L"a.wvx") && playlist_file(L"a.xspf") && !playlist_file(L"a.xml"));
+    CHECK(!playlist_file(L"http://radio.example/listen.pls"));     // (a web address: not opened as a file)
+
+    // PLS: by number, not by order
+    auto pls = playlist_parse_pls(L"[playlist]\r\nNumberOfEntries=3\r\nFile2=b.mp3\r\nTitle2=Bee\r\nLength2=61\r\n"
+                                  L"File1=http://radio.example:8000/live\r\nTitle1=Live radio\r\nLength1=-1\r\n"
+                                  L"Title3=no file\r\nVersion=2\r\n", L"C:\\M");
+    CHECK(pls.size() == 2);
+    if (pls.size() == 2) {
+        CHECK_EQ(pls[0].path, L"http://radio.example:8000/live");
+        CHECK_EQ(pls[0].title, L"Live radio");
+        CHECK(pls[0].duration == -1);
+        CHECK_EQ(pls[1].path, L"C:\\M\\b.mp3");
+        CHECK(pls[1].duration == 610000000LL && pls[1].title == L"Bee");
+    }
+    // WPL / ZPL
+    auto wpl = playlist_parse_xml(L"<?wpl version=\"1.0\"?><smil><head><title>Mix</title></head><body><seq>"
+                                  L"<media src=\"..\\Other\\a &amp; b.mp3\" tid=\"{x}\"/>"
+                                  L"<!-- <media src=\"commented.mp3\"/> -->"
+                                  L"<media src='C:\\Abs\\c.wma'/></seq></body></smil>", L"C:\\M\\Lists");
+    CHECK(wpl.size() == 2);
+    if (wpl.size() == 2) {
+        CHECK_EQ(wpl[0].path, L"C:\\M\\Other\\a & b.mp3");
+        CHECK(wpl[0].title.empty());                                  // (the playlist's title isn't a track's)
+        CHECK_EQ(wpl[1].path, L"C:\\Abs\\c.wma");
+    }
+    // ASX: the first of an entry's alternatives, its title; another playlist referred to
+    auto asx = playlist_parse_xml(L"<ASX version=\"3.0\"><Title>Show</Title>"
+                                  L"<Entry><Title>One</Title><Ref HREF=\"mms://media.example/one\"/><Ref href=\"http://media.example/one\"/></Entry>"
+                                  L"<ENTRY><REF HREF=\"two.wma\" /></ENTRY>"
+                                  L"<EntryRef href=\"more.asx\"/></ASX>", L"C:\\M");
+    CHECK(asx.size() == 3);
+    if (asx.size() == 3) {
+        CHECK_EQ(asx[0].path, L"mms://media.example/one");
+        CHECK_EQ(asx[0].title, L"One");
+        CHECK_EQ(asx[1].path, L"C:\\M\\two.wma");
+        CHECK_EQ(asx[2].path, L"C:\\M\\more.asx");
+    }
+    // XSPF: file URLs, percent-encoded relative ones, durations in ms, CDATA
+    auto xspf = playlist_parse_xml(L"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                                   L"<playlist version=\"1\" xmlns=\"http://xspf.org/ns/0/\"><title>Not a track</title><trackList>"
+                                   L"<track><location>file:///D:/Music/A%20b.flac</location><title>Ay</title><duration>2500</duration></track>"
+                                   L"<track><title><![CDATA[R&B]]></title><location>sub/Caf%C3%A9.mp3</location></track>"
+                                   L"<track><title>no location</title></track>"
+                                   L"</trackList></playlist>", L"C:\\M");
+    CHECK(xspf.size() == 2);
+    if (xspf.size() == 2) {
+        CHECK_EQ(xspf[0].path, L"D:\\Music\\A b.flac");
+        CHECK_EQ(xspf[0].title, L"Ay");
+        CHECK(xspf[0].duration == 25000000LL);
+        CHECK_EQ(xspf[1].path, L"C:\\M\\sub\\Caf\xE9.mp3");
+        CHECK_EQ(xspf[1].title, L"R&B");
+    }
+    // the content over the extension
+    CHECK(playlist_parse_any(L"\r\n[Playlist]\nFile1=x.mp3\n", L"C:\\", PlaylistKind::M3U).size() == 1);
+    CHECK(playlist_parse_any(L"x.mp3\ny.mp3\n", L"C:\\", PlaylistKind::XML).size() == 2);
+    CHECK(midi_file(L"a.MID") && midi_file(L"a.kar") && !midi_file(L"a.mp3") && cd_track_file(L"D:\\Track01.cda"));
     CHECK_EQ(playlist_parse(L"..\\..\\..\\x.mp3", L"C:\\a")[0].path, L"C:\\x.mp3");    // (not above the root)
 
     // written: relative inside the playlist's folder, #EXTINF where something is known
@@ -371,7 +434,7 @@ static void media_text() {
     CHECK_EQ(fmt_duration(0), L"0:00");
     CHECK_EQ(fmt_duration(1870000000LL), L"3:07");
     CHECK_EQ(fmt_duration(37230000000LL), L"1:02:03");
-    CHECK(media_extension_excluded(L".M3U") && media_extension_excluded(L".mid"));
+    CHECK(media_extension_excluded(L".M3U") && media_extension_excluded(L".xspf") && !media_extension_excluded(L".mid"));
     CHECK(!media_extension_excluded(L".mp3"));
     CHECK(!media_file_playable(L"C:\\x\\notes.txt"));
     CHECK(!media_file_playable(L"C:\\x\\list.m3u"));
