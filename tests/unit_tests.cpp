@@ -486,6 +486,57 @@ static void queue_remove() {
     CHECK(q.empty() && q.current() == -1);
 }
 
+static std::wstring paths_of(const PlayQueue& q) {
+    std::wstring s;
+    for (auto& e : q.entries()) s += e.path.substr(1) + L" ";
+    return s;
+}
+
+static void queue_move() {
+    PlayQueue q;
+    q.replace(names(6));
+    q.set_current(2);
+    unsigned id2 = q.at(2).id;
+    CHECK(q.move({ 4, 1 }, 0) == 0);                       // to the top, in their order
+    CHECK_EQ(paths_of(q), std::wstring(L"1 4 0 2 3 5 "));
+    CHECK(q.current() == 3 && q.at(3).id == id2);          // the current one goes along
+    CHECK(q.next(false) == 4 && q.previous() == 2);        // the order: as listed
+    CHECK(q.move({ 0 }, 6) == 5);                          // to the end
+    CHECK_EQ(paths_of(q), std::wstring(L"4 0 2 3 5 1 "));
+    CHECK(q.move({ 1, 2 }, 4) == 2);                       // down, before what was row 4
+    CHECK_EQ(paths_of(q), std::wstring(L"4 3 0 2 5 1 "));
+    CHECK(q.move({ 3 }, 3) == 3 && q.move({ 3 }, 4) == 3);  // where it is: stays
+    CHECK_EQ(paths_of(q), std::wstring(L"4 3 0 2 5 1 "));
+    CHECK(q.move({ 9, -1 }, 0) == -1);                     // none: nothing
+    // into another queue: ids kept; copies: new ones
+    PlayQueue b;
+    b.replace(names(2, 10));
+    b.set_current(1);
+    std::vector<QueueEntry> e{ q.at(0), q.at(1) };
+    CHECK(b.insert(1, e, false) == 1);
+    CHECK_EQ(paths_of(b), std::wstring(L"10 4 3 11 "));
+    CHECK(b.at(1).id == q.at(0).id && b.current() == 3 && b.next(false) == -1);
+    CHECK(b.insert(99, e, true) == 4 && b.size() == 6 && b.at(4).id != q.at(0).id && b.at(4).path == q.at(0).path);
+    // shuffled: the play order kept, every entry still in it once
+    PlayQueue s;
+    s.seed(3);
+    s.replace(names(10));
+    s.set_current(4);
+    s.set_shuffle(true);
+    std::vector<unsigned> order;
+    for (int i = s.current(), n = 0; i >= 0 && n < 20; i = s.next(false), ++n) { order.push_back(s.at(i).id); s.set_current(i); }
+    s.set_current(s.index_of(order[0]));
+    s.move({ 0, 9, 5 }, 3);
+    std::vector<unsigned> after;
+    for (int i = s.current(), n = 0; i >= 0 && n < 20; i = s.next(false), ++n) { after.push_back(s.at(i).id); s.set_current(i); }
+    CHECK(after == order);
+    s.set_current(s.index_of(order[0]));
+    s.insert(2, e, true);
+    int n = 0;
+    for (int i = s.current(); i >= 0 && n < 20; i = s.next(false), ++n) s.set_current(i);
+    CHECK(n == 12);
+}
+
 static void queue_shuffle() {
     PlayQueue q;
     q.seed(7);
@@ -1263,6 +1314,7 @@ int wmain() {
     text_operations();
     queue_order();
     queue_remove();
+    queue_move();
     queue_shuffle();
     player_sessions();
     playlists();

@@ -54,6 +54,9 @@ const ULONGLONG kOpenTogetherMs = 2500;     // files opened this close together:
 const UINT_PTR TIMER_POSITION = 1, TIMER_SKIP = 2, TIMER_HIDE_BAR = 3, TIMER_SPECTRUM = 4, TIMER_LEVEL = 5, TIMER_SUBS = 6, TIMER_ANIM = 7;
 const UINT_PTR TIMER_KEEP = 8;              // the queues kept a moment after a change
 const UINT kKeepDelayMs = 1000;
+const UINT_PTR TIMER_DRAG_TAB = 9;          // rows dragged held over a tab: it's shown
+const UINT_PTR TIMER_DRAG_SCROLL = 10;      // rows dragged near the list's top or bottom: it scrolls
+const UINT kDragTabMs = 600, kDragScrollMs = 50;
 const UINT_PTR kTipPlus = 2, kTipTab = 100; // the window's tooltips: 1 Clear queue, "+", the tabs (+ index)
 const wchar_t kAppId[] = L"RadimZatecka.ExplorerPlus.Player";   // its own taskbar button
 const UINT s_taskbarCreated = RegisterWindowMessageW(L"TaskbarButtonCreated");
@@ -69,6 +72,7 @@ enum Cmd : UINT {
     CMD_VIS = 300,                  // + VisStyle: the visualization
     CMD_SUB = 400,                  // + index: the subtitles shown (Player::subs)
     CMD_AUDIO = 500,                // + index: the audio track played
+    CMD_MOVE_TO = 600,              // + tab index: the rows selected moved to its queue (the tab count: a new one)
 };
 const int kSlideSecs[] = { 2, 3, 5, 10, 20, 30 };
 // the controls bar's parts (also its accessible children, in this order)
@@ -98,6 +102,13 @@ struct Player {
     int tabTips = 0;                // tab tooltips registered
     int hotTab = -1, hotClose = -1, dragTab = -1, dragX = 0;
     bool hotPlus = false, dragging = false, tracking = false;
+    // the queue's rows dragged: within it, onto another tab (or "+": a new one) to go there;
+    // held over a tab, that tab is shown and they go where they're let go in its list
+    bool rowDrag = false;
+    QueueTab* rowFrom = nullptr;    // their tab
+    std::vector<unsigned> rowIds;   // the entries (QueueEntry::id)
+    int dropRow = -1;               // where they'd go in the list shown (-1: not over it)
+    int dropTab = -1;               // the tab they'd go to the end of (-1: none; -2: "+")
     bool activeWnd = true;
     int capHot = -1, capPressed = -1;
     int markShown = -1;             // the playing tab's mark as drawn (-1: none; else playing * 2 + tab)
@@ -672,7 +683,7 @@ void set_volume(Player& p, int v) {
     InvalidateRect(p.bar, nullptr, FALSE);
 }
 
-void tags_read(PlayQueue& q, int from);
+void tags_read(PlayQueue& q, int from, int count = INT_MAX);
 void tags_forget();
 void save_queue(Player& p);
 void subs_open(Player& p);
@@ -1215,6 +1226,63 @@ void move_tab(Player& p, int from, int to) {
     keep_soon(p);
 }
 
+// The entries (ids) of tab `from` moved into tab `to`'s queue, before its entry `at` (-1: at
+// the end); `copy`: copies of them go, they stay. The one on goes along, playing on (its new
+// tab the one playing from now on). Those put in are selected, when their tab is shown.
+void move_entries(Player& p, QueueTab* from, const std::vector<unsigned>& ids, QueueTab* to, int at, bool copy) {
+    if (tab_index(p, from) < 0 || tab_index(p, to) < 0) return;
+    std::vector<int> rows;
+    for (unsigned id : ids)
+        if (int i = from->q.index_of(id); i >= 0) rows.push_back(i);
+    std::sort(rows.begin(), rows.end());
+    if (rows.empty()) return;
+    int first = 0, count = (int)rows.size();
+    if (from == to && !copy) first = to->q.move(rows, at < 0 ? to->q.size() : at);
+    else {
+        std::vector<QueueEntry> entries;
+        for (int i : rows) entries.push_back(from->q.at(i));
+        auto cur = std::find(rows.begin(), rows.end(), from->q.current());
+        bool carry = !copy && from == p.playing && cur != rows.end() && loaded(p);
+        int curAt = (int)(cur - rows.begin());
+        if (!copy) from->q.remove(rows);
+        first = to->q.insert(at, std::move(entries), copy);
+        if (copy) tags_read(to->q, first, count);      // (new ids: the tags still to come are the originals')
+        if (carry) {
+            p.playing = to;
+            p.q = &to->q;
+            to->q.set_current(first + curAt);
+        }
+    }
+    QueueTab* shown = p.tabs[(size_t)p.shown].get();
+    ListView_SetItemState(p.list, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+    queue_changed(p);
+    if (shown == to) {
+        for (int i = first; i < first + count; ++i) ListView_SetItemState(p.list, i, LVIS_SELECTED, LVIS_SELECTED);
+        ListView_SetItemState(p.list, first, LVIS_FOCUSED, LVIS_FOCUSED);
+        ListView_EnsureVisible(p.list, first + count - 1, FALSE);
+        ListView_EnsureVisible(p.list, first, FALSE);
+    } else if (shown == from && !vq(p).empty()) {
+        int focus = std::min(rows[0], vq(p).size() - 1);
+        ListView_SetItemState(p.list, focus, LVIS_FOCUSED | LVIS_SELECTED, LVIS_FOCUSED | LVIS_SELECTED);
+    }
+    invalidate_row(p);
+    refresh_all(p);
+}
+
+// to the end of tab i's queue (the tab count: a new tab's, which is then shown)
+void move_to_tab(Player& p, QueueTab* from, const std::vector<unsigned>& ids, int i, bool copy) {
+    bool fresh = i >= (int)p.tabs.size();
+    QueueTab* to = fresh ? add_tab(p, p.shown + 1, {}) : p.tabs[(size_t)i].get();
+    move_entries(p, from, ids, to, -1, copy);
+    if (fresh) show_tab(p, tab_index(p, to));
+}
+
+void move_selected(Player& p, int tab) {
+    std::vector<unsigned> ids;
+    for (int i : selected_rows(p)) ids.push_back(vq(p).at(i).id);
+    if (!ids.empty()) move_to_tab(p, p.tabs[(size_t)p.shown].get(), ids, tab, false);
+}
+
 // --- a tab's name, edited in place (Enter takes it, Esc or an empty name doesn't) ---
 LRESULT CALLBACK rename_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
     switch (msg) {
@@ -1605,9 +1673,9 @@ void tag_thread() {
     if (SUCCEEDED(co)) CoUninitialize();
 }
 
-void tags_read(PlayQueue& q, int from) {
+void tags_read(PlayQueue& q, int from, int count) {
     std::lock_guard<std::mutex> lk(s_tagMx);
-    for (int i = from; i < q.size(); ++i)
+    for (int i = from; i < q.size() && i - from < count; ++i)
         if (!image_file(q.at(i).path)) s_tagJobs.push_back({ q.at(i).id, q.at(i).path });   // (pictures: no tags read)
     if (!s_tagBusy && !s_tagJobs.empty()) {
         s_tagBusy = true;
@@ -3382,13 +3450,22 @@ void queue_menu(Player& p, POINT pt) {
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING | (sel ? 0 : MF_GRAYED), CMD_PLAY_SELECTED, L"Play\tEnter");
     AppendMenuW(m, MF_STRING | (sel ? 0 : MF_GRAYED), CMD_REMOVE_SELECTED, L"Remove from queue\tDelete");
+    // (the other queues; also by dragging the rows onto a tab)
+    HMENU to = CreatePopupMenu();
+    int n = (int)p.tabs.size();
+    for (int i = 0; i < n; ++i)
+        if (i != p.shown) AppendMenuW(to, MF_STRING, CMD_MOVE_TO + i, menu_text(p.tabs[(size_t)i]->name).c_str());
+    if (n > 1) AppendMenuW(to, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(to, MF_STRING, CMD_MOVE_TO + n, L"New queue");
+    AppendMenuW(m, MF_POPUP | (sel ? 0 : MF_GRAYED), (UINT_PTR)to, L"Move to queue");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     bool sound = std::any_of(vq(p).entries().begin(), vq(p).entries().end(), [](const QueueEntry& e) { return !image_file(e.path); });
     AppendMenuW(m, MF_STRING | (sound ? 0 : MF_GRAYED), CMD_SAVE_PLAYLIST, L"Save queue as playlist...\tCtrl+S");
     AppendMenuW(m, MF_STRING | (vq(p).empty() ? MF_GRAYED : 0), CMD_CLEAR, L"Clear queue");
     UINT id = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, p.wnd, nullptr);
     DestroyMenu(m);
-    if (id) command(p, id);
+    if (id >= CMD_MOVE_TO && id <= CMD_MOVE_TO + (UINT)n) move_selected(p, (int)(id - CMD_MOVE_TO));
+    else if (id) command(p, id);
 }
 
 // a tab's menu (what acts on the queue shown: this tab's, shown first)
@@ -3427,6 +3504,8 @@ void tab_menu(Player& p, int i, POINT pt) {
     }
 }
 
+void row_drag_start(Player& p);
+
 LRESULT list_notify(Player& p, NMHDR* hdr) {
     switch (hdr->code) {
         case LVN_GETDISPINFOW: {
@@ -3455,6 +3534,9 @@ LRESULT list_notify(Player& p, NMHDR* hdr) {
             play_row(p, ia->iItem);
             break;
         }
+        case LVN_BEGINDRAG:
+            row_drag_start(p);
+            break;
         case NM_CUSTOMDRAW: {
             // the rows are drawn here (title, duration on the right, Win11's rounded
             // selection); one column: the theme's column lines stay out
@@ -3467,6 +3549,16 @@ LRESULT list_notify(Player& p, NMHDR* hdr) {
                 int x = ListView_GetColumnWidth(p.list, 0);
                 RECT strip{ x - px(3), client.top, x + 1, client.bottom };
                 fill_rect(cd->nmcd.hdc, strip, pal().content);
+                // (rows dragged: the gap they'd go into)
+                if (p.rowDrag && p.dropRow >= 0) {
+                    int n = vq(p).size(), y = 0;
+                    RECT r{};
+                    if (n > 0 && ListView_GetItemRect(p.list, std::min(p.dropRow, n - 1), &r, LVIR_BOUNDS))
+                        y = p.dropRow < n ? r.top : r.bottom;
+                    int t = std::clamp(y - px(1), 0, std::max(0, (int)client.bottom - px(2)));
+                    RECT line{ px(4), t, x - px(4), t + px(2) };
+                    fill_rect(cd->nmcd.hdc, line, pal().accent);
+                }
                 return CDRF_DODEFAULT;
             }
             if (cd->nmcd.dwDrawStage != CDDS_ITEMPREPAINT) break;
@@ -3699,6 +3791,100 @@ void set_hot(Player& p, int tab, int close, bool plus) {
     invalidate_row(p);
 }
 
+// --- the queue's rows dragged (the window has the mouse meanwhile) ---
+void row_drag_start(Player& p) {
+    p.rowIds.clear();
+    for (int i : selected_rows(p)) p.rowIds.push_back(vq(p).at(i).id);
+    if (p.rowIds.empty()) return;
+    p.rowFrom = p.tabs[(size_t)p.shown].get();
+    p.rowDrag = true;
+    p.dropRow = p.dropTab = -1;
+    SetCapture(p.wnd);
+}
+
+// where rows let go at `pt` (the window's) would go in the list: before row k (the row count:
+// after the last); -1: not over the list
+int drop_row_at(Player& p, POINT pt) {
+    if (!IsWindowVisible(p.list)) return -1;
+    MapWindowPoints(p.wnd, p.list, &pt, 1);
+    RECT rc{}, r0{};
+    GetClientRect(p.list, &rc);
+    if (!PtInRect(&rc, pt)) return -1;
+    int n = vq(p).size();
+    if (n == 0 || !ListView_GetItemRect(p.list, 0, &r0, LVIR_BOUNDS) || r0.bottom <= r0.top) return 0;
+    int h = r0.bottom - r0.top;
+    return std::clamp((int)(pt.y - r0.top + h / 2) / h, 0, n);    // (the gap between rows nearest)
+}
+
+// they can go where they are: into the list, onto "+" or another queue's tab
+bool row_drop_ok(Player& p) {
+    return p.dropRow >= 0 || p.dropTab == -2 || (p.dropTab >= 0 && p.tabs[(size_t)p.dropTab].get() != p.rowFrom);
+}
+
+void row_drag_move(Player& p, POINT pt) {
+    int row = drop_row_at(p, pt), tab = -1;
+    if (row < 0 && pt.y < p.rowH && !p.full) {
+        tab = tab_at(p, pt);
+        if (tab < 0 && PtInRect(&p.plus, pt)) tab = -2;
+    }
+    if (tab != p.dropTab) {                 // (held over another tab: it's shown)
+        KillTimer(p.wnd, TIMER_DRAG_TAB);
+        if (tab >= 0 && tab != p.shown) SetTimer(p.wnd, TIMER_DRAG_TAB, kDragTabMs, nullptr);
+    }
+    if (row != p.dropRow) InvalidateRect(p.list, nullptr, FALSE);
+    p.dropRow = row;
+    p.dropTab = tab;
+    set_hot(p, std::max(tab, -1), -1, tab == -2);
+    // (near the list's top or bottom: it scrolls)
+    bool edge = false;
+    if (row >= 0) {
+        POINT lp = pt;
+        MapWindowPoints(p.wnd, p.list, &lp, 1);
+        RECT rc{};
+        GetClientRect(p.list, &rc);
+        edge = lp.y < px(24) || lp.y >= rc.bottom - px(24);
+    }
+    if (edge) SetTimer(p.wnd, TIMER_DRAG_SCROLL, kDragScrollMs, nullptr);
+    else KillTimer(p.wnd, TIMER_DRAG_SCROLL);
+    SetCursor(LoadCursorW(nullptr, row_drop_ok(p) ? IDC_ARROW : IDC_NO));
+}
+
+void row_drag_timer(Player& p, UINT_PTR id) {
+    if (id == TIMER_DRAG_TAB || !p.rowDrag) KillTimer(p.wnd, id);
+    if (!p.rowDrag) return;
+    POINT pt{};
+    GetCursorPos(&pt);
+    ScreenToClient(p.wnd, &pt);
+    if (id == TIMER_DRAG_TAB && p.dropTab >= 0 && p.dropTab != p.shown) show_tab(p, p.dropTab);
+    if (id == TIMER_DRAG_SCROLL) {
+        POINT lp = pt;
+        MapWindowPoints(p.wnd, p.list, &lp, 1);
+        RECT r0{};
+        int h = ListView_GetItemRect(p.list, 0, &r0, LVIR_BOUNDS) ? (int)(r0.bottom - r0.top) : px(32);
+        ListView_Scroll(p.list, 0, lp.y < px(24) ? -h : h);
+        InvalidateRect(p.list, nullptr, FALSE);     // (the drop line drawn again where it is now)
+    }
+    row_drag_move(p, pt);                   // (where they'd go now: the list moved under it)
+}
+
+// let go: `drop`, they go there (Ctrl held: copies of them); else they stay
+void row_drag_end(Player& p, bool drop) {
+    if (!p.rowDrag) return;
+    p.rowDrag = false;
+    KillTimer(p.wnd, TIMER_DRAG_TAB);
+    KillTimer(p.wnd, TIMER_DRAG_SCROLL);
+    int row = p.dropRow, tab = p.dropTab;
+    bool ok = drop && row_drop_ok(p);
+    p.dropRow = p.dropTab = -1;
+    if (GetCapture() == p.wnd) ReleaseCapture();
+    set_hot(p, -1, -1, false);
+    InvalidateRect(p.list, nullptr, FALSE);
+    if (!ok) return;
+    bool copy = GetKeyState(VK_CONTROL) < 0;
+    if (row >= 0) move_entries(p, p.rowFrom, p.rowIds, p.tabs[(size_t)p.shown].get(), row, copy);
+    else move_to_tab(p, p.rowFrom, p.rowIds, tab == -2 ? (int)p.tabs.size() : tab, copy);
+}
+
 // a tab dragged along the row (true), else what the mouse is over lit
 bool tabs_mouse_move(Player& p, POINT pt) {
     if (p.dragTab >= 0) {
@@ -3876,6 +4062,7 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (wp == TIMER_ANIM) anim_tick(p);
             else if (wp == TIMER_SKIP) { KillTimer(hwnd, TIMER_SKIP); next(p); }
             else if (wp == TIMER_KEEP) keep_now(p);
+            else if (wp == TIMER_DRAG_TAB || wp == TIMER_DRAG_SCROLL) row_drag_timer(p, wp);
             else if (wp == TIMER_HIDE_BAR) {
                 POINT c{};
                 GetCursorPos(&c);
@@ -3989,6 +4176,7 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case WM_MOUSEMOVE: {
             POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            if (p.rowDrag) { row_drag_move(p, pt); return 0; }
             if (p.splitting) {
                 RECT rc{};
                 GetClientRect(hwnd, &rc);
@@ -4019,6 +4207,7 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_LBUTTONUP:
+            if (p.rowDrag) { row_drag_end(p, true); return 0; }
             if (p.splitting) {
                 p.splitting = false;
                 ReleaseCapture();
@@ -4036,6 +4225,7 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_CAPTURECHANGED:
+            row_drag_end(p, false);
             p.splitting = false;
             p.dragTab = -1;
             p.dragging = false;
@@ -4235,6 +4425,10 @@ bool player_owns(HWND h) {
 bool player_translate(MSG* m) {
     if (!s_p || !s_p->mp || (m->message != WM_KEYDOWN && m->message != WM_SYSKEYDOWN)) return false;
     Player& p = *s_p;
+    if (p.rowDrag) {                            // (rows dragged: Esc leaves them where they were; no other keys meanwhile)
+        if (m->wParam == VK_ESCAPE) row_drag_end(p, false);
+        return true;
+    }
     if (p.rename && GetFocus() == p.rename) return false;     // (a tab's name edited: the box's keys)
     bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0, alt = GetKeyState(VK_MENU) < 0;
     bool inList = GetFocus() == p.list;

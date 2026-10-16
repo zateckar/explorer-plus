@@ -31,11 +31,12 @@ File Explorer while starting in well under 100 ms.
   folders, or its button beside Refresh): video, or for music the album cover, tags and a
   spectrogram or one of a dozen beat-driven visualizations (V). Queues in tabs at the top of
   the window, kept across restarts: one plays while you edit another (Ctrl+N new, Ctrl+W
-  close, Ctrl+Tab switch, F2 or double-click to rename, drag to reorder). Shuffle, repeat,
-  loudness levelling, full screen, media keys and taskbar thumbnail buttons. Plays whatever
-  Windows' Media Foundation can, nothing to install. Keys: Space play / pause, Left / Right
-  seek, Ctrl+Left / Right previous / next, Up / Down volume, M mute, F full screen,
-  Ctrl+H shuffle, Ctrl+T repeat.
+  close, Ctrl+Tab switch, F2 or double-click to rename, drag to reorder). Drag a queue's
+  items to reorder them, or onto another tab (or "+") to move them there; Ctrl copies.
+  Shuffle, repeat, loudness levelling, full screen, media keys and taskbar thumbnail
+  buttons. Plays whatever Windows' Media Foundation can, nothing to install. Keys: Space
+  play / pause, Left / Right seek, Ctrl+Left / Right previous / next, Up / Down volume,
+  M mute, F full screen, Ctrl+H shuffle, Ctrl+T repeat.
 - **Pictures in the player** ("View in Explorer Plus"): step through the folder with Left /
   Right or the wheel, slide show, zoom (Ctrl+wheel, + / −, 1, 0) and drag. JPEG, PNG, GIF,
   BMP, TIFF pages, HEIC / WebP / AVIF / raw (with their Store extensions), SVG, EMF / WMF,

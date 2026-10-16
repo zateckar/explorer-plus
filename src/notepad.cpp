@@ -112,6 +112,7 @@ struct Notepad {
     bool hotPlus = false, tracking = false;
     int dragTab = -1, dragX = 0;
     bool dragging = false;
+    int wheelV = 0, wheelH = 0;             // the wheel's turn not scrolled yet (a fine wheel's parts of a notch)
     // the title bar is the tab row: its minimize / maximize / close buttons (0, 1, 2)
     bool activeWnd = true;
     int capHot = -1, capPressed = -1;
@@ -758,6 +759,25 @@ void set_dirty(Notepad& n, Tab& t, bool on) {
     invalidate_row(n);
 }
 
+// The wheel: its lines (or a page) scrolled at once. The box's own wheel glides there a line
+// at a time, half a second a notch, lagging behind the hand turning it.
+void wheel_scroll(Notepad& n, HWND h, int delta) {
+    if ((n.wheelV > 0) != (delta > 0)) n.wheelV = 0;   // (turned the other way: the rest of the last turn goes)
+    n.wheelV += delta;
+    UINT per = 3;
+    SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &per, 0);
+    if (per == WHEEL_PAGESCROLL) {
+        for (; n.wheelV >= WHEEL_DELTA; n.wheelV -= WHEEL_DELTA) SendMessageW(h, WM_VSCROLL, SB_PAGEUP, 0);
+        for (; n.wheelV <= -WHEEL_DELTA; n.wheelV += WHEEL_DELTA) SendMessageW(h, WM_VSCROLL, SB_PAGEDOWN, 0);
+        return;
+    }
+    if (per == 0) { n.wheelV = 0; return; }
+    int lines = n.wheelV * (int)per / WHEEL_DELTA;      // (a fine wheel's parts of a notch: kept till a line)
+    if (!lines) return;
+    n.wheelV -= lines * WHEEL_DELTA / (int)per;
+    SendMessageW(h, EM_LINESCROLL, 0, -lines);
+}
+
 // The text box, as it scrolls, changes or is double-clicked: the part to show coloured before
 // it is painted (the colouring is posted: it comes before the paint), the word to mark.
 LRESULT CALLBACK edit_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR ref) {
@@ -791,7 +811,13 @@ LRESULT CALLBACK edit_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWO
                 if (Tab* t = cur(n); t && t->edit == h && !t->word.empty()) { clear_word(n, *t); return 0; }
             }
             [[fallthrough]];
-        case WM_VSCROLL: case WM_MOUSEWHEEL: case WM_SIZE: case WM_TIMER: case WM_LBUTTONUP:
+        case WM_MOUSEWHEEL:
+            if (msg == WM_MOUSEWHEEL && !(GET_KEYSTATE_WPARAM(wp) & (MK_CONTROL | MK_SHIFT))) {
+                wheel_scroll(n, h, GET_WHEEL_DELTA_WPARAM(wp));     // (its EM_LINESCROLL asks for the colours)
+                return 0;
+            }
+            [[fallthrough]];
+        case WM_VSCROLL: case WM_SIZE: case WM_TIMER: case WM_LBUTTONUP:
         case EM_LINESCROLL: case EM_SCROLLCARET: case EM_EXSETSEL: case EM_SETSEL: case EM_SETZOOM: case EM_SETTARGETDEVICE: {
             LRESULT r = DefSubclassProc(h, msg, wp, lp);
             request_colour(n);

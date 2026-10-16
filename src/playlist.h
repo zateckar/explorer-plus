@@ -33,6 +33,13 @@ public:
     // current one is then the entry that followed it, or none)
     bool remove(std::vector<int> indices);
     void clear();
+    // the entries at `indices` moved, in their order, to before the entry at `to` (size(): to
+    // the end); the current entry stays current, a shuffled play order stays. Returns the
+    // index of the first of them now (-1: none of them was in the queue)
+    int move(std::vector<int> indices, int to);
+    // entries put in before the entry at `at` (out of range: at the end), their ids kept
+    // (moved from another queue) or, `fresh`, new ones (copies). Returns `at` as used
+    int insert(int at, std::vector<QueueEntry> entries, bool fresh);
 
     // the entry to play after the current one, -1 when the queue is done. `automatic`:
     // the current track ended by itself (Repeat one plays it again)

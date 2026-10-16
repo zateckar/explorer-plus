@@ -91,6 +91,55 @@ void PlayQueue::clear() {
     m_current = -1;
 }
 
+int PlayQueue::move(std::vector<int> indices, int to) {
+    std::vector<bool> moved(m_entries.size(), false);
+    for (int i : indices)
+        if (i >= 0 && i < size()) moved[(size_t)i] = true;
+    std::vector<int> stay, go;                  // (the old indices, in their new order: those staying, those moved)
+    int at = 0;                                 // (where among those staying the moved ones go)
+    for (int i = 0; i < size(); ++i) {
+        (moved[(size_t)i] ? go : stay).push_back(i);
+        if (!moved[(size_t)i] && i < to) ++at;
+    }
+    if (go.empty()) return -1;
+    std::vector<int> now(stay.begin(), stay.begin() + at);
+    now.insert(now.end(), go.begin(), go.end());
+    now.insert(now.end(), stay.begin() + at, stay.end());
+    std::vector<int> remap(m_entries.size());
+    std::vector<QueueEntry> entries;
+    for (size_t k = 0; k < now.size(); ++k) {
+        remap[(size_t)now[k]] = (int)k;
+        entries.push_back(std::move(m_entries[(size_t)now[k]]));
+    }
+    m_entries = std::move(entries);
+    if (m_shuffle) for (int& i : m_order) i = remap[(size_t)i];
+    else std::iota(m_order.begin(), m_order.end(), 0);      // (in order: as listed)
+    if (m_current >= 0) m_current = remap[(size_t)m_current];
+    return at;
+}
+
+int PlayQueue::insert(int at, std::vector<QueueEntry> entries, bool fresh) {
+    if (at < 0 || at > size()) at = size();
+    int k = (int)entries.size();
+    if (!k) return at;
+    if (fresh)
+        for (auto& e : entries) e.id = s_nextId++;
+    m_entries.insert(m_entries.begin() + at, std::make_move_iterator(entries.begin()), std::make_move_iterator(entries.end()));
+    if (m_current >= at) m_current += k;
+    if (!m_shuffle) {
+        m_order.resize(m_entries.size());
+        std::iota(m_order.begin(), m_order.end(), 0);
+        return at;
+    }
+    for (int& i : m_order)
+        if (i >= at) i += k;
+    for (int i = at; i < at + k; ++i) {         // (as appended: somewhere among the entries still to come)
+        int from = m_current >= 0 ? order_pos(m_current) + 1 : 0;
+        m_order.insert(m_order.begin() + std::uniform_int_distribution<int>(from, (int)m_order.size())(m_rng), i);
+    }
+    return at;
+}
+
 int PlayQueue::next(bool automatic) const {
     if (m_order.empty()) return -1;
     if (m_current < 0) return m_order[0];
