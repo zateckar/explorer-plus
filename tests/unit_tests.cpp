@@ -523,6 +523,47 @@ static void queue_shuffle() {
     n = 0;
     for (int i = q.current(); i >= 0 && n < 30; i = q.next(false), ++n) q.set_current(i);
     CHECK(n == 22);
+    // ids: none shared between queues (the tags read find their entry in any of them)
+    PlayQueue a, b;
+    a.replace(names(2));
+    b.replace(names(2));
+    CHECK(a.at(0).id != b.at(0).id && a.at(1).id != b.at(1).id && b.index_of(a.at(0).id) == -1);
+}
+
+static void player_sessions() {
+    PlayerSession s;
+    s.active = 1;
+    QueueState a;
+    a.name = L" Mix = [one]; \"two\" ";
+    a.current = 1;
+    a.entries = { { L"C:\\Music\\a = b; [c].mp3", L"Title\twith a tab", 1234567 },
+                  { L"https://radio.example.com/live?x=1", L"", -1 },
+                  { L"D:\\x.flac", L"two\r\nlines", -1 } };
+    QueueState b;
+    b.name = L"Queue 2";
+    s.queues = { a, b };
+    PlayerSession r = player_session_parse(player_session_serialize(s));
+    CHECK(r.active == 1 && r.queues.size() == 2);
+    if (r.queues.size() == 2) {
+        CHECK_EQ(r.queues[0].name, a.name);
+        CHECK(r.queues[0].current == 1 && r.queues[0].entries.size() == 3);
+        if (r.queues[0].entries.size() == 3) {
+            CHECK_EQ(r.queues[0].entries[0].path, a.entries[0].path);
+            CHECK_EQ(r.queues[0].entries[0].title, L"Title\twith a tab");
+            CHECK(r.queues[0].entries[0].duration == 1234567);
+            CHECK_EQ(r.queues[0].entries[1].path, a.entries[1].path);
+            CHECK(r.queues[0].entries[1].title.empty() && r.queues[0].entries[1].duration == -1);
+            CHECK_EQ(r.queues[0].entries[2].title, L"two  lines");
+        }
+        CHECK_EQ(r.queues[1].name, L"Queue 2");
+        CHECK(r.queues[1].entries.empty() && r.queues[1].current == -1);
+    }
+    // nothing, or nonsense: defaults
+    r = player_session_parse(L"");
+    CHECK(r.queues.empty() && r.active == 0);
+    r = player_session_parse(L"[player]\r\nactive=7\r\n[queue1]\r\ncurrent=5\r\n1=\r\n2=a.mp3\t\r\nx=b.mp3\r\n[queue3]\r\n1=c.mp3\r\n");
+    CHECK(r.queues.size() == 1 && r.active == 0);
+    if (r.queues.size() == 1) CHECK(r.queues[0].entries.size() == 1 && r.queues[0].current == -1 && r.queues[0].name.empty());
 }
 
 static void media_text() {
@@ -1223,6 +1264,7 @@ int wmain() {
     queue_order();
     queue_remove();
     queue_shuffle();
+    player_sessions();
     playlists();
     shapes();
     media_text();

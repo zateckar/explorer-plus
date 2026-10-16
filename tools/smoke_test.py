@@ -1113,6 +1113,9 @@ with open(os.path.join(media, 'notes.txt'), 'w') as f:
 ini_player = ini + '.player'
 if os.path.exists(ini_player):
     os.remove(ini_player)
+queues_ini = os.path.join(os.path.dirname(ini_player), 'Player', 'queues.ini')   # (the queues kept, a run before)
+if os.path.exists(queues_ini):
+    os.remove(queues_ini)
 # extensions shown, as in the main settings above: a fresh image hides them, and then the
 # list's names would be "one", not "one.wav"
 with open(ini_player, 'w', encoding='utf-16') as f:
@@ -1220,6 +1223,8 @@ raw = open(ini_player, 'rb').read() if os.path.exists(ini_player) else b''
 saved = raw.decode('utf-16', 'replace') if raw[:2] == b'\xff\xfe' else raw.decode('utf-8', 'replace')
 check('the player\'s place is saved', 'playerW=' in saved)
 check('the visualization chosen is remembered', 'playerVisual=1' in saved)
+kept = open(queues_ini, 'rb').read().decode('utf-16', 'replace') if os.path.exists(queues_ini) else ''
+check('the play queue is kept for next time', '[queue1]' in kept and 'b.png' in kept, kept[:200])
 
 failed = [n for n, ok in results if not ok]
 if failed and os.path.exists(events):

@@ -9,6 +9,8 @@
 #include <mutex>
 #include <numeric>
 
+static unsigned s_nextId = 1;       // (the entries' ids: from one count for all queues)
+
 int PlayQueue::order_pos(int index) const {
     auto it = std::find(m_order.begin(), m_order.end(), index);
     return it == m_order.end() ? -1 : (int)(it - m_order.begin());
@@ -33,7 +35,7 @@ void PlayQueue::replace(const std::vector<std::wstring>& paths) {
     for (auto& p : paths) {
         QueueEntry e;
         e.path = p;
-        e.id = m_nextId++;
+        e.id = s_nextId++;
         m_entries.push_back(std::move(e));
     }
     m_order.resize(m_entries.size());
@@ -48,7 +50,7 @@ int PlayQueue::append(const std::vector<std::wstring>& paths) {
         int i = size();
         QueueEntry e;
         e.path = p;
-        e.id = m_nextId++;
+        e.id = s_nextId++;
         m_entries.push_back(std::move(e));
         if (!m_shuffle) { m_order.push_back(i); continue; }
         // somewhere among the entries still to come
@@ -593,4 +595,61 @@ bool playlist_save(const std::wstring& file, const std::vector<PlaylistEntry>& e
     if (ok) ok = MoveFileExW(tmp.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
     if (!ok) DeleteFileW(tmp.c_str());
     return ok;
+}
+
+// ------------------------------------------------------------------
+// the player's queues as they were left
+// ------------------------------------------------------------------
+// an entry's line: "path <tab> duration <tab> title" (no path holds a tab; the title, last,
+// may hold anything but a line break)
+std::wstring player_session_serialize(const PlayerSession& s) {
+    IniDoc d;
+    d.set(L"player", L"active", std::to_wstring(s.active));
+    for (size_t i = 0; i < s.queues.size(); ++i) {
+        const QueueState& q = s.queues[i];
+        KeyValues kv;
+        kv.push_back({ L"name", L"\"" + q.name + L"\"" });      // (quoted: blanks at its ends kept)
+        kv.push_back({ L"current", std::to_wstring(q.current) });
+        kv.reserve(q.entries.size() + 2);
+        for (size_t k = 0; k < q.entries.size(); ++k) {
+            const PlaylistEntry& e = q.entries[k];
+            std::wstring title = e.title;
+            for (auto& c : title) if (c == L'\r' || c == L'\n') c = L' ';
+            kv.push_back({ std::to_wstring(k + 1), e.path + L'\t' + std::to_wstring(e.duration) + L'\t' + title });
+        }
+        d.replace(L"queue" + std::to_wstring(i + 1), kv);    // (not set() one by one: thousands of entries)
+    }
+    return ini_serialize(d);
+}
+
+PlayerSession player_session_parse(const std::wstring& text) {
+    PlayerSession s;
+    IniDoc d = ini_parse(text);
+    for (int i = 1; i < 10000; ++i) {
+        std::wstring sec = L"queue" + std::to_wstring(i);
+        if (!d.find(sec)) break;
+        QueueState q;
+        int current = -1;
+        for (auto& [key, value] : d.entries(sec)) {
+            if (ini_ieq(key, L"name")) { q.name = value; continue; }
+            if (ini_ieq(key, L"current")) { current = (int)wcstol(value.c_str(), nullptr, 10); continue; }
+            if (key.empty() || !iswdigit(key[0])) continue;
+            size_t t1 = value.find(L'\t');
+            PlaylistEntry e;
+            e.path = value.substr(0, t1);
+            if (e.path.empty()) continue;
+            if (t1 != std::wstring::npos) {
+                size_t t2 = value.find(L'\t', t1 + 1);
+                e.duration = std::max(-1LL, wcstoll(value.substr(t1 + 1, t2 == std::wstring::npos ? std::wstring::npos : t2 - t1 - 1).c_str(), nullptr, 10));
+                if (t2 != std::wstring::npos) e.title = value.substr(t2 + 1);
+            }
+            q.entries.push_back(std::move(e));
+        }
+        q.current = current >= 0 && current < (int)q.entries.size() ? current : -1;
+        s.queues.push_back(std::move(q));
+    }
+    const std::wstring* a = d.get(L"player", L"active");
+    int active = a ? (int)wcstol(a->c_str(), nullptr, 10) : 0;
+    s.active = s.queues.empty() ? 0 : std::clamp(active, 0, (int)s.queues.size() - 1);
+    return s;
 }

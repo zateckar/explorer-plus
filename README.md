@@ -7,142 +7,56 @@ File Explorer while starting in well under 100 ms.
 
 ## Features
 
-- **Win11 layout**: tabs in the title bar, one navigation row (Back / Forward / Up /
-  Refresh, the Notepad and the player, breadcrumb address bar, search, "…" menu with the
-  command bar's commands),
-  navigation pane, details / preview pane, status bar with view toggles. Dark and light
-  mode follow Windows, Per-Monitor DPI v2.
-- **Pinned tabs** (right-click a tab ▸ Pin tab) stay first, can't be closed, and keep
-  their folder: a folder opened from one (file list, navigation pane, address bar, Up,
-  search) comes up in a new tab, whose Back leads to the pinned folder.
-- **Dual pane** ("…" ▸ Dual pane, Ctrl+Shift+D): a second file list beside the first, as
-  in Total Commander, each with its own folder, view and history. The list you click or
-  tab into is the active one (its caption is marked): the address bar, Back / Forward,
-  the navigation pane, search, the details pane and the commands act on it. Drag files
-  from one list to the other to move or copy them; drag the gap between them to resize.
-  Each tab remembers whether it shows one list or two, and their folders, across restarts.
-- **Navigation pane**: Home, Gallery, OneDrive, pinned Quick access folders, This PC,
-  Network; children listed in the background; follows the current folder. Each tab keeps
-  its own folders expanded and its scroll position, also across restarts.
-- **Views**: Details (with Win11 row spacing, or Compact like Windows' setting), Extra large /
-  Large / Medium / Small icons, List, Tiles; per-folder columns (any shell property), sort,
-  Group by; item check boxes; This PC drive tiles with free-space bars. The sort order
-  you choose is remembered across restarts. Each folder
-  remembers its own view; View ▸ "Apply this view to all folders" makes the current view
-  and columns the default (like Explorer's Folder Options), "Reset all folders" goes back.
-  Double-click on empty space goes up a level.
-- **Folder sizes**: the Size column shows each subfolder's total (all levels, hidden files
-  included; junctions and symbolic links not followed, and show no size themselves;
-  folders you have no access to left out), worked out in the background
-  after the listing and filled in as known; sorting by Size takes them into account.
-  "…" ▸ Folder sizes turns it off.
-- **Text size**: "…" ▸ Text size, or Ctrl+Plus / Ctrl+Minus / Ctrl+0, scales the text of
-  the navigation pane, the file list and the details pane (80–200 %), remembered.
-- **Command bar**: folded into the "…" menu by default; "…" ▸ Show command bar puts the
-  row back, and its own "…" menu (or a right-click on it) has "Hide command bar".
-- **Search**: Windows Search where the folder is indexed, otherwise a recursive search;
-  results as their own location with a Folder column.
-- **Compact context menu** like Windows 11: icon row (Cut / Copy / Rename / Share /
-  Delete), then your promoted items with their icons (see Settings) and Open in Terminal,
-  the common verbs, and "Show more options" for the full classic menu (Shift+right-click /
-  Shift+F10).
-- **File operations** through the shell (`IFileOperation`): copy, move, rename, delete to
-  the Recycle Bin, new folder / New ▸ items, drag and drop, clipboard. Deleting the open
-  folder in the navigation pane (Del, Shift+Del) opens the folder next to it; a folder
-  removed by another program sends the view to its parent.
-- **Large folders**: listings stream in; 30,000 files are on screen in ~60 ms and
-  complete in under 0.2 s.
-- **Media player**: "Play in Explorer Plus" / "Queue in Explorer Plus" in the compact menu
-  of audio and video files (and of folders with some: their files by name, subfolders
-  after) open a player window (its button beside Refresh, or "…" ▸ Player, brings it up,
-  empty to drop files on when none is open) — the video, or for sound the album cover (cover.jpg,
-  folder.jpg, … in the track's folder, else its biggest picture, else the art in the
-  file), the tags (album, year, genre, track, …) with the format, bitrate and sample
-  rate, and a scrolling spectrogram or a visualization (mirrored bars, waveform, circle,
-  particles, ribbons, a synthwave horizon, a tunnel, a warp through stars, ridges,
-  fireworks: right-click the player ▸ Visualization, or V; "Another with each track" picks
-  one by chance as tracks change; they move with the beat, found in the bass drum, eased so
-  nothing flashes; drawn on the GPU at the display's refresh rate; in full screen it fills
-  the screen);
-  the play queue (Enter plays, Delete removes, drop files on it); seek, volume, shuffle,
-  repeat, full screen. Tracks are evened out in
-  loudness (each measured as it comes up, the next one ahead; right-click the player to
-  turn it off). "View in Explorer Plus" on a picture shows its folder's pictures in the
-  player: Left / Right or the mouse wheel step through them, Play runs a slide show (its
-  interval in the right-click menu), full screen as for video; photos are turned upright
-  as the camera recorded. Whatever Windows has codecs for (JPEG, PNG, GIF, BMP, TIFF,
-  icons, HEIC / WebP / AVIF / camera raw with their Store extensions) and SVG, EMF / WMF,
-  TGA, QOI, Radiance HDR, Photoshop PSD / PSB (the saved composite) and PCX; GIF and APNG
-  animations play, a TIFF's pages turn with Page Up / Page Down, drawings are drawn sharp
-  at the size shown. Ctrl+wheel or + / − zoom in at the pointer (up to 16 screen pixels a
-  pixel; a photo is decoded again at its full size, a drawing drawn again sharp), drag to
-  look around, 1 actual size, 0 fitted. Its own taskbar button, with
-  the track's progress and Previous / Play / Next in the thumbnail. Windows' own Media
-  Foundation plays (the formats and codecs Windows has, Opus in MP4 too; Windows N needs
-  the Media Feature Pack), nothing to install. Keys: Space
-  play / pause, Left / Right ±5 s (Shift: 30 s), Ctrl+Left / Ctrl+Right previous / next,
-  Up / Down volume, M mute, V / Shift+V next / previous visualization, F or F11 full
-  screen, Ctrl+H shuffle, Ctrl+T repeat, S next subtitles, A next audio track; the media
-  keys too. One player for all windows; it stays open after the main window closes.
-- **Subtitles and audio tracks**: a video's subtitle files beside it (`Film.srt`,
-  `Film.en.srt`, `Film.English.vtt`; SubRip, WebVTT, SubStation `.ass` / `.ssa`) show over
-  it, the one in your language first; right-click ▸ Subtitles picks another, turns them off
-  or chooses a file elsewhere. Files with several audio streams (films' languages,
-  commentary) list them under right-click ▸ Audio track by name, language and format.
-- **MIDI and CDs**: `.mid` / `.midi` / `.rmi` / `.kar` play through Windows' own
-  synthesizer (its volume is the player's, in the Windows volume mixer), and an audio CD's
-  tracks (`Track01.cda`) from the drive.
-- **Playlists** (`.m3u`, `.m3u8`, `.pls`, `.wpl` / `.zpl`, `.asx` / `.wax` / `.wvx`, `.xspf`):
-  play one like a folder (its tracks in order, with their titles, nested playlists too;
-  missing files are skipped). Web addresses in them are internet radio and other streams:
-  they play live (tried once more if the connection drops). "Create playlist..." in the
-  compact menu of media files and folders writes one, and the player's queue menu has
-  "Save queue as playlist..." (Ctrl+S). Paths inside the playlist's folder are written
-  relative, so the folder can move; `.m3u8` is UTF-8.
-- **Media file types** ("…" ▸ Media file types...): tick the music, video, picture and
-  playlist types Explorer Plus should open and press Apply: Explorer Plus becomes their
-  default app at once, for your account only (no administrator needed). Unticked types go
-  back to the app they had before. A type Windows keeps to itself is left to Settings,
-  which then opens at Explorer Plus' page; double-click a type for Windows' own "Open with"
-  list. Files opened this way go to the one player; several opened together are queued.
-- **Notepad** (its button beside Refresh, "…" ▸ Notepad, or "Edit in Explorer Plus" in the
-  compact menu of text files): text files in tabs in its title bar, as in Windows 11's
-  Notepad, with a taskbar button and icon of its own. Its tabs stay as you leave them,
-  unsaved text included (kept a second after each change, so a crash loses nothing): closing
-  the window asks nothing, and it opens again with them. Files keep their encoding (UTF-8,
-  with or without BOM, UTF-16 LE / BE, ANSI) and line endings (CRLF, LF, CR), both shown in
-  the status bar and changeable there or in File; Save as offers the encoding too. Find,
-  replace (Replace all is one step to undo), go to line, word wrap, zoom, time / date; a file
-  changed by another program is read again unless you changed it too; drop files on it to
-  open them; drag tabs to reorder them. Keys: Ctrl+N / Ctrl+T new tab, Ctrl+O, Ctrl+S,
-  Ctrl+Shift+S, Ctrl+W, Ctrl+Shift+W close window, Ctrl+Tab / Ctrl+1..9, Ctrl+F, F3 /
-  Shift+F3, Ctrl+H, Ctrl+G, F5, Ctrl+Plus / Minus / 0 (or Ctrl+wheel), Alt+F / E / V menus.
-  - Syntax colours (as Visual Studio Code's Dark+ / Light+) by the file's name, or chosen in
-    View ▸ Syntax or the status bar: C / C++, C#, Java, JavaScript, TypeScript, Go, Rust,
-    Python, Ruby, Lua, PowerShell, batch files, shell scripts, SQL, CSS, JSON, XML, HTML
-    (its scripts and styles too), Markdown, INI, TOML, YAML and diffs. Edit ▸ Format document
-    (Alt+Shift+F) indents JSON and XML (an error: its line); Compact JSON puts it on one line.
-  - Double-click a word: it and every other one like it are marked (the status bar counts
-    them); Esc clears the marks.
-  - Edit ▸ Lines: duplicate (Ctrl+D), delete (Ctrl+Shift+K), move up / down (Alt+Up /
-    Down), sort ascending / descending (numbers by value), reverse, remove duplicates or
-    empty lines, trim trailing spaces, join (Ctrl+J); on the lines selected, else all.
-    Edit ▸ Convert: UPPER / lower / Title case (Ctrl+Shift+U / Ctrl+U), Base64 and URL
-    encode / decode, on the selection (else the word or the line).
-  - Big files (up to 64 MB) open at once: the first screen shows in a fraction of a second
-    and the rest goes in while you read (the status bar counts it in). Only the part shown
-    is coloured, so scrolling a 50 MB file stays smooth.
-- **Screenshots** (Alt+Q anywhere while Explorer Plus runs, or "…" ▸ Take a screenshot):
-  drag a region or click for the whole screen (Enter: the screen under the mouse, Esc
-  cancels). It is copied to the clipboard and opens in the picture editor.
-- **Picture editor** (screenshots; "Edit picture" in the compact menu of a picture, or
-  Ctrl+E in the player's picture view): rectangles and ellipses (Shift: square, circle),
-  outlined or filled, and text, in any colour, line width and text size. Until saved every
-  object stays one: select it to move, resize, recolour or delete it, double-click a text
-  to change it; undo / redo. Save overwrites PNG, JPEG, BMP, GIF and TIFF files, Save as
-  writes PNG, JPEG, BMP, GIF or TIFF; Copy puts the picture on the clipboard. Keys: V select, R rectangle,
-  E ellipse, T text, F fill, Del delete, arrows nudge, Ctrl+Z / Ctrl+Y, Ctrl+C, Ctrl+S,
-  Ctrl+Shift+S.
+- **Win11 layout**: tabs in the title bar, one navigation row with a breadcrumb address bar,
+  search and a "…" menu, navigation pane, details / preview pane, status bar. Dark and light
+  mode follow Windows; Per-Monitor DPI v2.
+- **Pinned tabs** stay first and keep their folder: folders opened from them open in a new tab.
+- **Dual pane** (Ctrl+Shift+D): two file lists side by side, each with its own folder, view
+  and history; drag files between them. Remembered per tab.
+- **Navigation pane**: Home, Gallery, OneDrive, Quick access, This PC, Network; follows the
+  current folder. Each tab keeps its expanded folders and scroll position.
+- **Views**: Details, icons in four sizes, List, Tiles; columns from any shell property, sort,
+  Group by, check boxes. Each folder remembers its view; one view can be applied to all.
+  Double-click empty space to go up.
+- **Folder sizes**: the Size column shows each subfolder's total, worked out in the background.
+- **Text size**: Ctrl+Plus / Ctrl+Minus / Ctrl+0 scales the panes' text (80–200 %).
+- **Command bar**: in the "…" menu by default; "Show command bar" brings the row back.
+- **Search**: Windows Search where the folder is indexed, otherwise a recursive search.
+- **Compact context menu** as in Windows 11, with your own promoted items (see Settings);
+  "Show more options" (Shift+F10) for the classic menu.
+- **File operations** through the shell: copy, move, rename, delete, new items, drag and
+  drop, clipboard.
+- **Large folders**: 30,000 files are on screen in ~60 ms and complete in under 0.2 s.
+- **Media player** ("Play" / "Queue in Explorer Plus" in the context menu of media files and
+  folders, or its button beside Refresh): video, or for music the album cover, tags and a
+  spectrogram or one of a dozen beat-driven visualizations (V). Queues in tabs at the top of
+  the window, kept across restarts: one plays while you edit another (Ctrl+N new, Ctrl+W
+  close, Ctrl+Tab switch, F2 or double-click to rename, drag to reorder). Shuffle, repeat,
+  loudness levelling, full screen, media keys and taskbar thumbnail buttons. Plays whatever
+  Windows' Media Foundation can, nothing to install. Keys: Space play / pause, Left / Right
+  seek, Ctrl+Left / Right previous / next, Up / Down volume, M mute, F full screen,
+  Ctrl+H shuffle, Ctrl+T repeat.
+- **Pictures in the player** ("View in Explorer Plus"): step through the folder with Left /
+  Right or the wheel, slide show, zoom (Ctrl+wheel, + / −, 1, 0) and drag. JPEG, PNG, GIF,
+  BMP, TIFF pages, HEIC / WebP / AVIF / raw (with their Store extensions), SVG, EMF / WMF,
+  TGA, QOI, HDR, PSD, PCX; animated GIF and APNG.
+- **Subtitles and audio tracks**: subtitle files beside a video (SRT, VTT, ASS / SSA) show
+  over it; S next subtitles, A next audio track, or right-click to choose.
+- **MIDI and audio CDs** play too.
+- **Playlists** (M3U / M3U8, PLS, WPL / ZPL, ASX, XSPF) play like folders, internet radio
+  included. "Create playlist..." writes one from files and folders; Ctrl+S saves a queue.
+- **Media file types** ("…" ▸ Media file types...): make Explorer Plus the default app for the
+  music, video, picture and playlist types you tick, for your account only.
+- **Notepad** (its button beside Refresh, or "Edit in Explorer Plus"): text files in tabs, as
+  in Windows 11, kept with unsaved text across restarts. Keeps each file's encoding and line
+  endings; find and replace, go to line, word wrap, zoom; syntax colours for some 25
+  languages; JSON / XML formatting; line tools (duplicate, move, sort, remove duplicates,
+  join) and case / Base64 / URL conversion; double-click marks a word everywhere. Files up
+  to 64 MB open at once.
+- **Screenshots** (Alt+Q anywhere, or "…" ▸ Take a screenshot): a region or the whole screen,
+  copied to the clipboard and opened in the picture editor.
+- **Picture editor**: rectangles, ellipses and text that stay editable until saved; undo /
+  redo; saves PNG, JPEG, BMP, GIF or TIFF.
 
 ## Requirements
 
@@ -189,7 +103,8 @@ screenshotHotkey=1
 
 `[tree]` caches the Quick access pins so they show instantly; it is rewritten
 automatically. The Notepad keeps its tabs in `Notepad\session.ini` beside the settings file,
-and each tab's unsaved text in a `note-*.txt` (UTF-16) there.
+and each tab's unsaved text in a `note-*.txt` (UTF-16) there; the player keeps its queues in
+`Player\queues.ini`.
 
 Environment variables (diagnostics and tests):
 
@@ -225,7 +140,7 @@ pwsh tools/package.ps1 -Version 1.2.0     # -> dist/explorer-plus-1.2.0-win-x64.
 ## Tests and profiling
 
 ```powershell
-ctest --test-dir build --output-on-failure                          # unit tests (INI, command line, play queue, text files)
+ctest --test-dir build --output-on-failure                          # unit tests (INI, command line, play queue, kept queues, text files)
 python -I tools/smoke_test.py build\explorer-plus.exe build\smoke   # GUI smoke test
 python -I tools/perf.py build\explorer-plus.exe build\perf 5         # startup / 30k files / scroll / sort / views / resize
 ```

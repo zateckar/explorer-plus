@@ -9,7 +9,7 @@
 enum class Repeat { Off = 0, All = 1, One = 2 };
 
 struct QueueEntry {
-    unsigned id = 0;                // stays the entry's while the queue changes around it
+    unsigned id = 0;                // stays the entry's while the queue changes around it (none other has it, in any queue)
     std::wstring path;
     std::wstring title;             // from the file's tags once known; empty: the file name is shown
     long long duration = -1;        // 100-ns units, -1: not known yet
@@ -49,7 +49,6 @@ private:
     std::vector<QueueEntry> m_entries;
     std::vector<int> m_order;       // play order (indices into m_entries): shuffled or 0..n-1
     int m_current = -1;
-    unsigned m_nextId = 1;
     bool m_shuffle = false;
     std::mt19937 m_rng{ std::random_device{}() };
     int order_pos(int index) const;
@@ -105,3 +104,19 @@ std::string playlist_encode(const std::wstring& text, bool m3u8);
 // read / write a playlist file (false: couldn't)
 bool playlist_load(const std::wstring& file, std::vector<PlaylistEntry>& out);
 bool playlist_save(const std::wstring& file, const std::vector<PlaylistEntry>& entries);
+
+// ------------------------------------------------------------------
+// the player's queues (its tabs) as they were left: an INI document ([player], then
+// [queue1], [queue2], ... with an entry a line), kept in a folder of its own
+// ------------------------------------------------------------------
+struct QueueState {
+    std::wstring name;
+    std::vector<PlaylistEntry> entries;
+    int current = -1;               // -1: none
+};
+struct PlayerSession {
+    std::vector<QueueState> queues;
+    int active = 0;                 // the tab shown
+};
+std::wstring player_session_serialize(const PlayerSession& s);
+PlayerSession player_session_parse(const std::wstring& text);

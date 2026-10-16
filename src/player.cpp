@@ -31,6 +31,7 @@ using std::min;
 #include <cwctype>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -44,12 +45,16 @@ const UINT WM_IMAGE = WM_APP + 44;          // lParam: ImageNote* (imageview.cpp
 const UINT WM_LOUDNESS = WM_APP + 45;       // lParam: LoudnessNote* (loudness.cpp)
 const UINT WM_VIS_FAILED = WM_APP + 46;     // the visualizations can't be drawn (visual.cpp)
 const UINT WM_PLAYLIST_FAILED = WM_APP + 47;    // to the message window, lParam: std::wstring* (the file)
+const UINT WM_RENAME_DONE = WM_APP + 48;    // a tab's name edited: wParam 1 taken, 0 not; lParam: the box
 // WM_COPYDATA: 'EPP1' play, 'EPP2' queue, 'EPP3' view (the first path: the picture to show),
 // 'EPP4' opened by its file type (play; queued after one opened a moment before: Explorer
 // opens each of the files selected in a process of its own)
 const ULONG_PTR kCopyPlay = 0x45505031, kCopyEnqueue = 0x45505032, kCopyView = 0x45505033, kCopyOpen = 0x45505034;
 const ULONGLONG kOpenTogetherMs = 2500;     // files opened this close together: one queue
 const UINT_PTR TIMER_POSITION = 1, TIMER_SKIP = 2, TIMER_HIDE_BAR = 3, TIMER_SPECTRUM = 4, TIMER_LEVEL = 5, TIMER_SUBS = 6, TIMER_ANIM = 7;
+const UINT_PTR TIMER_KEEP = 8;              // the queues kept a moment after a change
+const UINT kKeepDelayMs = 1000;
+const UINT_PTR kTipPlus = 2, kTipTab = 100; // the window's tooltips: 1 Clear queue, "+", the tabs (+ index)
 const wchar_t kAppId[] = L"RadimZatecka.ExplorerPlus.Player";   // its own taskbar button
 const UINT s_taskbarCreated = RegisterWindowMessageW(L"TaskbarButtonCreated");
 const size_t kMaxFiles = 10000;             // a folder walk stops there
@@ -59,6 +64,7 @@ enum Cmd : UINT {
     CMD_CLEAR, CMD_PLAY_SELECTED, CMD_REMOVE_SELECTED, CMD_LEVEL, CMD_VIS_NEXT, CMD_VIS_PREV,
     CMD_VIS_CYCLE, CMD_SAVE_PLAYLIST, CMD_EDIT_PICTURE, CMD_SUBS_OFF, CMD_SUBS_CHOOSE, CMD_SUBS_NEXT, CMD_AUDIO_NEXT,
     CMD_PAGE_PREV, CMD_PAGE_NEXT, CMD_ZOOM_IN, CMD_ZOOM_OUT, CMD_ZOOM_FIT, CMD_ZOOM_ACTUAL,
+    CMD_TAB_NEW, CMD_TAB_CLOSE, CMD_TAB_RENAME, CMD_TAB_CLOSE_OTHERS, CMD_TAB_CLOSE_RIGHT, CMD_TAB_NEXT, CMD_TAB_PREV,
     CMD_SLIDE = 200,                // + seconds: the slide show's interval
     CMD_VIS = 300,                  // + VisStyle: the visualization
     CMD_SUB = 400,                  // + index: the subtitles shown (Player::subs)
@@ -71,10 +77,33 @@ const UINT kPartCmd[P_COUNT] = { 0, CMD_SHUFFLE, CMD_PREV, CMD_PLAYPAUSE, CMD_NE
 
 using State = MediaPlayer::State;
 
+// a tab: a queue of its own
+struct QueueTab {
+    std::wstring name;
+    PlayQueue q;
+    int top = 0;                    // the list's first row shown, as it was left
+};
+
 struct Player {
     HWND wnd = nullptr, video = nullptr, bar = nullptr, list = nullptr, barTip = nullptr, headTip = nullptr;
     MediaPlayer* mp = nullptr;
-    PlayQueue q;
+    // the queues, a tab each: the one shown (in the list) and the one playing may differ
+    std::vector<std::unique_ptr<QueueTab>> tabs;
+    int shown = 0;
+    QueueTab* playing = nullptr;
+    PlayQueue* q = nullptr;         // the playing tab's queue (all that playback goes by)
+    // the tab row, in the title bar's place: the tabs, "+", the window's buttons (0, 1, 2)
+    int rowH = 0, tabW = 0, scroll = 0;     // a tab's width; the strip scrolled (more tabs than fit)
+    RECT strip{}, plus{};
+    int tabTips = 0;                // tab tooltips registered
+    int hotTab = -1, hotClose = -1, dragTab = -1, dragX = 0;
+    bool hotPlus = false, dragging = false, tracking = false;
+    bool activeWnd = true;
+    int capHot = -1, capPressed = -1;
+    int markShown = -1;             // the playing tab's mark as drawn (-1: none; else playing * 2 + tab)
+    HWND rename = nullptr;          // a tab's name being edited, in this box
+    QueueTab* renaming = nullptr;
+    HBRUSH editBrush = nullptr;
     int volume = 80;                // 0..100
     bool muted = false;
     bool queueShown = true;
@@ -84,7 +113,7 @@ struct Player {
     POINT lastCursor{ -1, -1 };
     int dpi = 96;
     HFONT font = nullptr, fontSmall = nullptr, fontBold = nullptr, fontBig = nullptr;
-    HFONT glyphs = nullptr, glyphsBig = nullptr, glyphsArt = nullptr;
+    HFONT glyphs = nullptr, glyphsBig = nullptr, glyphsArt = nullptr, glyphsSmall = nullptr, glyphsMid = nullptr;
     HIMAGELIST rowHeight = nullptr; // (sets the queue's row height)
     unsigned themeSeen = 0;
     std::wstring message;           // why the current entry doesn't play
@@ -164,6 +193,10 @@ ULONGLONG s_lastOpen = 0;           // when a file was last opened by its type (
 
 int px(int v) { return MulDiv(v, s_p ? s_p->dpi : 96, 96); }
 
+// the shown tab's queue: the list's
+PlayQueue& vq(Player& p) { return p.tabs[(size_t)p.shown]->q; }
+bool shown_plays(Player& p) { return &vq(p) == p.q; }
+
 // a visualization of visual.cpp's is chosen (and can be drawn): not the spectrogram
 bool vis_on(Player& p) { return p.visStyle != VIS_SPECTROGRAM && !p.vis.failed(); }
 
@@ -190,7 +223,7 @@ const std::wstring& player_class() {
 // main window)
 // ------------------------------------------------------------------
 void delete_fonts(Player& p) {
-    for (HFONT* f : { &p.font, &p.fontSmall, &p.fontBold, &p.fontBig, &p.glyphs, &p.glyphsBig, &p.glyphsArt })
+    for (HFONT* f : { &p.font, &p.fontSmall, &p.fontBold, &p.fontBig, &p.glyphs, &p.glyphsBig, &p.glyphsArt, &p.glyphsSmall, &p.glyphsMid })
         if (*f) { DeleteObject(*f); *f = nullptr; }
     if (p.rowHeight) { ImageList_Destroy(p.rowHeight); p.rowHeight = nullptr; }
 }
@@ -216,11 +249,14 @@ void make_fonts(Player& p) {
     p.glyphs = glyph_font_at(16, p.dpi);
     p.glyphsBig = glyph_font_at(18, p.dpi);
     p.glyphsArt = glyph_font_at(72, p.dpi);
+    p.glyphsSmall = glyph_font_at(10, p.dpi);         // (the tab row's: as the Notepad's)
+    p.glyphsMid = glyph_font_at(12, p.dpi);
     p.rowHeight = ImageList_Create(1, px(32), ILC_COLOR32, 1, 0);
     if (p.list) {
         SendMessageW(p.list, WM_SETFONT, (WPARAM)p.font, TRUE);
         ListView_SetImageList(p.list, p.rowHeight, LVSIL_SMALL);
     }
+    if (p.rename) SendMessageW(p.rename, WM_SETFONT, (WPARAM)p.font, TRUE);
     if (oldRows) ImageList_Destroy(oldRows);
 }
 
@@ -271,8 +307,8 @@ std::wstring entry_name(const QueueEntry& e) { return e.title.empty() ? file_tit
 // files the player takes: sound, video, pictures
 bool player_file(const std::wstring& path) { return media_file_playable(path) || image_file(path); }
 
-bool image_entry(Player& p, int i) { return i >= 0 && i < p.q.size() && image_file(p.q.at(i).path); }
-bool image_current(Player& p) { return image_entry(p, p.q.current()); }
+bool image_entry(Player& p, int i) { return i >= 0 && i < p.q->size() && image_file(p.q->at(i).path); }
+bool image_current(Player& p) { return image_entry(p, p.q->current()); }
 
 // a picture in an area aw x ah: fitted (full screen: filling it, a small picture enlarged up
 // to 3x; in a window: as big as it is at most), zoomed; `s` screen pixels a pixel of its own
@@ -308,7 +344,7 @@ ImageView image_view(Player& p) {
 // spectrogram (not a stream, nor MIDI or a CD track, which other devices play)
 bool decodable(const std::wstring& path) { return !media_url(path) && !midi_file(path) && !cd_track_file(path); }
 
-bool stream_current(Player& p) { int i = p.q.current(); return i >= 0 && media_url(p.q.at(i).path); }
+bool stream_current(Player& p) { int i = p.q->current(); return i >= 0 && media_url(p.q->at(i).path); }
 
 // "radio.example.com" of a web address
 std::wstring url_host(const std::wstring& url) {
@@ -320,25 +356,25 @@ std::wstring url_host(const std::wstring& url) {
 }
 
 std::wstring current_title(Player& p) {
-    int i = p.q.current();
+    int i = p.q->current();
     if (i < 0) return {};
     if (!image_current(p) && !p.mp->title().empty()) return p.mp->title();
-    return entry_name(p.q.at(i));
+    return entry_name(p.q->at(i));
 }
 
 std::wstring current_detail(Player& p) {
     if (image_current(p)) {                 // "4032 × 3024 · 250 % · 3 of 120"
         std::wstring s;
-        if (p.img.id == p.q.at(p.q.current()).id && p.img.fullW > 0) {
+        if (p.img.id == p.q->at(p.q->current()).id && p.img.fullW > 0) {
             s = std::to_wstring(p.img.fullW) + L" \x00D7 " + std::to_wstring(p.img.fullH) + L" \x00B7 " +
                 (p.img.pages > 1 ? L"page " + std::to_wstring(p.img.page + 1) + L" of " + std::to_wstring(p.img.pages) + L" \x00B7 " : L"");
             if (p.zoom != 1) s += std::to_wstring((int)(image_view(p).s * 100 + 0.5)) + L" % \x00B7 ";
         }
-        return s + std::to_wstring(p.q.current() + 1) + L" of " + std::to_wstring(p.q.size());
+        return s + std::to_wstring(p.q->current() + 1) + L" of " + std::to_wstring(p.q->size());
     }
     std::wstring a = p.mp->artist(), b = p.mp->album();
     if (!a.empty() && !b.empty()) return a + L" \x2014 " + b;
-    if (a.empty() && b.empty() && stream_current(p)) return L"Stream \x00B7 " + url_host(p.q.at(p.q.current()).path);
+    if (a.empty() && b.empty() && stream_current(p)) return L"Stream \x00B7 " + url_host(p.q->at(p.q->current()).path);
     return a.empty() ? b : a;
 }
 
@@ -354,8 +390,8 @@ std::wstring state_text(Player& p) {
     std::wstring s;
     if (image_current(p)) {
         if (!p.message.empty()) return L"Can't show: " + p.message;
-        return std::wstring(p.slideshow ? L"Slide show" : L"Picture") + L" \x00B7 " + std::to_wstring(p.q.current() + 1) +
-               L" of " + std::to_wstring(p.q.size());
+        return std::wstring(p.slideshow ? L"Slide show" : L"Picture") + L" \x00B7 " + std::to_wstring(p.q->current() + 1) +
+               L" of " + std::to_wstring(p.q->size());
     }
     State st = p.mp->state();
     if (p.levelWait && st != State::Failed) st = State::Opening;    // (its loudness measured first)
@@ -364,7 +400,7 @@ std::wstring state_text(Player& p) {
         case State::Paused:  s = L"Paused"; break;
         case State::Opening: s = L"Opening"; break;
         case State::Failed:  return L"Can't play: " + p.message;
-        default:             s = p.q.empty() ? L"Empty" : L"Stopped"; break;
+        default:             s = p.q->empty() ? L"Empty" : L"Stopped"; break;
     }
     if (p.mp->duration() > 0)
         s += L" \x00B7 " + fmt_duration(p.mp->position()) + L" / " + fmt_duration(p.mp->duration());
@@ -384,6 +420,8 @@ void update_title(Player& p) {
 void update_taskbar(Player& p);
 bool now_playing(Player& p);
 void vis_update(Player& p);
+int play_mark(Player& p);
+void invalidate_row(Player& p);
 
 // the bar's text (what screen readers and the tests read), its paint, the taskbar button,
 // the position timer, the spectrogram's frames and the visualization
@@ -396,6 +434,7 @@ void refresh_bar(Player& p) {
         acc_notify(p.bar, EVENT_OBJECT_VALUECHANGE, -1);
     }
     InvalidateRect(p.bar, nullptr, FALSE);
+    if (p.rowH && play_mark(p) != p.markShown) invalidate_row(p);     // (the playing tab's mark)
     update_taskbar(p);
     bool running = p.mp->state() == State::Playing || (image_current(p) && p.slideshow);
     if (running) SetTimer(p.wnd, TIMER_POSITION, 250, nullptr);
@@ -462,10 +501,87 @@ void layout_bar(Player& p) {
     for (int i = 0; i < P_COUNT; ++i) set_tool_rect(p.barTip, p.bar, (UINT_PTR)i, p.parts[i]);
 }
 
+// the tab row: tab i, its close button; the window's buttons at the row's right end
+RECT tab_rect(const Player& p, int i) {
+    int x = p.strip.left + i * p.tabW - p.scroll;
+    return { x, px(6), x + p.tabW, p.rowH };
+}
+
+RECT tab_close_rect(const Player& p, int i) {
+    RECT r = tab_rect(p, i);
+    int s = px(24), top = (r.top + r.bottom - s) / 2;
+    return { r.right - px(8) - s, top, r.right - px(8), top + s };
+}
+
+RECT cap_button(const Player& p, int i) {
+    RECT rc{};
+    GetClientRect(p.wnd, &rc);
+    int w = px(46), right = rc.right - (2 - i) * w;
+    return { right - w, 0, right, p.rowH };
+}
+
+int tab_at(const Player& p, POINT pt) {
+    if (!PtInRect(&p.strip, pt)) return -1;
+    for (int i = 0; i < (int)p.tabs.size(); ++i) {
+        RECT r = tab_rect(p, i);
+        if (PtInRect(&r, pt)) return i;
+    }
+    return -1;
+}
+
+void invalidate_row(Player& p) {
+    RECT r{ 0, 0, 0x7FFF, p.rowH };
+    InvalidateRect(p.wnd, &r, FALSE);
+}
+
+void place_rename(Player& p);
+
+// the tabs share the row (each between a minimum and a maximum width) with the window's
+// buttons and some room to drag it by; more than fit scroll, the shown one in view
+void layout_tabs(Player& p) {
+    RECT rc{};
+    GetClientRect(p.wnd, &rc);
+    int count = (int)p.tabs.size(), plusW = px(36);
+    int left = px(8), avail = std::max(px(80), (int)rc.right - left - plusW - 3 * px(46) - px(48));
+    p.tabW = count ? std::clamp(avail / count, px(90), px(220)) : 0;
+    int total = count * p.tabW;
+    if (total <= avail) {
+        p.scroll = 0;
+    } else {
+        int a = p.shown * p.tabW;
+        p.scroll = std::clamp(p.scroll, a + p.tabW - avail, a);
+        p.scroll = std::clamp(p.scroll, 0, total - avail);
+    }
+    p.strip = { left, 0, left + std::min(total, avail), p.rowH };
+    int py = px(8);
+    p.plus = p.rowH ? RECT{ p.strip.right + px(4), py, p.strip.right + px(4) + px(32), py + px(28) } : RECT{};
+    // the tooltips: one per tab, and "+"
+    for (int i = 0; i < p.tabTips; ++i) {
+        TTTOOLINFOW ti{ sizeof(ti) };
+        ti.hwnd = p.wnd;
+        ti.uId = kTipTab + (UINT_PTR)i;
+        SendMessageW(p.headTip, TTM_DELTOOLW, 0, (LPARAM)&ti);
+    }
+    p.tabTips = p.rowH ? count : 0;
+    for (int i = 0; i < p.tabTips; ++i) {
+        TTTOOLINFOW ti{ sizeof(ti) };
+        ti.uFlags = TTF_SUBCLASS;
+        ti.hwnd = p.wnd;
+        ti.uId = kTipTab + (UINT_PTR)i;
+        ti.lpszText = LPSTR_TEXTCALLBACKW;
+        RECT r = tab_rect(p, i);
+        IntersectRect(&ti.rect, &r, &p.strip);
+        SendMessageW(p.headTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+    }
+    set_tool_rect(p.headTip, p.wnd, kTipPlus, p.plus);
+    place_rename(p);
+}
+
 void layout(Player& p) {
     RECT rc{};
     GetClientRect(p.wnd, &rc);
     int w = rc.right, h = rc.bottom;
+    p.rowH = p.full ? 0 : px(40);              // (full screen: no tabs, nothing but the picture)
     bool bar = !p.full || p.barInFull;
     int barH = bar ? px(96) : 0;
     bool queue = p.queueShown && !p.full;
@@ -476,17 +592,19 @@ void layout(Player& p) {
         gap = px(4);
     }
     int vw = w - qw - gap > 0 ? w - qw - gap : 0;
-    int bodyH = h - barH > 0 ? h - barH : 0;
+    int top = p.rowH;
+    int bodyH = h - barH - top > 0 ? h - barH - top : 0;
     p.splitX = vw;
     p.headH = queue ? px(44) : 0;
-    MoveWindow(p.video, 0, 0, vw, bodyH, TRUE);
+    MoveWindow(p.video, 0, top, vw, bodyH, TRUE);
     ShowWindow(p.list, queue ? SW_SHOWNA : SW_HIDE);
-    if (queue) MoveWindow(p.list, w - qw, p.headH, qw, bodyH - p.headH > 0 ? bodyH - p.headH : 0, TRUE);
+    if (queue) MoveWindow(p.list, w - qw, top + p.headH, qw, bodyH - p.headH > 0 ? bodyH - p.headH : 0, TRUE);
     ShowWindow(p.bar, bar ? SW_SHOWNA : SW_HIDE);
     if (bar) MoveWindow(p.bar, 0, h - barH, w, barH, TRUE);
     int cb = px(32);
-    p.clearBtn = queue ? RECT{ w - px(8) - cb, (p.headH - cb) / 2, w - px(8), (p.headH + cb) / 2 } : RECT{};
+    p.clearBtn = queue ? RECT{ w - px(8) - cb, top + (p.headH - cb) / 2, w - px(8), top + (p.headH + cb) / 2 } : RECT{};
     set_tool_rect(p.headTip, p.wnd, 1, p.clearBtn);
+    layout_tabs(p);
     if (queue) fit_columns(p);
     InvalidateRect(p.wnd, nullptr, FALSE);
     vis_update(p);
@@ -513,13 +631,13 @@ const double* loudness_of(Player& p, const std::wstring& path) {
 // track's, likely the same album's), and the next track measured ahead
 void level_track(Player& p, int i) {
     if (!p.level || image_entry(p, i)) return;
-    const std::wstring& path = p.q.at(i).path;
+    const std::wstring& path = p.q->at(i).path;
     if (!decodable(path)) p.gainDb = 0;                 // (a stream, MIDI, a CD: as they are)
     else if (const double* l = loudness_of(p, path)) p.gainDb = loudness_gain_db(*l);
     else loudness_request(p.wnd, WM_LOUDNESS, path, true);
-    int n = p.q.next(false);
-    if (n >= 0 && n != i && !image_entry(p, n) && decodable(p.q.at(n).path) && !loudness_of(p, p.q.at(n).path))
-        loudness_request(p.wnd, WM_LOUDNESS, p.q.at(n).path, false);
+    int n = p.q->next(false);
+    if (n >= 0 && n != i && !image_entry(p, n) && decodable(p.q->at(n).path) && !loudness_of(p, p.q->at(n).path))
+        loudness_request(p.wnd, WM_LOUDNESS, p.q->at(n).path, false);
 }
 
 // the start held back for the track's loudness: now (it's known, or took too long)
@@ -535,12 +653,12 @@ void level_start(Player& p) {
 void on_loudness(Player& p, LoudnessNote* n) {
     if (p.loud.size() > 5000) p.loud.clear();
     p.loud[n->path] = n->lufs;
-    int i = p.q.current();
-    if (p.level && i >= 0 && !image_current(p) && p.q.at(i).path == n->path) {
+    int i = p.q->current();
+    if (p.level && i >= 0 && !image_current(p) && p.q->at(i).path == n->path) {
         p.gainDb = loudness_gain_db(n->lufs);
         apply_volume(p);
         InvalidateRect(p.video, nullptr, FALSE);
-        if (p.levelWait == p.q.at(i).id) level_start(p);
+        if (p.levelWait == p.q->at(i).id) level_start(p);
     }
     delete n;
 }
@@ -554,7 +672,7 @@ void set_volume(Player& p, int v) {
     InvalidateRect(p.bar, nullptr, FALSE);
 }
 
-void tags_read(Player& p, int from);
+void tags_read(PlayQueue& q, int from);
 void tags_forget();
 void save_queue(Player& p);
 void subs_open(Player& p);
@@ -577,8 +695,8 @@ void image_zoom_reset(Player& p) {
 // it at once; a drawing: with room to zoom on), 32 megapixels at most
 void image_sharpen(Player& p, const ImageView& v) {
     const ImageNote& im = p.img;
-    int i = p.q.current();
-    if (p.zoom == 1 || v.fit <= 0 || i < 0 || im.id != p.q.at(i).id) return;
+    int i = p.q->current();
+    if (p.zoom == 1 || v.fit <= 0 || i < 0 || im.id != p.q->at(i).id) return;
     auto capped = [](double w, double h, int& bw, int& bh) {
         double k = std::sqrt(std::min(1.0, (double)(1 << 25) / (w * h)));
         bw = std::max(1, (int)(w * k));
@@ -591,7 +709,7 @@ void image_sharpen(Player& p, const ImageView& v) {
     if (bw == p.sharpW && bh == p.sharpH) return;       // (asked for already)
     p.sharpW = bw;
     p.sharpH = bh;
-    image_request(p.wnd, WM_IMAGE, im.id, p.q.at(i).path, bw, bh, std::wstring(), im.page, 1e6);
+    image_request(p.wnd, WM_IMAGE, im.id, p.q->at(i).path, bw, bh, std::wstring(), im.page, 1e6);
 }
 
 void image_forget(Player& p) {
@@ -632,30 +750,37 @@ void anim_tick(Player& p) {
 
 // a TIFF's page before / after the one shown
 void image_page(Player& p, int step) {
-    int i = p.q.current();
-    if (!image_current(p) || p.img.id != p.q.at(i).id || p.img.pages < 2) return;
+    int i = p.q->current();
+    if (!image_current(p) || p.img.id != p.q->at(i).id || p.img.pages < 2) return;
     int page = p.img.page + step;
     if (page < 0 || page >= p.img.pages) { MessageBeep(MB_OK); return; }
     int w = 0, h = 0;
     image_box(p, w, h);
-    image_request(p.wnd, WM_IMAGE, p.img.id, p.q.at(i).path, w, h, std::wstring(), page);
+    image_request(p.wnd, WM_IMAGE, p.img.id, p.q->at(i).path, w, h, std::wstring(), page);
 }
 
 // a picture: shown (decoded on a thread; the one before stays meanwhile), the next one
 // decoded ahead; `play`: a slide show
 void show_image(Player& p, int i, bool play) {
     p.mp->close();
-    const QueueEntry& e = p.q.at(i);
+    const QueueEntry& e = p.q->at(i);
     p.slideshow = play;
     p.slideDone = 0;
     p.slideStart = p.img.id == e.id && p.img.pixels ? GetTickCount64() : 0;
     if (p.img.id != e.id) {
-        int n = p.q.next(false);
+        int n = p.q->next(false);
         int w = 0, h = 0;
         image_box(p, w, h);
-        image_request(p.wnd, WM_IMAGE, e.id, e.path, w, h, image_entry(p, n) && n != i ? p.q.at(n).path : std::wstring());
+        image_request(p.wnd, WM_IMAGE, e.id, e.path, w, h, image_entry(p, n) && n != i ? p.q->at(n).path : std::wstring());
     }
     InvalidateRect(p.video, nullptr, FALSE);
+}
+
+void keep_soon(Player& p);
+
+// the list's row i in view, when the list shows the queue playing
+void show_row(Player& p, int i) {
+    if (shown_plays(p) && i >= 0) ListView_EnsureVisible(p.list, i, FALSE);
 }
 
 // opens entry i and plays it (or shows it stopped at the start)
@@ -664,20 +789,21 @@ void play_index(Player& p, int i, bool play) {
     KillTimer(p.wnd, TIMER_LEVEL);
     p.levelWait = 0;
     p.streamRetry = 0;
-    p.q.set_current(i);
+    p.q->set_current(i);
     p.message.clear();
     spectrum_reset(p);
-    if (p.q.current() < 0) {
+    keep_soon(p);
+    if (p.q->current() < 0) {
         p.mp->close();
         p.slideshow = false;
         image_forget(p);
     } else if (image_entry(p, i)) {
         show_image(p, i, play);
-        ListView_EnsureVisible(p.list, i, FALSE);
+        show_row(p, i);
     } else {
         p.slideshow = false;
         image_forget(p);
-        const QueueEntry& e = p.q.at(i);
+        const QueueEntry& e = p.q->at(i);
         // the cover and the tags (the panel keeps the album's cover meanwhile)
         if (p.infoFor != e.id) media_info_request(p.wnd, WM_MEDIA_INFO, e.id, e.path, std::max(400, px(400)));
         // not measured yet (the first track, one jumped to): its start waits for that a
@@ -693,35 +819,59 @@ void play_index(Player& p, int i, bool play) {
             SetTimer(p.wnd, TIMER_LEVEL, 1500, nullptr);
         }
         if (p.mp->state() == State::Failed) on_failed(p);
-        ListView_EnsureVisible(p.list, i, FALSE);
+        show_row(p, i);
     }
     refresh_all(p);
 }
 
+// nothing playing or shown any more (the queue's current entry stays where it was)
+void stop_playback(Player& p) {
+    KillTimer(p.wnd, TIMER_SKIP);
+    KillTimer(p.wnd, TIMER_LEVEL);
+    p.levelWait = 0;
+    p.streamRetry = 0;
+    p.failsInRow = 0;
+    p.message.clear();
+    spectrum_reset(p);
+    p.mp->close();
+    p.slideshow = false;
+    image_forget(p);
+}
+
+// the queue of tab `t` is the one playing from now on (what played before stops)
+void set_playing(Player& p, QueueTab* t) {
+    if (p.playing == t) return;
+    if (p.playing) stop_playback(p);
+    p.playing = t;
+    p.q = &t->q;
+    InvalidateRect(p.list, nullptr, FALSE);     // (the playing entry's mark)
+    invalidate_row(p);
+}
+
 void on_failed(Player& p) {
-    int i = p.q.current();
+    int i = p.q->current();
     if (i < 0) return;
     // a stream: once more before giving up on it (a server or connection hiccup)
-    if (stream_current(p) && p.streamRetry != p.q.at(i).id) {
-        p.streamRetry = p.q.at(i).id;
-        p.mp->open(p.q.at(i).path, true);
+    if (stream_current(p) && p.streamRetry != p.q->at(i).id) {
+        p.streamRetry = p.q->at(i).id;
+        p.mp->open(p.q->at(i).path, true);
         if (p.mp->state() != State::Failed) { refresh_all(p); return; }
     }
     p.levelWait = 0;
     KillTimer(p.wnd, TIMER_LEVEL);
-    p.q.at(i).failed = true;
+    p.q->at(i).failed = true;
     p.message = media_error_text(p.mp->error());
     ++p.failsInRow;
     // (on to the next one after a moment, unless nothing can play here at all)
-    if (media_available() && p.failsInRow < p.q.size() && p.q.next(false) >= 0)
+    if (media_available() && p.failsInRow < p.q->size() && p.q->next(false) >= 0)
         SetTimer(p.wnd, TIMER_SKIP, 1500, nullptr);
     refresh_all(p);
 }
 
 void track_ended(Player& p) {
-    int n = p.q.next(true);
+    int n = p.q->next(true);
     if (n >= 0) play_index(p, n, true);
-    else play_index(p, p.q.first(), false);         // the end of the queue: back to its start
+    else play_index(p, p.q->first(), false);         // the end of the queue: back to its start
 }
 
 // the slide show on or off (the picture's time shown so far kept)
@@ -782,9 +932,27 @@ void image_pan(Player& p, POINT pt) {
     UpdateWindow(p.video);
 }
 
+// the playing queue's current entry is on: playing, paused or opening; a picture shown
+bool loaded(Player& p) {
+    if (image_current(p)) return p.img.id == p.q->at(p.q->current()).id;
+    State s = p.mp->state();
+    return p.levelWait || s == State::Opening || s == State::Playing || s == State::Paused;
+}
+
 void play_pause(Player& p) {
-    if (p.q.empty()) return;
-    if (image_current(p)) { set_slideshow(p, !p.slideshow); return; }
+    // nothing on in the queue played last: the one shown plays (where it was left)
+    if (!shown_plays(p) && !vq(p).empty() && !loaded(p)) {
+        set_playing(p, p.tabs[(size_t)p.shown].get());
+        p.failsInRow = 0;
+        play_index(p, p.q->current() >= 0 ? p.q->current() : p.q->first(), true);
+        return;
+    }
+    if (p.q->empty()) return;
+    if (image_current(p)) {
+        if (!loaded(p)) play_index(p, p.q->current(), true);    // (not shown yet: as it was left)
+        else set_slideshow(p, !p.slideshow);
+        return;
+    }
     if (p.levelWait) {                      // (about to start: it doesn't)
         p.levelWait = 0;
         KillTimer(p.wnd, TIMER_LEVEL);
@@ -798,42 +966,42 @@ void play_pause(Player& p) {
             p.mp->play();
             break;
         default:
-            play_index(p, p.q.current() >= 0 ? p.q.current() : p.q.first(), true);
+            play_index(p, p.q->current() >= 0 ? p.q->current() : p.q->first(), true);
             break;
     }
 }
 
 void previous(Player& p) {
-    if (p.q.empty()) return;
+    if (p.q->empty()) return;
     bool loaded = p.mp->state() == State::Playing || p.mp->state() == State::Paused;
-    int i = p.q.previous();
+    int i = p.q->previous();
     // 3 s into the track, or nothing before it: from its start
     if (loaded && (p.mp->position() > 30000000 || i < 0)) { p.mp->seek(0); return; }
     // (from a picture: a slide show goes on, a picture looked at stays looked at)
-    play_index(p, i >= 0 ? i : p.q.first(), !image_current(p) || p.slideshow);
+    play_index(p, i >= 0 ? i : p.q->first(), !image_current(p) || p.slideshow);
 }
 
 void next(Player& p) {
-    if (p.q.empty()) return;
-    int i = p.q.next(false);
+    if (p.q->empty()) return;
+    int i = p.q->next(false);
     if (i >= 0) play_index(p, i, !image_current(p) || p.slideshow);
-    else play_index(p, p.q.first(), false);           // past the end: its start, stopped
+    else play_index(p, p.q->first(), false);           // past the end: its start, stopped
 }
 
 // the slide show's picture has been shown long enough
 void slide_tick(Player& p) {
-    int i = p.q.current();
-    if (!image_current(p) || !p.slideshow || !p.slideStart || p.img.id != p.q.at(i).id) return;
+    int i = p.q->current();
+    if (!image_current(p) || !p.slideshow || !p.slideStart || p.img.id != p.q->at(i).id) return;
     if (GetTickCount64() - p.slideStart < (ULONGLONG)p.slideSecs * 1000) return;
-    int n = p.q.next(true);
+    int n = p.q->next(true);
     if (n >= 0) play_index(p, n, true);
     else set_slideshow(p, false);                     // the last one: it stays
 }
 
 void on_image(Player& p, ImageNote* n) {
-    int i = p.q.current();
-    if (i >= 0 && image_current(p) && p.q.at(i).id == n->id) {
-        QueueEntry& e = p.q.at(i);
+    int i = p.q->current();
+    if (i >= 0 && image_current(p) && p.q->at(i).id == n->id) {
+        QueueEntry& e = p.q->at(i);
         if (n->pixels) {
             if (p.img.id != n->id || p.img.page != n->page) image_zoom_reset(p);     // (not this one decoded sharper)
             p.img = std::move(*n);
@@ -847,44 +1015,49 @@ void on_image(Player& p, ImageNote* n) {
             p.img.id = e.id;
             e.failed = true;
             p.message = L"This picture can't be opened: its file type isn't supported, or the file is damaged.";
-            if (p.slideshow && p.q.next(false) >= 0) SetTimer(p.wnd, TIMER_SKIP, 1500, nullptr);
+            if (p.slideshow && p.q->next(false) >= 0) SetTimer(p.wnd, TIMER_SKIP, 1500, nullptr);
         }
-        ListView_RedrawItems(p.list, i, i);
+        if (shown_plays(p)) ListView_RedrawItems(p.list, i, i);
         refresh_all(p);
     }
     delete n;
 }
 
+// the shown queue's entries changed: the list, its heading; kept
 void queue_changed(Player& p) {
-    ListView_SetItemCountEx(p.list, p.q.size(), LVSICF_NOSCROLL);
+    ListView_SetItemCountEx(p.list, vq(p).size(), LVSICF_NOSCROLL);
     InvalidateRect(p.list, nullptr, FALSE);
     fit_columns(p);
-    RECT head{ p.splitX, 0, 0x7FFF, p.headH };
+    RECT head{ p.splitX, p.rowH, 0x7FFF, p.rowH + p.headH };
     InvalidateRect(p.wnd, &head, FALSE);
+    keep_soon(p);
 }
 
-// `start`: the entry to begin with (a picture viewed: its folder's pictures from it)
+// into the queue shown. `start`: the entry to begin with (a picture viewed: its folder's
+// pictures from it)
 void add(Player& p, const std::vector<std::wstring>& paths, bool enqueue, const std::wstring& start = {}) {
     if (paths.empty()) return;
-    State s = p.mp->state();
-    bool idle = !(s == State::Playing || s == State::Paused || s == State::Opening || image_current(p));
+    QueueTab* tab = p.tabs[(size_t)p.shown].get();
     if (!enqueue) {
         tags_forget();
-        p.q.replace(paths);
+        set_playing(p, tab);                // (what played before stops: this plays)
+        p.q->replace(paths);
         if (!start.empty())
-            for (int i = 0; i < p.q.size(); ++i)
-                if (p.q.at(i).path == start) { p.q.set_current(i); break; }
+            for (int i = 0; i < p.q->size(); ++i)
+                if (p.q->at(i).path == start) { p.q->set_current(i); break; }
         p.failsInRow = 0;
         queue_changed(p);
-        tags_read(p, 0);
+        tags_read(*p.q, 0);
         // (a picture is shown, not run as a slide show: Play starts that)
-        play_index(p, p.q.current(), !image_current(p));
+        play_index(p, p.q->current(), !image_current(p));
         return;
     }
-    int first = p.q.append(paths);
+    bool idle = !loaded(p);
+    int first = tab->q.append(paths);
     queue_changed(p);
-    tags_read(p, first);
-    if (idle) {
+    tags_read(tab->q, first);
+    if (idle) {                             // (nothing on: this plays)
+        set_playing(p, tab);
         p.failsInRow = 0;
         play_index(p, first, !image_entry(p, first));
     }
@@ -901,24 +1074,294 @@ void remove_selected(Player& p) {
     std::vector<int> sel = selected_rows(p);
     if (sel.empty()) return;
     bool was = playing(p);
-    bool hit = p.q.remove(sel);
+    PlayQueue& v = vq(p);
+    bool hit = v.remove(sel) && shown_plays(p);
     ListView_SetItemState(p.list, -1, 0, LVIS_SELECTED);
     queue_changed(p);
-    int focus = std::min(sel[0], p.q.size() - 1);
+    int focus = std::min(sel[0], v.size() - 1);
     if (focus >= 0) ListView_SetItemState(p.list, focus, LVIS_FOCUSED | LVIS_SELECTED, LVIS_FOCUSED | LVIS_SELECTED);
     if (hit) {
-        if (p.q.current() >= 0) play_index(p, p.q.current(), was);
+        if (p.q->current() >= 0) play_index(p, p.q->current(), was);
         else play_index(p, -1, false);
     }
     refresh_all(p);
 }
 
+// the queue shown emptied (playing: it stops)
 void clear_queue(Player& p) {
     tags_forget();
-    p.q.clear();
-    play_index(p, -1, false);
+    vq(p).clear();
+    if (shown_plays(p)) play_index(p, -1, false);
     queue_changed(p);
     refresh_all(p);
+}
+
+// ------------------------------------------------------------------
+// the tabs: a queue each. The one shown is in the list; the one playing goes on while
+// another is looked at (nothing on: the one shown is the one playing)
+// ------------------------------------------------------------------
+int tab_index(const Player& p, const QueueTab* t) {
+    for (size_t i = 0; i < p.tabs.size(); ++i)
+        if (p.tabs[i].get() == t) return (int)i;
+    return -1;
+}
+
+// "Queue 2": the first number no tab has
+std::wstring new_tab_name(const Player& p) {
+    for (int n = 1;; ++n) {
+        std::wstring s = L"Queue " + std::to_wstring(n);
+        if (std::none_of(p.tabs.begin(), p.tabs.end(), [&](const auto& t) { return lstrcmpiW(t->name.c_str(), s.c_str()) == 0; }))
+            return s;
+    }
+}
+
+// a new tab at `at` (shuffle and repeat as the others have them)
+QueueTab* add_tab(Player& p, int at, const std::wstring& name) {
+    auto t = std::make_unique<QueueTab>();
+    t->name = name.empty() ? new_tab_name(p) : name;
+    t->q.repeat = p.q ? p.q->repeat : (Repeat)std::clamp(settings_pref(L"playerRepeat", 0), 0, 2);
+    t->q.set_shuffle(p.q ? p.q->shuffle() : settings_pref(L"playerShuffle", 0) != 0);
+    at = std::clamp(at, 0, (int)p.tabs.size());
+    QueueTab* r = t.get();
+    p.tabs.insert(p.tabs.begin() + at, std::move(t));
+    if (p.tabs.size() > 1 && at <= p.shown) ++p.shown;
+    return r;
+}
+
+// the playing queue's current entry on screen (not played): a picture shown; sound and
+// video wait for Play
+void show_current(Player& p) {
+    if (image_current(p) && !loaded(p)) play_index(p, p.q->current(), false);
+    else refresh_all(p);
+}
+
+void end_rename(Player& p, bool take);
+
+// tab i shown: its queue in the list, scrolled as it was left
+void show_tab(Player& p, int i, bool keepPlace = true) {
+    if (i < 0 || i >= (int)p.tabs.size()) return;
+    end_rename(p, true);
+    if (keepPlace && p.shown < (int)p.tabs.size()) p.tabs[(size_t)p.shown]->top = ListView_GetTopIndex(p.list);
+    p.shown = i;
+    ListView_SetItemState(p.list, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+    queue_changed(p);
+    int n = vq(p).size(), top = std::min(p.tabs[(size_t)i]->top, n - 1);
+    if (top > 0) ListView_EnsureVisible(p.list, n - 1, FALSE);     // (then up to it: it's the first row shown)
+    if (n > 0) ListView_EnsureVisible(p.list, std::max(0, top), FALSE);
+    // nothing on: this one plays from now on (what the video area shows is its)
+    if (!loaded(p) && !shown_plays(p)) {
+        set_playing(p, p.tabs[(size_t)i].get());
+        show_current(p);
+    }
+    layout_tabs(p);
+    invalidate_row(p);
+    refresh_all(p);
+}
+
+void new_tab(Player& p) {
+    add_tab(p, p.shown + 1, {});
+    show_tab(p, p.shown + 1);
+    SetFocus(IsWindowVisible(p.list) ? p.list : p.wnd);
+}
+
+// its queue goes (playing: the playback stops). The last one: the window closes (as the
+// Notepad's), the queue left empty for next time
+void close_tab(Player& p, int i) {
+    if (i < 0 || i >= (int)p.tabs.size()) return;
+    end_rename(p, false);
+    if (p.tabs.size() == 1) {
+        tags_forget();
+        p.tabs[0]->q.clear();
+        p.tabs[0]->top = 0;
+        PostMessageW(p.wnd, WM_CLOSE, 0, 0);
+        return;
+    }
+    bool wasShown = i == p.shown, wasPlaying = p.tabs[(size_t)i].get() == p.playing;
+    if (wasPlaying) stop_playback(p);
+    p.tabs.erase(p.tabs.begin() + i);
+    p.hotTab = p.hotClose = -1;
+    if (i < p.shown) --p.shown;
+    p.shown = std::min(p.shown, (int)p.tabs.size() - 1);
+    if (wasPlaying) {
+        p.playing = nullptr;                // (gone: the one shown plays from now on)
+        set_playing(p, p.tabs[(size_t)p.shown].get());
+    }
+    if (wasShown) show_tab(p, p.shown, false);
+    else { layout_tabs(p); invalidate_row(p); keep_soon(p); }
+    if (wasPlaying) show_current(p);
+}
+
+// the list's row i played: its tab is the one playing from now on
+void play_row(Player& p, int i) {
+    if (i < 0 || i >= vq(p).size()) return;
+    set_playing(p, p.tabs[(size_t)p.shown].get());
+    p.failsInRow = 0;
+    play_index(p, i, true);
+}
+
+void step_tab(Player& p, int step) {
+    int n = (int)p.tabs.size();
+    if (n > 1) show_tab(p, (p.shown + step + n) % n);
+}
+
+// the tab shown, dragged to `to`
+void move_tab(Player& p, int from, int to) {
+    auto t = std::move(p.tabs[(size_t)from]);
+    p.tabs.erase(p.tabs.begin() + from);
+    p.tabs.insert(p.tabs.begin() + to, std::move(t));
+    p.shown = to;
+    layout_tabs(p);
+    invalidate_row(p);
+    keep_soon(p);
+}
+
+// --- a tab's name, edited in place (Enter takes it, Esc or an empty name doesn't) ---
+LRESULT CALLBACK rename_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    switch (msg) {
+        case WM_GETDLGCODE: return DefSubclassProc(h, msg, wp, lp) | DLGC_WANTALLKEYS;
+        case WM_KEYDOWN:
+            // (posted: the box mustn't go while it handles its own key)
+            if (wp == VK_RETURN || wp == VK_ESCAPE) { PostMessageW(GetParent(h), WM_RENAME_DONE, wp == VK_RETURN, (LPARAM)h); return 0; }
+            break;
+        case WM_CHAR:
+            if (wp == L'\r' || wp == 27) return 0;     // (no beep)
+            break;
+        case WM_NCDESTROY:
+            RemoveWindowSubclass(h, rename_proc, 1);
+            break;
+    }
+    return DefSubclassProc(h, msg, wp, lp);
+}
+
+RECT rename_rect(const Player& p, int i) {
+    RECT r = tab_rect(p, i), cr = tab_close_rect(p, i);
+    int h = px(24), cy = (r.top + r.bottom) / 2;
+    return { r.left + px(10), cy - h / 2, cr.left - px(2), cy - h / 2 + h };
+}
+
+// the box over its tab (inside the frame drawn around it), as the tabs are laid out now
+void place_rename(Player& p) {
+    if (!p.rename) return;
+    int i = tab_index(p, p.renaming);
+    RECT r = i >= 0 && p.rowH ? rename_rect(p, i) : RECT{};
+    InflateRect(&r, -px(4), -px(3));
+    MoveWindow(p.rename, r.left, r.top, std::max(0, (int)(r.right - r.left)), std::max(0, (int)(r.bottom - r.top)), TRUE);
+}
+
+void start_rename(Player& p, int i) {
+    if (i < 0 || i >= (int)p.tabs.size() || !p.rowH) return;
+    end_rename(p, true);
+    if (i != p.shown) show_tab(p, i);
+    p.renaming = p.tabs[(size_t)i].get();
+    p.rename = CreateWindowExW(0, L"EDIT", p.renaming->name.c_str(), WS_CHILD | ES_AUTOHSCROLL, 0, 0, 0, 0, p.wnd, nullptr,
+                               g_hinst, nullptr);
+    if (!p.rename) { p.renaming = nullptr; return; }
+    SetWindowSubclass(p.rename, rename_proc, 1, 0);
+    SendMessageW(p.rename, WM_SETFONT, (WPARAM)p.font, FALSE);
+    SendMessageW(p.rename, EM_LIMITTEXT, 100, 0);
+    place_rename(p);
+    ShowWindow(p.rename, SW_SHOW);
+    SendMessageW(p.rename, EM_SETSEL, 0, -1);
+    SetFocus(p.rename);
+    invalidate_row(p);
+}
+
+void end_rename(Player& p, bool take) {
+    if (!p.rename) return;
+    HWND e = p.rename;
+    p.rename = nullptr;                     // (before the focus leaves it: its EN_KILLFOCUS comes back here)
+    if (take && tab_index(p, p.renaming) >= 0) {
+        wchar_t b[128]{};
+        GetWindowTextW(e, b, ARRAYSIZE(b));
+        std::wstring name = b;
+        size_t a = name.find_first_not_of(L" \t"), z = name.find_last_not_of(L" \t");
+        name = a == std::wstring::npos ? std::wstring() : name.substr(a, z - a + 1);
+        if (!name.empty() && name != p.renaming->name) {
+            p.renaming->name = name;
+            keep_soon(p);
+        }
+    }
+    p.renaming = nullptr;
+    if (GetFocus() == e) SetFocus(IsWindowVisible(p.list) ? p.list : p.wnd);
+    DestroyWindow(e);
+    invalidate_row(p);
+}
+
+// ------------------------------------------------------------------
+// the queues kept as they were left (in a folder next to the settings file; tests: theirs)
+// ------------------------------------------------------------------
+std::wstring queues_file() {
+    std::wstring ini = settings_file_path();
+    size_t slash = ini.find_last_of(L"\\/");
+    if (ini.empty() || slash == std::wstring::npos) return {};
+    std::wstring dir = ini.substr(0, slash) + L"\\Player";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir + L"\\queues.ini";
+}
+
+void keep_soon(Player& p) { if (p.wnd) SetTimer(p.wnd, TIMER_KEEP, kKeepDelayMs, nullptr); }
+
+bool keep_now(Player& p) {
+    if (p.wnd) KillTimer(p.wnd, TIMER_KEEP);
+    std::wstring file = queues_file();
+    if (file.empty() || p.tabs.empty()) return false;
+    PlayerSession s;
+    s.active = p.shown;
+    for (auto& t : p.tabs) {
+        QueueState qs;
+        qs.name = t->name;
+        qs.current = t->q.current();
+        qs.entries.reserve((size_t)t->q.size());
+        for (auto& e : t->q.entries()) qs.entries.push_back({ e.path, e.title, e.duration });
+        s.queues.push_back(std::move(qs));
+    }
+    std::wstring text = player_session_serialize(s);
+    // (UTF-16 with its BOM, as the settings file; written beside, then moved over)
+    std::wstring tmp = file + L".tmp";
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD put = 0, size = (DWORD)(text.size() * sizeof(wchar_t));
+    bool ok = WriteFile(h, "\xFF\xFE", 2, &put, nullptr) && put == 2 && WriteFile(h, text.data(), size, &put, nullptr) && put == size;
+    CloseHandle(h);
+    if (ok) ok = MoveFileExW(tmp.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+    if (!ok) DeleteFileW(tmp.c_str());
+    return ok;
+}
+
+// the tabs as they were left (none: an empty one); before the window is made
+void restore_queues(Player& p) {
+    PlayerSession s;
+    std::wstring file = queues_file();
+    HANDLE h = file.empty() ? INVALID_HANDLE_VALUE
+                            : CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                          FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER size{};
+        std::string raw;
+        DWORD got = 0;
+        if (GetFileSizeEx(h, &size) && size.QuadPart > 0 && size.QuadPart < (256 << 20)) {
+            raw.resize((size_t)size.QuadPart);
+            if (ReadFile(h, raw.data(), (DWORD)raw.size(), &got, nullptr) && got == raw.size()) s = player_session_parse(ini_decode(raw));
+        }
+        CloseHandle(h);
+    }
+    for (auto& qs : s.queues) {
+        QueueTab* t = add_tab(p, (int)p.tabs.size(), qs.name);
+        std::vector<std::wstring> paths;
+        paths.reserve(qs.entries.size());
+        for (auto& e : qs.entries) paths.push_back(e.path);
+        t->q.append(paths);
+        for (int i = 0; i < t->q.size(); ++i) {
+            t->q.at(i).title = qs.entries[(size_t)i].title;
+            t->q.at(i).duration = qs.entries[(size_t)i].duration;
+        }
+        t->q.set_current(qs.current);
+        t->top = std::max(0, qs.current - 3);    // (the list where its current entry is)
+    }
+    if (p.tabs.empty()) add_tab(p, 0, {});
+    p.shown = std::clamp(s.active, 0, (int)p.tabs.size() - 1);
+    p.playing = p.tabs[(size_t)p.shown].get();
+    p.q = &p.playing->q;
 }
 
 void set_full(Player& p, bool on) {
@@ -963,14 +1406,18 @@ void command(Player& p, UINT cmd) {
         case CMD_PLAYPAUSE: play_pause(p); break;
         case CMD_PREV: previous(p); break;
         case CMD_NEXT: next(p); break;
-        case CMD_SHUFFLE:
-            p.q.set_shuffle(!p.q.shuffle());
-            settings_set_pref(L"playerShuffle", p.q.shuffle());
+        case CMD_SHUFFLE: {                 // (all the queues alike)
+            bool on = !p.q->shuffle();
+            for (auto& t : p.tabs) t->q.set_shuffle(on);
+            settings_set_pref(L"playerShuffle", on);
             break;
-        case CMD_REPEAT:
-            p.q.repeat = (Repeat)(((int)p.q.repeat + 1) % 3);
-            settings_set_pref(L"playerRepeat", (int)p.q.repeat);
+        }
+        case CMD_REPEAT: {
+            Repeat r = (Repeat)(((int)p.q->repeat + 1) % 3);
+            for (auto& t : p.tabs) t->q.repeat = r;
+            settings_set_pref(L"playerRepeat", (int)r);
             break;
+        }
         case CMD_MUTE:
             p.muted = !p.muted;
             apply_volume(p);
@@ -986,19 +1433,23 @@ void command(Player& p, UINT cmd) {
         case CMD_CLEAR: clear_queue(p); break;
         case CMD_SAVE_PLAYLIST: save_queue(p); break;
         case CMD_EDIT_PICTURE:
-            if (image_current(p)) imageedit_open_file(p.q.at(p.q.current()).path);
+            if (image_current(p)) imageedit_open_file(p.q->at(p.q->current()).path);
             break;
         case CMD_PLAY_SELECTED: {
             int i = ListView_GetNextItem(p.list, -1, LVNI_SELECTED);
             if (i < 0) i = ListView_GetNextItem(p.list, -1, LVNI_FOCUSED);
-            if (i >= 0) { p.failsInRow = 0; play_index(p, i, true); }
+            if (i >= 0) play_row(p, i);
             break;
         }
         case CMD_REMOVE_SELECTED: remove_selected(p); break;
+        case CMD_TAB_NEW: new_tab(p); break;
+        case CMD_TAB_CLOSE: close_tab(p, p.shown); break;
+        case CMD_TAB_RENAME: start_rename(p, p.shown); break;
+        case CMD_TAB_NEXT: case CMD_TAB_PREV: step_tab(p, cmd == CMD_TAB_NEXT ? 1 : -1); break;
         case CMD_LEVEL:
             p.level = !p.level;
             settings_set_pref(L"playerLevel", p.level);
-            if (p.level && p.q.current() >= 0) level_track(p, p.q.current());
+            if (p.level && p.q->current() >= 0) level_track(p, p.q->current());
             apply_volume(p);
             InvalidateRect(p.video, nullptr, FALSE);
             break;
@@ -1053,17 +1504,18 @@ bool media_command(Player& p, int app) {
 void on_note(Player& p, LPARAM lp) {
     using Change = MediaPlayer::Change;
     Change c = p.mp->handle(reinterpret_cast<MediaNote*>(lp));
-    int i = p.q.current();
+    int i = p.q->current();
     if (image_current(p)) return;          // (the playback closed for a picture: late news of it)
     switch (c) {
         case Change::None: return;
         case Change::Opened:
             if (i >= 0) {
-                QueueEntry& e = p.q.at(i);
+                QueueEntry& e = p.q->at(i);
                 if (p.mp->duration() > 0) e.duration = p.mp->duration();
                 if (!p.mp->title().empty()) e.title = p.mp->title();
                 e.failed = false;
-                ListView_RedrawItems(p.list, i, i);
+                if (shown_plays(p)) ListView_RedrawItems(p.list, i, i);
+                keep_soon(p);
                 // sound: its spectrogram, from a decoding of its own
                 if (!p.mp->has_video() && decodable(e.path)) {
                     p.feed.start(e.path, p.mp->position(), std::max(30, MulDiv(60, p.dpi, 96)));
@@ -1085,7 +1537,7 @@ void on_note(Player& p, LPARAM lp) {
             break;
         case Change::Failed: on_failed(p); return;
         case Change::DeviceLost:              // (headphones unplugged: on with the next device, same place)
-            if (i >= 0) p.mp->open(p.q.at(i).path, playing(p), p.mp->position());
+            if (i >= 0) p.mp->open(p.q->at(i).path, playing(p), p.mp->position());
             break;
     }
     refresh_bar(p);
@@ -1153,10 +1605,10 @@ void tag_thread() {
     if (SUCCEEDED(co)) CoUninitialize();
 }
 
-void tags_read(Player& p, int from) {
+void tags_read(PlayQueue& q, int from) {
     std::lock_guard<std::mutex> lk(s_tagMx);
-    for (int i = from; i < p.q.size(); ++i)
-        if (!image_entry(p, i)) s_tagJobs.push_back({ p.q.at(i).id, p.q.at(i).path });     // (pictures: no tags read)
+    for (int i = from; i < q.size(); ++i)
+        if (!image_file(q.at(i).path)) s_tagJobs.push_back({ q.at(i).id, q.at(i).path });   // (pictures: no tags read)
     if (!s_tagBusy && !s_tagJobs.empty()) {
         s_tagBusy = true;
         std::thread(tag_thread).detach();
@@ -1176,15 +1628,22 @@ void tags_apply() {
     }
     Player* p = s_p;
     if (!p) return;
+    size_t at = 0;                          // (the tab the last one was found in: the next likely is too)
     for (const TagInfo& info : done) {
-        int i = p->q.index_of(info.id);
-        if (i < 0) continue;
-        QueueEntry& e = p->q.at(i);
-        if (e.title.empty() && !info.title.empty()) e.title = info.title;
-        if (e.duration < 0 && info.duration >= 0) e.duration = info.duration;
-        if (i == p->q.current()) { update_title(*p); InvalidateRect(p->video, nullptr, FALSE); InvalidateRect(p->bar, nullptr, FALSE); }
+        for (size_t k = 0; k < p->tabs.size(); ++k) {
+            PlayQueue& q = p->tabs[(at + k) % p->tabs.size()]->q;
+            int i = q.index_of(info.id);
+            if (i < 0) continue;
+            at = (at + k) % p->tabs.size();
+            QueueEntry& e = q.at(i);
+            if (e.title.empty() && !info.title.empty()) e.title = info.title;
+            if (e.duration < 0 && info.duration >= 0) e.duration = info.duration;
+            if (&q == p->q && i == q.current()) { update_title(*p); InvalidateRect(p->video, nullptr, FALSE); InvalidateRect(p->bar, nullptr, FALSE); }
+            break;
+        }
     }
     InvalidateRect(p->list, nullptr, FALSE);
+    keep_soon(*p);
 }
 
 // ------------------------------------------------------------------
@@ -1464,7 +1923,7 @@ void playlist_place(const std::vector<std::wstring>& paths, std::wstring& dir, s
 void save_queue(Player& p) {
     std::vector<PlaylistEntry> entries;
     std::vector<std::wstring> paths;
-    for (auto& e : p.q.entries())
+    for (auto& e : vq(p).entries())
         if (!image_file(e.path)) {          // (sound and video: a picture isn't a playlist's)
             entries.push_back({ e.path, e.title, e.duration });
             paths.push_back(e.path);
@@ -1500,7 +1959,7 @@ void slider(HDC dc, Player& p, const RECT& rail, double frac, bool enabled, bool
 bool part_enabled(Player& p, int part) {
     switch (part) {
         case P_SEEK: return seekable(p);
-        case P_PREV: case P_PLAY: case P_NEXT: return !p.q.empty();
+        case P_PREV: case P_PLAY: case P_NEXT: return !p.q->empty();
         default: return true;
     }
 }
@@ -1511,7 +1970,7 @@ wchar_t part_glyph(Player& p, int part) {
         case P_PREV:    return L'\xE892';
         case P_PLAY:    return playing(p) ? L'\xE769' : L'\xE768';
         case P_NEXT:    return L'\xE893';
-        case P_REPEAT:  return p.q.repeat == Repeat::One ? L'\xE8ED' : L'\xE8EE';
+        case P_REPEAT:  return p.q->repeat == Repeat::One ? L'\xE8ED' : L'\xE8EE';
         case P_MUTE:
             if (p.muted || p.volume == 0) return L'\xE74F';
             return p.volume < 34 ? L'\xE993' : p.volume < 67 ? L'\xE994' : L'\xE995';
@@ -1523,8 +1982,8 @@ wchar_t part_glyph(Player& p, int part) {
 
 bool part_on(Player& p, int part) {
     switch (part) {
-        case P_SHUFFLE: return p.q.shuffle();
-        case P_REPEAT:  return p.q.repeat != Repeat::Off;
+        case P_SHUFFLE: return p.q->shuffle();
+        case P_REPEAT:  return p.q->repeat != Repeat::Off;
         case P_QUEUE:   return p.queueShown && !p.full;
     }
     return false;
@@ -1534,7 +1993,7 @@ std::wstring part_name(Player& p, int part, std::wstring* key = nullptr) {
     std::wstring k, n;
     switch (part) {
         case P_SEEK:    n = L"Position"; k = L"Left, Right"; break;
-        case P_SHUFFLE: n = p.q.shuffle() ? L"Shuffle: on" : L"Shuffle: off"; k = L"Ctrl+H"; break;
+        case P_SHUFFLE: n = p.q->shuffle() ? L"Shuffle: on" : L"Shuffle: off"; k = L"Ctrl+H"; break;
         case P_PREV:    n = L"Previous"; k = image_current(p) ? L"Left" : L"Ctrl+Left"; break;
         case P_PLAY:
             n = image_current(p) ? (p.slideshow ? L"Stop slide show" : L"Slide show") : playing(p) ? L"Pause" : L"Play";
@@ -1542,7 +2001,7 @@ std::wstring part_name(Player& p, int part, std::wstring* key = nullptr) {
             break;
         case P_NEXT:    n = L"Next"; k = image_current(p) ? L"Right" : L"Ctrl+Right"; break;
         case P_REPEAT:
-            n = p.q.repeat == Repeat::One ? L"Repeat: one" : p.q.repeat == Repeat::All ? L"Repeat: all" : L"Repeat: off";
+            n = p.q->repeat == Repeat::One ? L"Repeat: one" : p.q->repeat == Repeat::All ? L"Repeat: all" : L"Repeat: off";
             k = L"Ctrl+T";
             break;
         case P_MUTE:    n = p.muted ? L"Unmute" : L"Mute"; k = L"M"; break;
@@ -1571,7 +2030,7 @@ void paint_bar(Player& p) {
     COLORREF timeColor = canSeek ? c.textSecondary : c.textDisabled;
     if (image_current(p)) {
         // a picture: which one of how many; the slide show's time to the next one
-        text_at(dc, std::to_wstring(p.q.current() + 1) + L" / " + std::to_wstring(p.q.size()), tl, c.textSecondary,
+        text_at(dc, std::to_wstring(p.q->current() + 1) + L" / " + std::to_wstring(p.q->size()), tl, c.textSecondary,
                 p.fontSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         text_at(dc, std::to_wstring(p.slideSecs) + L" s", tr, p.slideshow ? c.textSecondary : c.textDisabled,
                 p.fontSmall, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
@@ -1635,28 +2094,28 @@ void paint_bar(Player& p) {
 // ------------------------------------------------------------------
 // the video area shows the panel: an entry is current and it isn't (or isn't yet) a video
 bool now_playing(Player& p) {
-    int i = p.q.current();
+    int i = p.q->current();
     if (i < 0 || p.mp->has_video() || image_current(p)) return false;
     // (a video file still opening: no panel flashing up before its picture)
-    return !(p.mp->state() == State::Opening && media_file_video(p.q.at(i).path));
+    return !(p.mp->state() == State::Opening && media_file_video(p.q->at(i).path));
 }
 
 std::wstring folder_of(const std::wstring& path) { return path.substr(0, path.find_last_of(L"\\/") + 1); }
 
 // the tags read for the current entry; null while they're on their way
 const MediaInfo* current_info(Player& p) {
-    int i = p.q.current();
-    return i >= 0 && p.infoFor == p.q.at(i).id ? &p.info : nullptr;
+    int i = p.q->current();
+    return i >= 0 && p.infoFor == p.q->at(i).id ? &p.info : nullptr;
 }
 
 // the cover to show: the current entry's, or meanwhile the previous one's when it's a
 // picture of the same folder (the next track of an album)
 bool cover_shown(Player& p) {
-    int i = p.q.current();
+    int i = p.q->current();
     if (i < 0 || !p.info.cover) return false;
     if (current_info(p)) return true;
     const std::wstring& from = p.info.coverFrom;
-    return !from.empty() && folder_of(from) == folder_of(p.q.at(i).path) && is_image_name(from);
+    return !from.empty() && folder_of(from) == folder_of(p.q->at(i).path) && is_image_name(from);
 }
 
 // what the panel lists under the title: the tags, then the stream's format
@@ -1665,10 +2124,10 @@ std::vector<std::pair<std::wstring, std::wstring>> now_details(Player& p) {
     const MediaInfo* info = current_info(p);
     if (info) out = info->tags;
     const AudioInfo& a = p.mp->audio();
-    int i = p.q.current();
+    int i = p.q->current();
     std::wstring fmt = audio_format_name(a.format);
-    if (fmt.empty() && i >= 0 && !media_url(p.q.at(i).path)) {     // (unknown: the file type)
-        const wchar_t* ext = PathFindExtensionW(p.q.at(i).path.c_str());
+    if (fmt.empty() && i >= 0 && !media_url(p.q->at(i).path)) {     // (unknown: the file type)
+        const wchar_t* ext = PathFindExtensionW(p.q->at(i).path.c_str());
         if (*ext) { fmt = ext + 1; for (auto& ch : fmt) ch = (wchar_t)towupper(ch); }
     }
     unsigned bitrate = info && info->bitrate ? info->bitrate : a.bitrate;
@@ -1684,7 +2143,7 @@ std::vector<std::pair<std::wstring, std::wstring>> now_details(Player& p) {
     if (lossless && a.bits) audio += (audio.empty() ? L"" : L", ") + std::to_wstring(a.bits) + L"-bit";
     if (!audio.empty()) out.push_back({ L"Audio", audio });
     // its loudness; levelled: by how much
-    if (const double* l = i >= 0 ? loudness_of(p, p.q.at(i).path) : nullptr; l && std::isfinite(*l)) {
+    if (const double* l = i >= 0 ? loudness_of(p, p.q->at(i).path) : nullptr; l && std::isfinite(*l)) {
         wchar_t b[96];
         double g = loudness_gain_db(*l);
         if (p.level) swprintf_s(b, L"%.1f LUFS, levelled %s%.1f dB", *l, g >= 0 ? L"+" : L"\x2212", std::fabs(g));
@@ -1704,8 +2163,8 @@ NowRects now_rects(Player& p, const RECT& rc) {
     NowRects r;
     int w = rc.right - rc.left, h = rc.bottom - rc.top, pad = px(24);
     // (a visualization: a little more room than the spectrogram)
-    int i = p.q.current();
-    bool analysed = i >= 0 && decodable(p.q.at(i).path);     // (a stream, MIDI, a CD track: nothing to show there)
+    int i = p.q->current();
+    bool analysed = i >= 0 && decodable(p.q->at(i).path);     // (a stream, MIDI, a CD track: nothing to show there)
     int specH = h < px(300) || !analysed ? 0 : vis_on(p) ? std::clamp(h * 36 / 100, px(100), px(300)) : std::clamp(h * 30 / 100, px(80), px(220));
     if (specH) r.spec = { rc.left + pad, rc.bottom - pad - specH, rc.right - pad, rc.bottom - pad };
     int top = rc.top + pad, bottom = (specH ? r.spec.top - px(8) : rc.bottom - pad);
@@ -1889,8 +2348,8 @@ void spectrum_tick(Player& p) {
     LONGLONG pos = p.mp->position();
     // a seek (or a jump of the clock): the analysis starts again there
     if (p.specPos >= 0 && (pos < p.specPos - 2000000 || pos > p.specPos + 15000000)) {
-        int i = p.q.current();
-        if (i >= 0) p.feed.start(p.q.at(i).path, pos, std::max(30, MulDiv(60, p.dpi, 96)));
+        int i = p.q->current();
+        if (i >= 0) p.feed.start(p.q->at(i).path, pos, std::max(30, MulDiv(60, p.dpi, 96)));
         p.vis.set_source(p.feed.tap());
         p.spec.clear();
         if (p.specBits) std::fill(p.specBits, p.specBits + (size_t)p.specW * p.specH, p.specLut[0]);
@@ -2012,12 +2471,12 @@ void paint_idle(Player& p, HDC dc, const RECT& rc) {
     const Palette& c = pal();
     std::wstring title, detail;
     wchar_t g = L'\xE8D6';                     // (music note)
-    if (p.q.empty()) {
+    if (p.q->empty()) {
         title = L"Nothing to play";
         detail = L"Choose Play, View or Queue in Explorer Plus in a file's menu, or drop files here.";
-    } else if (p.q.current() < 0) {
+    } else if (p.q->current() < 0) {
         title = L"Play queue";
-        detail = std::to_wstring(p.q.size()) + (p.q.size() == 1 ? L" item" : L" items");
+        detail = std::to_wstring(p.q->size()) + (p.q->size() == 1 ? L" item" : L" items");
     } else {
         title = current_title(p);
         detail = current_detail(p);
@@ -2256,7 +2715,7 @@ void thumb_buttons(Player& p, bool add) {
         b[i].iId = ids[i];
         b[i].hIcon = p.thumbIcons[i];
         wcscpy_s(b[i].szTip, tips[i]);
-        b[i].dwFlags = p.q.empty() ? THBF_DISABLED : THBF_ENABLED;
+        b[i].dwFlags = p.q->empty() ? THBF_DISABLED : THBF_ENABLED;
     }
     if (add) p.taskbar->ThumbBarAddButtons(p.wnd, 3, b);
     else p.taskbar->ThumbBarUpdateButtons(p.wnd, 3, b);
@@ -2298,15 +2757,84 @@ void update_taskbar(Player& p) {
     thumb_buttons(p, false);
 }
 
+// the window's buttons, at the tab row's right end: minimize, maximize, close
+void paint_cap_buttons(Player& p, HDC dc, COLORREF bg) {
+    const Palette& c = pal();
+    static const wchar_t kGlyph[3] = { L'\xE921', L'\xE922', L'\xE8BB' };
+    for (int i = 0; i < 3; ++i) {
+        RECT r = cap_button(p, i);
+        COLORREF fg = p.activeWnd ? c.text : c.textDisabled;
+        bool on = p.capHot == i || p.capPressed == i;
+        if (i == 2 && on) {
+            fill_rect(dc, r, p.capPressed == 2 ? blend(c.closeHover, RGB(0, 0, 0), 0.1) : c.closeHover);
+            fg = RGB(255, 255, 255);
+        } else if (on) {
+            fill_rect(dc, r, blend(bg, g_dark ? RGB(255, 255, 255) : RGB(0, 0, 0), p.capPressed == i ? 0.04 : 0.07));
+        }
+        glyph_at(dc, i == 1 && IsZoomed(p.wnd) ? L'\xE923' : kGlyph[i], r, fg, p.glyphsSmall);
+    }
+}
+
+// the playing tab's mark: a speaker (accent: playing; grey: paused), none when nothing is on
+int play_mark(Player& p) { return !loaded(p) ? 0 : playing(p) ? 2 : 1; }
+
+// the tab row, in the title bar's place: the tabs (as Notepad's), "+", the window's buttons
+void paint_tabs(Player& p, HDC dc, const RECT& rc) {
+    const Palette& c = pal();
+    COLORREF capBg = p.activeWnd ? c.caption : c.captionInactive;
+    fill_rect(dc, RECT{ 0, 0, rc.right, p.rowH }, capBg);
+    paint_cap_buttons(p, dc, capBg);
+    p.markShown = play_mark(p);
+    int saved = SaveDC(dc);                     // (scrolled: cut at the strip's ends)
+    if (p.scroll || (int)p.tabs.size() * p.tabW > p.strip.right - p.strip.left)
+        IntersectClipRect(dc, p.strip.left, 0, p.strip.right, p.rowH);
+    for (int i = 0; i < (int)p.tabs.size(); ++i) {
+        const QueueTab& t = *p.tabs[(size_t)i];
+        RECT r = tab_rect(p, i);
+        if (r.right < p.strip.left || r.left > p.strip.right) continue;
+        bool act = i == p.shown, hot = i == p.hotTab;
+        if (act) {
+            fill_tab_shape(dc, r, px(8), c.layer);
+        } else if (hot) {
+            RECT h{ r.left + px(2), r.top + px(2), r.right - px(2), r.bottom - px(4) };
+            fill_rrect(dc, h, px(6), c.tabHover);
+        } else if (i + 1 != p.shown && i + 1 != p.hotTab && i + 1 < (int)p.tabs.size()) {
+            fill_rect(dc, RECT{ r.right - 1, r.top + px(10), r.right, r.bottom - px(10) }, c.divider);
+        }
+        RECT cr = tab_close_rect(p, i);
+        int bottom = r.bottom - (act ? 0 : px(2)), left = r.left + px(12);
+        if (&t == p.playing && p.markShown) {
+            RECT g{ left - px(2), r.top, left + px(16), bottom };
+            glyph_at(dc, L'\xE767', g, p.markShown == 2 ? c.accent : c.textSecondary, p.glyphsSmall);
+            left += px(20);
+        }
+        if (&t == p.renaming) {                 // (the box over it: framed)
+            fill_rrect(dc, rename_rect(p, i), px(4), c.content, c.accent);
+            continue;
+        }
+        RECT tr{ left, r.top, cr.left - px(4), bottom };
+        text_at(dc, t.name, tr, act ? c.text : c.textSecondary, p.font, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        if (act || hot) {
+            if (p.hotClose == i) fill_rrect(dc, cr, px(4), act ? c.hover : c.layer);
+            glyph_at(dc, L'\xE711', cr, c.text, p.glyphsSmall);
+        }
+    }
+    RestoreDC(dc, saved);
+    if (p.hotPlus) fill_rrect(dc, p.plus, px(4), c.tabHover);
+    glyph_at(dc, L'\xE710', p.plus, c.text, p.glyphsMid);
+}
+
 void paint_main(Player& p) {
     BufferedPaint bp(p.wnd);
     const Palette& c = pal();
     fill_rect(bp.dc, bp.rc, c.layer);           // (the gap between the video and the queue)
+    if (p.rowH) paint_tabs(p, bp.dc, bp.rc);
     if (!p.queueShown || p.full) return;
-    RECT head{ p.splitX + px(4), 0, bp.rc.right, p.headH };
+    const PlayQueue& q = vq(p);
+    RECT head{ p.splitX + px(4), p.rowH, bp.rc.right, p.rowH + p.headH };
     fill_rect(bp.dc, head, c.content);
-    RECT tr{ head.left + px(12), 0, p.clearBtn.left - px(8), p.headH };
-    std::wstring count = std::to_wstring(p.q.size()) + (p.q.size() == 1 ? L" item" : L" items");
+    RECT tr{ head.left + px(12), head.top, p.clearBtn.left - px(8), head.bottom };
+    std::wstring count = std::to_wstring(q.size()) + (q.size() == 1 ? L" item" : L" items");
     HGDIOBJ of = SelectObject(bp.dc, p.fontBold);
     int tw = text_width(bp.dc, L"Play queue");
     SelectObject(bp.dc, of);
@@ -2314,8 +2842,8 @@ void paint_main(Player& p) {
     RECT cr = tr;
     cr.left += tw + px(8);
     if (cr.right > cr.left) text_at(bp.dc, count, cr, c.textSecondary, p.fontSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    if (p.clearHot && !p.q.empty()) fill_rrect(bp.dc, p.clearBtn, px(4), c.hover);
-    glyph_at(bp.dc, L'\xE74D', p.clearBtn, p.q.empty() ? c.textDisabled : c.text, p.glyphs);
+    if (p.clearHot && !q.empty()) fill_rrect(bp.dc, p.clearBtn, px(4), c.hover);
+    glyph_at(bp.dc, L'\xE74D', p.clearBtn, q.empty() ? c.textDisabled : c.text, p.glyphs);
 }
 
 // ------------------------------------------------------------------
@@ -2597,8 +3125,8 @@ void subs_draw(Player& p, const std::wstring& text, const RECT& pic, int barTop)
 // the text of the moment on screen (the timer's: while a video with subtitles is open;
 // also as the window moves)
 void subs_tick(Player& p) {
-    int i = p.q.current();
-    if (p.cues.empty() || !p.mp->has_video() || !p.message.empty() || i < 0 || p.q.at(i).path != p.subsOf) {
+    int i = p.q->current();
+    if (p.cues.empty() || !p.mp->has_video() || !p.message.empty() || i < 0 || p.q->at(i).path != p.subsOf) {
         subs_hide(p);
         p.subShown.clear();
         KillTimer(p.wnd, TIMER_SUBS);
@@ -2625,9 +3153,9 @@ void subs_tick(Player& p) {
 }
 // a file opened (Opened): a video's subtitles looked up (once per video) and shown
 void subs_open(Player& p) {
-    int i = p.q.current();
+    int i = p.q->current();
     if (i >= 0 && p.mp->has_video()) {
-        const std::wstring& path = p.q.at(i).path;
+        const std::wstring& path = p.q->at(i).path;
         if (p.subsOf != path) {
             subs_find(p, path);
             p.cues.clear();
@@ -2855,12 +3383,48 @@ void queue_menu(Player& p, POINT pt) {
     AppendMenuW(m, MF_STRING | (sel ? 0 : MF_GRAYED), CMD_PLAY_SELECTED, L"Play\tEnter");
     AppendMenuW(m, MF_STRING | (sel ? 0 : MF_GRAYED), CMD_REMOVE_SELECTED, L"Remove from queue\tDelete");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    bool sound = std::any_of(p.q.entries().begin(), p.q.entries().end(), [](const QueueEntry& e) { return !image_file(e.path); });
+    bool sound = std::any_of(vq(p).entries().begin(), vq(p).entries().end(), [](const QueueEntry& e) { return !image_file(e.path); });
     AppendMenuW(m, MF_STRING | (sound ? 0 : MF_GRAYED), CMD_SAVE_PLAYLIST, L"Save queue as playlist...\tCtrl+S");
-    AppendMenuW(m, MF_STRING | (p.q.empty() ? MF_GRAYED : 0), CMD_CLEAR, L"Clear queue");
+    AppendMenuW(m, MF_STRING | (vq(p).empty() ? MF_GRAYED : 0), CMD_CLEAR, L"Clear queue");
     UINT id = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, p.wnd, nullptr);
     DestroyMenu(m);
     if (id) command(p, id);
+}
+
+// a tab's menu (what acts on the queue shown: this tab's, shown first)
+void tab_menu(Player& p, int i, POINT pt) {
+    QueueTab* t = p.tabs[(size_t)i].get();
+    int n = (int)p.tabs.size();
+    bool sound = std::any_of(t->q.entries().begin(), t->q.entries().end(), [](const QueueEntry& e) { return !image_file(e.path); });
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING, CMD_TAB_NEW, L"New queue\tCtrl+N");
+    AppendMenuW(m, MF_STRING, CMD_TAB_RENAME, L"Rename\tF2");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | (sound ? 0 : MF_GRAYED), CMD_SAVE_PLAYLIST, L"Save queue as playlist...\tCtrl+S");
+    AppendMenuW(m, MF_STRING | (t->q.empty() ? MF_GRAYED : 0), CMD_CLEAR, L"Clear queue");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, CMD_TAB_CLOSE, L"Close queue\tCtrl+W");
+    AppendMenuW(m, MF_STRING | (n > 1 ? 0 : MF_GRAYED), CMD_TAB_CLOSE_OTHERS, L"Close other queues");
+    AppendMenuW(m, MF_STRING | (i + 1 < n ? 0 : MF_GRAYED), CMD_TAB_CLOSE_RIGHT, L"Close queues to the right");
+    UINT id = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, p.wnd, nullptr);
+    DestroyMenu(m);
+    i = tab_index(p, t);                        // (where it is now)
+    if (!id || i < 0) return;
+    switch (id) {
+        case CMD_TAB_CLOSE: close_tab(p, i); break;
+        case CMD_TAB_CLOSE_OTHERS:
+            for (int k = (int)p.tabs.size() - 1; k >= 0; --k)
+                if (p.tabs[(size_t)k].get() != t) close_tab(p, k);
+            break;
+        case CMD_TAB_CLOSE_RIGHT:
+            for (int k = (int)p.tabs.size() - 1; k > tab_index(p, t); --k) close_tab(p, k);
+            break;
+        case CMD_TAB_RENAME: start_rename(p, i); break;
+        default:
+            show_tab(p, i);
+            command(p, id);
+            break;
+    }
 }
 
 LRESULT list_notify(Player& p, NMHDR* hdr) {
@@ -2868,27 +3432,27 @@ LRESULT list_notify(Player& p, NMHDR* hdr) {
         case LVN_GETDISPINFOW: {
             auto* di = (NMLVDISPINFOW*)hdr;
             int i = di->item.iItem;
-            if (i < 0 || i >= p.q.size() || !(di->item.mask & LVIF_TEXT) || !di->item.pszText) break;
-            const QueueEntry& e = p.q.at(i);
+            if (i < 0 || i >= vq(p).size() || !(di->item.mask & LVIF_TEXT) || !di->item.pszText) break;
+            const QueueEntry& e = vq(p).at(i);
             lstrcpynW(di->item.pszText, entry_name(e).c_str(), di->item.cchTextMax);
             break;
         }
         case LVN_ODFINDITEMW: {
             // type-ahead: the next entry whose name starts with what was typed (0 would be "row 0")
             auto* fi = (NMLVFINDITEMW*)hdr;
-            if (!(fi->lvfi.flags & (LVFI_STRING | LVFI_PARTIAL)) || !fi->lvfi.psz || p.q.empty()) return -1;
+            if (!(fi->lvfi.flags & (LVFI_STRING | LVFI_PARTIAL)) || !fi->lvfi.psz || vq(p).empty()) return -1;
             size_t n = wcslen(fi->lvfi.psz);
-            int start = fi->iStart >= 0 && fi->iStart < p.q.size() ? fi->iStart : 0;
-            for (int k = 0; k < p.q.size(); ++k) {
-                int i = (start + k) % p.q.size();
-                std::wstring name = entry_name(p.q.at(i));
+            int start = fi->iStart >= 0 && fi->iStart < vq(p).size() ? fi->iStart : 0;
+            for (int k = 0; k < vq(p).size(); ++k) {
+                int i = (start + k) % vq(p).size();
+                std::wstring name = entry_name(vq(p).at(i));
                 if (name.size() >= n && _wcsnicmp(name.c_str(), fi->lvfi.psz, n) == 0) return i;
             }
             return -1;
         }
         case NM_DBLCLK: {
             auto* ia = (NMITEMACTIVATE*)hdr;
-            if (ia->iItem >= 0) { p.failsInRow = 0; play_index(p, ia->iItem, true); }
+            play_row(p, ia->iItem);
             break;
         }
         case NM_CUSTOMDRAW: {
@@ -2907,7 +3471,7 @@ LRESULT list_notify(Player& p, NMHDR* hdr) {
             }
             if (cd->nmcd.dwDrawStage != CDDS_ITEMPREPAINT) break;
             int i = (int)cd->nmcd.dwItemSpec;
-            if (i < 0 || i >= p.q.size()) return CDRF_SKIPDEFAULT;
+            if (i < 0 || i >= vq(p).size()) return CDRF_SKIPDEFAULT;
             HDC dc = cd->nmcd.hdc;
             const Palette& c = pal();
             RECT rc{};
@@ -2924,8 +3488,8 @@ LRESULT list_notify(Player& p, NMHDR* hdr) {
             if ((st & LVIS_FOCUSED) && GetFocus() == p.list &&
                 !(SendMessageW(p.list, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS))
                 fill_rrect(dc, box, px(4), CLR_NONE, c.text);
-            const QueueEntry& e = p.q.at(i);
-            bool cur = i == p.q.current();
+            const QueueEntry& e = vq(p).at(i);
+            bool cur = i == vq(p).current();
             if (cur) {                                   // (the playing one: a bar on its left, as Win11's selection)
                 int h = px(16), cy = (box.top + box.bottom) / 2;
                 RECT bar{ box.left, cy - h / 2, box.left + px(3), cy + h / 2 };
@@ -2950,6 +3514,8 @@ void apply_theme(Player& p) {
     BOOL dark = g_dark;
     DwmSetWindowAttribute(p.wnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof(dark));
     theme_style_list(p.list);
+    if (p.editBrush) DeleteObject(p.editBrush);
+    p.editBrush = CreateSolidBrush(pal().content);  // (a tab's name edited: the box's)
     if (p.specBmp) spectrum_redraw(p);
     vis_update(p);
     RedrawWindow(p.wnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
@@ -3014,6 +3580,7 @@ void register_classes() {
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.lpfnWndProc = player_proc;
     wc.lpszClassName = player_class().c_str();
+    wc.style = CS_DBLCLKS;                  // (a tab double-clicked: its name edited)
     wc.hIcon = big;
     wc.hIconSm = small ? small : big;
     RegisterClassExW(&wc);
@@ -3065,6 +3632,8 @@ void on_create(Player& p, HWND hwnd) {
     for (int i = 1; i < P_COUNT; ++i) add_tool(p.barTip, p.bar, (UINT_PTR)i, LPSTR_TEXTCALLBACKW);
     p.headTip = make_tip(hwnd);
     add_tool(p.headTip, hwnd, 1, L"Clear queue");
+    add_tool(p.headTip, hwnd, kTipPlus, LPSTR_TEXTCALLBACKW);
+    SendMessageW(p.headTip, TTM_SETMAXTIPWIDTH, 0, px(600));
     p.mp = new MediaPlayer(hwnd, WM_MEDIA_NOTE, p.video);
     apply_volume(p);
     apply_theme(p);
@@ -3075,7 +3644,10 @@ void on_create(Player& p, HWND hwnd) {
 }
 
 void on_destroy(Player& p) {
+    end_rename(p, true);
+    keep_now(p);                            // (the queues as they are now, for next time)
     p.vis.destroy();
+    KillTimer(p.wnd, TIMER_KEEP);
     KillTimer(p.wnd, TIMER_POSITION);
     KillTimer(p.wnd, TIMER_SKIP);
     KillTimer(p.wnd, TIMER_HIDE_BAR);
@@ -3103,11 +3675,12 @@ void on_destroy(Player& p) {
     free_thumb_icons(p);
     set_app_id(p.wnd, false);
     delete_fonts(p);
+    if (p.editBrush) { DeleteObject(p.editBrush); p.editBrush = nullptr; }
 }
 
 void on_media_info(Player& p, MediaInfoNote* n) {
-    int i = p.q.current();
-    if (i >= 0 && p.q.at(i).id == n->id) {
+    int i = p.q->current();
+    if (i >= 0 && p.q->at(i).id == n->id) {
         p.info = std::move(n->info);
         p.infoFor = n->id;
         if (p.coverBmp) DeleteObject(p.coverBmp);
@@ -3117,12 +3690,158 @@ void on_media_info(Player& p, MediaInfoNote* n) {
     delete n;
 }
 
+// --- the tab row and the mouse ---
+void set_hot(Player& p, int tab, int close, bool plus) {
+    if (tab == p.hotTab && close == p.hotClose && plus == p.hotPlus) return;
+    p.hotTab = tab;
+    p.hotClose = close;
+    p.hotPlus = plus;
+    invalidate_row(p);
+}
+
+// a tab dragged along the row (true), else what the mouse is over lit
+bool tabs_mouse_move(Player& p, POINT pt) {
+    if (p.dragTab >= 0) {
+        if (!p.dragging && abs(pt.x - p.dragX) > GetSystemMetrics(SM_CXDRAG)) p.dragging = true;
+        if (p.dragging && p.tabW > 0) {
+            int to = std::clamp((int)(pt.x - p.strip.left + p.scroll) / p.tabW, 0, (int)p.tabs.size() - 1);
+            if (to != p.dragTab) {
+                move_tab(p, p.dragTab, to);
+                p.dragTab = to;
+                set_hot(p, to, -1, false);
+            }
+        }
+        return true;
+    }
+    int tab = tab_at(p, pt), close = -1;
+    if (tab >= 0) {
+        RECT cr = tab_close_rect(p, tab);
+        if (PtInRect(&cr, pt)) close = tab;
+    }
+    set_hot(p, tab, close, PtInRect(&p.plus, pt) != FALSE);
+    return false;
+}
+
+// a press on the tab row (true: it was there)
+bool tabs_mouse_down(Player& p, POINT pt, bool dbl) {
+    if (pt.y >= p.rowH) return false;
+    int tab = tab_at(p, pt);
+    if (tab >= 0) {
+        RECT cr = tab_close_rect(p, tab);
+        if (PtInRect(&cr, pt) && (tab == p.shown || tab == p.hotTab)) { close_tab(p, tab); return true; }
+        if (dbl) { start_rename(p, tab); return true; }
+        if (tab != p.shown) show_tab(p, tab);
+        p.dragTab = tab;
+        p.dragX = pt.x;
+        p.dragging = false;
+        SetCapture(p.wnd);
+        return true;
+    }
+    if (PtInRect(&p.plus, pt)) command(p, CMD_TAB_NEW);
+    return true;
+}
+
+// The frame, as the Notepad's and the main window's (chrome.cpp): no title bar, the tab
+// row in its place. Its empty part moves the window (and snaps it, maximizes on a
+// double-click), its buttons are the system's to Windows (snap layouts over maximize).
+// Full screen: no frame, no row.
+int frame_y(const Player& p) {
+    return GetSystemMetricsForDpi(SM_CYFRAME, p.dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, p.dpi);
+}
+
+void invalidate_cap_buttons(Player& p) {
+    RECT r = cap_button(p, 0);
+    r.right = cap_button(p, 2).right;
+    InvalidateRect(p.wnd, &r, FALSE);
+}
+
+int cap_button_of(WPARAM ht) { return ht == HTMINBUTTON ? 0 : ht == HTMAXBUTTON ? 1 : ht == HTCLOSE ? 2 : -1; }
+
+LRESULT hit_test(Player& p, LPARAM lp) {
+    LRESULT def = DefWindowProcW(p.wnd, WM_NCHITTEST, 0, lp);  // (the side and bottom borders)
+    if (def != HTCLIENT || p.full) return def;
+    POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+    ScreenToClient(p.wnd, &pt);
+    if (pt.y >= p.rowH) return HTCLIENT;
+    for (int i = 0; i < 3; ++i) {
+        RECT r = cap_button(p, i);
+        if (PtInRect(&r, pt)) return i == 0 ? HTMINBUTTON : i == 1 ? HTMAXBUTTON : HTCLOSE;
+    }
+    int fy = frame_y(p);
+    if (!IsZoomed(p.wnd) && pt.y < fy) {        // (the top border is in the client area)
+        RECT rc{};
+        GetClientRect(p.wnd, &rc);
+        return pt.x < fy * 2 ? HTTOPLEFT : pt.x >= rc.right - fy * 2 ? HTTOPRIGHT : HTTOP;
+    }
+    if (p.dragTab >= 0 || tab_at(p, pt) >= 0 || PtInRect(&p.plus, pt)) return HTCLIENT;
+    return HTCAPTION;
+}
+
+bool frame_message(Player& p, UINT msg, WPARAM wp, LPARAM lp, LRESULT* result) {
+    switch (msg) {
+        case WM_NCCALCSIZE: {
+            if (!wp || p.full) return false;
+            auto* np = (NCCALCSIZE_PARAMS*)lp;
+            LONG top = np->rgrc[0].top;
+            DefWindowProcW(p.wnd, msg, wp, lp);
+            np->rgrc[0].top = top + (IsZoomed(p.wnd) ? frame_y(p) : 0);  // (maximized: the frame is off the screen)
+            *result = 0;
+            return true;
+        }
+        case WM_NCHITTEST:
+            *result = hit_test(p, lp);
+            return true;
+        case WM_NCACTIVATE:
+            p.activeWnd = wp != FALSE;
+            invalidate_row(p);
+            *result = DefWindowProcW(p.wnd, msg, wp, -1);   // (-1: no classic frame painted)
+            return true;
+        case WM_NCMOUSEMOVE: {
+            int b = cap_button_of(wp);
+            if (b != p.capHot) { p.capHot = b; invalidate_cap_buttons(p); }
+            TRACKMOUSEEVENT te{ sizeof(te), TME_LEAVE | TME_NONCLIENT, p.wnd, 0 };
+            TrackMouseEvent(&te);
+            if (p.hotTab >= 0 || p.hotPlus) set_hot(p, -1, -1, false);     // (off the tabs, onto the row's empty part)
+            if (b < 0) return false;
+            *result = 0;
+            return true;
+        }
+        case WM_NCMOUSELEAVE:
+        case WM_MOUSEMOVE:                          // (into the client area: a press there is let go)
+            if (p.capHot >= 0 || p.capPressed >= 0) { p.capHot = p.capPressed = -1; invalidate_cap_buttons(p); }
+            return false;
+        case WM_NCLBUTTONDOWN:
+        case WM_NCLBUTTONDBLCLK: {
+            int b = cap_button_of(wp);
+            if (b < 0) return false;
+            p.capPressed = b;
+            invalidate_cap_buttons(p);
+            *result = 0;
+            return true;
+        }
+        case WM_NCLBUTTONUP: {
+            int b = cap_button_of(wp);
+            bool fire = b >= 0 && b == p.capPressed;
+            if (p.capPressed >= 0) { p.capPressed = -1; invalidate_cap_buttons(p); }
+            if (b < 0) return false;
+            if (fire) {
+                p.capHot = -1;
+                PostMessageW(p.wnd, WM_SYSCOMMAND, b == 0 ? SC_MINIMIZE : b == 2 ? SC_CLOSE : IsZoomed(p.wnd) ? SC_RESTORE : SC_MAXIMIZE, 0);
+            }
+            *result = 0;
+            return true;
+        }
+    }
+    return false;
+}
+
 LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     Player* pp = s_p;
     if (msg == WM_CREATE && pp) { on_create(*pp, hwnd); return 0; }
     if (!pp || pp->wnd != hwnd || !pp->mp) return DefWindowProcW(hwnd, msg, wp, lp);
     Player& p = *pp;
     if (msg == s_taskbarCreated && s_taskbarCreated) { taskbar_created(p); return 0; }
+    if (LRESULT r = 0; frame_message(p, msg, wp, lp, &r)) return r;
     switch (msg) {
         case WM_MEDIA_NOTE: on_note(p, lp); return 0;
         case WM_MEDIA_INFO: on_media_info(p, reinterpret_cast<MediaInfoNote*>(lp)); return 0;
@@ -3133,12 +3852,22 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             refresh_all(p);
             return 0;
         case WM_COMMAND:
+            // (a tab's name edited: the box left takes it)
+            if (lp && (HWND)lp == p.rename && HIWORD(wp) == EN_KILLFOCUS) { PostMessageW(hwnd, WM_RENAME_DONE, 1, lp); return 0; }
             // (menus and accelerators; the taskbar thumbnail's buttons)
             if ((HIWORD(wp) == 0 || HIWORD(wp) == THBN_CLICKED) && LOWORD(wp) >= CMD_PLAYPAUSE) command(p, LOWORD(wp));
             return 0;
         case WM_APPCOMMAND:
             if (media_command(p, GET_APPCOMMAND_LPARAM(lp))) return TRUE;
             break;
+        case WM_RENAME_DONE:
+            if (p.rename && (HWND)lp == p.rename) end_rename(p, wp != 0);
+            return 0;
+        case WM_CTLCOLOREDIT:
+            if ((HWND)lp != p.rename) break;
+            SetTextColor((HDC)wp, pal().text);
+            SetBkColor((HDC)wp, pal().content);
+            return (LRESULT)p.editBrush;
         case WM_TIMER:
             if (wp == TIMER_POSITION) { slide_tick(p); refresh_bar(p); }
             else if (wp == TIMER_SPECTRUM) spectrum_tick(p);
@@ -3146,6 +3875,7 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (wp == TIMER_SUBS) subs_tick(p);
             else if (wp == TIMER_ANIM) anim_tick(p);
             else if (wp == TIMER_SKIP) { KillTimer(hwnd, TIMER_SKIP); next(p); }
+            else if (wp == TIMER_KEEP) keep_now(p);
             else if (wp == TIMER_HIDE_BAR) {
                 POINT c{};
                 GetCursorPos(&c);
@@ -3159,9 +3889,31 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_NOTIFY: {
             auto* hdr = (NMHDR*)lp;
             if (hdr->hwndFrom == p.list) return list_notify(p, hdr);
+            if (hdr->hwndFrom == p.headTip && hdr->code == TTN_GETDISPINFOW) {
+                // "+", a tab: its name, how many entries, whether it plays
+                static std::wstring text;
+                size_t i = hdr->idFrom - kTipTab;
+                if (hdr->idFrom == kTipPlus) text = L"New queue (Ctrl+N)";
+                else if (hdr->idFrom >= kTipTab && i < p.tabs.size()) {
+                    const QueueTab& t = *p.tabs[i];
+                    text = t.name + L" \x00B7 " + std::to_wstring(t.q.size()) + (t.q.size() == 1 ? L" item" : L" items");
+                    if (&t == p.playing && play_mark(p)) text += play_mark(p) == 2 ? L" \x00B7 playing" : L" \x00B7 paused";
+                } else text.clear();
+                ((NMTTDISPINFOW*)lp)->lpszText = text.data();
+                return 0;
+            }
             break;
         }
         case WM_CONTEXTMENU:
+            if ((HWND)wp == hwnd && lp != -1) {        // (the tab row: a tab's menu)
+                POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+                ScreenToClient(hwnd, &pt);
+                if (pt.y < p.rowH) {
+                    int tab = tab_at(p, pt);
+                    if (tab >= 0) tab_menu(p, tab, POINT{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
+                    return 0;
+                }
+            }
             if ((HWND)wp == p.list) { queue_menu(p, { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }); return 0; }
             if ((HWND)wp == hwnd || (HWND)wp == p.video) { view_menu(p, { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }); return 0; }
             break;
@@ -3232,7 +3984,7 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 POINT c{};
                 GetCursorPos(&c);
                 ScreenToClient(hwnd, &c);
-                if (c.x >= p.splitX && c.x < p.splitX + px(4)) { SetCursor(LoadCursorW(nullptr, IDC_SIZEWE)); return TRUE; }
+                if (c.y >= p.rowH && c.x >= p.splitX && c.x < p.splitX + px(4)) { SetCursor(LoadCursorW(nullptr, IDC_SIZEWE)); return TRUE; }
             }
             break;
         case WM_MOUSEMOVE: {
@@ -3244,6 +3996,7 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 layout(p);
                 return 0;
             }
+            if (tabs_mouse_move(p, pt)) return 0;
             bool hot = PtInRect(&p.clearBtn, pt) != FALSE;
             if (hot != p.clearHot) { p.clearHot = hot; InvalidateRect(hwnd, &p.clearBtn, FALSE); }
             TRACKMOUSEEVENT te{ sizeof(te), TME_LEAVE, hwnd, 0 };
@@ -3252,10 +4005,13 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_MOUSELEAVE:
             if (p.clearHot) { p.clearHot = false; InvalidateRect(hwnd, &p.clearBtn, FALSE); }
+            if (p.dragTab < 0) set_hot(p, -1, -1, false);
             return 0;
-        case WM_LBUTTONDOWN: {
+        case WM_LBUTTONDOWN:
+        case WM_LBUTTONDBLCLK: {
             POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-            if (PtInRect(&p.clearBtn, pt) && !p.q.empty()) { command(p, CMD_CLEAR); return 0; }
+            if (tabs_mouse_down(p, pt, msg == WM_LBUTTONDBLCLK)) return 0;
+            if (PtInRect(&p.clearBtn, pt) && !vq(p).empty()) { command(p, CMD_CLEAR); return 0; }
             if (p.queueShown && !p.full && pt.x >= p.splitX && pt.x < p.splitX + px(4)) {
                 p.splitting = true;
                 SetCapture(hwnd);
@@ -3268,9 +4024,21 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 ReleaseCapture();
                 settings_set_pref(L"playerQueueWidth", p.queueW96);
             }
+            if (p.dragTab >= 0) {
+                p.dragTab = -1;
+                p.dragging = false;
+                ReleaseCapture();
+            }
             return 0;
+        case WM_MBUTTONUP: {                        // (a tab: closed)
+            int tab = tab_at(p, POINT{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
+            if (tab >= 0) close_tab(p, tab);
+            return 0;
+        }
         case WM_CAPTURECHANGED:
             p.splitting = false;
+            p.dragTab = -1;
+            p.dragging = false;
             return 0;
         case WM_ACTIVATE:
             if (LOWORD(wp) == WA_INACTIVE) {
@@ -3301,8 +4069,11 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(p.bar, nullptr, FALSE);
             return 0;
         }
+        case WM_QUERYENDSESSION:
+            keep_now(p);
+            return TRUE;
         case WM_ENDSESSION:
-            if (wp) { save_place(p); settings_save_all(); }
+            if (wp) { save_place(p); keep_now(p); settings_save_all(); }
             return 0;
         case WM_CLOSE:
             // (sent while the playback closes, which answers sent messages: once that's done)
@@ -3328,8 +4099,7 @@ bool create_player(bool activate) {
     Player& p = *s_p;
     p.volume = std::clamp(settings_pref(L"playerVolume", 80), 0, 100);
     p.muted = settings_pref(L"playerMuted", 0) != 0;
-    p.q.repeat = (Repeat)std::clamp(settings_pref(L"playerRepeat", 0), 0, 2);
-    p.q.set_shuffle(settings_pref(L"playerShuffle", 0) != 0);
+    restore_queues(p);                      // (shuffle and repeat as the settings have them)
     p.queueShown = settings_pref(L"playerQueue", 1) != 0;
     p.queueW96 = std::clamp(settings_pref(L"playerQueueWidth", 300), 160, 900);
     p.level = settings_pref(L"playerLevel", 1) != 0;
@@ -3347,7 +4117,11 @@ bool create_player(bool activate) {
         s_p = nullptr;
         return false;
     }
+    // (the tab row in the title bar's place)
+    SetWindowPos(w, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     set_app_id(w, true);                    // (before it's shown: the button is made then)
+    show_tab(p, p.shown, false);            // (its list where it was left)
+    show_current(p);
     ShowWindow(w, maximized ? SW_SHOWMAXIMIZED : activate ? SW_SHOWNORMAL : SW_SHOWNOACTIVATE);
     if (activate) SetForegroundWindow(w);
     return true;
@@ -3461,6 +4235,7 @@ bool player_owns(HWND h) {
 bool player_translate(MSG* m) {
     if (!s_p || !s_p->mp || (m->message != WM_KEYDOWN && m->message != WM_SYSKEYDOWN)) return false;
     Player& p = *s_p;
+    if (p.rename && GetFocus() == p.rename) return false;     // (a tab's name edited: the box's keys)
     bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0, alt = GetKeyState(VK_MENU) < 0;
     bool inList = GetFocus() == p.list;
     UINT vk = (UINT)m->wParam;
@@ -3522,7 +4297,8 @@ bool player_translate(MSG* m) {
             if (!ctrl || shift) return false;
             if (!held) command(p, vk == 'S' ? CMD_SAVE_PLAYLIST : CMD_EDIT_PICTURE);
             return true;
-        case VK_PRIOR: case VK_NEXT:                // a TIFF's pages
+        case VK_PRIOR: case VK_NEXT:                // the tab before / after; a TIFF's pages
+            if (ctrl && !shift) { command(p, vk == VK_NEXT ? CMD_TAB_NEXT : CMD_TAB_PREV); return true; }
             if (inList || ctrl || !image_current(p) || p.img.pages < 2) return false;
             command(p, vk == VK_NEXT ? CMD_PAGE_NEXT : CMD_PAGE_PREV);
             return true;
@@ -3532,6 +4308,14 @@ bool player_translate(MSG* m) {
             command(p, vk == VK_ADD || vk == VK_OEM_PLUS ? CMD_ZOOM_IN : vk == VK_SUBTRACT || vk == VK_OEM_MINUS ? CMD_ZOOM_OUT
                        : vk == '0' || vk == VK_NUMPAD0 ? CMD_ZOOM_FIT : CMD_ZOOM_ACTUAL);
             return true;
+        case 'N': case 'W':                         // a new queue, the one shown closed
+            if (!ctrl || shift) return false;
+            if (!held) command(p, vk == 'N' ? CMD_TAB_NEW : CMD_TAB_CLOSE);
+            return true;
+        case VK_F2:
+            if (ctrl || shift) return false;
+            command(p, CMD_TAB_RENAME);
+            return true;
         case VK_F11:
             if (!held) command(p, CMD_FULL);
             return true;
@@ -3540,6 +4324,7 @@ bool player_translate(MSG* m) {
             if (!held) command(p, CMD_FULL);
             return true;
         case VK_TAB: case VK_F6:
+            if (ctrl && vk == VK_TAB) { command(p, shift ? CMD_TAB_PREV : CMD_TAB_NEXT); return true; }
             if (ctrl) return false;
             if (IsWindowVisible(p.list)) SetFocus(inList ? p.wnd : p.list);
             return true;
