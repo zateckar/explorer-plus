@@ -152,6 +152,25 @@ Key x25519_shared(const Key& secret, const Key& peerPublic) {
     return s;
 }
 
+// ------------------------------------------------------------------ EdDSA
+void eddsa_public(const Key& seed, Key& pub) {
+    uint8_t sk[64], s[32];
+    std::memcpy(s, seed.data(), 32);                     // crypto_eddsa_key_pair wipes the seed it's given
+    crypto_eddsa_key_pair(sk, pub.data(), s);
+    crypto_wipe(sk, 64);
+}
+void eddsa_sign(const Key& seed, const void* msg, size_t n, uint8_t sig[kSig]) {
+    uint8_t sk[64], s[32];
+    Key pub;
+    std::memcpy(s, seed.data(), 32);
+    crypto_eddsa_key_pair(sk, pub.data(), s);
+    crypto_eddsa_sign(sig, sk, (const uint8_t*)msg, n);
+    crypto_wipe(sk, 64);
+}
+bool eddsa_check(const Key& pub, const void* msg, size_t n, const uint8_t sig[kSig]) {
+    return crypto_eddsa_check(sig, pub.data(), (const uint8_t*)msg, n) == 0;
+}
+
 // ------------------------------------------------------------------ SHA-256 (BCrypt)
 static BCRYPT_ALG_HANDLE alg(bool hmac) {
     static BCRYPT_ALG_HANDLE plain = nullptr, keyed = nullptr;
@@ -374,6 +393,15 @@ bool self_test(std::string* failed) {
     if (!aead_unlock(k, nonce, "ad", 2, c.data(), c.size(), p) || p != Bytes{ 'h', 'e', 'l', 'l', 'o' }) return fail("aead");
     c[0] ^= 1;
     if (aead_unlock(k, nonce, "ad", 2, c.data(), c.size(), p)) return fail("aead forgery");
+    // EdDSA: a signature checks, a changed message or key doesn't
+    {
+        Key pub, other;
+        uint8_t sig[kSig];
+        eddsa_public(k, pub);
+        eddsa_sign(k, "msg", 3, sig);
+        eddsa_public(ak, other);
+        if (!eddsa_check(pub, "msg", 3, sig) || eddsa_check(pub, "msh", 3, sig) || eddsa_check(other, "msg", 3, sig)) return fail("eddsa");
+    }
     return true;
 }
 

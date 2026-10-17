@@ -31,9 +31,10 @@ column (badges only), version history / restore and exclude from the context men
 Windows sign-in prompt before showing the recovery key (it can't be shown again: only "New
 recovery key"), "Re-encrypt everything", the benchmark, and phase 7. A review of the
 cryptography is in [sync-review.md](sync-review.md). Its clear-cut findings are fixed.
-S1 and S2 are open: a removed device that keeps write access to the storage. They need a
-format addition (device-signed hand-overs, a member list in the ring), and until then a
-removal must come with revoking that device's storage credentials.
+S1 and S2 (a removed device that keeps write access to the storage) are fixed as far as
+the format allows: a member list in the ring, device-signed key objects, and a note of
+retired key versions. A short window remains until each device has caught up with the
+removal, so a removal should still come with revoking that device's storage credentials.
 
 ## Ground rules from the codebase
 
@@ -481,8 +482,9 @@ had (S3 key, PAT). Removing a device can't wipe it; that's for Windows' own remo
 *(Review, [sync-review.md](sync-review.md) S1 and S2: revoking those credentials is not
 optional. A removed device that can still write to the storage can forge a hand-over to a
 device that hasn't taken its own yet, plant a device record in a vault not yet upgraded,
-and write files under the older key versions that the remaining devices accept. Closing
-that needs device-signed hand-overs and a member list in the ring.)*
+and write files under the older key versions that the remaining devices accept. Members
+and signatures now close that for every device that has caught up with the removal; the
+review lists what stays open until then.)*
 
 ### Effects on the rest of the design
 

@@ -2,8 +2,11 @@
 #include "crypto_file.h"
 #include "crypto_names.h"
 #include "sync_paths.h"
+#include <array>
+#include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
 
 namespace sync {
 
@@ -29,6 +32,93 @@ bool sane_name(const std::string& n) {
     return true;
 }
 
+// ---- retired key versions (docs/sync-review.md, S2). When a vault key version stops being
+// current (a device was removed, or the recovery key replaced), what is on the storage at
+// that moment is noted: (stored path, revision) of each file with the lowest content key
+// version it may have, and the stored folders. Content under a retired version opens only
+// as it was then; a folder name under one only if the folder was there then. A removed
+// device knows the retired versions, not the new one, so whatever it writes afterwards is
+// refused.
+using SnapKey = std::array<uint8_t, 16>;
+SnapKey snap_key(const RelPath& stored, const std::string& rev, bool dir) {
+    std::string s = to_utf8(stored);
+    s.push_back(dir ? 1 : 0);
+    if (!dir) s += rev;
+    crypto::Hash32 h = crypto::blake2b(s.data(), s.size());
+    SnapKey k;
+    std::copy(h.begin(), h.begin() + 16, k.begin());
+    return k;
+}
+
+struct Retired {
+    uint32_t below = 0;                      // key versions below this are retired (0: not known yet)
+    std::map<SnapKey, uint32_t> files;       // (stored path, rev) -> lowest content key version taken
+    std::set<SnapKey> dirs;                  // stored folders
+
+    // "EPS1" | below | files: count, (key, version)... | folders: count, key...
+    crypto::Bytes serialize() const {
+        crypto::Bytes b = { 'E', 'P', 'S', '1' };
+        auto put32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) b.push_back((uint8_t)(v >> (8 * i))); };
+        put32(below);
+        put32((uint32_t)files.size());
+        for (auto& [k, v] : files) { b.insert(b.end(), k.begin(), k.end()); put32(v); }
+        put32((uint32_t)dirs.size());
+        for (auto& k : dirs) b.insert(b.end(), k.begin(), k.end());
+        return b;
+    }
+    bool parse(const crypto::Bytes& b) {
+        size_t pos = 4;
+        bool bad = b.size() < 4 || std::memcmp(b.data(), "EPS1", 4) != 0;
+        auto get32 = [&]() -> uint32_t {
+            if (bad || b.size() - pos < 4) { bad = true; return 0; }
+            uint32_t v = b[pos] | (b[pos + 1] << 8) | (b[pos + 2] << 16) | ((uint32_t)b[pos + 3] << 24);
+            pos += 4;
+            return v;
+        };
+        auto getk = [&](SnapKey& k) {
+            if (bad || b.size() - pos < 16) { bad = true; return; }
+            std::memcpy(k.data(), b.data() + pos, 16);
+            pos += 16;
+        };
+        Retired x;
+        x.below = get32();
+        uint32_t nf = get32();
+        for (uint32_t i = 0; i < nf && !bad; ++i) { SnapKey k; getk(k); x.files[k] = get32(); }
+        uint32_t nd = get32();
+        for (uint32_t i = 0; i < nd && !bad; ++i) { SnapKey k; getk(k); x.dirs.insert(k); }
+        if (bad || pos != b.size()) return false;
+        *this = std::move(x);
+        return true;
+    }
+};
+
+bool read_file(const std::wstring& path, crypto::Bytes& out) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size;
+    bool ok = GetFileSizeEx(h, &size) && size.QuadPart < (1ll << 31);
+    if (ok) {
+        out.resize((size_t)size.QuadPart);
+        DWORD got = 0;
+        ok = out.empty() || (ReadFile(h, out.data(), (DWORD)out.size(), &got, nullptr) && got == out.size());
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+bool write_file(const std::wstring& path, const crypto::Bytes& data) {
+    std::wstring tmp = path + L".tmp";
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD n = 0;
+    bool ok = WriteFile(h, data.data(), (DWORD)data.size(), &n, nullptr) && n == data.size() && FlushFileBuffers(h);
+    CloseHandle(h);
+    return ok && MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+}
+
+const wchar_t kRetiredWhy[] = L"Written with a vault key that was retired when a device was removed (or the recovery key replaced), "
+                              L"after it was retired: not taken.";
+
 struct HashSink : ByteSink {
     ByteSink& out;
     crypto::Blake2b h;
@@ -38,9 +128,16 @@ struct HashSink : ByteSink {
 
 class EncBackend : public Backend {
 public:
-    EncBackend(std::unique_ptr<Backend> raw, const synckeys::Vault& v, VaultReopen reopen)
-        : m_raw(std::move(raw)), m_vault(v), m_reopen(std::move(reopen)) {
+    EncBackend(std::unique_ptr<Backend> raw, const synckeys::Vault& v, VaultReopen reopen, const std::wstring& retiredFile)
+        : m_raw(std::move(raw)), m_vault(v), m_reopen(std::move(reopen)), m_retiredFile(retiredFile) {
         m_rawCaps = m_raw->caps();
+        crypto::Bytes b;
+        if (m_retiredFile.empty() || !read_file(m_retiredFile, b) || !m_ret.parse(b)) m_ret = {};
+        if (m_ret.below == 0 && m_vault.vks.begin()->first >= m_vault.current) {
+            m_ret.below = m_vault.current;               // nothing retired yet: nothing to note
+            save_retired_locked();
+        }
+        m_retirePending = m_ret.below < m_vault.current;  // first sight of retired versions, or rotated meanwhile
     }
 
     Caps caps() const override {
@@ -83,6 +180,7 @@ public:
                 if (rr.st == Status::Locked) return rr;
             }
         }
+        if (Result s = settle_retired(prog, &rb); !s.ok()) return s;
         r = translate(rb, out, prog);
         if (r.st == Status::NotFound && !rb.full) {              // a removal we can't place: list it all
             rb = {};
@@ -91,6 +189,7 @@ public:
             out = {};
             r = translate(rb, out, prog);
         }
+        if (r.ok()) r = settle_retired(prog);                    // a rotation met while translating
         return r;
     }
 
@@ -136,7 +235,8 @@ public:
         re.path = stored;
         re.size = cfile::cipher_size(e.size);
         HashSink hs(sink);
-        cfile::DecryptingSink ds(hs, keys());
+        uint32_t ver = 0;
+        cfile::DecryptingSink ds(hs, keys(&ver));
         FileMeta ignored;
         Result r = m_raw->download(re, ds, ignored, prog);
         Result f = ds.finish();
@@ -145,6 +245,7 @@ public:
         crypto::Hash32 got = hs.h.final();
         const cfile::Meta& m = ds.meta();
         if (got != m.fingerprint) return Result::fail(Status::Tampered, L"The file doesn't match its fingerprint.");
+        if (Result c = check_retired(stored, e.rev, ver, prog); !c.ok()) return c;
         meta.mtime = m.mtime;
         meta.attributes = m.attributes;
         meta.version = m.version;
@@ -168,8 +269,10 @@ public:
             if (s.data.size() < cfile::kPrefix) return r.ok() ? Result::fail(Status::Tampered) : r;
         }
         cfile::Meta m;
-        r = cfile::read_meta(s.data.data(), s.data.size(), keys(), m);
+        uint32_t ver = 0;
+        r = cfile::read_meta(s.data.data(), s.data.size(), keys(&ver), m);
         if (!r.ok()) return r;
+        if (Result c = check_retired(stored, e.rev, ver, prog); !c.ok()) return c;
         out.kind = HashKind::Blake2b;
         out.bytes = m.fingerprint;
         return {};
@@ -220,6 +323,14 @@ public:
         if (!m_rawCaps.serverMove) return Result::fail(Status::Unsupported);
         RelPath storedFrom;
         if (Result r = stored_of(from, storedFrom, prog); !r.ok()) return r;
+        // content that may be under a retired key version is taken only at its stored path:
+        // upload it again (under the current version) instead of moving it
+        if (Result r = settle_retired(prog); !r.ok()) return r;
+        {
+            std::lock_guard<std::mutex> lk(m_mx);
+            if (m_ret.below > 1 && (expectedRev.empty() || expectedRev == "*" || m_ret.files.count(snap_key(storedFrom, expectedRev, false))))
+                return Result::fail(Status::Unsupported);
+        }
         Target t;
         if (Result r = target_of(to, t, prog); !r.ok()) return r;
         if (Result r = write_sidecars(t, prog); !r.ok()) return r;
@@ -272,8 +383,10 @@ private:
         std::vector<std::pair<RelPath, RelPath>> newDirs;        // plain, stored (prefixes made up here)
     };
 
-    cfile::KeyLookup keys() {
-        return [this](uint32_t v, crypto::Key& k) {
+    // usedVersion: the key version the content asked for
+    cfile::KeyLookup keys(uint32_t* usedVersion = nullptr) {
+        return [this, usedVersion](uint32_t v, crypto::Key& k) {
+            if (usedVersion) *usedVersion = v;
             {
                 std::lock_guard<std::mutex> lk(m_mx);
                 if (m_vault.key(v, k)) return true;
@@ -294,10 +407,111 @@ private:
         if (r.ok()) {
             m_vault = v;
             m_names.clear();
+            if (m_ret.below < m_vault.current) m_retirePending = true;
         } else if (r.st == Status::Locked) {
             m_lockedOut = r;
         }
         return r;
+    }
+
+    void save_retired_locked() {
+        if (!m_retiredFile.empty()) write_file(m_retiredFile, m_ret.serialize());
+    }
+
+    // a key version was retired since the last note (or this is the first sight of retired
+    // ones): note what's on the storage now, from a full listing (`given` when it is one)
+    Result settle_retired(Progress& prog, const ChangeBatch* given = nullptr) {
+        {
+            std::lock_guard<std::mutex> lk(m_mx);
+            if (!m_retirePending) return {};
+        }
+        ChangeBatch own;
+        if (!given || !given->full) {
+            Result r = m_raw->changes("", own, prog);
+            if (!r.ok()) return r;
+            given = &own;
+        }
+        load_sidecars(*given, prog);
+        std::lock_guard<std::mutex> lk(m_mx);
+        bool first = m_ret.below == 0;                   // trust on first use: all of it
+        Retired next;
+        next.below = m_vault.current;
+        for (auto& e : given->upserts) {
+            if (synckeys::is_vault_path(e.path) || (!e.isDir && is_sidecar_path(e.path))) continue;
+            // the folders on the way (stores without folder objects list only files)
+            std::vector<std::wstring> comps = split(e.path);
+            RelPath sp;
+            for (size_t i = 0; i < comps.size(); ++i) {
+                RelPath nsp = join_path(sp, comps[i]);
+                if (i + 1 < comps.size() || e.isDir) {
+                    SnapKey k = snap_key(nsp, {}, true);
+                    uint32_t v;
+                    if (first || m_ret.dirs.count(k) || (comp_version_locked(sp, comps[i], v) && v >= m_ret.below)) next.dirs.insert(k);
+                }
+                sp = nsp;
+            }
+            if (e.isDir) continue;
+            // a file noted before keeps what it was allowed; one written since must be at
+            // least the version that was current then (which a device removed before
+            // never had)
+            SnapKey k = snap_key(e.path, e.rev, false);
+            auto f = m_ret.files.find(k);
+            next.files[k] = first ? 0 : f != m_ret.files.end() ? f->second : m_ret.below;
+        }
+        m_ret = std::move(next);
+        m_retirePending = false;
+        save_retired_locked();
+        return {};
+    }
+
+    // content under key version `ver` at a stored path, listed with revision `rev`
+    Result check_retired(const RelPath& stored, const std::string& rev, uint32_t ver, Progress& prog) {
+        if (Result r = settle_retired(prog); !r.ok()) return r;
+        {
+            std::lock_guard<std::mutex> lk(m_mx);
+            if (ver >= m_ret.below) return {};
+        }
+        // a retired version: only what was there when it was retired, as it was (the
+        // revision now, so an overwrite after the listing isn't taken for the listed one)
+        RemoteEntry now;
+        Result r = m_raw->stat(stored, now, prog);
+        if (!r.ok()) return r.st == Status::NotFound ? Result::fail(Status::Tampered, kRetiredWhy) : r;
+        std::lock_guard<std::mutex> lk(m_mx);
+        auto f = m_ret.files.find(snap_key(stored, now.rev, false));
+        if ((!rev.empty() && now.rev != rev) || f == m_ret.files.end() || ver < f->second) return Result::fail(Status::Tampered, kRetiredWhy);
+        return {};
+    }
+
+    // the key version of a stored component (m_mx held)
+    bool comp_version_locked(const RelPath& storedParent, const std::wstring& comp, uint32_t& v) {
+        std::string full = to_utf8(comp);
+        if (cnames::is_short(full)) {
+            auto f = m_sidecar.find(join_path(storedParent, comp + L".name"));
+            if (f == m_sidecar.end() || cnames::shortened(f->second) != full) return false;
+            full = f->second;
+        }
+        uint16_t x;
+        if (!cnames::stored_version(full, x)) return false;
+        v = x;
+        return true;
+    }
+
+    // every folder on a stored path (the path itself when it's one) named under a key
+    // version that is current, or there when its version was retired (m_mx held)
+    bool folders_allowed_locked(const RelPath& stored, bool isDir) {
+        if (m_ret.below <= 1) return true;
+        std::vector<std::wstring> comps = split(stored);
+        RelPath sp;
+        for (size_t i = 0; i < comps.size(); ++i) {
+            RelPath nsp = join_path(sp, comps[i]);
+            if (i + 1 < comps.size() || isDir) {
+                uint32_t v;
+                if (!comp_version_locked(sp, comps[i], v)) return false;
+                if (v < m_ret.below && !m_ret.dirs.count(snap_key(nsp, {}, true))) return false;
+            }
+            sp = nsp;
+        }
+        return true;
     }
 
     // name keys of a version (m_mx held)
@@ -359,8 +573,8 @@ private:
 
     static bool is_sidecar_path(const RelPath& p) { return cnames::is_sidecar(to_utf8(leaf_of(p))); }
 
-    Result translate(const ChangeBatch& rb, ChangeBatch& out, Progress& prog) {
-        // sidecars first: the full names of shortened components
+    // the sidecars of a listing: the full names of shortened components
+    void load_sidecars(const ChangeBatch& rb, Progress& prog) {
         for (auto& e : rb.upserts) {
             if (e.isDir || synckeys::is_vault_path(e.path) || !is_sidecar_path(e.path)) continue;
             {
@@ -375,14 +589,24 @@ private:
             m_sidecar[e.path] = std::string(b.begin(), b.end());
             m_sidecarRev[e.path] = e.rev;
         }
+    }
+
+    Result translate(const ChangeBatch& rb, ChangeBatch& out, Progress& prog) {
+        load_sidecars(rb, prog);
         bool refreshed = false;
         for (int round = 0; round < 2; ++round) {
             std::lock_guard<std::mutex> lk(m_mx);
             ChangeBatch o;
             bool unknownVersion = false;
-            if (rb.full) { m_byStored.clear(); m_byPlain.clear(); }
+            if (rb.full) { m_byStored.clear(); m_byPlain.clear(); m_refused.clear(); }
             for (auto& e : rb.upserts) {
                 if (synckeys::is_vault_path(e.path) || (!e.isDir && is_sidecar_path(e.path))) continue;
+                // before its names are taken in (they'd be used for new uploads)
+                if (!folders_allowed_locked(e.path, e.isDir)) {
+                    m_refused.insert(e.path);
+                    o.problems.push_back({ e.path, kRetiredWhy });
+                    continue;
+                }
                 RelPath plain;
                 Dec d = decrypt_path(e.path, plain, e.isDir);
                 if (d == Dec::Unknown && !refreshed) { unknownVersion = true; continue; }
@@ -403,6 +627,7 @@ private:
             for (auto& sp : rb.removals) {
                 if (synckeys::is_vault_path(sp)) continue;
                 if (is_sidecar_path(sp)) { m_sidecar.erase(sp); m_sidecarRev.erase(sp); continue; }
+                if (m_refused.erase(sp)) continue;                             // never passed on
                 RelPath plain;
                 Dec d = decrypt_path(sp, plain, false);
                 if (d == Dec::Unknown && !refreshed) { unknownVersion = true; continue; }
@@ -455,6 +680,7 @@ private:
         ChangeBatch rb, out;
         Result r = m_raw->changes("", rb, prog);
         if (!r.ok()) return r;
+        if (Result s = settle_retired(prog, &rb); !s.ok()) return s;
         return translate(rb, out, prog);
     }
 
@@ -545,12 +771,17 @@ private:
     std::map<std::wstring, Node> m_byPlain;              // case key of the plaintext -> both
     std::map<RelPath, std::string> m_sidecar, m_sidecarRev;
     bool m_loaded = false;
+    std::wstring m_retiredFile;            // where m_ret is kept (empty: in memory only)
+    Retired m_ret;
+    bool m_retirePending = false;          // a version was retired: note the storage at the next listing
+    std::set<RelPath> m_refused;           // stored paths refused for a retired folder name
 };
 
 } // namespace
 
-std::unique_ptr<Backend> make_encrypting(std::unique_ptr<Backend> raw, const synckeys::Vault& vault, VaultReopen reopen) {
-    return std::make_unique<EncBackend>(std::move(raw), vault, std::move(reopen));
+std::unique_ptr<Backend> make_encrypting(std::unique_ptr<Backend> raw, const synckeys::Vault& vault, VaultReopen reopen,
+                                         const std::wstring& retiredFile) {
+    return std::make_unique<EncBackend>(std::move(raw), vault, std::move(reopen), retiredFile);
 }
 
 Result open_pair_backend(const std::wstring& typeId, const BackendConfig& cfg, synckeys::KeyStore& ks, bool create,
@@ -571,7 +802,7 @@ Result open_pair_backend(const std::wstring& typeId, const BackendConfig& cfg, s
         if (pin->file.empty()) return synckeys::open_vault(b, k, cr, v, p);
         synckeys::VaultPin next = pin->pin;
         Result r = synckeys::open_vault(b, k, cr, v, p, &next);
-        if (r.ok() && (next.id != pin->pin.id || next.gen != pin->pin.gen || next.version != pin->pin.version)) {
+        if (r.ok() && (next.id != pin->pin.id || next.gen != pin->pin.gen || next.version != pin->pin.version || next.hash != pin->pin.hash)) {
             pin->pin = next;
             pin->pin.save(pin->file);
         }
@@ -581,10 +812,13 @@ Result open_pair_backend(const std::wstring& typeId, const BackendConfig& cfg, s
     r = open(*raw, ks, create, v, prog);
     if (!r.ok()) return r;
     synckeys::KeyStore* keys = &ks;
+    // the retired key versions' note beside the pin
+    std::wstring retired;
+    if (size_t sl = pinFile.find_last_of(L"\\/"); sl != std::wstring::npos) retired = pinFile.substr(0, sl + 1) + L"retired.dat";
     out = make_encrypting(std::move(raw), v, [keys, open](Backend& b, synckeys::Vault& nv) {
         NoProgress np;
         return open(b, *keys, false, nv, np);
-    });
+    }, retired);
     return {};
 }
 

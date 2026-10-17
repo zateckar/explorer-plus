@@ -2,7 +2,8 @@
 
 An adversarial review of the end-to-end encryption of Sync folders, as built in commit
 16f3a39, against the threat model in [sync-plan.md](sync-plan.md) ("End-to-end encryption")
-and the stored formats in [sync-format.md](sync-format.md). It is the review that phase 6
+and the stored formats in [sync-format.md](sync-format.md). S1 and S2 were then fixed in a
+follow-up (key objects version 2; the note of retired key versions). It is the review that phase 6
 of the plan makes a release gate.
 
 **Scope:** `crypto.cpp` (Monocypher wrapper, KDF, AEAD, Argon2id, codes), `crypto_file.cpp`
@@ -22,14 +23,16 @@ Monocypher itself is out of scope (it has its own audit).
   old one leaked;
 - **another local process**, of the same user or of another account.
 
-Format v1's bytes are unchanged; `FORMAT_V1_KAT` still passes.
+Files and names (format v1) are unchanged; `FORMAT_V1_KAT` still passes. The fixes for S1
+moved the key objects to version 2 (`EPR2`, `EPV2`, `EPD2`, `EPP2`, `EPX2`); version 1 key
+objects are refused. Nothing had been released, so no migration is needed.
 
 ## Summary
 
 | # | severity | finding | status |
 |---|---|---|---|
-| S1 | **critical** | A removed device that can still write to the storage gets the next ring back (forged hand-over, planted device record, rolled-back vault) | narrowed; design fix needed |
-| S2 | high | A removed device can still write files and names that the remaining devices accept | open; documented |
+| S1 | **critical** | A removed device that can still write to the storage gets the next ring back (forged hand-over, planted device record, rolled-back vault) | **fixed** (members, signatures; key objects v2); the window before a device hears of the removal stays |
+| S2 | high | A removed device can still write files and names that the remaining devices accept | **narrowed** (retired key versions); what stays open is listed |
 | S3 | high | Retried uploads re-encrypted under the same salt: nonce reuse when the file changed between attempts | **fixed** |
 | S4 | high | "New recovery key" left the old key able to open everything, including what is written later | **fixed** |
 | S5 | medium | The vault object can be rolled back, swapped for another vault of the user's, or deleted | **fixed** (pin) |
@@ -76,58 +79,127 @@ opens it treats it as "behind the ring" and upgrades it again, which runs (b).
 **The same goes for the holder of a replaced recovery key.** The old recovery wrap in
 an old copy of any vault opens the ring of that time.
 
-**Done here:**
-- (c) is closed for every device that has seen the newer vault. The vault pin (S5) refuses
-  an older generation.
-- (a) is narrowed. `take_rotations` takes a hand-over only if it *continues this device's
-  current generation*: sealed under it, or carrying it. Once B has taken its legitimate
-  hand-over (generation g+1), D can't seal anything that B accepts. Hand-overs that open
-  but don't continue are deleted.
+**Fix (key objects version 2).** Membership is now carried in the ring and every key
+object is signed by the device that wrote it:
+- The ring (`EPR2`) lists the **members**: device ID, X25519 key and EdDSA key. Only
+  devices that aren't removed get the new ring, and removal takes the device out of the
+  list.
+- Each device has an EdDSA signing key (seed `KDF(device secret, "ep sign")`).
+  - Hand-overs (`EPX2`) carry the sender's ID and its signature.
+  - Device records (`EPD2`) carry the device's EdDSA key and are signed by it.
+  - The vault object (`EPV2`) names its signer and is signed.
+- A device takes a hand-over only from a member of its own ring that isn't removed, with a
+  valid signature. The new ring must keep both the receiver and the sender as members, and
+  continue the receiver's current generation (the earlier fix). A hand-over from a removed
+  device or with a bad signature is deleted; one from an unknown sender is left.
+- A device record makes its device a member only when it is sealed under the reader's
+  **current** generation. A removed device never has that generation. Hand-overs go only
+  to members that have a record in the vault, so a planted record gets nothing.
+- A vault object signed by a removed device, or by a non-member, is refused as
+  `Tampered`. One exception: the removed device signed it while it was a member, and this
+  device already took exactly that object (the pin now holds its hash). Opening it then
+  moves it on, signed by the opening device.
+- "Remove device" checks the vault against the ring of before the removal, then re-signs
+  it.
 
-**Still open:**
-- (a) in the window before B takes its legitimate hand-over. An attacker with write
-  access can delete A's hand-over and plant its own, so it controls that window.
-- (b) in vaults that are upgraded lazily.
+How each attack is refused now:
+- **(a)** A device that has the removal refuses D's hand-over: D is listed as removed. No
+  device takes a hand-over from someone who was never a member, or one signed with
+  another device's key.
+- **(b)** When A moves a lagging vault on, F's record (sealed under the old generation)
+  isn't taken in. B's record is deleted, and only C gets a hand-over.
+- **(c)**
+  - A vault D makes up is refused by every device that knows of the removal, pinned or not.
+  - A rolled-back copy is refused by pinned devices (S5).
+  - A device without a pin moves the copy on, but hands over only to members, so nothing
+    reaches D.
+- **The old recovery key's holder** gets the members from an old wrap, but no member's
+  signing key and not the current generation. So it can't sign anything the devices
+  accept, and a device it registers isn't taken in.
 
-No local fix can close these. When B is still on generation g, D and the remover A look
-exactly the same to B: both are former members with the same keys.
+Tests: `test_removal_hardening` covers each case (second vault X for (b) and (c), signed
+forgeries for (a)), plus `test_ring_codec`.
 
-**Recommendation (a format addition, not a v1 change):**
-- Carry the member list (device ID → public key) inside the ring, which only devices that
-  aren't removed receive.
-- Have the sender sign hand-overs and device records with its device key (static-static
-  X25519 into the KDF, or an Ed25519 signature).
-- Accept a hand-over only from a member of the receiver's own ring, and only one that keeps
-  the receiver's generations.
-- On a conflict (two different rings for the same generation), stop and ask the user.
+**What stays open:**
+- **The window.** A remaining device that hasn't yet taken in the removal (no hand-over
+  taken, no newer vault opened) still counts D as a member. D can hand it a ring, plant
+  records under the old generation that it admits, and sign vault objects it accepts. D
+  can also delete A's hand-over, so with write access D can stretch that window. No local
+  rule can close it: to such a device, D and A are equal members with the same keys. It
+  closes as soon as the device takes A's hand-over or opens a vault A moved on (sealed
+  under a generation D doesn't have). Conflicting hand-overs (two rings continuing the
+  same generation) aren't detected yet; the recommendation to stop and ask the user
+  stands. Revoking D's storage access is still the first step of a removal.
+- **Admission is per generation.** A device that the remover hadn't taken in by the time
+  it rotated gets no hand-over. Its record was sealed under a generation that is no longer
+  current, and rings received from others replace the members list. Such a device must
+  pair again. Every open of a vault and the "Devices" list take members in, so in practice
+  this needs a device paired and a removal done before the remover opened that vault
+  again.
+- **Unpinned rolled-back vaults.** A device without a pin for that location still moves
+  an old copy on. That leaks nothing, but the new key version number collides with the
+  real one: denial of service, as before (S5).
+- **A vault last written by D** (while a member) can be opened only by devices that pinned
+  that exact object. A device that first meets the location after the removal refuses it
+  until a pinned device moves it on.
 
-`Ring::parse` ignores trailing bytes, so a member section after `removed` stays readable
-by v1 code.
-
-Until then:
-- In "Remove device", make revoking the removed device's storage credentials the *first*
-  step, not an afterthought.
-- Say plainly that removal protects nothing against a device that can still write to the
-  storage.
-
-### S2 (high): a removed device can still write accepted content
+### S2 (high, narrowed): a removed device can still write accepted content
 
 Vault key versions from before a removal must stay readable, because old files use
-them. Nothing marks them as superseded for *writing*. A removed device that can still
-write to the storage can do both of these under VK_old:
+them. Nothing marked them as superseded for *writing*. A removed device that can still
+write to the storage could do both of these under VK_old:
 - upload new files;
 - overwrite existing ones.
 
-The names authenticate too. The remaining devices download them as ordinary remote
-edits, and the planner even prefers an edit over a delete. The plan promises only
-confidentiality for what is written after a removal, but users will assume integrity.
+The names authenticate too. The remaining devices downloaded them as ordinary remote
+edits, and the planner even prefers an edit over a delete.
 
-**Recommendation:**
-- In the vault payload, record the generation at which each key version was superseded.
-- Once every remaining device has moved on (they re-register under the new generation),
-  refuse *new* revisions written under superseded versions.
-- Alternatively, the signed per-vault manifest from phase 7.
-- "Re-encrypt everything" followed by dropping old versions from the vault closes it fully.
+**Fix (narrowed, without a signed manifest): the note of retired key versions.** When a
+device's encrypting layer learns that the vault's current key version moved on, it lists
+the storage once and notes what is there, in `Sync\pairs\<id>\retired.dat`
+(sync-format.md):
+- each file's stored path and revision, with the lowest content key version it may have;
+- the stored folders.
+
+From then on:
+- **Content under a retired version** downloads (and its fingerprint is taken) only if
+  its stored path and current revision are in the note. The revision is checked again
+  after the download, so an overwrite during it isn't taken for the noted object.
+- **A file written after an earlier note** must have content of at least that note's
+  version. That catches D replacing a newer file's content with one under VK_old: new
+  names can only be made under the current version, but contents can be swapped in.
+- **A folder named under a retired version** is listed only if it is in the note.
+- **A file that may hold retired content** is uploaded again under the current version
+  rather than moved on the server. A moved file would no longer match the note.
+
+Everything else D writes with the retired keys (new files, new folders, overwrites of old
+or new files) is refused as `Tampered`, or reported as a problem. Local copies stay as
+they were. Test: `test_removal_hardening`, the S2 part, which also restarts a device to
+check that the note persists.
+
+**What stays open (the signed per-vault manifest of phase 7 closes all of it; member
+signing keys now exist for it):**
+- **Until each device notes the storage.** Writes D makes between the removal and a
+  device's next listing after the vault changed are noted as legitimate *by that device*.
+  For a running device that's one poll; for one that is off, until it next starts.
+- **Trust on first use.** A device that first sees the vault after the removal (a new pair,
+  a re-paired device) notes everything there.
+- **Folder revisions.** On a Folder store the revision is size + time + file ID. D can
+  overwrite a noted file in place with the same size and put the time back; the revision
+  is then unchanged and the content accepted. Git, S3 and Azure DevOps revisions follow
+  the content.
+- **Deleting, withholding, rolling back.** D (like the storage) can delete files, or put
+  back an older ciphertext of a file that was written under the current version. These
+  are the known limitations (I9).
+- **Devices that were behind.** A device that wrote under the old version before it
+  learned of the rotation sees its files refused by the others until they are edited
+  again, or until "Re-encrypt" rewrites them.
+- **Revisions that change on their own** (a store migrated, objects copied) make old files
+  fail as tampered. "Re-encrypt" also fixes those.
+- **Old versions** from the storage's version list aren't checked against the note.
+  Restoring one is the user's choice of content the storage serves.
+- **Dropping old key versions.** "Re-encrypt everything" followed by removing the retired
+  versions from the vault would close it fully for that vault.
 
 ### S3 (high, fixed): nonce reuse on retried uploads
 
@@ -268,9 +340,10 @@ current generation's.
   `parse` can't read back (before, a 65th generation would have been saved and then lost
   on the next load). Pruning is needed eventually.
 - **I6, unbound fields of the vault object.** `gen`, `umk`, and the recovery wrap with its
-  salt and parameters aren't bound to the sealed payload. The storage can paste an older
-  `recovery=` line into the current vault. The new recovery key then fails on that vault
-  (denial of service); the old key gets only the old ring, which an old copy gave it anyway.
+  salt and parameters weren't bound to the sealed payload, so the storage could paste an
+  older `recovery=` line into the current vault (denial of service for the new recovery
+  key). Since S1's fix the whole object is signed by its writer, so lines can no longer
+  be mixed; whole old objects are the pin's concern (S5).
 - **I7, names.** The version prefix isn't in the SIV tag, which is harmless: another
   version means another key, and the tag fails. The encrypting layer's `sane_name` lets
   `\` and `:` through. The engine's `windows_valid_path` refuses them before anything is
@@ -289,13 +362,15 @@ current generation's.
 ## Checked and found sound
 
 - **KDF domain separation.** The contexts are all different: `ep file`, `meta`, `data`,
-  `ep names`, `mac`, `enc`, `ep umk id`, `ep vault`, `ep devices`, `ep rotate`.
+  `ep names`, `mac`, `enc`, `ep umk id`, `ep vault`, `ep devices`, `ep rotate`, `ep sign`.
+  Signatures cover a context too (`ep vault object`, `ep device record`, `ep rotate`), so
+  no signature counts for another kind of object.
   - The length prefix rules out context/salt ambiguity.
   - Sub-keys come from different parent keys: `K_file` per salt, `K_names` per vault key.
   - No subkey of one use equals one of another.
 - **AEAD use.** Every seal has its own key *and* its own additional data:
   - `ep vault`, `ep recovery`;
-  - `ep device <id>`, `ep pair <expiry>`, `ep rotate <id>`.
+  - `ep device <id>`, `ep pair <expiry>`, `ep rotate <sender> <receiver>`.
 
   One kind of object can't be passed off as another. Nonces are random 24-byte values for
   wraps. File keys are new per upload (per pass, after S3), so the zero meta nonce and the
@@ -320,7 +395,8 @@ current generation's.
   - Offline guessing costs a 256 MiB Argon2id per guess over 75 bits.
   - A replayed grant still needs the code.
 - **Device records.** The storage can't forge them: it would need the UMK. The ID is
-  bound to the public key, and removed IDs are dropped from hand-overs.
+  bound to the X25519 key, the record is signed with the EdDSA key inside it, and only
+  members get hand-overs (S1).
 - **Random numbers.**
   - `BCryptGenRandom` aborts on failure.
   - Codes take 5 uniform bits per character.
@@ -334,16 +410,29 @@ current generation's.
 ## Tests added
 
 - `tests/sync_tests.cpp`:
+  - the EdDSA self test (round trip, changed message, wrong key);
   - a retried upload gets a new salt and still decrypts;
   - a fixed salt still repeats;
   - Argon2id parameter bounds;
   - the test-only cost is gated.
 - `tests/sync_crypt_tests.cpp`:
   - `test_long_names`: swapped sidecars are refused;
+  - `test_ring_codec`: members round-trip; a member whose ID isn't its key's, and the
+    format before members, are refused;
   - `test_removal_hardening`:
     - a running device's first upload after a removal is under the new key version;
     - the vault pin refuses a rolled-back, swapped or missing vault;
-    - a hand-over forged under an old generation is taken by a device still on it (the
-      remaining window of S1) and refused by one that moved on;
+    - S1 (a): a hand-over signed by the removed device is taken by a device still on the
+      old generation (the remaining window) and refused by one that moved on; a
+      non-member's hand-over, or a non-member's key passed off as a member's, is refused
+      even by a lagging device;
+    - S1 (b): a record planted in a vault not yet moved on is neither taken in nor handed
+      over to, and the removed device's record goes;
+    - S1 (c): a vault made up and signed by the removed device is refused, pinned or not;
+      a rolled-back copy is refused by a pinned device, and moved on by an unpinned one
+      with hand-overs to members only;
+    - S2: a new file, a new folder, an overwritten old file and a newer file with VK_old
+      content, all written by the removed device, are refused by both remaining devices
+      (also after a restart); an old file renamed is uploaded again and arrives;
     - after "New recovery key", the ring from an old copy of the vault no longer opens it,
       and the other devices follow.

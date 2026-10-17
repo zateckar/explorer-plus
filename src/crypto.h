@@ -76,6 +76,13 @@ bool argon2_params_ok(const Argon2Params& p);
 void x25519_public(const Key& secret, Key& pub);
 Key  x25519_shared(const Key& secret, const Key& peerPublic);   // raw shared secret: hash it (kdf) before use
 
+// EdDSA (Monocypher's: Curve25519 with BLAKE2b, not RFC 8032's SHA-512 Ed25519): a key
+// pair from a 32-byte seed; signatures are 64 bytes
+constexpr size_t kSig = 64;
+void eddsa_public(const Key& seed, Key& pub);
+void eddsa_sign(const Key& seed, const void* msg, size_t n, uint8_t sig[kSig]);
+bool eddsa_check(const Key& pub, const void* msg, size_t n, const uint8_t sig[kSig]);
+
 // SHA-256 / HMAC-SHA256 (BCrypt: AWS signatures need them; Monocypher has neither)
 Hash32 sha256(const void* data, size_t n);
 Hash32 hmac_sha256(const void* key, size_t keyLen, const void* data, size_t n);

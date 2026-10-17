@@ -1,9 +1,12 @@
-# Sync folders: stored formats (version 1)
+# Sync folders: stored formats (files and names version 1, key objects version 2)
 
 What Explorer Plus writes to a sync storage location, and what it keeps on the PC. Written
 so another client (a recovery tool, a phone app) can be built from this document alone.
 The design and the reasons behind it are in [sync-plan.md](sync-plan.md). Format version 1
-is frozen by known-answer tests (`tests/sync_tests.cpp`, `FORMAT_V1_KAT`).
+is frozen by known-answer tests (`tests/sync_tests.cpp`, `FORMAT_V1_KAT`). The key objects
+(ring, vault, device records, pairing grants, hand-overs) are at version 2: their magics end
+in `2`, and version 1 objects are refused (they had no members and no signatures; see
+[sync-review.md](sync-review.md), S1).
 
 Integers are little-endian. `||` is concatenation. All cryptography is Monocypher's,
 except the random source (`BCryptGenRandom`).
@@ -18,6 +21,7 @@ except the random source (`BCryptGenRandom`).
 | `Argon2id(code, salt, mem, passes)` | Argon2id, 1 lane, 32-byte output; `code` is the normalized code (below) |
 | `umk_id(UMK)` | the first 8 bytes of `KDF(UMK, "ep umk id")` as 16 lowercase hex digits |
 | `base32` | RFC 4648 alphabet, lowercase, no padding |
+| `SIGN(dev, ctx, m)` | Monocypher EdDSA (Curve25519 with BLAKE2b, not RFC 8032's SHA-512) over `ctx \|\| 0x00 \|\| m`, with the device's signing key; 64 bytes |
 
 **Codes** (recovery key, pairing code): 15 characters of Crockford Base32
 (`0123456789ABCDEFGHJKMNPQRSTVWXYZ`), shown as `XXXXX-XXXXX-XXXXX`. Before use they are
@@ -30,17 +34,29 @@ passes (stored with each use, so it can change later).
 - **UMK** (user master key): 32 random bytes per *generation* `g` (1, 2, ...). A new
   generation is made when a device is removed.
 - **Ring**: every UMK generation the user has, plus the recovery key's Argon2id salt,
-  parameters and result (`recKek`), plus the IDs of removed devices:
+  parameters and result (`recKek`), the IDs of removed devices, and the **members** (the
+  user's devices, with their public keys):
   ```
-  "EPR1" | n (u32) | n × (gen (u32) | UMK (32)) | recSalt (16) | recMem KiB (u32) | recPasses (u32)
-         | recKek (32) | m (u32) | m × deviceId (16 ASCII hex)
+  "EPR2" | n (u32) | n × (gen (u32) | UMK (32)) | recSalt (16) | recMem KiB (u32) | recPasses (u32)
+         | recKek (32) | r (u32) | r × deviceId (16 ASCII hex)
+         | m (u32) | m × (deviceId (16 ASCII hex) | X25519 public (32) | EdDSA public (32))
   ```
-  The current generation is the **last** entry (not necessarily the highest number when
-  two rings were merged; see the code's `merge`).
+  The current generation is the **last** entry. A reader refuses a member whose ID isn't
+  its X25519 key's. A ring that comes from another device (pairing grant, recovery wrap,
+  hand-over) replaces the device's current generation, recovery key, members and removed
+  list; the device keeps its other generations as older ones, and adds itself as a member
+  unless the ring lists it as removed (then, on pairing or recovery, it makes a new device
+  key and comes back as a new device).
 - **Vault key** `VK_v`: 32 random bytes per version `v` (1, 2, ...), one set per storage
   location ("vault"). New uploads and names use the current version.
 - **Device key**: an X25519 key pair per device; `deviceId` = the first 8 bytes of
-  `BLAKE2b(public key)` as 16 hex digits.
+  `BLAKE2b(public key)` as 16 hex digits. Its **signing key** is the EdDSA key pair from
+  the seed `KDF(X25519 secret, "ep sign")`.
+- **Members**: a device signs the vault objects, device records and hand-overs it writes;
+  the others believe them only from a member of their ring that isn't removed. A device
+  becomes a member by pairing or recovery (it adds itself), or when a member reads its
+  device record sealed under the member's **current** generation: a removed device never
+  has that one, so it can't bring devices of its own in.
 
 Keys derived from a vault key:
 
@@ -62,7 +78,7 @@ encrypted file or folder under an encrypted name.
 UTF-8 text, one `key=value` per line after the first:
 
 ```
-EPV1
+EPV2
 umk=<umk_id of the generation the payload is sealed under>
 gen=<that generation's number>
 data=<base64 SEAL(KDF(UMK_gen, "ep vault"), "ep vault", payload)>
@@ -70,27 +86,36 @@ rsalt=<base64 of the recovery key's 16-byte Argon2id salt>
 rmem=<Argon2id memory, KiB>
 rpasses=<Argon2id passes>
 recovery=<base64 SEAL(Argon2id(recovery key, rsalt, rmem, rpasses), "ep recovery", ring)>
+signer=<deviceId of the device that wrote it>
+sig=<base64 SIGN(signer, "ep vault object", every byte of the object before this line)>
 ```
 
 `payload` = `"EPVP" | vault id (16) | current version (u32) | n (u32) | n × (version (u32) | VK (32))`.
 
 The recovery wrap holds the whole ring, so the recovery key alone opens every generation.
-A vault whose `umk` isn't in a device's ring is *locked* for that device.
+A vault whose `umk` isn't in a device's ring is *locked* for that device. A vault whose
+signer is removed, isn't a member, or whose signature doesn't check is refused as tampered,
+except (removed signer) when it is byte for byte the object this device took before (the
+pin's `hash`): what the removed device wrote while it was a member. Opening it then moves
+it on, signed by the opening device.
 
 ### `.ep-vault/devices/<deviceId>`
 
 ```
-"EPD1" | gen (u32) | umk_id (16 ASCII) | SEAL(KDF(UMK, "ep devices"), "ep device " + deviceId,
-                                               public key (32) | added (u64 FILETIME) | name (UTF-8))
+body = "EPD2" | gen (u32) | umk_id (16 ASCII) | SEAL(KDF(UMK, "ep devices"), "ep device " + deviceId,
+                        X25519 public (32) | EdDSA public (32) | added (u64 FILETIME) | name (UTF-8))
+record = body | SIGN(the device itself, "ep device record", body)
 ```
 
-The reader checks that `BLAKE2b(public key)` gives the file's `deviceId`. Only holders of
-the UMK can write a record; the storage learns nothing about the devices.
+The reader checks that `BLAKE2b(X25519 public)` gives the file's `deviceId` and that the
+signature checks with the EdDSA key inside. Only holders of the UMK can write a record; the
+storage learns nothing about the devices. A record makes its device a member only when it
+is sealed under the reader's current generation (above); "Devices" lists members only.
 
 ### `.ep-vault/pair/<16 hex>` (Add a device)
 
 ```
-"EPP1" | salt (16) | mem KiB (u32) | passes (u32) | expiry (u64 FILETIME)
+"EPP2" | salt (16) | mem KiB (u32) | passes (u32) | expiry (u64 FILETIME)
        | SEAL(Argon2id(code, salt, mem, passes), "ep pair " + decimal(expiry), ring)
 ```
 
@@ -103,15 +128,21 @@ grants at most.
 ### `.ep-vault/rotate/<deviceId>-g<gen>` (a device was removed)
 
 ```
-"EPX1" | umk_id of the previous generation (16 ASCII) | ephemeral X25519 public key (32)
-       | SEAL(KDF(UMK_previous, "ep rotate", X25519(eph, device public key)), "ep rotate " + deviceId, new ring)
+body = "EPX2" | umk_id of the previous generation (16 ASCII) | sender deviceId (16 ASCII)
+       | ephemeral X25519 public key (32)
+       | SEAL(KDF(UMK_previous, "ep rotate", X25519(eph, receiver public key)),
+              "ep rotate " + sender deviceId + " " + receiver deviceId, new ring)
+object = body | SIGN(sender, "ep rotate", body)
 ```
 
-One per remaining device: it needs both its device key and the previous UMK to open it.
-The device takes it into its ring and deletes it. The removed device gets none, and its
-`devices/` record is deleted. A device only takes a hand-over that continues its current
-generation: one sealed under it, or one whose ring contains it. It deletes others that
-open. "New recovery key" also makes a new generation and hands it over the same way.
+One per remaining member that has a record in this vault: it needs both its device key
+and the previous UMK to open it. The removed device gets none, and its `devices/` record is
+deleted; records of devices that aren't members get none either. A device takes a
+hand-over only when its sender is a member of its ring, not removed, and the signature
+checks; the new ring lists both the receiver and the sender as members (not removed); and
+it continues the receiver's current generation (sealed under it, or its ring contains it).
+It deletes the hand-over once read, and keeps one whose sender or generation it doesn't
+know yet. "New recovery key" also makes a new generation and hands it over the same way.
 
 ### `.ep-vault/head`
 
@@ -182,9 +213,27 @@ subfolder. Commits carry a neutral author `Explorer Plus <sync@localhost>` and t
 - **`Sync\pairs\<id>\`**: the pair's state journal, transfers in progress, and for git
   storage the bare mirror `repo.git`.
 - **`Sync\pairs\<id>\vault.pin`**: what this device saw of the pair's vault, as text:
-  `EPN1`, then `id=` (vault ID, 32 hex), `gen=` (highest UMK generation) and `version=`
-  (highest vault key version). A vault with another ID, an older generation or fewer key
-  versions, or no vault at all, is refused as tampered (rolled back or swapped).
+  `EPN1`, then `id=` (vault ID, 32 hex), `gen=` (highest UMK generation), `version=`
+  (highest vault key version) and `hash=` (BLAKE2b-256 of the vault object last taken, hex).
+  A vault with another ID, an older generation or fewer key versions, or no vault at all,
+  is refused as tampered (rolled back or swapped).
+- **`Sync\pairs\<id>\retired.dat`**: the note of **retired key versions**. When the
+  vault's current key version moves on (a device removed, a new recovery key), the device
+  lists the storage and notes what is there, so that what a removed device writes later
+  with the keys it still has is refused:
+  ```
+  "EPS1" | below (u32) | f (u32) | f × (key (16) | lowest content version (u32))
+         | d (u32) | d × key (16)
+  file key   = BLAKE2b-256(UTF-8 stored path || 0x00 || revision)[0..16)
+  folder key = BLAKE2b-256(UTF-8 stored path || 0x01)[0..16)
+  ```
+  Versions below `below` are retired. A file whose content is under a retired version
+  opens only if its stored path and current revision are noted and its content version is
+  at least the noted one (files noted at the first sight: 0; files written since the
+  previous note: that note's `below`). A folder named under a retired version is listed only
+  if it is noted. A file that may hold retired content is uploaded again under the
+  current version rather than moved. The first time a device sees a vault with retired
+  versions it notes everything there (trust on first use).
 
 ## Differences from the plan
 
@@ -199,6 +248,9 @@ subfolder. Commits carry a neutral author `Explorer Plus <sync@localhost>` and t
 - **Sizes**: the plan's intro promises sizes "to the nearest 64 KiB"; format v1 has no size
   padding, so a stored file's size gives its exact plaintext size. Padding is a later
   option (plan, phase 7).
+- **Known limitation, retired keys**: the note is per device and made when the device
+  learns of the new key version; see sync-review.md, S2, for what stays open until the
+  signed manifest.
 - **Known limitation, file swaps**: a file's content isn't bound to its path. A storage
   that swaps two stored files (or serves an old version of one) isn't detected; each file
   still authenticates on its own. A signed per-vault manifest (plan, phase 7) would close
