@@ -102,6 +102,7 @@
 #define IDM_VIEW_FOLDERSIZES 40159
 #define IDM_SCREENSHOT       40106  // the region picker (Alt+Q from anywhere)
 #define IDM_MEDIA_TYPES      40107  // the media file types Explorer Plus opens
+#define IDM_SYNC_FOLDERS     40112  // Sync folders (docs/sync-plan.md)
 #define IDM_NOTEPAD          40108  // the Notepad window (its tabs as left)
 #define IDM_PLAYER           40109  // the media player's window (brought forward; an empty one when none)
 // Sort by the folder's columns: IDM_SORT_COL_BASE + column (subitem) index

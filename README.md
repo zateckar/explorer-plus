@@ -1,7 +1,8 @@
 # Explorer Plus
 
 A Windows 11 style file manager written from scratch in **C++20 and raw Win32**: no
-frameworks, no third-party libraries. It hosts the real Windows shell (folders, icons,
+frameworks, and one third-party library, [Monocypher](https://monocypher.org) (the
+cryptography of Sync folders, vendored). It hosts the real Windows shell (folders, icons,
 thumbnails, context menus, preview handlers, file operations), so it behaves like
 File Explorer while starting in well under 100 ms.
 
@@ -58,6 +59,46 @@ File Explorer while starting in well under 100 ms.
   copied to the clipboard and opened in the picture editor.
 - **Picture editor**: rectangles, ellipses and text that stay editable until saved; undo /
   redo; saves PNG, JPEG, BMP, GIF or TIFF.
+- **Sync folders** ("…" ▸ Sync folders...): keep folders the same on your PCs through an S3
+  bucket, a Git repository (Azure DevOps too) or a shared folder, end-to-end encrypted. See
+  below.
+
+## Sync folders
+
+A folder on this PC is kept the same as a storage location, and through it on your other
+PCs, like OneDrive or Dropbox but with storage you choose. A small background process
+(`explorer-plus.exe --sync`, in the tray) does the work, also while Explorer Plus is closed;
+tick "Start sync when I sign in to Windows" to have it always running. Files show a badge
+(synced, waiting, conflict, error) and the status bar shows the folder's state.
+
+**What the encryption means.** Everything is encrypted on your PC before it's sent: file
+contents, file and folder names, times. The storage (and anyone who gets into it) sees only
+scrambled names and data, how big the files are and how the folders nest; it can't read a file or
+change one unnoticed. The keys never leave your devices. Nobody, Explorer Plus included,
+can open your files without either one of your devices or your **recovery key**: 15
+letters and digits shown once when you set up the first sync folder. Write it down. A
+storage can still delete files or withhold new ones, and it sees when you sync. The formats
+are in [docs/sync-format.md](docs/sync-format.md).
+
+**A second PC**: add the same storage there. It asks for a code: on a PC that's already set
+up, "Devices and keys" ▸ "Add a device" shows one (valid 15 minutes), or type the recovery
+key. **Removing a device** makes new keys it never gets, and a new recovery key.
+
+Storage:
+
+- **Azure DevOps Git**: the repository's clone URL and a personal access token (scope Code,
+  Read & write). Uses its own branch, `explorerplus-sync` by default; not one with branch
+  policies. Needs [Git for Windows](https://gitforwindows.org) 2.31 or later.
+- **Git**: any repository URL git can push to with credentials it already has (an SSH key,
+  or ones Git Credential Manager stored); it never asks. Every version of a file is kept whole in the history, so it suits
+  documents more than big files that change often.
+- **S3**: a bucket (AWS, or an S3-compatible endpoint such as MinIO, R2, B2, Wasabi), an
+  optional prefix, an access key and its secret key.
+- **Folder**: a NAS share or a USB disk.
+
+Tokens and keys are kept in Windows' Credential Manager, never in the settings files.
+Conflicting edits keep both versions ("name (conflicted copy, PC, date).ext"); deleting
+many files at once waits for you to confirm in Sync folders.
 
 ## Requirements
 
@@ -83,6 +124,8 @@ Command line: `explorer-plus.exe [--new-window] [folder or file]`; a file opens 
 with the file selected. `explorer-plus.exe --play <file>` plays a media file or playlist (or
 shows a picture) in the player, as the registered file types do. `explorer-plus.exe --notepad
 [file]` opens the Notepad (with the file in a tab); a Notepad already open takes it.
+`explorer-plus.exe --sync` runs the sync agent; `--sync-folders` opens the Sync folders
+window alone; `--sync-cli <request> [key=value ...]` talks to the agent (scripts, tests).
 
 ## Settings
 
@@ -105,7 +148,7 @@ screenshotHotkey=1
 `[tree]` caches the Quick access pins so they show instantly; it is rewritten
 automatically. The Notepad keeps its tabs in `Notepad\session.ini` beside the settings file,
 and each tab's unsaved text in a `note-*.txt` (UTF-16) there; the player keeps its queues in
-`Player\queues.ini`.
+`Player\queues.ini`. Sync folders are in `Sync\pairs.ini` (their state in `Sync\pairs\`).
 
 Environment variables (diagnostics and tests):
 
@@ -114,6 +157,9 @@ Environment variables (diagnostics and tests):
 | `EXPLORERPLUS_SETTINGS=<file>` | use another settings file |
 | `EXPLORERPLUS_THEME=light\|dark` | override the Windows theme |
 | `EXPLORERPLUS_PERF=<log file>` | write timing events (startup, listings, paints, slow UI messages) |
+| `EXPLORERPLUS_SYNC_KDF_KIB=<KiB>` | tests: a cheaper Argon2id for sync codes |
+| `EXPLORERPLUS_SYNC_TRASH=1` | tests: sync keeps deleted files in its own folder, not the Recycle Bin |
+| `EXPLORERPLUS_AZDO_TEST_URL`, `_PAT` | sync tests: run the Azure DevOps end-to-end tests against this repository |
 
 ## Troubleshooting
 
@@ -144,7 +190,14 @@ pwsh tools/package.ps1 -Version 1.2.0     # -> dist/explorer-plus-1.2.0-win-x64.
 ctest --test-dir build --output-on-failure                          # unit tests (INI, command line, play queue, kept queues, text files)
 python -I tools/smoke_test.py build\explorer-plus.exe build\smoke   # GUI smoke test
 python -I tools/perf.py build\explorer-plus.exe build\perf 5         # startup / 30k files / scroll / sort / views / resize
+python -I tools/sync_test.py build\explorer-plus.exe build\synctest  # three devices syncing through the agents
 ```
+
+`ctest` also runs `explorer-plus-sync-tests`: the sync engine, cryptography (published test
+vectors and frozen known answers), keys, the git backend against a local bare repository
+and S3 against an in-process mock. With `EXPLORERPLUS_AZDO_TEST_URL` and
+`EXPLORERPLUS_AZDO_TEST_PAT` set, both it and `sync_test.py` also run against that Azure
+DevOps repository, each on a branch of its own that is deleted afterwards.
 
 The smoke test works in a scratch folder with a scratch settings file. Note that its
 delete checks send one scratch file and one empty scratch folder to the Recycle Bin.
@@ -190,10 +243,14 @@ src/notepad, textfile  the Notepad window; text encodings, line endings, its kep
 src/syntax, textops    the Notepad's lexers, JSON / XML formatting; line, case, Base64, URL operations
 src/settings, ini, theme, perf, crash   settings.ini, colours and fonts, profiling, crash dumps
 src/cmdline            command line and typed-path text
+src/sync_*             Sync folders: engine, stores (folder, s3, git, azdo), encryption and keys, agent, IPC, UI
+src/crypto*, sigv4, credstore, http, proc   cryptography, AWS signatures, Credential Manager, WinHTTP, child processes
+third_party/monocypher Monocypher (cryptography, CC0 / BSD-2-Clause)
 tests/                 unit tests (ctest)
 tools/                 smoke test, perf scenarios, packaging, icon generator
 ```
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). Monocypher: CC0 or BSD-2-Clause, at your choice
+([third_party/monocypher](third_party/monocypher)).

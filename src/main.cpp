@@ -39,6 +39,8 @@ using std::min;
 #include "screenshot.h"
 #include "assoc.h"
 #include "notepad.h"
+#include "sync_agent.h"
+#include "sync_ui.h"
 #include <uxtheme.h>
 #include <dwmapi.h>
 #include <oleacc.h>
@@ -119,6 +121,8 @@ void status_update() {
         a = count ? a + L" (listing stopped)" : L"Can't open this location";
         b = err;
     }
+    std::wstring sync = sync_view_status(g_pane->index);      // (inside a sync folder)
+    if (!sync.empty()) a += L"     " + sync;
 
     statusbar_set(a, b);
     cmdbar_refresh();
@@ -495,6 +499,7 @@ static void on_command(WORD id) {
             break;
         case IDM_SCREENSHOT: screenshot_start(300); break;     // (the menu's fade first)
         case IDM_MEDIA_TYPES: assoc_dialog(g_main); break;
+        case IDM_SYNC_FOLDERS: sync_folders_dialog(g_main); break;
         case IDM_NOTEPAD: notepad_open({}); break;
         case IDM_PLAYER: player_show(); break;
 
@@ -926,6 +931,12 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     g_hinst = hInst;
     OleInit ole;            // also initializes COM (STA) for this thread
     if (!ole.ok()) return 1;
+    {
+        // the sync agent and its command line: no windows of the app's own
+        CommandLine sc = parse_command_line(GetCommandLineW());
+        if (sc.sync) std::_Exit(sync_agent_main(sc.headless));
+        if (sc.syncCli) std::_Exit(sync_cli_main(sc.syncArgs));
+    }
 
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_WIN95_CLASSES | ICC_TREEVIEW_CLASSES |
                               ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES };
@@ -986,6 +997,12 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         }
         theme_shutdown();
         std::_Exit(code);                   // (as below: detached workers may still run)
+    }
+    if (cl.syncFolders) {
+        // from the sync agent's tray icon: the Sync folders window alone
+        sync_folders_dialog(nullptr);
+        theme_shutdown();
+        std::_Exit(0);
     }
     perf_event("settings");
     // the system image list is set up here, once, before any worker asks for icons (those
@@ -1085,6 +1102,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     dnd_register_sources();         // (~4 ms: once the window is on screen)
     screenshot_init();              // Alt+Q
     std::thread(assoc_follow_exe).detach();     // (the media types registered: by an exe since moved?)
+    std::thread(sync_agent_ensure_running).detach();    // (sync folders: their agent, when it isn't running)
 
     HACCEL acc = s_accel;
     MSG m{};

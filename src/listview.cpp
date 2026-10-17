@@ -14,6 +14,7 @@
 #include "columns.h"
 #include "searchbox.h"
 #include "perf.h"
+#include "sync_ui.h"
 
 static const UINT WM_LIST_COLUMNS_CHANGED = WM_APP + 60;   // posted to the list after header edits
 
@@ -554,7 +555,7 @@ static void draw_row_images(NMLVCUSTOMDRAW* cd) {
     if (!ListView_GetItemRect(g_pane->list, idx, &ic, LVIR_ICON)) return;
     bool checked = g_checkBoxes && (ListView_GetItemState(g_pane->list, idx, LVIS_SELECTED) & LVIS_SELECTED);
     bool hot = cd->nmcd.uItemState & CDIS_HOT;
-    int icon = -1, overlay = 0;
+    int icon = -1, overlay = 0, synced = 0;
     bool cut = false;
     {
         std::lock_guard<std::mutex> lk(g_pane->itemsMx);
@@ -563,6 +564,7 @@ static void draw_row_images(NMLVCUSTOMDRAW* cd) {
         icon = it->icon;
         overlay = it->overlay;
         cut = (it->attrs & SFGAO_GHOSTED) || fileops_is_cut(it->pidl);
+        synced = sync_view_item(g_pane->index, it->fileName);      // (inside a sync folder: its state)
     }
     HDC dc = cd->nmcd.hdc;
     int saved = SaveDC(dc);
@@ -590,6 +592,7 @@ static void draw_row_images(NMLVCUSTOMDRAW* cd) {
         p.fStyle = ILD_TRANSPARENT | INDEXTOOVERLAYMASK(overlay);
         if (cut) { p.fState = ILS_ALPHA; p.Frame = 128; }
         ImageList_DrawIndirect(&p);
+        if (synced) sync_draw_badge(dc, RECT{ p.x, p.y, p.x + cx, p.y + cy }, synced, (int)GetDpiForWindow(g_pane->list));
     }
     if (g_checkBoxes && (checked || hot)) {
         // the state slot sits right before the icon

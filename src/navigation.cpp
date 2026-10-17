@@ -20,6 +20,7 @@
 #include <atomic>
 #include <memory>
 #include "workers.h"
+#include "sync_ui.h"
 
 static std::vector<std::wstring> g_addrHistory;
 // bumped by every navigation; a typed path resolved after that is dropped
@@ -38,6 +39,10 @@ void address_history_add(const std::wstring& s) {
 static void start_enum_current(bool keepView) {
     enumerate_start(g_pane->current, keepView);
     watcher_register_for(g_pane->current);
+    // a folder inside a sync folder: its sync state (status bar, badges)
+    WCHAR fsDir[MAX_PATH]{};
+    if (!g_pane->current || ILIsEmpty(g_pane->current) || !SHGetPathFromIDListW(g_pane->current, fsDir)) fsDir[0] = 0;
+    sync_view_folder(g_pane->index, fsDir);
 }
 
 // the active list's folder on everything around the lists: address bar, navigation

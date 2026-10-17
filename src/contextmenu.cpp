@@ -16,6 +16,7 @@
 #include "imageview.h"
 #include "imageedit.h"
 #include "notepad.h"
+#include "sync_ui.h"
 #include <algorithm>
 #include <map>
 
@@ -174,7 +175,7 @@ static void invoke_id(HWND hwnd, IContextMenu* cm, UINT id, POINT pt, PCIDLIST_A
 // ------------------------------------------------------------------
 static const UINT kFlyMore = 0x8001, kFlyNewTab = 0x8002, kFlyNewWindow = 0x8003;
 static const UINT kFlyPlay = 0x8004, kFlyEnqueue = 0x8005, kFlyPlaylist = 0x8006, kFlyEditPicture = 0x8007;
-static const UINT kFlyNotepad = 0x8008;
+static const UINT kFlyNotepad = 0x8008, kFlySyncNow = 0x8009;
 
 struct ShellEntry {
     UINT id = 0;
@@ -343,9 +344,10 @@ static void fly_app_verbs(std::vector<FlyEntry>& list, const std::vector<ShellEn
             list.push_back(fly_from(e, L'\xE7EF'));
 }
 
-// `picture`: one picture chosen (Edit picture); `text`: text files (Edit in Explorer Plus)
+// `picture`: one picture chosen (Edit picture); `text`: text files (Edit in Explorer Plus);
+// `synced`: items inside a sync folder (Sync now)
 static UINT item_flyout(HWND hwnd, IContextMenu* cm, HMENU m, POINT pt, bool folder, PlayerOffer media, bool picture,
-                        bool text) {
+                        bool text, bool synced) {
     auto items = menu_entries(cm, m);
     std::vector<FlyButton> row;
     static const struct { const wchar_t* verb; wchar_t glyph; const wchar_t* tip; } kRow[] = {
@@ -382,6 +384,7 @@ static UINT item_flyout(HWND hwnd, IContextMenu* cm, HMENU m, POINT pt, bool fol
     }
     if (picture) list.push_back(fly_item(kFlyEditPicture, L"Edit picture", L'\xE70F'));
     if (text) list.push_back(fly_item(kFlyNotepad, L"Edit in Explorer Plus", L'\xE70B'));
+    if (synced) list.push_back(fly_item(kFlySyncNow, L"Sync now", L'\xE895'));
     for (auto& e : items)
         if (e.sub && plain_text(lower(e.text)).rfind(L"open with", 0) == 0) {
             if (!taken(&e)) { list.push_back(fly_from(e, L'\xE7AC')); used.push_back(&e); }
@@ -503,8 +506,13 @@ static void show_cm(HWND hwnd, POINT pt, IShellFolder* parent, PCIDLIST_ABSOLUTE
     // (text files, all of them: each in a tab of the Notepad)
     bool text = !media.empty() && media.size() == cidl && media.size() <= 100 &&
                 std::all_of(media.begin(), media.end(), [](const MediaItem& i) { return !i.folder && notepad_text_file(i.path); });
-    UINT id = track(hwnd, cm.get(), m, pt, [&] { return item_flyout(hwnd, cm.get(), m, pt, folder, offer, picture, text); });
-    if (id == kFlyNotepad) {
+    std::vector<std::wstring> paths;
+    for (auto& i : media) paths.push_back(i.path);
+    bool synced = sync_paths_synced(paths);
+    UINT id = track(hwnd, cm.get(), m, pt, [&] { return item_flyout(hwnd, cm.get(), m, pt, folder, offer, picture, text, synced); });
+    if (id == kFlySyncNow) {
+        sync_now_for(paths);
+    } else if (id == kFlyNotepad) {
         std::vector<std::wstring> files;
         for (auto& i : media) files.push_back(i.path);
         notepad_open(files);

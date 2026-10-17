@@ -262,6 +262,7 @@ static HMENU build_more_menu() {
     AppendMenuW(m, MF_STRING, IDM_PLAYER, L"Player");
     AppendMenuW(m, MF_STRING, IDM_SCREENSHOT, L"Take a screenshot\tAlt+Q");
     AppendMenuW(m, MF_STRING, IDM_MEDIA_TYPES, L"Media file types...");
+    AppendMenuW(m, MF_STRING, IDM_SYNC_FOLDERS, L"Sync folders...");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_VIEW_CMDBAR, L"Hide command bar");   // back into the nav row's "..."
     return m;
@@ -349,6 +350,7 @@ void cmdbar_show_tools() {
     item(IDM_PLAYER, L"Pla&yer", L'\xE768');
     item(IDM_SCREENSHOT, L"Take a &screenshot", L'\xE722', L"Alt+Q");
     item(IDM_MEDIA_TYPES, L"&Media file types...", L'\xE8B9');
+    item(IDM_SYNC_FOLDERS, L"Sync fo&lders...", L'\xE895');
     UINT id = flyout_track(g_main, pt, row, list);
     DestroyMenu(sort);
     DestroyMenu(view);

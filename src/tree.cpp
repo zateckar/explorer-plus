@@ -13,6 +13,7 @@
 #include <mutex>
 #include <thread>
 #include "workers.h"
+#include "sync_ui.h"
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -764,6 +765,13 @@ void initialize_tree(HWND tree) {
             CoTaskMemFree(od);
         }
     }
+    // sync folders (docs/sync-plan.md), beside OneDrive
+    for (auto& [name, root] : sync_roots())
+        if (PathIsDirectoryW(root.c_str()))
+            if (PIDLIST_ABSOLUTE abs = parse_shell(root.c_str())) {
+                NodeInfo n = describe(abs, true);
+                insert_node(tree, TVI_ROOT, n);
+            }
     // pinned Quick access folders: the cached ones first, then the current ones
     s_pinsAfter = TreeView_GetRoot(tree);
     for (HTREEITEM n; s_pinsAfter && (n = TreeView_GetNextSibling(tree, s_pinsAfter));) s_pinsAfter = n;
