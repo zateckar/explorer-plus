@@ -28,8 +28,9 @@ versions / restore / re-encryption, S3 against an in-process mock, Azure DevOps 
 env variables are set), `tools/sync_test.py` (three devices through the agents, over a
 Folder store and Azure DevOps) and `explorer-plus-sync-tests --bench` ("Benchmark" below).
 
-Not built: phase 7 (each item "later, on its own", by decision). The independent review of
-the cryptography is in [sync-review.md](sync-review.md) on its own branch until it merges.
+Deferred, out of this plan's scope (decided 2026-10-17): phase 7, each item "later, on its
+own". The independent review of the cryptography is in [sync-review.md](sync-review.md) on
+its own branch until it merges.
 
 *Recovery key, as built*: the Sync folders window keeps the recovery key it shows (or the
 one typed to unlock this PC) in Credential Manager beside the key ring. "Show recovery
