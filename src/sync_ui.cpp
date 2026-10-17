@@ -1,4 +1,5 @@
 #include "sync_ui.h"
+#include "credstore.h"
 #include "crypto.h"
 #include "resource.h"
 #include "sync_agent.h"
@@ -7,6 +8,7 @@
 #include "sync_ipc.h"
 #include "theme.h"
 #include <commctrl.h>
+#include <wincred.h>
 #include <dwmapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
@@ -680,12 +682,50 @@ void save_text(HWND owner, const std::wstring& name, const std::wstring& s) {
 // ------------------------------------------------------------------
 // the pages
 // ------------------------------------------------------------------
-enum { ID_COPY = 10, ID_SAVE, ID_TEST, ID_ADD, ID_REMOVE, ID_PAUSE, ID_SYNCNOW, ID_DEVICES, ID_ADDDEV, ID_REMOVEDEV, ID_NEWREC, ID_EDIT, ID_REENC };
+enum { ID_COPY = 10, ID_SAVE, ID_TEST, ID_ADD, ID_REMOVE, ID_PAUSE, ID_SYNCNOW, ID_DEVICES, ID_ADDDEV, ID_REMOVEDEV, ID_NEWREC, ID_EDIT, ID_REENC,
+       ID_SHOWREC };
 
-// A code to write down. recovery: the recovery key, typed back once before the form closes.
-void show_code(HWND owner, const std::string& code, bool recovery) {
+// The recovery key as last shown on this PC, for "Show recovery key" (behind a Windows
+// sign-in): in Credential Manager like the key ring itself, "<code>\t<FILETIME>".
+const wchar_t* kRecoveryCred = L"recovery-key";
+
+// Windows asks for this account's password (or PIN / smart card); true once it's verified
+bool windows_sign_in(HWND owner, const wchar_t* why) {
+    wchar_t user[256] = L"";
+    DWORD n = ARRAYSIZE(user);
+    GetUserNameW(user, &n);
+    CREDUI_INFOW ui{ sizeof(ui), owner, L"Show recovery key", why, nullptr };
+    for (DWORD err = 0;;) {
+        ULONG pkg = 0, outSize = 0;
+        LPVOID out = nullptr;
+        BOOL save = FALSE;
+        DWORD r = CredUIPromptForWindowsCredentialsW(&ui, err, &pkg, nullptr, 0, &out, &outSize, &save, CREDUIWIN_ENUMERATE_CURRENT_USER);
+        if (r != ERROR_SUCCESS) return false;                  // cancelled
+        wchar_t name[514] = L"", domain[256] = L"", pass[512] = L"";
+        DWORD nn = ARRAYSIZE(name), dn = ARRAYSIZE(domain), pn = ARRAYSIZE(pass);
+        BOOL unpacked = CredUnPackAuthenticationBufferW(0, out, outSize, name, &nn, domain, &dn, pass, &pn);
+        SecureZeroMemory(out, outSize);
+        CoTaskMemFree(out);
+        HANDLE tok = nullptr;
+        bool ok = unpacked && LogonUserW(name, dn > 1 ? domain : nullptr, pass, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, &tok);
+        SecureZeroMemory(pass, sizeof(pass));
+        if (tok) CloseHandle(tok);
+        if (ok) return true;
+        err = ERROR_LOGON_FAILURE;                             // asked again, with "incorrect" shown
+    }
+}
+
+// A code to write down. recovery: the recovery key, typed back once before the form closes
+// (`again`: shown once more, from what this PC kept; nothing to type back).
+void show_code(HWND owner, const std::string& code, bool recovery, bool again = false) {
     Form f;
     std::wstring shown = w16(crypto::format_code(code));
+    if (recovery && !again) {
+        FILETIME now;
+        GetSystemTimeAsFileTime(&now);
+        uint64_t t = ((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime;
+        credstore::put_text(kRecoveryCred, w16(crypto::normalize_code(code)) + L"\t" + std::to_wstring(t));
+    }
     if (recovery) {
         f.title = L"Recovery key";
         f.heading = L"Your recovery key";
@@ -703,7 +743,7 @@ void show_code(HWND owner, const std::string& code, bool recovery) {
     c.kind = F_CODE;
     c.value = shown;
     f.fields.push_back(c);
-    if (recovery) {
+    if (recovery && !again) {
         FField a;
         a.key = L"again";
         a.label = L"Type it again, to be sure it's written down right";
@@ -711,14 +751,14 @@ void show_code(HWND owner, const std::string& code, bool recovery) {
     }
     f.buttons = { { ID_COPY, L"Copy", true } };
     if (recovery) f.buttons.push_back({ ID_SAVE, L"Save as...", true });
-    f.buttons.push_back({ IDOK, recovery ? L"Done" : L"Close" });
+    f.buttons.push_back({ IDOK, recovery && !again ? L"Done" : L"Close" });
     f.onButton = [&](Form& f, int id) {
         if (id == ID_COPY) { copy_text(f.wnd, shown); return false; }
         if (id == ID_SAVE) {
             save_text(f.wnd, L"Explorer Plus recovery key", L"Explorer Plus sync - recovery key\r\n\r\n" + shown + L"\r\n");
             return false;
         }
-        if (!recovery) return true;
+        if (!recovery || again) return true;
         if (id == IDOK) {
             std::string typed = crypto::normalize_code(u8(f.get(L"again")));
             if (!typed.empty() && typed == crypto::normalize_code(code)) return true;
@@ -760,7 +800,14 @@ bool unlock_form(HWND owner, const std::string& pairId, const std::wstring& name
         q.push_back({ "pair", pairId });
         q.push_back({ "mode", u8(f.get(L"mode")) });
         q.push_back({ "code", u8(f.get(L"code")) });
-        return agent_ok(f, q, r, f.title.c_str());
+        if (!agent_ok(f, q, r, f.title.c_str())) return false;
+        if (f.get(L"mode") == L"recovery") {                  // (it works: kept for Show recovery key)
+            FILETIME now;
+            GetSystemTimeAsFileTime(&now);
+            uint64_t t = ((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime;
+            credstore::put_text(kRecoveryCred, w16(crypto::normalize_code(u8(f.get(L"code")))) + L"\t" + std::to_wstring(t));
+        }
+        return true;
     };
     return run_form(owner, f) == IDOK;
 }
@@ -967,7 +1014,7 @@ void devices_form(HWND owner, const syncconf::Pair& pair) {
     f.columns = { L"Device", L"Added", L"" };
     f.widths = { 500, 300, 200 };
     f.buttons = { { ID_ADDDEV, L"Add a device...", true }, { ID_REMOVEDEV, L"Remove device", true }, { ID_NEWREC, L"New recovery key", true },
-                  { ID_REENC, L"Re-encrypt files", true }, { IDCANCEL, L"Close" } };
+                  { ID_SHOWREC, L"Show recovery key...", true }, { ID_REENC, L"Re-encrypt files", true }, { IDCANCEL, L"Close" } };
     std::vector<DeviceRow> devs;
     // every synced file uploaded again under the current keys, sync folder by sync folder
     auto reencrypt = [&](Form& f) {
@@ -1038,6 +1085,26 @@ void devices_form(HWND owner, const syncconf::Pair& pair) {
                     reencrypt(f);
             }
             reload(f);
+        } else if (id == ID_SHOWREC) {
+            std::wstring kept = credstore::get_text(kRecoveryCred);
+            size_t tab = kept.find(L'\t');
+            if (tab == std::wstring::npos) {
+                MessageBoxW(f.wnd, L"This PC doesn't have your recovery key: it was made on another of your devices (or before this "
+                                   L"version kept it). Show it there, or make a new one here with New recovery key.",
+                            f.title.c_str(), MB_OK | MB_ICONINFORMATION);
+                return false;
+            }
+            if (!windows_sign_in(f.wnd, L"Sign in with your Windows account to see your sync recovery key.")) return false;
+            uint64_t t = wcstoull(kept.c_str() + tab + 1, nullptr, 10);
+            FILETIME ft{ (DWORD)t, (DWORD)(t >> 32) }, lt;
+            SYSTEMTIME st{};
+            wchar_t date[64] = L"";
+            if (FileTimeToLocalFileTime(&ft, &lt) && FileTimeToSystemTime(&lt, &st))
+                GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_LONGDATE, &st, nullptr, date, ARRAYSIZE(date), nullptr);
+            MessageBoxW(f.wnd, (L"The recovery key this PC showed last, on " + std::wstring(date) + L".\n\nIf another of your devices made a new one "
+                                L"since (New recovery key, or removing a device), that one is the key that works.").c_str(),
+                        f.title.c_str(), MB_OK | MB_ICONINFORMATION);
+            show_code(f.wnd, u8(kept.substr(0, tab)), true, true);
         } else if (id == ID_REENC) {
             if (MessageBoxW(f.wnd, L"Upload every synced file again under the current keys?\n\nUse it after removing a device: what's on the "
                                    L"storage from before stays readable with that device's old keys until then.",

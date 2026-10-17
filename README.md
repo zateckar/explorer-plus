@@ -80,7 +80,8 @@ contents, file and folder names, times. The storage (and anyone who gets into it
 scrambled names and data, how big the files are and how the folders nest; it can't read a file or
 change one unnoticed. The keys never leave your devices. Nobody, Explorer Plus included,
 can open your files without either one of your devices or your **recovery key**: 15
-letters and digits shown once when you set up the first sync folder. Write it down. A
+letters and digits shown when you set up the first sync folder. Write it down. "Devices and
+keys" ▸ "Show recovery key..." shows it again after you sign in with your Windows account. A
 storage can still delete files or withhold new ones, and it sees when you sync. The formats
 are in [docs/sync-format.md](docs/sync-format.md).
 

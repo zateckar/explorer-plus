@@ -28,9 +28,14 @@ versions / restore / re-encryption, S3 against an in-process mock, Azure DevOps 
 env variables are set), `tools/sync_test.py` (three devices through the agents, over a
 Folder store and Azure DevOps) and `explorer-plus-sync-tests --bench` ("Benchmark" below).
 
-Not built: the Windows sign-in prompt before showing the recovery key (it isn't kept, so
-it can't be shown again: only "New recovery key"), and phase 7 (each item "later, on its
-own"). The independent review of the cryptography is under way.
+Not built: phase 7 (each item "later, on its own", by decision). The independent review of
+the cryptography is in [sync-review.md](sync-review.md) on its own branch until it merges.
+
+*Recovery key, as built*: the Sync folders window keeps the recovery key it shows (or the
+one typed to unlock this PC) in Credential Manager beside the key ring. "Show recovery
+key..." in Devices and keys shows it again after a Windows sign-in prompt
+(`CredUIPromptForWindowsCredentials`, checked with `LogonUser`), with the date it was kept:
+another device may have made a newer one since. Nothing goes through the agent's pipe.
 
 ### Benchmark
 

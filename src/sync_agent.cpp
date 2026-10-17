@@ -799,6 +799,7 @@ int sync_cli_main(const std::vector<std::wstring>& args) {
         if (syncipc::agent_running()) { out("error=quit the agent first\n"); return 1; }
         for (auto& p : syncconf::load()) syncconf::forget_secrets(p.id);
         synckeys::credential_key_store()->forget();
+        credstore::erase(L"recovery-key");                    // (kept by the UI for Show recovery key)
         out("ok=1\n");
         return 0;
     }
