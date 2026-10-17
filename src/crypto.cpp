@@ -116,8 +116,11 @@ void xchacha20(const Key& k, const uint8_t nonce[kNonce], const uint8_t* in, uin
 Argon2Params argon2_default() {
     Argon2Params p;
     wchar_t buf[32];
-    // tests only: the parameters travel with each wrap, so smaller ones stay readable
-    if (GetEnvironmentVariableW(L"EXPLORERPLUS_SYNC_KDF_KIB", buf, 32) > 0) {
+    // tests only, and only with a settings file of their own (EXPLORERPLUS_SETTINGS): the
+    // parameters travel with each wrap, so smaller ones stay readable, but a stray variable
+    // must not weaken a real recovery wrap or pairing grant
+    if (GetEnvironmentVariableW(L"EXPLORERPLUS_SETTINGS", nullptr, 0) > 0 &&
+        GetEnvironmentVariableW(L"EXPLORERPLUS_SYNC_KDF_KIB", buf, 32) > 0) {
         long v = wcstol(buf, nullptr, 10);
         if (v >= 8) p.memKiB = (uint32_t)v;
         p.passes = 1;
@@ -125,17 +128,20 @@ Argon2Params argon2_default() {
     return p;
 }
 
-Key argon2id(std::string_view pass, const uint8_t* salt, size_t saltLen, const Argon2Params& p) {
-    Key out;
+bool argon2_params_ok(const Argon2Params& p) {
+    return p.memKiB >= 8 && p.memKiB <= kArgon2MaxKiB && p.passes >= 1 && p.passes <= kArgon2MaxPasses;
+}
+
+bool argon2id(std::string_view pass, const uint8_t* salt, size_t saltLen, const Argon2Params& p, Key& out) {
     uint32_t blocks = std::max<uint32_t>(p.memKiB, 8);
     void* work = VirtualAlloc(nullptr, (SIZE_T)blocks * 1024, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!work) std::abort();
+    if (!work) return false;                             // not enough memory: the caller says so
     crypto_argon2_config cfg{ CRYPTO_ARGON2_ID, blocks, std::max<uint32_t>(p.passes, 1), 1 };
     crypto_argon2_inputs in{ (const uint8_t*)pass.data(), salt, (uint32_t)pass.size(), (uint32_t)saltLen };
     crypto_argon2(out.data(), 32, work, cfg, in, crypto_argon2_no_extras);
     crypto_wipe(work, (size_t)blocks * 1024);
     VirtualFree(work, 0, MEM_RELEASE);
-    return out;
+    return true;
 }
 
 // ------------------------------------------------------------------ X25519
@@ -144,6 +150,25 @@ Key x25519_shared(const Key& secret, const Key& peerPublic) {
     Key s;
     crypto_x25519(s.data(), secret.data(), peerPublic.data());
     return s;
+}
+
+// ------------------------------------------------------------------ EdDSA
+void eddsa_public(const Key& seed, Key& pub) {
+    uint8_t sk[64], s[32];
+    std::memcpy(s, seed.data(), 32);                     // crypto_eddsa_key_pair wipes the seed it's given
+    crypto_eddsa_key_pair(sk, pub.data(), s);
+    crypto_wipe(sk, 64);
+}
+void eddsa_sign(const Key& seed, const void* msg, size_t n, uint8_t sig[kSig]) {
+    uint8_t sk[64], s[32];
+    Key pub;
+    std::memcpy(s, seed.data(), 32);
+    crypto_eddsa_key_pair(sk, pub.data(), s);
+    crypto_eddsa_sign(sig, sk, (const uint8_t*)msg, n);
+    crypto_wipe(sk, 64);
+}
+bool eddsa_check(const Key& pub, const void* msg, size_t n, const uint8_t sig[kSig]) {
+    return crypto_eddsa_check(sig, pub.data(), (const uint8_t*)msg, n) == 0;
 }
 
 // ------------------------------------------------------------------ SHA-256 (BCrypt)
@@ -339,15 +364,44 @@ bool self_test(std::string* failed) {
     if (hex(apub.b) != "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a") return fail("x25519 public");
     Key shared = x25519_shared(ak, bk);
     if (hex(shared.b) != "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742") return fail("x25519");
-    // AEAD: round trip, and a flipped bit fails
+    // XChaCha20-Poly1305 (draft-irtf-cfrg-xchacha-03, A.3.1)
     Key k;
     for (int i = 0; i < 32; ++i) k.b[i] = (uint8_t)(0x80 + i);
     uint8_t nonce[kNonce];
     for (int i = 0; i < 24; ++i) nonce[i] = (uint8_t)(0x40 + i);
+    {
+        const char* pt = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+        Bytes ad;
+        unhex("50515253c0c1c2c3c4c5c6c7", ad);
+        Bytes x = aead_lock(k, nonce, ad.data(), ad.size(), pt, std::strlen(pt));
+        if (hex(x.data(), 16) != "bd6d179d3e83d43b9576579493c0e939" ||
+            hex(x.data() + x.size() - 16, 16) != "c0875924c1c7987947deafd8780acf49") return fail("xchacha20-poly1305");
+    }
+    // Argon2id (RFC 9106, 5.3)
+    {
+        uint8_t pass[32], salt[16], secret[8], adata[12], out[32];
+        std::memset(pass, 1, 32); std::memset(salt, 2, 16); std::memset(secret, 3, 8); std::memset(adata, 4, 12);
+        std::vector<uint8_t> work(32 * 1024);
+        crypto_argon2_config cfg{ CRYPTO_ARGON2_ID, 32, 3, 4 };
+        crypto_argon2_inputs in{ pass, salt, 32, 16 };
+        crypto_argon2_extras ex{ secret, adata, 8, 12 };
+        crypto_argon2(out, 32, work.data(), cfg, in, ex);
+        if (!eq_hex(out, 32, "0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659")) return fail("argon2id");
+    }
+    // AEAD: round trip, and a flipped bit fails
     Bytes c = aead_lock(k, nonce, "ad", 2, "hello", 5), p;
     if (!aead_unlock(k, nonce, "ad", 2, c.data(), c.size(), p) || p != Bytes{ 'h', 'e', 'l', 'l', 'o' }) return fail("aead");
     c[0] ^= 1;
     if (aead_unlock(k, nonce, "ad", 2, c.data(), c.size(), p)) return fail("aead forgery");
+    // EdDSA: a signature checks, a changed message or key doesn't
+    {
+        Key pub, other;
+        uint8_t sig[kSig];
+        eddsa_public(k, pub);
+        eddsa_sign(k, "msg", 3, sig);
+        eddsa_public(ak, other);
+        if (!eddsa_check(pub, "msg", 3, sig) || eddsa_check(pub, "msh", 3, sig) || eddsa_check(other, "msg", 3, sig)) return fail("eddsa");
+    }
     return true;
 }
 

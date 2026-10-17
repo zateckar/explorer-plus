@@ -30,8 +30,14 @@ Folder store and Azure DevOps) and `explorer-plus-sync-tests --bench` ("Benchmar
 
 Deferred, out of this plan's scope (decided 2026-10-17): phase 7, each item "later, on its
 own", except two asked for on 2026-10-18: Azure DevOps over its REST API (built) and the
-signed per-vault manifest. The independent review of the cryptography is in [sync-review.md](sync-review.md) on
-its own branch until it merges.
+signed per-vault manifest.
+
+The independent review of the cryptography is in [sync-review.md](sync-review.md). Its
+clear-cut findings are fixed. S1 and S2 (a removed device that keeps write access to the
+storage) are fixed as far as the format allows: a member list in the ring, device-signed
+key objects, and a note of retired key versions. A short window remains until each device
+has caught up with the removal, so a removal should still come with revoking that device's
+storage credentials.
 
 *Recovery key, as built*: the Sync folders window keeps the recovery key it shows (or the
 one typed to unlock this PC) in Credential Manager beside the key ring. "Show recovery
@@ -349,9 +355,11 @@ with another person later by wrapping its key for them.
 On the device, the key ring and the device's private key are kept in Credential Manager
 (`CRED_PERSIST_LOCAL_MACHINE`, DPAPI-protected under the Windows account; never
 `ENTERPRISE`, which would roam), with names that include the settings folder hash (test
-isolation). Keys in memory sit in `VirtualLock`ed pages, are wiped with `crypto_wipe`, and
-are left out of crash minidumps through `MiniDumpWriteDump`'s callback (`crash.cpp`). No
-secret goes into logs, perf events or IPC (except the explicit "show recovery key").
+isolation). Keys in memory are wiped with `crypto_wipe`. Keeping them in `VirtualLock`ed
+pages and out of crash minidumps (`MiniDumpWriteDump`'s callback, `crash.cpp`) is planned
+but not built yet *(review I1)*. No secret goes into logs or perf events. The agent's pipe
+carries codes (a new pairing code, the code typed to unlock, a new recovery key) to the
+current user's processes only *(review I4)*.
 Later option: wrap the ring with a TPM-bound key (NCrypt Platform Crypto Provider) or gate
 it behind Windows Hello.
 
@@ -372,8 +380,9 @@ from the engine, and encrypted names never start with `.` so nothing collides wi
   (it can't MAC one) or learn device names.
 - `.ep-vault/pair/<id>`: a short-lived pairing grant (below), deleted once used or after
   15 minutes.
-- `.ep-vault/head`: the change marker, a small encrypted counter every device bumps after a
-  pass that changed something. Other devices poll only this object, with a conditional GET
+- `.ep-vault/head`: the change marker, 16 random bytes every device rewrites after a pass
+  that changed something (not authenticated: the storage could move it, but it can
+  withhold changes anyway). Other devices poll only this object, with a conditional GET
   (`If-None-Match` its ETag → `304 Not Modified`): one tiny request per poll, and the full
   listing only when it moved. (git backends don't need it: `ls-remote` does the same.)
 
@@ -512,6 +521,13 @@ edited a file before it saw the re-encryption gets no conflict: the stored finge
 matches what it last synced, so its base takes the new rev and its edit goes up. Old
 ciphertext stays in git history and in S3 versions: the removed device can read those as
 long as it can reach them.
+
+*(Review, [sync-review.md](sync-review.md) S1 and S2: revoking those credentials is not
+optional. A removed device that can still write to the storage can forge a hand-over to a
+device that hasn't taken its own yet, plant a device record in a vault not yet upgraded,
+and write files under the older key versions that the remaining devices accept. Members
+and signatures now close that for every device that has caught up with the removal; the
+review lists what stays open until then.)*
 
 ### Effects on the rest of the design
 

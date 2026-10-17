@@ -57,23 +57,29 @@ static void meta_decode(const uint8_t in[kMetaPlain], Meta& m) {
 // ------------------------------------------------------------------ encrypt
 EncryptingSource::EncryptingSource(sync::ByteSource& plain, const Key& vk, uint32_t vkVersion, const Meta& meta,
                                    const uint8_t* fixedSalt)
-    : m_plain(plain) {
+    : m_plain(plain), m_vk(vk), m_vkVersion(vkVersion), m_meta(meta), m_fixedSalt(fixedSalt != nullptr) {
     m_plainSize = meta.size;
     m_chunks = chunks_for(m_plainSize);
     m_total = cipher_size(m_plainSize);
+    if (fixedSalt) std::memcpy(m_head + 12, fixedSalt, 32);
+    start();
+}
+
+// the header and meta block of one pass: a new salt each time (unless fixed), so a retried
+// upload of a file that changed meanwhile never reuses a (key, nonce) pair
+void EncryptingSource::start() {
     uint8_t* h = m_head;
     std::memcpy(h, "EPSF", 4);
     h[4] = (uint8_t)kFormat;
     h[5] = 16;                                            // chunk size log2
     h[6] = h[7] = 0;
-    put32(h + 8, vkVersion);
-    if (fixedSalt) std::memcpy(h + 12, fixedSalt, 32);
-    else crypto::random(h + 12, 32);
+    put32(h + 8, m_vkVersion);
+    if (!m_fixedSalt) crypto::random(h + 12, 32);
     std::memset(h + 44, 0, 4);
     Key mk;
-    file_keys(vk, h + 12, mk, m_data);
+    file_keys(m_vk, h + 12, mk, m_data);
     uint8_t* mb = h + kHeader;
-    meta_encode(meta, mb);
+    meta_encode(m_meta, mb);
     uint8_t nonce[crypto::kNonce] = {};
     crypto::aead_lock_into(mk, nonce, h, kHeader, mb, kMetaPlain, mb + kMetaPlain);
     m_buf.assign(m_head, m_head + kPrefix);
@@ -86,8 +92,8 @@ bool EncryptingSource::rewind() {
     m_next = 0;
     m_emitted = 0;
     m_bufPos = 0;
-    m_buf.assign(m_head, m_head + kPrefix);
     m_failed = false;
+    start();
     return true;
 }
 

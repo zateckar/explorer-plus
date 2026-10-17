@@ -89,7 +89,10 @@ are in [docs/sync-format.md](docs/sync-format.md).
 up, "Devices and keys" ▸ "Add a device" shows one (valid 15 minutes), or type the recovery
 key. **Removing a device** makes new keys it never gets, and a new recovery key; "Re-encrypt
 files" then uploads everything again under the new keys (what the device could already read
-stays readable to it in the storage's history: revoke its token too).
+stays readable to it in the storage's history). First revoke the storage access that device
+had (its S3 key, its PAT): a removed device that can still write to the storage can get
+around the removal. A **new recovery key** also makes new keys, so the old one opens only
+what was written before.
 
 Storage:
 
@@ -167,7 +170,7 @@ Environment variables (diagnostics and tests):
 | `EXPLORERPLUS_SETTINGS=<file>` | use another settings file |
 | `EXPLORERPLUS_THEME=light\|dark` | override the Windows theme |
 | `EXPLORERPLUS_PERF=<log file>` | write timing events (startup, listings, paints, slow UI messages) |
-| `EXPLORERPLUS_SYNC_KDF_KIB=<KiB>` | tests: a cheaper Argon2id for sync codes |
+| `EXPLORERPLUS_SYNC_KDF_KIB=<KiB>` | tests: a cheaper Argon2id for sync codes (only with `EXPLORERPLUS_SETTINGS`) |
 | `EXPLORERPLUS_SYNC_TRASH=1` | tests: sync keeps deleted files in its own folder, not the Recycle Bin |
 | `EXPLORERPLUS_AZDO_TEST_URL`, `_PAT` | sync tests: run the Azure DevOps end-to-end tests against this repository |
 

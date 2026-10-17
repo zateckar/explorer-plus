@@ -18,6 +18,12 @@
 //
 // Codes (pairing, recovery) are 15 Crockford Base32 characters; Argon2id turns them into
 // keys, and they never touch the storage.
+//
+// Members: the ring lists the user's devices (ID, X25519 and EdDSA public keys). Vault
+// objects, device records and rotation hand-overs are signed by the device that wrote them;
+// a signer that isn't a member, or was removed, is refused. A device becomes a member by
+// pairing (it adds itself), or when a member reads its record sealed under the member's
+// current generation (which a removed device never has). A hand-over goes to members only.
 namespace synckeys {
 
 using sync::Result;
@@ -25,24 +31,32 @@ using sync::Status;
 
 struct Ring {
     struct Gen { uint32_t gen = 0; crypto::Key umk; };
+    // a device of the user's: only members hand over and receive new generations, sign
+    // vault objects and device records that are believed
+    struct Member { std::string id; crypto::Key xpub, spub; };
     std::vector<Gen> gens;                   // ascending; back() is current
     uint8_t recSalt[16]{};                   // the recovery key's Argon2id salt, parameters, result
     crypto::Argon2Params recParams;
     crypto::Key recKek;
     std::vector<std::string> removed;        // device IDs removed (their records go, they get no new generation)
+    std::vector<Member> members;
     bool empty() const { return gens.empty(); }
     const Gen& current() const { return gens.back(); }
     const Gen* find(const std::string& umkId) const;
+    const Member* member(const std::string& id) const;
+    bool is_removed(const std::string& id) const;
     crypto::Bytes serialize() const;
     bool parse(const crypto::Bytes& b);
 };
 std::string umk_id(const crypto::Key& umk);  // 16 hex: which UMK a vault needs
 
 struct DeviceKey {
-    crypto::Key secret, pub;
+    crypto::Key secret, pub;                 // X25519
+    crypto::Key spub;                        // EdDSA, from the seed KDF(secret, "ep sign")
     std::string id;                          // 16 hex of BLAKE2b(pub)
     std::wstring name;
     bool valid() const { return !id.empty(); }
+    Ring::Member member() const { return { id, pub, spub }; }
 };
 DeviceKey new_device_key(const std::wstring& name);
 
@@ -70,6 +84,7 @@ struct Vault {
     std::string id;                          // 32 hex
     uint32_t current = 0;                    // VK version new uploads and names use
     std::map<uint32_t, crypto::Key> vks;
+    std::string rev;                         // the vault object's revision when it was read (not stored)
     bool key(uint32_t version, crypto::Key& out) const {
         auto f = vks.find(version);
         if (f == vks.end()) return false;
@@ -91,7 +106,22 @@ struct DeviceInfo {
 //   a vault the ring can't open: Locked (pair this device first)
 // Also: registers this device in the vault, takes a new ring generation handed to this
 // device (rotation), and moves the vault to the current generation when it's behind.
-Result open_vault(sync::Backend& raw, KeyStore& ks, bool create, Vault& out, sync::Progress& prog);
+//
+// pin: what this device saw of the pair's vault before (kept beside the pair's state).
+// A vault with another ID (the storage swapped in another of the user's vaults), or sealed
+// under an older generation, or with fewer key versions (an old copy brought back), is
+// refused as Tampered; on success the pin is updated (the caller saves it).
+// A vault object signed by a device that has since been removed is taken only when it's
+// the very object this device took before (hash): the removed device wrote it while it was
+// a member, and opening it now moves the vault on, signed by this device.
+struct VaultPin {
+    std::string id;                          // empty: nothing seen yet (trust on first use)
+    uint32_t gen = 0, version = 0;           // highest UMK generation and vault key version seen
+    std::string hash;                        // BLAKE2b of the vault object last taken (hex)
+    bool load(const std::wstring& file);
+    bool save(const std::wstring& file) const;
+};
+Result open_vault(sync::Backend& raw, KeyStore& ks, bool create, Vault& out, sync::Progress& prog, VaultPin* pin = nullptr);
 
 // "Add a device": a pairing grant in the vault (the ring under Argon2id(code)), valid 15
 // minutes; the code is returned for display.
@@ -107,14 +137,16 @@ Result list_devices(sync::Backend& raw, KeyStore& ks, std::vector<DeviceInfo>& o
 Result remove_device(sync::Backend& raw, KeyStore& ks, const std::string& deviceId, std::string& newRecoveryCode,
                      sync::Progress& prog);
 
-// "New recovery key": a new code for the ring (shown once); every vault this device then
-// opens or refreshes carries the new recovery wrap (the old code keeps opening vaults not
-// yet refreshed)
+// "New recovery key": a new code for the ring (shown once) and a new UMK generation;
+// every vault this device then opens or refreshes moves to that generation (a new vault
+// key version, hand-overs for the other devices) and carries the new recovery wrap. The
+// old code keeps opening old copies of vaults, and with them what was written before.
 Result new_recovery_key(KeyStore& ks, std::string& code);
 Result refresh_vault_recovery(sync::Backend& raw, KeyStore& ks, sync::Progress& prog);
 
 // the reserved folder on the store
 constexpr wchar_t kVaultDir[] = L".ep-vault";
+constexpr wchar_t kVaultFileRel[] = L".ep-vault/vault";
 inline bool is_vault_path(const sync::RelPath& p) {
     return p.compare(0, 9, kVaultDir) == 0 && (p.size() == 9 || p[9] == L'/');
 }

@@ -60,8 +60,24 @@ static void test_vectors() {
     {
         uint8_t s1[16] = { 1 }, s2[16] = { 2 };
         crypto::Argon2Params p{ 64, 1 };
-        CHECK(crypto::argon2id("ABCDE", s1, 16, p) == crypto::argon2id("ABCDE", s1, 16, p));
-        CHECK(!(crypto::argon2id("ABCDE", s1, 16, p) == crypto::argon2id("ABCDE", s2, 16, p)));
+        crypto::Key a, b, c;
+        CHECK(crypto::argon2id("ABCDE", s1, 16, p, a) && crypto::argon2id("ABCDE", s1, 16, p, b) &&
+              crypto::argon2id("ABCDE", s2, 16, p, c));
+        CHECK(a == b && !(a == c));
+        // parameters from the storage: a planted wrap can't ask for terabytes or hours
+        CHECK(crypto::argon2_params_ok(crypto::Argon2Params{}));
+        CHECK(!crypto::argon2_params_ok(crypto::Argon2Params{ 0xFFFFFFFFu, 3 }));
+        CHECK(!crypto::argon2_params_ok(crypto::Argon2Params{ 256 * 1024, 1000 }));
+        CHECK(!crypto::argon2_params_ok(crypto::Argon2Params{ 4, 1 }));
+        // the test-only cost needs the test's own settings file
+        wchar_t keep[MAX_PATH] = {};
+        GetEnvironmentVariableW(L"EXPLORERPLUS_SETTINGS", keep, MAX_PATH);
+        SetEnvironmentVariableW(L"EXPLORERPLUS_SYNC_KDF_KIB", L"64");
+        CHECK(crypto::argon2_default().memKiB == 64);
+        SetEnvironmentVariableW(L"EXPLORERPLUS_SETTINGS", nullptr);
+        CHECK(crypto::argon2_default().memKiB == 256 * 1024 && crypto::argon2_default().passes == 3);
+        SetEnvironmentVariableW(L"EXPLORERPLUS_SETTINGS", keep);
+        SetEnvironmentVariableW(L"EXPLORERPLUS_SYNC_KDF_KIB", nullptr);
     }
     // SigV4 signing key (AWS docs, "Examples of how to derive a signing key")
     {
@@ -164,6 +180,35 @@ static void test_file_format() {
     // the same content twice: different bytes (fresh salt)
     std::vector<uint8_t> p(1000, 'x');
     CHECK(encrypt_all(p, vk, 3) != encrypt_all(p, vk, 3));
+    // a retried upload (rewind) of a file that changed meanwhile: a new salt, so no
+    // (key, nonce) pair encrypts two different plaintexts; a fixed salt (tests) repeats
+    {
+        auto pass = [](cfile::EncryptingSource& e) {
+            std::vector<uint8_t> out(e.size());
+            size_t got = 0;
+            CHECK(e.read(out.data(), out.size(), &got) && got == out.size());
+            return out;
+        };
+        VecSource src;
+        src.d.assign(70000, 'a');
+        cfile::Meta m;
+        m.size = src.d.size();
+        cfile::EncryptingSource e(src, vk, 3, m);
+        auto first = pass(e);
+        src.d.assign(70000, 'b');                                  // same size, new content
+        CHECK(e.rewind());
+        auto second = pass(e);
+        CHECK(!std::equal(first.begin() + 12, first.begin() + 44, second.begin() + 12));   // the salt
+        std::vector<uint8_t> q;
+        CHECK(decrypt_all(first, vk, q).ok() && q == std::vector<uint8_t>(70000, 'a'));
+        CHECK(decrypt_all(second, vk, q).ok() && q == std::vector<uint8_t>(70000, 'b'));
+        uint8_t salt[32] = { 9 };
+        src.rewind();
+        cfile::EncryptingSource f(src, vk, 3, m, salt);
+        auto a = pass(f);
+        CHECK(f.rewind());
+        CHECK(pass(f) == a);
+    }
     // known answer: fixed key + salt gives fixed bytes forever (format v1 is frozen)
     {
         crypto::Key fk;

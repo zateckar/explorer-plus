@@ -177,13 +177,16 @@ void Server::loop() {
     // the current user only, no network clients
     std::wstring sddl = L"D:P(A;;GA;;;" + std::wstring(user_sid()) + L")";
     SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, FALSE };
-    ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sa.lpSecurityDescriptor, nullptr);
+    // no descriptor (the user's SID couldn't be read): no pipe, rather than the default
+    // one, which lets every local account read it
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sa.lpSecurityDescriptor, nullptr))
+        return;
     bool first = true;
     while (WaitForSingleObject(m_stop, 0) != WAIT_OBJECT_0) {
         HANDLE p = CreateNamedPipeW(pipe_name().c_str(),
                                     PIPE_ACCESS_DUPLEX | (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0),
                                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                                    PIPE_UNLIMITED_INSTANCES, 64 * 1024, 64 * 1024, 0, sa.lpSecurityDescriptor ? &sa : nullptr);
+                                    PIPE_UNLIMITED_INSTANCES, 64 * 1024, 64 * 1024, 0, &sa);
         if (p == INVALID_HANDLE_VALUE) { Sleep(200); continue; }
         first = false;
         BOOL connected = ConnectNamedPipe(p, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED;
@@ -208,7 +211,7 @@ void Server::loop() {
                               }),
                               done });
     }
-    if (sa.lpSecurityDescriptor) LocalFree(sa.lpSecurityDescriptor);
+    LocalFree(sa.lpSecurityDescriptor);
 }
 
 } // namespace syncipc

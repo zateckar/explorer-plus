@@ -64,14 +64,24 @@ bool  open(const Key& k, std::string_view ad, const Bytes& sealed, Bytes& plain)
 // XChaCha20 keystream (the name encryption's cipher)
 void xchacha20(const Key& k, const uint8_t nonce[kNonce], const uint8_t* in, uint8_t* out, size_t n);
 
-// Argon2id (memKiB >= 8): the slow key from a short code
+// Argon2id (memKiB >= 8): the slow key from a short code; false when the memory can't be had
 struct Argon2Params { uint32_t memKiB = 256 * 1024, passes = 3; };
-Key argon2id(std::string_view pass, const uint8_t* salt, size_t saltLen, const Argon2Params& p);
+bool argon2id(std::string_view pass, const uint8_t* salt, size_t saltLen, const Argon2Params& p, Key& out);
 Argon2Params argon2_default();             // 256 MiB / 3 passes (EXPLORERPLUS_SYNC_KDF_KIB: tests only)
+// parameters read from the storage (untrusted): within these, or the wrap is refused
+constexpr uint32_t kArgon2MaxKiB = 1024 * 1024, kArgon2MaxPasses = 10;
+bool argon2_params_ok(const Argon2Params& p);
 
 // X25519
 void x25519_public(const Key& secret, Key& pub);
 Key  x25519_shared(const Key& secret, const Key& peerPublic);   // raw shared secret: hash it (kdf) before use
+
+// EdDSA (Monocypher's: Curve25519 with BLAKE2b, not RFC 8032's SHA-512 Ed25519): a key
+// pair from a 32-byte seed; signatures are 64 bytes
+constexpr size_t kSig = 64;
+void eddsa_public(const Key& seed, Key& pub);
+void eddsa_sign(const Key& seed, const void* msg, size_t n, uint8_t sig[kSig]);
+bool eddsa_check(const Key& pub, const void* msg, size_t n, const uint8_t sig[kSig]);
 
 // SHA-256 / HMAC-SHA256 (BCrypt: AWS signatures need them; Monocypher has neither)
 Hash32 sha256(const void* data, size_t n);
