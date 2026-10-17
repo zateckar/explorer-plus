@@ -29,8 +29,11 @@ Not built yet: the Edit button (remove and add the pair again), the "Sync status
 column (badges only), version history / restore and exclude from the context menu,
 `subscribe` push updates (the lists poll every 2 s while a sync folder is shown), the
 Windows sign-in prompt before showing the recovery key (it can't be shown again: only "New
-recovery key"), "Re-encrypt everything", the benchmark, and phase 7. The independent
-review of the cryptography is still to be done.
+recovery key"), "Re-encrypt everything", the benchmark, and phase 7. A review of the
+cryptography is in [sync-review.md](sync-review.md). Its clear-cut findings are fixed.
+S1 and S2 are open: a removed device that keeps write access to the storage. They need a
+format addition (device-signed hand-overs, a member list in the ring), and until then a
+removal must come with revoking that device's storage credentials.
 
 ## Ground rules from the codebase
 
@@ -319,9 +322,11 @@ with another person later by wrapping its key for them.
 On the device, the key ring and the device's private key are kept in Credential Manager
 (`CRED_PERSIST_LOCAL_MACHINE`, DPAPI-protected under the Windows account; never
 `ENTERPRISE`, which would roam), with names that include the settings folder hash (test
-isolation). Keys in memory sit in `VirtualLock`ed pages, are wiped with `crypto_wipe`, and
-are left out of crash minidumps through `MiniDumpWriteDump`'s callback (`crash.cpp`). No
-secret goes into logs, perf events or IPC (except the explicit "show recovery key").
+isolation). Keys in memory are wiped with `crypto_wipe`. Keeping them in `VirtualLock`ed
+pages and out of crash minidumps (`MiniDumpWriteDump`'s callback, `crash.cpp`) is planned
+but not built yet *(review I1)*. No secret goes into logs or perf events. The agent's pipe
+carries codes (a new pairing code, the code typed to unlock, a new recovery key) to the
+current user's processes only *(review I4)*.
 Later option: wrap the ring with a TPM-bound key (NCrypt Platform Crypto Provider) or gate
 it behind Windows Hello.
 
@@ -342,8 +347,9 @@ from the engine, and encrypted names never start with `.` so nothing collides wi
   (it can't MAC one) or learn device names.
 - `.ep-vault/pair/<id>`: a short-lived pairing grant (below), deleted once used or after
   15 minutes.
-- `.ep-vault/head`: the change marker, a small encrypted counter every device bumps after a
-  pass that changed something. Other devices poll only this object, with a conditional GET
+- `.ep-vault/head`: the change marker, 16 random bytes every device rewrites after a pass
+  that changed something (not authenticated: the storage could move it, but it can
+  withhold changes anyway). Other devices poll only this object, with a conditional GET
   (`If-None-Match` its ETag → `304 Not Modified`): one tiny request per poll, and the full
   listing only when it moved. (git backends don't need it: `ls-remote` does the same.)
 
@@ -471,6 +477,12 @@ stay readable by the removed device if it can still reach the storage, since it 
 them before. "Re-encrypt everything" (download, encrypt under the new version, upload) is
 offered for that case, and the user should also revoke the storage credentials that device
 had (S3 key, PAT). Removing a device can't wipe it; that's for Windows' own remote wipe.
+
+*(Review, [sync-review.md](sync-review.md) S1 and S2: revoking those credentials is not
+optional. A removed device that can still write to the storage can forge a hand-over to a
+device that hasn't taken its own yet, plant a device record in a vault not yet upgraded,
+and write files under the older key versions that the remaining devices accept. Closing
+that needs device-signed hand-overs and a member list in the ring.)*
 
 ### Effects on the rest of the design
 

@@ -70,6 +70,7 @@ struct Vault {
     std::string id;                          // 32 hex
     uint32_t current = 0;                    // VK version new uploads and names use
     std::map<uint32_t, crypto::Key> vks;
+    std::string rev;                         // the vault object's revision when it was read (not stored)
     bool key(uint32_t version, crypto::Key& out) const {
         auto f = vks.find(version);
         if (f == vks.end()) return false;
@@ -91,7 +92,18 @@ struct DeviceInfo {
 //   a vault the ring can't open: Locked (pair this device first)
 // Also: registers this device in the vault, takes a new ring generation handed to this
 // device (rotation), and moves the vault to the current generation when it's behind.
-Result open_vault(sync::Backend& raw, KeyStore& ks, bool create, Vault& out, sync::Progress& prog);
+//
+// pin: what this device saw of the pair's vault before (kept beside the pair's state).
+// A vault with another ID (the storage swapped in another of the user's vaults), or sealed
+// under an older generation, or with fewer key versions (an old copy brought back), is
+// refused as Tampered; on success the pin is updated (the caller saves it).
+struct VaultPin {
+    std::string id;                          // empty: nothing seen yet (trust on first use)
+    uint32_t gen = 0, version = 0;           // highest UMK generation and vault key version seen
+    bool load(const std::wstring& file);
+    bool save(const std::wstring& file) const;
+};
+Result open_vault(sync::Backend& raw, KeyStore& ks, bool create, Vault& out, sync::Progress& prog, VaultPin* pin = nullptr);
 
 // "Add a device": a pairing grant in the vault (the ring under Argon2id(code)), valid 15
 // minutes; the code is returned for display.
@@ -107,14 +119,16 @@ Result list_devices(sync::Backend& raw, KeyStore& ks, std::vector<DeviceInfo>& o
 Result remove_device(sync::Backend& raw, KeyStore& ks, const std::string& deviceId, std::string& newRecoveryCode,
                      sync::Progress& prog);
 
-// "New recovery key": a new code for the ring (shown once); every vault this device then
-// opens or refreshes carries the new recovery wrap (the old code keeps opening vaults not
-// yet refreshed)
+// "New recovery key": a new code for the ring (shown once) and a new UMK generation;
+// every vault this device then opens or refreshes moves to that generation (a new vault
+// key version, hand-overs for the other devices) and carries the new recovery wrap. The
+// old code keeps opening old copies of vaults, and with them what was written before.
 Result new_recovery_key(KeyStore& ks, std::string& code);
 Result refresh_vault_recovery(sync::Backend& raw, KeyStore& ks, sync::Progress& prog);
 
 // the reserved folder on the store
 constexpr wchar_t kVaultDir[] = L".ep-vault";
+constexpr wchar_t kVaultFileRel[] = L".ep-vault/vault";
 inline bool is_vault_path(const sync::RelPath& p) {
     return p.compare(0, 9, kVaultDir) == 0 && (p.size() == 9 || p[9] == L'/');
 }

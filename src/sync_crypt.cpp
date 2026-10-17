@@ -67,6 +67,22 @@ public:
         ChangeBatch rb;
         Result r = m_raw->changes(loaded ? cursor : std::string(), rb, prog);
         if (!r.ok()) return r;
+        // the vault object changed (a rotation): read it again before anything is written,
+        // so uploads and new names move to the new key version now, not whenever this
+        // device next meets a file written under it
+        for (auto& e : rb.upserts) {
+            if (e.isDir || e.path != synckeys::kVaultFileRel) continue;
+            bool stale;
+            {
+                std::lock_guard<std::mutex> lk(m_mx);
+                stale = m_vaultListRev.empty() ? e.rev != m_vault.rev : e.rev != m_vaultListRev;
+                m_vaultListRev = e.rev;
+            }
+            if (stale) {
+                Result rr = refresh_vault();
+                if (rr.st == Status::Locked) return rr;
+            }
+        }
         r = translate(rb, out, prog);
         if (r.st == Status::NotFound && !rb.full) {              // a removal we can't place: list it all
             rb = {};
@@ -300,6 +316,9 @@ private:
         if (cnames::is_short(full)) {
             auto f = m_sidecar.find(join_path(storedParent, comp + L".name"));
             if (f == m_sidecar.end()) return Dec::NeedSidecar;
+            // the sidecar must be the one this short name was made from: otherwise the
+            // storage could swap two long-named siblings' sidecars (both authentic here)
+            if (cnames::shortened(f->second) != full) return Dec::Bad;
             full = f->second;
         }
         uint16_t ver;
@@ -520,6 +539,7 @@ private:
     synckeys::Vault m_vault;
     VaultReopen m_reopen;
     Result m_lockedOut;                    // refresh_vault found this device locked out
+    std::string m_vaultListRev;            // the vault object's revision in the last listing
     std::map<uint32_t, std::unique_ptr<cnames::NameKeys>> m_names;
     std::map<RelPath, RelPath> m_byStored;               // stored path -> plaintext
     std::map<std::wstring, Node> m_byPlain;              // case key of the plaintext -> both
@@ -534,20 +554,36 @@ std::unique_ptr<Backend> make_encrypting(std::unique_ptr<Backend> raw, const syn
 }
 
 Result open_pair_backend(const std::wstring& typeId, const BackendConfig& cfg, synckeys::KeyStore& ks, bool create,
-                         std::unique_ptr<Backend>& out, Progress& prog) {
+                         std::unique_ptr<Backend>& out, Progress& prog, const std::wstring& pinFile) {
     std::wstring why;
     std::unique_ptr<Backend> raw = create_raw_backend(typeId, cfg, &why);
     if (!raw) return Result::fail(Status::Fatal, why);
     raw = make_retrying(std::move(raw));
     Result r = raw->connect(prog);
     if (!r.ok()) return r;
+    // the pin: every open of this pair's vault checks it and moves it on
+    struct Pin { std::mutex mx; std::wstring file; synckeys::VaultPin pin; };
+    auto pin = std::make_shared<Pin>();
+    pin->file = pinFile;
+    if (!pinFile.empty()) pin->pin.load(pinFile);
+    auto open = [pin](Backend& b, synckeys::KeyStore& k, bool cr, synckeys::Vault& v, Progress& p) {
+        std::lock_guard<std::mutex> lk(pin->mx);
+        if (pin->file.empty()) return synckeys::open_vault(b, k, cr, v, p);
+        synckeys::VaultPin next = pin->pin;
+        Result r = synckeys::open_vault(b, k, cr, v, p, &next);
+        if (r.ok() && (next.id != pin->pin.id || next.gen != pin->pin.gen || next.version != pin->pin.version)) {
+            pin->pin = next;
+            pin->pin.save(pin->file);
+        }
+        return r;
+    };
     synckeys::Vault v;
-    r = synckeys::open_vault(*raw, ks, create, v, prog);
+    r = open(*raw, ks, create, v, prog);
     if (!r.ok()) return r;
     synckeys::KeyStore* keys = &ks;
-    out = make_encrypting(std::move(raw), v, [keys](Backend& b, synckeys::Vault& nv) {
+    out = make_encrypting(std::move(raw), v, [keys, open](Backend& b, synckeys::Vault& nv) {
         NoProgress np;
-        return synckeys::open_vault(b, *keys, false, nv, np);
+        return open(b, *keys, false, nv, np);
     });
     return {};
 }

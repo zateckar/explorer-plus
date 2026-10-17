@@ -95,7 +95,10 @@ the UMK can write a record; the storage learns nothing about the devices.
 ```
 
 Valid for 15 minutes; the redeeming device deletes it, and expired grants are deleted by
-the next device that makes one. The code itself is never stored.
+the next device that makes one. The code itself is never stored. A reader only tries
+grants whose Argon2id parameters are within 8 KiB–1 GiB and 1–10 passes (the same bounds
+apply to the recovery wrap) and whose expiry is at most 30 minutes ahead. It tries 8
+grants at most.
 
 ### `.ep-vault/rotate/<deviceId>-g<gen>` (a device was removed)
 
@@ -106,7 +109,9 @@ the next device that makes one. The code itself is never stored.
 
 One per remaining device: it needs both its device key and the previous UMK to open it.
 The device takes it into its ring and deletes it. The removed device gets none, and its
-`devices/` record is deleted.
+`devices/` record is deleted. A device only takes a hand-over that continues its current
+generation: one sealed under it, or one whose ring contains it. It deletes others that
+open. "New recovery key" also makes a new generation and hands it over the same way.
 
 ### `.ep-vault/head`
 
@@ -132,7 +137,8 @@ in two folders gives two different stored names.
 
 A stored component longer than the store allows (Folder: 255 characters) is written as
 `base32(BLAKE2b-256(stored)[0..20)) + ".epn"`, with the full stored name as the content of
-a plain sidecar object beside it, `<that>.epn.name`.
+a plain sidecar object beside it, `<that>.epn.name`. A reader checks that the sidecar's
+content gives the short name.
 
 ### Files
 
@@ -175,6 +181,10 @@ subfolder. Commits carry a neutral author `Explorer Plus <sync@localhost>` and t
   `type`, `paused`, `create`, `exclude=` lines and `cfg.<field>=` lines; never secrets).
 - **`Sync\pairs\<id>\`**: the pair's state journal, transfers in progress, and for git
   storage the bare mirror `repo.git`.
+- **`Sync\pairs\<id>\vault.pin`**: what this device saw of the pair's vault, as text:
+  `EPN1`, then `id=` (vault ID, 32 hex), `gen=` (highest UMK generation) and `version=`
+  (highest vault key version). A vault with another ID, an older generation or fewer key
+  versions, or no vault at all, is refused as tampered (rolled back or swapped).
 
 ## Differences from the plan
 

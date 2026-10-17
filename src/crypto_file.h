@@ -31,8 +31,9 @@ bool plain_size(uint64_t cipher, uint64_t& plain);      // false: not a size thi
 // the vault key of a version (false: unknown version)
 using KeyLookup = std::function<bool(uint32_t version, crypto::Key& vk)>;
 
-// Encrypts `plain` (its size() bytes) as it is read. Deterministic for a given salt, so
-// rewind() starts the same bytes again (a retried upload).
+// Encrypts `plain` (its size() bytes) as it is read. rewind() (a retried upload) starts
+// again under a new salt, so a file that changed between attempts never reuses a nonce
+// under the same key; with fixedSalt (tests) every pass gives the same bytes.
 class EncryptingSource : public sync::ByteSource {
 public:
     EncryptingSource(sync::ByteSource& plain, const crypto::Key& vk, uint32_t vkVersion, const Meta& meta,
@@ -43,9 +44,13 @@ public:
     bool rewind() override;
     bool failed() const { return m_failed; }                         // the plaintext didn't have the size it claimed
 private:
+    void start();
     bool fill();
     sync::ByteSource& m_plain;
-    crypto::Key m_data;
+    crypto::Key m_vk, m_data;
+    uint32_t m_vkVersion;
+    Meta m_meta;
+    bool m_fixedSalt;
     uint8_t m_head[kPrefix];
     uint64_t m_plainSize, m_total, m_chunks, m_next = 0;   // chunks produced so far
     std::vector<uint8_t> m_buf;                             // produced, not yet read

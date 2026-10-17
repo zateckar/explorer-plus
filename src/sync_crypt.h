@@ -10,13 +10,15 @@
 namespace sync {
 
 // reopen: called when a name or file needs a vault key version this vault object doesn't
-// have yet (another device rotated): refreshes the vault from the store
+// have yet, or when the vault object changed since it was read (another device rotated:
+// new uploads must use the new key version at once): refreshes the vault from the store
 using VaultReopen = std::function<Result(Backend& raw, synckeys::Vault& v)>;
 std::unique_ptr<Backend> make_encrypting(std::unique_ptr<Backend> raw, const synckeys::Vault& vault, VaultReopen reopen = {});
 
 // A pair's store: the raw store of its type, with retries, its vault opened (created in an
 // empty place when `create`), encrypted. Locked: this device can't open the vault yet.
+// pinFile: where the pair keeps what it saw of its vault (synckeys::VaultPin); empty: none.
 Result open_pair_backend(const std::wstring& typeId, const BackendConfig& cfg, synckeys::KeyStore& ks, bool create,
-                         std::unique_ptr<Backend>& out, Progress& prog);
+                         std::unique_ptr<Backend>& out, Progress& prog, const std::wstring& pinFile = {});
 
 } // namespace sync

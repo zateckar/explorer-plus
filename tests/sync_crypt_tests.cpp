@@ -7,8 +7,12 @@
 #include "sync_crypt.h"
 #include "sync_keys.h"
 #include "crypto.h"
+#include "crypto_names.h"
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
+#include <map>
+#include <set>
 
 using namespace sync;
 
@@ -299,7 +303,223 @@ void test_long_names() {
     CHECK(b.sync().downloads == 1);
     PassReport r = b.sync();
     CHECK(r.log.empty());
+    // two long-named siblings: the storage swaps their sidecars (each holds a name that's
+    // authentic in this folder). A short name must match its sidecar, so neither shows up
+    // under the other's name.
+    tu::write(a.root, longDir + L"/" + std::wstring(200, L'm') + L".txt", "long two");
+    CHECK(a.sync().result.ok());
+    std::map<std::wstring, std::vector<std::filesystem::path>> sidecars;
+    for (auto& f : std::filesystem::recursive_directory_iterator(dir))
+        if (f.is_regular_file() && cnames::is_sidecar(f.path().filename().string())) sidecars[f.path().parent_path().wstring()].push_back(f.path());
+    bool swapped = false;
+    for (auto& [parent, files] : sidecars) {
+        if (files.size() != 2) continue;
+        std::filesystem::path tmp = files[0].wstring() + L".swap";
+        std::filesystem::rename(files[0], tmp);
+        std::filesystem::rename(files[1], files[0]);
+        std::filesystem::rename(tmp, files[1]);
+        swapped = true;
+    }
+    CHECK(swapped);
+    EDev c(L"lc", raw);
+    {
+        auto rr = raw();
+        CHECK(synckeys::redeem_recovery(*rr, *c.ks, rec, p).ok());
+    }
+    CHECK(c.open(false).ok());
+    c.sync();
+    CHECK(!tu::exists(c.root, longDir + L"/" + longName + L".txt"));
+    CHECK(!tu::exists(c.root, longDir + L"/" + std::wstring(200, L'm') + L".txt"));
+    CHECK(tu::read(c.root, L"short.txt") == "short, changed");
     tu::rmrf(dir);
+}
+
+// a rotation hand-over as the format describes it (sync-format.md, EPX1): what a removed
+// device that kept its storage access can make with the generations it still has
+crypto::Bytes forge_rotation(const synckeys::Ring& ring, const synckeys::Ring::Gen& under, const synckeys::DeviceKey& to) {
+    crypto::Key eph = crypto::random_key(), ephPub;
+    crypto::x25519_public(eph, ephPub);
+    crypto::Key shared = crypto::x25519_shared(eph, to.pub);
+    crypto::Key k = crypto::kdf(under.umk, "ep rotate", shared.data(), 32);
+    crypto::Bytes rb = ring.serialize();
+    crypto::Bytes s = crypto::seal(k, "ep rotate " + to.id, rb.data(), rb.size());
+    crypto::Bytes b = { 'E', 'P', 'X', '1' };
+    std::string uid = synckeys::umk_id(under.umk);
+    b.insert(b.end(), uid.begin(), uid.end());
+    b.insert(b.end(), ephPub.b.begin(), ephPub.b.end());
+    b.insert(b.end(), s.begin(), s.end());
+    return b;
+}
+
+void put_raw(FakeStore& s, const std::wstring& path, const crypto::Bytes& data) {
+    std::lock_guard<std::mutex> lk(s.mx);
+    auto& o = s.objs[path];
+    o.data = data;
+    o.isDir = false;
+    o.rev = s.next_rev();
+    s.changelog.push_back({ ++s.gen, path });
+}
+
+// the vault key version in the header of every stored file not in `before`
+std::vector<uint32_t> new_file_versions(FakeStore& s, const std::set<std::wstring>& before) {
+    std::lock_guard<std::mutex> lk(s.mx);
+    std::vector<uint32_t> v;
+    for (auto& [path, o] : s.objs)
+        if (!o.isDir && !before.count(path) && !synckeys::is_vault_path(path) && o.data.size() >= 12)
+            v.push_back(o.data[8] | (o.data[9] << 8) | (o.data[10] << 16) | ((uint32_t)o.data[11] << 24));
+    return v;
+}
+
+std::set<std::wstring> object_names(FakeStore& s) {
+    std::lock_guard<std::mutex> lk(s.mx);
+    std::set<std::wstring> n;
+    for (auto& [path, o] : s.objs) n.insert(path);
+    return n;
+}
+
+// A removed device that kept its storage access, and a storage that brings back old
+// copies of the vault (docs/sync-review.md)
+void test_removal_hardening() {
+    auto store = std::make_shared<FakeStore>();
+    auto raw = [store] { return std::unique_ptr<Backend>(std::make_unique<FakeBackend>(store, false)); };
+    EDev a(L"ha", raw), b(L"hb", raw), c(L"hc", raw);
+    NoProgress p;
+    std::string recovery;
+    CHECK(synckeys::setup_ring(*a.ks, recovery).ok());
+    CHECK(a.open(true).ok());
+    for (EDev* d : { &b, &c }) {
+        auto r = raw();
+        CHECK(synckeys::redeem_recovery(*r, *d->ks, recovery, p).ok());
+        CHECK(d->open(false).ok());
+    }
+    synckeys::VaultPin pin;                                   // C's view of the vault
+    {
+        auto r = raw();
+        synckeys::Vault v;
+        CHECK(synckeys::open_vault(*r, *c.ks, false, v, p, &pin).ok());
+        CHECK(pin.id == v.id && pin.gen == 1 && pin.version == 1);
+    }
+    tu::write(c.root, L"before.txt", "1");
+    CHECK(c.sync().result.ok());
+    crypto::Bytes oldVault = store->objs[L".ep-vault/vault"].data;      // the storage keeps a copy
+    synckeys::Ring bRing;
+    CHECK(b.ks->load_ring(bRing));
+
+    // A removes B. C keeps running: its next pass reads the changed vault before it
+    // writes, so a new file is under the new key version, which B never got
+    std::string newRecovery;
+    {
+        auto r = raw();
+        CHECK(synckeys::remove_device(*r, *a.ks, synckeys::device_key(*b.ks).id, newRecovery, p).ok());
+    }
+    auto before = object_names(*store);
+    tu::write(c.root, L"after.txt", "TOPSECRET-AFTER");
+    CHECK(c.sync().result.ok());
+    auto vers = new_file_versions(*store, before);
+    CHECK(vers.size() == 1 && vers[0] == 2);
+    synckeys::Ring cRing;
+    CHECK(c.ks->load_ring(cRing) && cRing.current().gen == 2);
+
+    // the pin: C has seen generation 2 and key version 2
+    {
+        auto r = raw();
+        synckeys::Vault v;
+        CHECK(synckeys::open_vault(*r, *c.ks, false, v, p, &pin).ok());
+        CHECK(pin.gen == 2 && pin.version == 2);
+    }
+    // the storage brings back the old vault (generation 1, which B has): refused, where
+    // it used to be "upgraded" with hand-overs sealed under generation 1
+    crypto::Bytes curVault = store->objs[L".ep-vault/vault"].data;
+    put_raw(*store, L".ep-vault/vault", oldVault);
+    {
+        auto r = raw();
+        synckeys::Vault v;
+        synckeys::VaultPin pc = pin;
+        CHECK(synckeys::open_vault(*r, *c.ks, false, v, p, &pc).st == Status::Tampered);
+    }
+    // another of the user's vaults in its place: refused too
+    {
+        auto other = std::make_shared<FakeStore>();
+        FakeBackend ob(other, false);
+        synckeys::Vault v;
+        CHECK(synckeys::open_vault(ob, *a.ks, true, v, p).ok());
+        put_raw(*store, L".ep-vault/vault", other->objs[L".ep-vault/vault"].data);
+        auto r = raw();
+        synckeys::VaultPin pc = pin;
+        CHECK(synckeys::open_vault(*r, *c.ks, false, v, p, &pc).st == Status::Tampered);
+        // gone altogether: not quietly made again
+        {
+            std::lock_guard<std::mutex> lk(store->mx);
+            store->objs.erase(L".ep-vault/vault");
+        }
+        CHECK(synckeys::open_vault(*r, *c.ks, true, v, p, &pc).st == Status::Tampered);
+    }
+    put_raw(*store, L".ep-vault/vault", curVault);
+    {
+        auto r = raw();
+        synckeys::Vault v;
+        CHECK(synckeys::open_vault(*r, *c.ks, false, v, p, &pin).ok());
+    }
+
+    // B hands C a ring of its own (generation 99, its own user key), sealed under
+    // generation 1, which C still has. A device still on generation 1 takes it (the window
+    // the review describes); C, on 2, refuses it and drops it.
+    synckeys::Ring evil = bRing;
+    synckeys::Ring::Gen x;
+    x.gen = 99;
+    x.umk = crypto::random_key();
+    evil.gens.push_back(x);
+    synckeys::DeviceKey ck = synckeys::device_key(*c.ks);
+    std::wstring rotPath = L".ep-vault/rotate/" + std::wstring(ck.id.begin(), ck.id.end()) + L"-g99";
+    crypto::Bytes forged = forge_rotation(evil, bRing.current(), ck);
+    {
+        auto lagging = synckeys::memory_key_store();             // C's device key with the old ring
+        lagging->save_ring(bRing);
+        lagging->save_device(ck);
+        put_raw(*store, rotPath, forged);
+        auto r = raw();
+        synckeys::Vault v;
+        synckeys::open_vault(*r, *lagging, false, v, p);
+        synckeys::Ring got;
+        CHECK(lagging->load_ring(got) && got.current().gen == 99);    // the forgery is well-formed
+    }
+    put_raw(*store, rotPath, forged);
+    {
+        auto r = raw();
+        synckeys::Vault v;
+        CHECK(synckeys::open_vault(*r, *c.ks, false, v, p, &pin).ok());
+        synckeys::Ring got;
+        CHECK(c.ks->load_ring(got) && got.current().gen == 2 && !got.find(synckeys::umk_id(x.umk)));
+        CHECK(!store->objs.count(rotPath));
+    }
+
+    // a new recovery key starts a new generation: the ring an old copy of the vault gives
+    // to the previous recovery key no longer opens the vault, and C follows
+    std::string thirdRecovery;
+    CHECK(synckeys::new_recovery_key(*a.ks, thirdRecovery).ok());
+    crypto::Bytes gen2Vault = store->objs[L".ep-vault/vault"].data;
+    {
+        auto r = raw();
+        CHECK(synckeys::refresh_vault_recovery(*r, *a.ks, p).ok());
+    }
+    {
+        auto copy = std::make_shared<FakeStore>();
+        put_raw(*copy, L".ep-vault/vault", gen2Vault);
+        FakeBackend cb(copy, false);
+        auto leaked = synckeys::memory_key_store();
+        CHECK(synckeys::redeem_recovery(cb, *leaked, newRecovery, p).ok());
+        auto r = raw();
+        synckeys::Vault v;
+        CHECK(synckeys::open_vault(*r, *leaked, false, v, p).st == Status::Locked);
+    }
+    before = object_names(*store);
+    tu::write(c.root, L"third.txt", "3");
+    CHECK(c.sync().result.ok());
+    vers = new_file_versions(*store, before);
+    CHECK(vers.size() == 1 && vers[0] == 3);
+    CHECK(a.open(false).ok());
+    CHECK(a.sync().result.ok());
+    CHECK(tu::read(a.root, L"third.txt") == "3" && tu::read(a.root, L"after.txt") == "TOPSECRET-AFTER");
 }
 
 } // namespace
@@ -312,4 +532,5 @@ void run_crypt_tests() {
     test_two_devices(true);
     test_tamper();
     test_long_names();
+    test_removal_hardening();
 }

@@ -64,10 +64,13 @@ bool  open(const Key& k, std::string_view ad, const Bytes& sealed, Bytes& plain)
 // XChaCha20 keystream (the name encryption's cipher)
 void xchacha20(const Key& k, const uint8_t nonce[kNonce], const uint8_t* in, uint8_t* out, size_t n);
 
-// Argon2id (memKiB >= 8): the slow key from a short code
+// Argon2id (memKiB >= 8): the slow key from a short code; false when the memory can't be had
 struct Argon2Params { uint32_t memKiB = 256 * 1024, passes = 3; };
-Key argon2id(std::string_view pass, const uint8_t* salt, size_t saltLen, const Argon2Params& p);
+bool argon2id(std::string_view pass, const uint8_t* salt, size_t saltLen, const Argon2Params& p, Key& out);
 Argon2Params argon2_default();             // 256 MiB / 3 passes (EXPLORERPLUS_SYNC_KDF_KIB: tests only)
+// parameters read from the storage (untrusted): within these, or the wrap is refused
+constexpr uint32_t kArgon2MaxKiB = 1024 * 1024, kArgon2MaxPasses = 10;
+bool argon2_params_ok(const Argon2Params& p);
 
 // X25519
 void x25519_public(const Key& secret, Key& pub);

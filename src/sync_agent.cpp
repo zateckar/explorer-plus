@@ -146,7 +146,9 @@ private:
     Result open(Runner& r) {
         CancelProgress prog(r.cancel);
         std::unique_ptr<Backend> b;
-        Result res = open_pair_backend(r.pair.type, pair_config(r.pair), *m_ks, r.pair.create, b, prog);
+        std::wstring sd = syncconf::state_dir(r.pair.id);
+        Result res = open_pair_backend(r.pair.type, pair_config(r.pair), *m_ks, r.pair.create, b, prog,
+                                       sd.empty() ? sd : sd + L"\\vault.pin");     // what it saw of its vault
         if (!res.ok()) return res;
         if (r.pair.create) {                            // the vault exists now: never make another
             auto pairs = syncconf::load();
@@ -408,6 +410,7 @@ private:
                 std::lock_guard<std::mutex> op(rn->opMx);
                 Result rr;
                 if (auto b = raw_of(*rn, rr)) synckeys::refresh_vault_recovery(*b, *m_ks, np);
+                rn->poke(true);                              // its encrypting layer: the new key version
             }
             syncipc::Msg m = syncipc::ok();
             m.push_back({ "code", code });

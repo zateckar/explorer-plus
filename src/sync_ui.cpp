@@ -1010,7 +1010,8 @@ void devices_form(HWND owner, const syncconf::Pair& pair) {
             }
             std::wstring ask = L"Remove " + devs[i].name + L"?\n\nIt can't read anything synced from now on: new keys are made and passed to your "
                                L"other devices, and you get a new recovery key (the old one stops working for the new keys). "
-                               L"Files it already has stay on it.";
+                               L"Files it already has stay on it.\n\nRevoke its access to the storage first (its S3 key, its token): "
+                               L"a device that can still write there can get around the removal.";
             if (MessageBoxW(f.wnd, ask.c_str(), f.title.c_str(), MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK) return false;
             Msg q = syncipc::request("remove-device"), r;
             q.push_back({ "pair", pair.id });
@@ -1018,7 +1019,8 @@ void devices_form(HWND owner, const syncconf::Pair& pair) {
             if (agent_ok(f, q, r, f.title.c_str(), 600000)) show_code(f.wnd, syncipc::get(r, "code"), true);
             reload(f);
         } else if (id == ID_NEWREC) {
-            if (MessageBoxW(f.wnd, L"Make a new recovery key? The old one stops working as each storage is updated with the new one.",
+            if (MessageBoxW(f.wnd, L"Make a new recovery key? New keys are made too and passed to your other devices: the old "
+                                   L"recovery key can still open what was synced before, nothing from now on.",
                             f.title.c_str(), MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
                 return false;
             Msg q = syncipc::request("new-recovery-key"), r;

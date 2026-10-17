@@ -192,7 +192,8 @@ public:
     }
     bool save_ring(const Ring& r) override {
         Bytes b = r.serialize();
-        bool ok = b.size() <= credstore::kMaxBlob && credstore::put(L"sync.ring", b);
+        // never save what load_ring couldn't read back (Ring::parse: at most 64 generations)
+        bool ok = r.gens.size() <= 64 && b.size() <= credstore::kMaxBlob && credstore::put(L"sync.ring", b);
         crypto::wipe(b.data(), b.size());
         return ok;
     }
@@ -234,11 +235,13 @@ DeviceKey device_key(KeyStore& ks) {
     return d;
 }
 
-static void new_recovery(Ring& r, std::string& code) {
+static const wchar_t kNoMemory[] = L"There isn't enough free memory to protect the code (Argon2id needs 256 MB).";
+
+static bool new_recovery(Ring& r, std::string& code) {
     code = crypto::new_code();
     crypto::random(r.recSalt, 16);
     r.recParams = crypto::argon2_default();
-    r.recKek = crypto::argon2id(code, r.recSalt, 16, r.recParams);
+    return crypto::argon2id(code, r.recSalt, 16, r.recParams, r.recKek);
 }
 
 Result setup_ring(KeyStore& ks, std::string& recoveryCode) {
@@ -247,7 +250,7 @@ Result setup_ring(KeyStore& ks, std::string& recoveryCode) {
     g.gen = 1;
     g.umk = crypto::random_key();
     r.gens.push_back(g);
-    new_recovery(r, recoveryCode);
+    if (!new_recovery(r, recoveryCode)) return Result::fail(Status::Fatal, kNoMemory);
     if (!ks.save_ring(r)) return Result::fail(Status::Fatal, L"The keys couldn't be saved in Credential Manager.");
     device_key(ks);
     recoveryCode = crypto::format_code(recoveryCode);
@@ -450,7 +453,7 @@ Bytes rotation_object(const Ring& newRing, const Ring::Gen& old, const std::stri
     return b;
 }
 
-bool open_rotation(const Bytes& b, const Ring& ring, const DeviceKey& me, Ring& out) {
+bool open_rotation(const Bytes& b, const Ring& ring, const DeviceKey& me, Ring& out, const Ring::Gen** sealedUnder) {
     Reader r(b);
     if (!r.magic("EPX1")) return false;
     char uid[16];
@@ -460,6 +463,7 @@ bool open_rotation(const Bytes& b, const Ring& ring, const DeviceKey& me, Ring& 
     if (r.bad) return false;
     const Ring::Gen* g = ring.find(std::string(uid, 16));
     if (!g) return false;
+    *sealedUnder = g;
     Key shared = crypto::x25519_shared(me.secret, ephPub);
     Key k = crypto::kdf(g->umk, "ep rotate", shared.data(), 32);
     Bytes sealed(b.begin() + r.pos, b.end()), p;
@@ -470,23 +474,37 @@ bool open_rotation(const Bytes& b, const Ring& ring, const DeviceKey& me, Ring& 
 }
 } // namespace
 
-// takes the rotation hand-overs left for this device: true when the ring moved on
+// takes the rotation hand-overs left for this device: true when the ring moved on.
+// A hand-over is only taken when it continues this device's current generation: sealed
+// under it, or carrying it. Whoever knows only older generations (a removed device, the
+// holder of a replaced recovery key) can seal hand-overs under those, but not that, so once
+// this device has moved past them it can't be handed a ring of theirs. (Before it has, it
+// can: see docs/sync-review.md, S1.)
 static bool take_rotations(Backend& raw, KeyStore& ks, Ring& ring, const DeviceKey& me, Progress& prog) {
     std::vector<sync::RemoteEntry> items;
     if (!list_dir(raw, kRotate, items, prog).ok()) return false;
-    bool changed = false;
+    std::vector<std::pair<RelPath, Bytes>> mine;
     for (auto& e : items) {
         std::wstring leaf = sync::leaf_of(e.path);
-        if (leaf.compare(0, me.id.size(), w(me.id)) != 0) continue;
+        if (leaf.size() <= me.id.size() || leaf.compare(0, me.id.size(), w(me.id)) != 0 || leaf[me.id.size()] != L'-') continue;
         Bytes b;
-        if (!get_object(raw, e.path, b, nullptr, prog).ok()) continue;
-        Ring got;
-        if (!open_rotation(b, ring, me, got)) continue;
-        if (got.current().gen > ring.current().gen || !ring.find(umk_id(got.current().umk))) {
-            ring = merge(ring, got);
-            changed = true;
+        if (get_object(raw, e.path, b, nullptr, prog).ok()) mine.push_back({ e.path, std::move(b) });
+    }
+    bool changed = false;
+    for (bool progress = true; progress;) {             // a chain of rotations: in order, whatever the listing's
+        progress = false;
+        for (auto it = mine.begin(); it != mine.end();) {
+            Ring got;
+            const Ring::Gen* under = nullptr;
+            if (!open_rotation(it->second, ring, me, got, &under)) { ++it; continue; }
+            bool continues = under->umk == ring.current().umk || got.find(umk_id(ring.current().umk));
+            if (continues && (got.current().gen > ring.current().gen || !ring.find(umk_id(got.current().umk)))) {
+                ring = merge(ring, got);
+                changed = progress = true;
+            }
+            remove_object(raw, it->first, prog);             // taken, or stale / not ours to take
+            it = mine.erase(it);
         }
-        remove_object(raw, e.path, prog);
     }
     if (changed) ks.save_ring(ring);
     return changed;
@@ -521,22 +539,67 @@ static Result register_device(Backend& raw, const Ring& ring, const DeviceKey& m
     if (r.ok()) {
         DeviceInfo di;
         Key pub;
-        // already there, readable with the current generation: nothing to do
+        // already there, sealed under the current generation (its UMK id, not the plain
+        // generation number, which nothing authenticates) and readable: nothing to do
         Reader q(cur);
-        if (q.magic("EPD1") && q.u32() == ring.current().gen && open_device_record(cur, ring, me.id, di, pub)) return {};
+        char uid[16];
+        q.magic("EPD1");
+        q.u32();
+        q.get(uid, 16);
+        if (!q.bad && std::string(uid, 16) == umk_id(ring.current().umk) && open_device_record(cur, ring, me.id, di, pub) &&
+            pub == me.pub)
+            return {};
     } else if (r.st != Status::NotFound) return r;
     return put_object(raw, p, device_record(me, ring.current(), now_ft()), "*", prog);
 }
 
-Result open_vault(Backend& raw, KeyStore& ks, bool create, Vault& out, Progress& prog) {
+bool VaultPin::load(const std::wstring& file) {
+    *this = {};
+    HANDLE h = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    char buf[256];
+    DWORD n = 0;
+    bool ok = ReadFile(h, buf, sizeof(buf) - 1, &n, nullptr) != 0;
+    CloseHandle(h);
+    if (!ok) return false;
+    auto m = parse_lines(Bytes(buf, buf + n));
+    if (!m.count("EPN1") || m["id"].size() != 32) return false;
+    id = m["id"];
+    gen = (uint32_t)strtoul(m["gen"].c_str(), nullptr, 10);
+    version = (uint32_t)strtoul(m["version"].c_str(), nullptr, 10);
+    return true;
+}
+
+bool VaultPin::save(const std::wstring& file) const {
+    std::string s = "EPN1\nid=" + id + "\ngen=" + std::to_string(gen) + "\nversion=" + std::to_string(version) + "\n";
+    std::wstring tmp = file + L".tmp";
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD n = 0;
+    bool ok = WriteFile(h, s.data(), (DWORD)s.size(), &n, nullptr) && n == s.size() && FlushFileBuffers(h);
+    CloseHandle(h);
+    return ok && MoveFileExW(tmp.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+}
+
+Result open_vault(Backend& raw, KeyStore& ks, bool create, Vault& out, Progress& prog, VaultPin* pin) {
     Ring ring;
     bool haveRing = ks.load_ring(ring);
     DeviceKey me = device_key(ks);
+    bool pinned = pin && !pin->id.empty();
+    // what this device ends up seeing, into the pin
+    auto seen = [&](const Vault& v, uint32_t gen) {
+        if (!pin) return;
+        pin->id = v.id;
+        pin->gen = std::max(pin->gen, gen);
+        pin->version = std::max(pin->version, v.vks.rbegin()->first);
+    };
     for (int attempt = 0; attempt < 4; ++attempt) {
         Bytes vb;
         std::string rev;
         Result r = get_object(raw, kVaultFile, vb, &rev, prog);
         if (r.st == Status::NotFound) {
+            // the vault this pair synced with is gone: never quietly start another one
+            if (pinned) return Result::fail(Status::Tampered, L"The vault file is missing from the storage.");
             // no vault: a new one, only in an empty place
             std::vector<sync::RemoteEntry> all;
             Result l = raw.list(L"", all, prog);
@@ -552,11 +615,12 @@ Result open_vault(Backend& raw, KeyStore& ks, bool create, Vault& out, Progress&
             v.id = crypto::hex(id, 16);
             v.current = 1;
             v.vks[1] = crypto::random_key();
-            r = put_object(raw, kVaultFile, write_vault(seal_vault(v, ring)), "", prog);
+            r = put_object(raw, kVaultFile, write_vault(seal_vault(v, ring)), "", prog, &v.rev);
             if (r.st == Status::PreconditionFailed) continue;          // another device was quicker
             if (!r.ok()) return r;
             r = register_device(raw, ring, me, prog);
             if (!r.ok()) return r;
+            seen(v, ring.current().gen);
             out = v;
             return {};
         }
@@ -577,20 +641,31 @@ Result open_vault(Backend& raw, KeyStore& ks, bool create, Vault& out, Progress&
             return Result::fail(Status::Tampered, L"The vault file on the storage doesn't authenticate.");
         }
         crypto::wipe(p.data(), p.size());
+        if (pinned) {
+            if (v.id != pin->id)
+                return Result::fail(Status::Tampered, L"The storage holds a different vault than the one this folder syncs with.");
+            if (g->gen < pin->gen || v.vks.rbegin()->first < pin->version)
+                return Result::fail(Status::Tampered, L"The vault file on the storage is older than one this device already saw (rolled back).");
+        }
+        v.rev = rev;
+        uint32_t gen = g->gen;
         // behind the ring (a device was removed meanwhile): a new vault key version under
         // the current generation, and the hand-overs for this vault's other devices
         if (g->gen < ring.current().gen) {
             Ring::Gen old = *g;
             uint32_t nv = v.vks.rbegin()->first + 1;
+            if (nv == 0 || nv > 0xFFFF) return Result::fail(Status::Tampered, L"The vault has run out of key versions.");
             v.vks[nv] = crypto::random_key();
             v.current = nv;
-            r = put_object(raw, kVaultFile, write_vault(seal_vault(v, ring)), rev, prog);
+            r = put_object(raw, kVaultFile, write_vault(seal_vault(v, ring)), rev, prog, &v.rev);
             if (r.st == Status::PreconditionFailed) continue;
             if (!r.ok()) return r;
             hand_over(raw, ring, old, me, prog);
+            gen = ring.current().gen;
         }
         r = register_device(raw, ring, me, prog);
         if (!r.ok()) return r;
+        seen(v, gen);
         out = v;
         return {};
     }
@@ -605,7 +680,8 @@ Result create_pairing(Backend& raw, KeyStore& ks, std::string& code, Progress& p
     uint8_t salt[16];
     crypto::random(salt, 16);
     crypto::Argon2Params ap = crypto::argon2_default();
-    Key k = crypto::argon2id(c, salt, 16, ap);
+    Key k;
+    if (!crypto::argon2id(c, salt, 16, ap, k)) return Result::fail(Status::Fatal, kNoMemory);
     uint64_t expiry = now_ft() + kPairLifetime;
     Bytes rb = ring.serialize();
     Bytes s = crypto::seal(k, "ep pair " + std::to_string(expiry), rb.data(), rb.size());
@@ -651,6 +727,7 @@ Result redeem_pairing(Backend& raw, KeyStore& ks, const std::string& typed, Prog
     Result r = list_dir(raw, kPair, items, prog);
     if (!r.ok()) return r;
     bool any = false;
+    int tried = 0;
     for (auto& e : items) {
         Bytes b;
         if (!get_object(raw, e.path, b, nullptr, prog).ok()) continue;
@@ -662,9 +739,14 @@ Result redeem_pairing(Backend& raw, KeyStore& ks, const std::string& typed, Prog
         ap.memKiB = q.u32();
         ap.passes = q.u32();
         uint64_t expiry = q.u64();
-        if (q.bad || expiry < now_ft() || ap.memKiB < 8 || ap.memKiB > 4u * 1024 * 1024 || ap.passes == 0 || ap.passes > 16) continue;
+        // a planted grant costs one Argon2id run at most, within bounds: no far-future
+        // expiry (it would never go away), no huge parameters, a handful of grants per try
+        uint64_t now = now_ft();
+        if (q.bad || expiry < now || expiry > now + 2 * kPairLifetime || !crypto::argon2_params_ok(ap)) continue;
+        if (++tried > 8) break;
         any = true;
-        Key k = crypto::argon2id(c, salt, 16, ap);
+        Key k;
+        if (!crypto::argon2id(c, salt, 16, ap, k)) return Result::fail(Status::Fatal, kNoMemory);
         Bytes sealed(b.begin() + q.pos, b.end()), p;
         if (!crypto::open(k, "ep pair " + std::to_string(expiry), sealed, p)) continue;
         Ring got;
@@ -688,9 +770,9 @@ Result redeem_recovery(Backend& raw, KeyStore& ks, const std::string& typed, Pro
     if (!r.ok()) return r;
     VaultFile f;
     if (!parse_vault(vb, f)) return Result::fail(Status::Tampered, L"The vault file on the storage is damaged.");
-    if (f.rparams.memKiB < 8 || f.rparams.memKiB > 4u * 1024 * 1024 || f.rparams.passes == 0 || f.rparams.passes > 16)
-        return Result::fail(Status::Tampered, L"The vault file on the storage is damaged.");
-    Key k = crypto::argon2id(c, f.rsalt.data(), 16, f.rparams);
+    if (!crypto::argon2_params_ok(f.rparams)) return Result::fail(Status::Tampered, L"The vault file on the storage is damaged.");
+    Key k;
+    if (!crypto::argon2id(c, f.rsalt.data(), 16, f.rparams, k)) return Result::fail(Status::Fatal, kNoMemory);
     Bytes p;
     if (!crypto::open(k, "ep recovery", f.recovery, p)) return Result::fail(Status::Rejected, L"The recovery key doesn't match.");
     Ring got;
@@ -739,7 +821,7 @@ Result remove_device(Backend& raw, KeyStore& ks, const std::string& deviceId, st
     ring.gens.push_back(g);
     if (std::find(ring.removed.begin(), ring.removed.end(), deviceId) == ring.removed.end()) ring.removed.push_back(deviceId);
     std::string code;
-    new_recovery(ring, code);
+    if (!new_recovery(ring, code)) return Result::fail(Status::Fatal, kNoMemory);
     if (!ks.save_ring(ring)) return Result::fail(Status::Fatal, L"The keys couldn't be saved in Credential Manager.");
     // this vault moves on now; the others when this device next opens them
     for (int attempt = 0; attempt < 4; ++attempt) {
@@ -773,8 +855,15 @@ Result remove_device(Backend& raw, KeyStore& ks, const std::string& deviceId, st
 Result new_recovery_key(KeyStore& ks, std::string& code) {
     Ring ring;
     if (!ks.load_ring(ring)) return Result::fail(Status::Locked, L"This device has no keys.");
+    // a new UMK generation too: the old recovery key opens old recovery wraps (a storage
+    // keeps old copies: git history, S3 versions), and with them the ring of that time. Its
+    // holder must not get the user key that seals vaults from now on.
+    Ring::Gen g;
+    g.gen = ring.current().gen + 1;
+    g.umk = crypto::random_key();
+    ring.gens.push_back(g);
     std::string c;
-    new_recovery(ring, c);
+    if (!new_recovery(ring, c)) return Result::fail(Status::Fatal, kNoMemory);
     if (!ks.save_ring(ring)) return Result::fail(Status::Fatal, L"The keys couldn't be saved in Credential Manager.");
     code = crypto::format_code(c);
     return {};
