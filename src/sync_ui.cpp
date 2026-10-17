@@ -1231,11 +1231,17 @@ bool edit_form(HWND owner, const syncconf::Pair& old) {
         }
         sync::BackendConfig cfg = typed(f), secrets;
         syncconf::split_secrets(p.type, cfg, secrets);
+        // only the settings that say where the data is make it another storage (not "Connect through")
+        auto location = [&](const std::wstring& k) {
+            if (const sync::BackendType* t = sync::find_backend(old.type))
+                for (auto& fd : t->fields) if (_wcsicmp(fd.key.c_str(), k.c_str()) == 0) return fd.location;
+            return true;
+        };
         bool moved = false;
         for (auto& [k, v] : cfg)
-            if (sync::config_get(old.cfg, k) != v) moved = true;
+            if (location(k) && sync::config_get(old.cfg, k) != v) moved = true;
         for (auto& [k, v] : old.cfg)
-            if (sync::config_get(cfg, k) != v) moved = true;
+            if (location(k) && sync::config_get(cfg, k) != v) moved = true;
         if (moved) {
             vault = test(f);
             if (vault.empty()) return false;

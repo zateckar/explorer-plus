@@ -4,6 +4,10 @@
 
 namespace sync {
 
+// the "Connect through" choices (persisted as shown)
+static const wchar_t kViaRest[] = L"REST API";
+static const wchar_t kViaGit[] = L"git.exe";
+
 std::wstring azdo_clone_url(const std::wstring& typed, std::wstring* why) {
     std::wstring u = typed;
     while (!u.empty() && (u.back() == L' ' || u.back() == L'/')) u.pop_back();
@@ -114,6 +118,9 @@ void register_azdo_backend() {
         { L"pat", L"Personal access token", ConfigField::Secret, true, L"", {}, L"Scope: Code (Read & write), for this organization only, with an expiry." },
         { L"branch", L"Branch", ConfigField::Text, false, L"explorerplus-sync", {}, L"Created by the first sync. Not one with branch policies." },
         { L"subfolder", L"Folder in the repository", ConfigField::Text, false, L"", {}, L"" },
+        { L"via", L"Connect through", ConfigField::Choice, false, kViaRest, { kViaRest, kViaGit },
+          L"REST API: nothing to install, files up to 18 MB. git.exe: Git for Windows 2.31+, bigger files, a copy of the history on this PC.",
+          false },
     };
     t.validate = [](const BackendConfig& c) -> std::wstring {
         std::wstring why;
@@ -124,6 +131,16 @@ void register_azdo_backend() {
     t.create = [](const BackendConfig& c) -> std::unique_ptr<Backend> {
         std::wstring url = azdo_clone_url(config_get(c, L"url"), nullptr);
         if (url.empty()) return nullptr;
+        // both connections keep the same layout on the branch: switching is just a setting
+        if (config_get(c, L"via", kViaRest) != kViaGit) {
+            AzdoRestOptions o;
+            o.url = url;
+            o.pat = config_get(c, L"pat");
+            o.branch = config_get(c, L"branch", L"explorerplus-sync");
+            if (o.branch.empty()) o.branch = L"explorerplus-sync";
+            o.subfolder = config_get(c, L"subfolder");
+            return make_azdo_rest_backend(std::move(o));
+        }
         GitOptions o = azdo_git_options(url, config_get(c, L"pat"), config_get(c, L"branch", L"explorerplus-sync"),
                                         config_get(c, L"subfolder"), config_get(c, L"mirror"));
         return make_git_backend(std::move(o));

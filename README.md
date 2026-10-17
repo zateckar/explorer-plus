@@ -95,7 +95,10 @@ Storage:
 
 - **Azure DevOps Git**: the repository's clone URL and a personal access token (scope Code,
   Read & write). Uses its own branch, `explorerplus-sync` by default; not one with branch
-  policies. Needs [Git for Windows](https://gitforwindows.org) 2.31 or later.
+  policies. "Connect through": the REST API (the default: nothing to install, files up to
+  about 18 MB) or git.exe ([Git for Windows](https://gitforwindows.org) 2.31 or later:
+  bigger files, keeps a copy of the history on the PC). Both keep the same data on the
+  branch, so PCs can use either and the setting can change any time.
 - **Git**: any repository URL git can push to with credentials it already has (an SSH key,
   or ones Git Credential Manager stored); it never asks. Every version of a file is kept whole in the history, so it suits
   documents more than big files that change often.

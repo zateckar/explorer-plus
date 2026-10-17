@@ -43,6 +43,8 @@ set(EP_SYNC_CORE_SOURCES
     src/sync_s3.cpp
     src/sync_git.cpp
     src/sync_azdo.cpp
+    src/sync_azdo_rest.cpp
+    src/json.cpp
     src/sync_keys.cpp
     src/sync_crypt.cpp
     src/sync_config.cpp

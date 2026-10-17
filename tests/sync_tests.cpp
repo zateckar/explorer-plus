@@ -302,10 +302,18 @@ int wmain(int argc, wchar_t** argv) {
     std::wstring settingsDir = std::wstring(tmp) + L"ep-sync-tests-" + std::to_wstring(GetCurrentProcessId());
     CreateDirectoryW(settingsDir.c_str(), nullptr);
     SetEnvironmentVariableW(L"EXPLORERPLUS_SETTINGS", (settingsDir + L"\\settings.ini").c_str());
-    if (argc > 1 && std::wstring(argv[1]) == L"--bench") {
+    if (argc > 1 && wcscmp(argv[1], L"--bench") == 0) {
         int r = run_sync_bench(argc > 2 ? _wtoi(argv[2]) : 10000, argc > 3 ? _wcstoui64(argv[3], nullptr, 10) : 2048);
         RemoveDirectoryW(settingsDir.c_str());
         return r;
+    }
+    if (argc > 1 && wcscmp(argv[1], L"--azdo") == 0) {        // the Azure DevOps tests alone
+        extern void run_azdo_tests();
+        run_azdo_tests();
+        RemoveDirectoryW((settingsDir + L"\\Sync").c_str());
+        RemoveDirectoryW(settingsDir.c_str());
+        std::printf("%d checks, %d failed\n", t_run, t_failed);
+        return t_failed ? 1 : 0;
     }
     test_ipc_and_config();
     test_vectors();

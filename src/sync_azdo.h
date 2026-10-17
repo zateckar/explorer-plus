@@ -23,4 +23,27 @@ std::string azdo_scrub(const std::string& text, const std::string& pat);
 // deletes a branch of the remote (tests clean up their run's branch; "remove the pair's data")
 Result git_delete_remote_branch(const GitOptions& o);
 
+// ------------------------------------------------------------------ the REST API store
+// The same repository layout as the git store (blob ids as revs, commit ids as cursors, one
+// commit per pass), so devices can mix the two; no git.exe and no local copy of the history.
+// Azure DevOps refuses a push request over 25 MiB: bigger passes go up as several pushes,
+// and a single file over about 18 MB can't go up this way.
+struct AzdoRestOptions {
+    std::wstring url;                          // the clone URL (azdo_clone_url)
+    std::wstring pat;
+    std::wstring branch = L"explorerplus-sync";
+    std::wstring subfolder;
+    std::wstring author = L"Explorer Plus", email = L"sync@localhost";
+    uint64_t maxPushBytes = 24ull << 20;       // one push's request body
+    int pollSeconds = 60;
+};
+std::unique_ptr<Backend> make_azdo_rest_backend(AzdoRestOptions o);
+// ".../_git/repo" -> ".../_apis/git/repositories/repo" ("" when it isn't a clone URL)
+std::wstring azdo_api_url(const std::wstring& cloneUrl);
+// a failed REST exchange -> a status and the server's own words (TF401028: CommitRaced...)
+Result azdo_rest_failure(int httpStatus, const std::string& body, const std::wstring& what);
+// the git blob id of some bytes (SHA-1 of "blob <size>\0" + the bytes), lowercase hex
+std::string git_blob_id(const void* data, size_t n);
+Result azdo_rest_delete_branch(const AzdoRestOptions& o);
+
 } // namespace sync

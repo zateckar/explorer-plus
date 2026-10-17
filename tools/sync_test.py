@@ -8,8 +8,9 @@ three sync agents) share one Folder store under <workdir>. Driven through
   B  joins with the recovery key; files go both ways; a conflict
   C  joins with a pairing code from A; A then removes C (new keys C never gets)
 
-Optionally the same pair of devices over Azure DevOps Git, when EXPLORERPLUS_AZDO_TEST_URL
-and EXPLORERPLUS_AZDO_TEST_PAT are set (a branch of its own, deleted at the end).
+Optionally the same devices over Azure DevOps Git, through its REST API and through git.exe,
+when EXPLORERPLUS_AZDO_TEST_URL and EXPLORERPLUS_AZDO_TEST_PAT are set (a branch of its own
+for each, deleted at the end).
 Everything is cleaned up: agents stopped, keys and secrets out of Credential Manager.
 """
 import os, sys, time, shutil, subprocess, secrets
@@ -118,7 +119,10 @@ def run_pair(label, type_args, cleanup=None):
         code = r.get('code', '')
         check(r['_rc'] == 0 and len(code.replace('-', '')) == 15, 'A: keys made, recovery key %s' % ('shown' if code else 'missing'))
         r = a.sync()
-        check(r.get('state') == 'up to date', 'A: first sync up to date (%s %s)' % (r.get('state'), r.get('message', '')))
+        st = r.get('state')
+        if st == 'syncing':          # files younger than the settle time wait for the next pass
+            st = wait_state(a, ('up to date', 'error'))
+        check(st == 'up to date', 'A: first sync up to date (%s %s)' % (st, r.get('message', '')))
 
         # the store holds nothing readable
         if 'type=folder' in type_args:
@@ -185,10 +189,16 @@ def run_pair(label, type_args, cleanup=None):
         check(items.get('hello.txt') == 'synced', 'status: hello.txt synced (%s)' % items.get('hello.txt'))
 
         # watch: answers at once with a new state, waits while nothing changes
-        h = a.cli('watch', 'folder=' + a.root, 'wait=0').get('hash', '')
-        t0 = time.time()
-        r = a.cli('watch', 'folder=' + a.root, 'since=' + h, 'wait=2000')
-        check(r.get('hash') == h and time.time() - t0 >= 1.5, 'watch: waits while nothing changes')
+        # (a pass the agent starts on its own changes the state too: up to three tries)
+        for _ in range(3):
+            wait_state(a, ('up to date',))
+            h = a.cli('watch', 'folder=' + a.root, 'wait=0').get('hash', '')
+            t0 = time.time()
+            r = a.cli('watch', 'folder=' + a.root, 'since=' + h, 'wait=2000')
+            waited = r.get('hash') == h and time.time() - t0 >= 1.5
+            if waited:
+                break
+        check(waited, 'watch: waits while nothing changes')
         write(os.path.join(a.root, 'watched.txt'), 'new')
         a.sync()
         r = a.cli('watch', 'folder=' + a.root, 'since=' + h, 'wait=20000')
@@ -275,19 +285,23 @@ run_pair('folder', ['type=folder', 'cfg.path=' + store])
 
 url, pat = os.environ.get('EXPLORERPLUS_AZDO_TEST_URL'), os.environ.get('EXPLORERPLUS_AZDO_TEST_PAT')
 if url and pat:
-    branch = 'sync-test/' + secrets.token_hex(4)
-
-    def delete_branch():
-        env = dict(os.environ)
-        hdr = 'Authorization: Basic ' + __import__('base64').b64encode((':' + pat).encode()).decode()
-        env.update({'GIT_CONFIG_COUNT': '2', 'GIT_CONFIG_KEY_0': 'http.extraHeader', 'GIT_CONFIG_VALUE_0': hdr,
-                    'GIT_CONFIG_KEY_1': 'credential.helper', 'GIT_CONFIG_VALUE_1': '', 'GIT_TERMINAL_PROMPT': '0'})
-        r = subprocess.run(['git', '-c', 'http.sslBackend=schannel', 'push', url, '--delete', branch], env=env, capture_output=True)
-        print('  (branch %s %s)' % (branch, 'deleted' if r.returncode == 0 else 'NOT deleted'))
+    def deleter(branch):
+        def delete_branch():
+            env = dict(os.environ)
+            hdr = 'Authorization: Basic ' + __import__('base64').b64encode((':' + pat).encode()).decode()
+            env.update({'GIT_CONFIG_COUNT': '2', 'GIT_CONFIG_KEY_0': 'http.extraHeader', 'GIT_CONFIG_VALUE_0': hdr,
+                        'GIT_CONFIG_KEY_1': 'credential.helper', 'GIT_CONFIG_VALUE_1': '', 'GIT_TERMINAL_PROMPT': '0'})
+            r = subprocess.run(['git', '-c', 'http.sslBackend=schannel', 'push', url, '--delete', branch], env=env, capture_output=True)
+            print('  (branch %s %s)' % (branch, 'deleted' if r.returncode == 0 else 'NOT deleted'))
+        return delete_branch
 
     # (the PAT goes through the environment of the CLI only: add-pair reads it from there)
     os.environ['EXPLORERPLUS_SYNC_TEST_PAT'] = pat
-    run_pair('azdo', ['type=azdo', 'cfg.url=' + url, 'cfg.branch=' + branch, 'cfg.pat=env:EXPLORERPLUS_SYNC_TEST_PAT'], delete_branch)
+    # through the REST API (the default), then through git.exe
+    for via, label in (('REST API', 'azdo-rest'), ('git.exe', 'azdo-git')):
+        branch = 'sync-test/' + secrets.token_hex(4)
+        run_pair(label, ['type=azdo', 'cfg.url=' + url, 'cfg.branch=' + branch, 'cfg.via=' + via,
+                                     'cfg.pat=env:EXPLORERPLUS_SYNC_TEST_PAT'], deleter(branch))
 
 rmtree(work)
 print('%d failed' % len(failures) if failures else 'all passed')

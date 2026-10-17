@@ -192,6 +192,7 @@ struct ConfigField {
     std::wstring def;
     std::vector<std::wstring> choices;
     std::wstring help;
+    bool location = true;        // says where the data is (changed: another storage); false: only how to reach it
 };
 using BackendConfig = std::vector<std::pair<std::wstring, std::wstring>>;
 std::wstring config_get(const BackendConfig& c, const std::wstring& key, const std::wstring& def = {});

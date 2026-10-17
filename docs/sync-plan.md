@@ -16,7 +16,7 @@ is no passphrase. A removed device is locked out of everything written after its
 ## Status
 
 Phases 1–6 are built: the engine, encryption and keys, the Folder, S3, git and Azure
-DevOps Git backends, the agent (`--sync`, tray icon, `--sync-cli`), and the UI (Sync
+DevOps Git backends (Azure DevOps through its REST API or through git.exe), the agent (`--sync`, tray icon, `--sync-cli`), and the UI (Sync
 folders window with Add / Edit / Remove / Pause / Sync now, Devices and keys with
 "Re-encrypt files", badges and a "Sync status" column, status bar, navigation pane nodes,
 Sync now / Exclude from sync / Include in sync / Version history... in the context menu,
@@ -29,7 +29,8 @@ env variables are set), `tools/sync_test.py` (three devices through the agents, 
 Folder store and Azure DevOps) and `explorer-plus-sync-tests --bench` ("Benchmark" below).
 
 Deferred, out of this plan's scope (decided 2026-10-17): phase 7, each item "later, on its
-own". The independent review of the cryptography is in [sync-review.md](sync-review.md) on
+own", except two asked for on 2026-10-18: Azure DevOps over its REST API (built) and the
+signed per-vault manifest. The independent review of the cryptography is in [sync-review.md](sync-review.md) on
 its own branch until it merges.
 
 *Recovery key, as built*: the Sync folders window keeps the recovery key it shows (or the
@@ -726,9 +727,48 @@ used for the integration test.
   PATs over Basic; Kerberos / NTLM sign-in isn't used.
 - Polling: `ls-remote` every 60 s (one small request); Azure DevOps service hooks could
   push changes, but they need a public endpoint, so no.
-- Later option: Azure DevOps' REST API (pushes with `oldObjectId`, items, diffs) would drop
-  the git.exe requirement for this backend; it needs JSON with Base64 bodies and has its
-  own push size limits, so not in this plan.
+
+**Through the REST API, as built** (`sync_azdo_rest.cpp`, `json.cpp`; the default of the
+"Connect through" setting, the other choice being git.exe). It keeps exactly the git
+store's layout on the branch, so devices can mix the two and a pair can switch without a
+new first sync: revisions are git blob ids (computed locally, SHA-1 of `blob <size>\0` +
+the bytes), cursors and change tokens are commit ids, one commit per pass. Nothing to
+install and no local copy of the history (the git store's mirror holds every version).
+
+| need | request (`api-version=5.0`: Azure DevOps Server 2019 and later, and Services) |
+|---|---|
+| connect | `GET _apis/git/repositories/<repo>` |
+| poll (change token) | `GET .../refs?filter=heads/<branch>` (a prefix filter: the exact name is picked) |
+| listing | `GET .../commits/<tip>` for the tree id, then `GET .../trees/<id>?recursive=true` (a full listing whenever the tip moved; no incremental feed) |
+| download | `GET .../blobs/<id>?$format=octetstream`, four at a time |
+| pass | `POST .../pushes`: one commit with add / edit / delete / rename changes, Base64 contents, `oldObjectId` = the commit the pass started from |
+| versions | `GET .../commits?searchCriteria.itemPath=...`, then the file's blob at each (`items`, `blobs`) |
+
+- A push made on a stale commit is refused whole with `TF401028` → `CommitRaced`, and the
+  engine re-plans, as with git's rejected push. Uploads only gather the push (several
+  transfer threads read and encode files side by side); renames go up as `rename`
+  changes, and a rename that touches a name already gathered sends what's gathered first.
+- **Size limit**: the server refuses a push request over 25 MiB ("The maximum request
+  size of 26214400 bytes was exceeded"). A pass that would pass 24 MiB goes up as several
+  pushes, each a whole commit; a single file over about 18 MB of ciphertext is reported as
+  too big for the REST API, with a pointer to the git.exe connection.
+- Commits carry the neutral author and committer (`Explorer Plus <sync@localhost>`); the
+  server's push record still names the token's account, as it does for git pushes.
+- Answers: `203` (the sign-in page) and `401` → `AuthFailed`; `TF402455` (branch
+  policies) and other `TF…` refusals → `Rejected` with the server's words; `429` / `503`
+  → `Throttled` honouring `Retry-After`; other `5xx` and no answer → `Offline`. Requests
+  send `X-TFS-FedAuthRedirect: Suppress`, so a refused token gets a `401`, not a page.
+- The token goes into the `Authorization` header of each request (WinHTTP, the Windows
+  proxy settings and certificate store); it's kept as that header in memory, wiped when
+  the store closes, and never in a URL, a log or a message (`azdo_scrub` on every text
+  from the server).
+- Tests: the unit part (JSON, blob ids against the server's own ids, the answers above, a
+  file over the limit refused before sending) always runs; with the environment variables
+  set, the raw store's contract runs against the server (conditional writes, a race,
+  moves, versions, a pass split into three pushes, a git.exe store reading the same
+  branch), and the end-to-end run has two encrypted devices on the REST API and a third
+  on git.exe joining the same branch. `tools/sync_test.py` runs its whole scenario through
+  the agents twice, once per connection.
 
 ## UI (Explorer Plus)
 
@@ -848,7 +888,8 @@ by tests only.
    - Size padding beyond 64 KiB steps (hides sizes better, costs space), and a signed
      per-vault manifest to detect withheld or rolled-back files across the whole tree.
    - TPM / Windows Hello protection of the local key ring.
-   - Azure DevOps over its REST API (no git.exe needed).
+   - Azure DevOps over its REST API (no git.exe needed). *Built 2026-10-18*, see "Azure
+     DevOps Git".
    - Sharing a vault with another person (their public key), more backends (WebDAV /
      Nextcloud, OneDrive / SharePoint, Google Drive, Dropbox, Azure Blob).
 
