@@ -5,6 +5,7 @@
 #include "theme.h"
 #include "searchbox.h"
 #include "foldersizes.h"
+#include "sync_ui.h"
 #include <propsys.h>
 #include <propvarutil.h>
 #include <algorithm>
@@ -16,11 +17,15 @@ static bool same_key(const PROPERTYKEY& a, const PROPERTYKEY& b) {
     return a.pid == b.pid && IsEqualGUID(a.fmtid, b.fmtid);
 }
 
+// "Sync status": no shell property, the sync agent's state of the item (sync_ui.h)
+static const PROPERTYKEY kSyncStatusKey = { { 0x5c0e7a31, 0x8d2b, 0x4f6e, { 0x9a, 0x41, 0x2e, 0x17, 0xc3, 0x5b, 0x60, 0xd8 } }, 2 };
+
 static int kind_of(const PROPERTYKEY& k) {
     if (same_key(k, PKEY_ItemNameDisplay)) return COL_NAME;
     if (same_key(k, PKEY_Size))            return COL_SIZE;
     if (same_key(k, PKEY_ItemTypeText))    return COL_TYPE;
     if (same_key(k, PKEY_DateModified))    return COL_DATE;
+    if (same_key(k, kSyncStatusKey))       return COL_SYNC;
     return COL_EXTRA;
 }
 
@@ -36,10 +41,11 @@ static std::wstring title_for(const PROPERTYKEY& k) {
 }
 
 static Column make_column(const PROPERTYKEY& k, std::wstring title, int fmt, int cxChar) {
-    static const int kBuiltinW[] = { 280, 90, 150, 160 };     // name, size, type, date
+    static const int kBuiltinW[] = { 280, 90, 150, 160, 0, 110 };     // name, size, type, date, -, sync status
     Column c;
     c.key = k;
     c.kind = kind_of(k);
+    if (c.kind == COL_SYNC && title.empty()) title = L"Sync status";
     c.title = title.empty() ? title_for(k) : std::move(title);
     c.fmt = fmt & LVCFMT_JUSTIFYMASK;
     if (c.kind == COL_SIZE) c.fmt = LVCFMT_RIGHT;
@@ -77,9 +83,14 @@ static ColumnSet fs_defaults() {
 
 ColumnSet columns_defaults(IShellFolder* folder, PCIDLIST_ABSOLUTE abs) {
     // file-system folders: Explorer's generic template (Name, Date modified, Type, Size),
-    // not the shell folder's raw column order
+    // not the shell folder's raw column order; in a sync folder Sync status too
     WCHAR path[MAX_PATH];
-    if (!abs || ILIsEmpty(abs) || SHGetPathFromIDListW(abs, path)) return fs_defaults();
+    if (!abs || ILIsEmpty(abs)) return fs_defaults();
+    if (SHGetPathFromIDListW(abs, path)) {
+        ColumnSet cols = fs_defaults();
+        if (sync_in_sync_folder(path)) cols.push_back(make_column(kSyncStatusKey, L"", LVCFMT_LEFT, 0));
+        return cols;
+    }
     ColumnSet cols;
     com_ptr<IShellFolder2> sf2;
     if (folder) folder->QueryInterface(IID_PPV_ARGS(sf2.put()));
@@ -237,6 +248,11 @@ const wchar_t* columns_text(const Item* it, int sub) {
         case COL_SIZE: return it->size.c_str();
         case COL_TYPE: return it->type.c_str();
         case COL_DATE: return it->date.c_str();
+        case COL_SYNC: {
+            static std::wstring s;
+            s = sync_status_text(g_pane->index, it->fileName);
+            return s.c_str();
+        }
     }
     return c.extra >= 0 && c.extra < (int)it->extra.size() ? it->extra[c.extra].c_str() : L"";
 }
@@ -424,6 +440,10 @@ void columns_header_menu(POINT screen) {
             cands.push_back({ k, title, sd.fmt, sd.cxChar, false });
         }
     }
+    WCHAR path[MAX_PATH];
+    if (SHGetPathFromIDListW(g_pane->current, path) && sync_in_sync_folder(path) &&
+        std::none_of(cands.begin(), cands.end(), [](const Cand& c) { return same_key(c.key, kSyncStatusKey); }))
+        cands.push_back({ kSyncStatusKey, L"Sync status", LVCFMT_LEFT, 0, false });
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, 1, L"Size all columns to fit");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);

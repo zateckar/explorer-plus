@@ -236,6 +236,34 @@ void test_encrypted_engine() {
     CHECK(tu::read(a.root, L"report.docx") == "REPORT-BYTES v2");
     CHECK(tu::read(a.root, L"photos/beach.jpg") == std::string(200000, 'J'));
     CHECK(!tu::exists(a.root, L"photos/2026"));
+    {
+        // version history: newest first, plaintext sizes; the first version restored comes back
+        // here and goes to the other device as the newest
+        NoProgress np;
+        std::vector<RemoteVersion> vs;
+        CHECK(a.eng->versions(L"report.docx", vs, np).ok() && vs.size() == 2);
+        if (vs.size() == 2) {
+            CHECK(vs[0].size == 15 && vs[1].size == 12);
+            CHECK(a.eng->restore_version(L"report.docx", vs[1].rev, np).ok());
+            CHECK(tu::read(a.root, L"report.docx") == "REPORT-BYTES");
+            CHECK(sync(a).result.ok());
+            CHECK(sync(b).result.ok());
+            CHECK(tu::read(b.root, L"report.docx") == "REPORT-BYTES");
+        }
+        CHECK(!a.eng->restore_version(L"report.docx", "0123456789abcdef0123456789abcdef01234567", np).ok());
+        // re-encrypt everything: each file uploaded again; the other device still reads them,
+        // and an edit it made meanwhile isn't a conflict (only the encryption changed there)
+        Engine::Reencrypted done;
+        CHECK(a.eng->reencrypt(np, done).ok() && done.files == 2 && done.skipped == 0);
+        tu::write(b.root, L"report.docx", "REPORT-BYTES v3");
+        PassReport rb = sync(b);
+        CHECK(rb.result.ok() && rb.conflicts == 0);
+        CHECK(tu::read(b.root, L"photos/beach.jpg") == std::string(200000, 'J'));
+        CHECK(tu::tree(b.root).size() == 3);                 // report, photos, photos/beach.jpg: no conflict copy
+        CHECK(sync(a).result.ok());
+        CHECK(tu::read(a.root, L"report.docx") == "REPORT-BYTES v3");
+        CHECK(a.eng->versions(L"report.docx", vs, np).ok() && vs.size() == 5);
+    }
     // nothing readable in the repository: every blob and every path
     proc::Options o;
     o.env = { { L"GIT_DIR", remote } };

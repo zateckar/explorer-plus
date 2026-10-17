@@ -26,7 +26,7 @@ public:
         c.rangeReads = true;
         c.caseSensitive = false;
         c.emptyDirs = true;
-        c.parallelism = 4;
+        c.parallelism = 1;      // (measured: 4 threads writing small files were 7-20x slower, docs/sync-plan.md "Benchmark")
         c.maxNameLength = 255;
         c.maxPathLength = 30000;
         c.pollSeconds = 30;

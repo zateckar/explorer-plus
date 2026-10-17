@@ -167,7 +167,7 @@ void Server::stop() {
     HANDLE h = CreateFileW(pipe_name().c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
     if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
     if (m_thread.joinable()) m_thread.join();
-    for (auto& w : m_workers) if (w.joinable()) w.join();
+    for (auto& w : m_workers) if (w.th.joinable()) w.th.join();
     m_workers.clear();
     CloseHandle(m_stop);
     m_stop = nullptr;
@@ -189,20 +189,24 @@ void Server::loop() {
         BOOL connected = ConnectNamedPipe(p, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED;
         if (WaitForSingleObject(m_stop, 0) == WAIT_OBJECT_0) { CloseHandle(p); break; }
         if (!connected) { CloseHandle(p); continue; }
-        m_workers.emplace_back([this, p] {
-            Msg req, reply;
-            if (recv_msg(p, req)) {
-                reply = m_handler(req);
-                send_msg(p, reply);
-                FlushFileBuffers(p);
-            }
-            DisconnectNamedPipe(p);
-            CloseHandle(p);
-        });
-        if (m_workers.size() > 64) {                       // keep the list short: join the oldest
-            m_workers.front().join();
-            m_workers.erase(m_workers.begin());
+        // finished workers are joined as new ones start (a long "watch" mustn't hold up the rest)
+        for (auto it = m_workers.begin(); it != m_workers.end();) {
+            if (*it->done) { it->th.join(); it = m_workers.erase(it); }
+            else ++it;
         }
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        m_workers.push_back({ std::thread([this, p, done] {
+                                  Msg req, reply;
+                                  if (recv_msg(p, req)) {
+                                      reply = m_handler(req);
+                                      send_msg(p, reply);
+                                      FlushFileBuffers(p);
+                                  }
+                                  DisconnectNamedPipe(p);
+                                  CloseHandle(p);
+                                  *done = true;
+                              }),
+                              done });
     }
     if (sa.lpSecurityDescriptor) LocalFree(sa.lpSecurityDescriptor);
 }

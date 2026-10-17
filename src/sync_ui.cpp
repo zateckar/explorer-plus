@@ -680,7 +680,7 @@ void save_text(HWND owner, const std::wstring& name, const std::wstring& s) {
 // ------------------------------------------------------------------
 // the pages
 // ------------------------------------------------------------------
-enum { ID_COPY = 10, ID_SAVE, ID_TEST, ID_ADD, ID_REMOVE, ID_PAUSE, ID_SYNCNOW, ID_DEVICES, ID_ADDDEV, ID_REMOVEDEV, ID_NEWREC };
+enum { ID_COPY = 10, ID_SAVE, ID_TEST, ID_ADD, ID_REMOVE, ID_PAUSE, ID_SYNCNOW, ID_DEVICES, ID_ADDDEV, ID_REMOVEDEV, ID_NEWREC, ID_EDIT, ID_REENC };
 
 // A code to write down. recovery: the recovery key, typed back once before the form closes.
 void show_code(HWND owner, const std::string& code, bool recovery) {
@@ -967,8 +967,22 @@ void devices_form(HWND owner, const syncconf::Pair& pair) {
     f.columns = { L"Device", L"Added", L"" };
     f.widths = { 500, 300, 200 };
     f.buttons = { { ID_ADDDEV, L"Add a device...", true }, { ID_REMOVEDEV, L"Remove device", true }, { ID_NEWREC, L"New recovery key", true },
-                  { IDCANCEL, L"Close" } };
+                  { ID_REENC, L"Re-encrypt files", true }, { IDCANCEL, L"Close" } };
     std::vector<DeviceRow> devs;
+    // every synced file uploaded again under the current keys, sync folder by sync folder
+    auto reencrypt = [&](Form& f) {
+        size_t files = 0, skipped = 0;
+        for (auto& p : syncconf::load()) {
+            Msg q = syncipc::request("reencrypt"), r;
+            q.push_back({ "pair", p.id });
+            if (!agent_ok(f, q, r, (L"Re-encrypt " + p.name).c_str(), 24 * 3600 * 1000)) return;
+            files += num(syncipc::get(r, "files", "0"));
+            skipped += num(syncipc::get(r, "skipped", "0"));
+        }
+        std::wstring s = std::to_wstring(files) + (files == 1 ? L" file" : L" files") + L" re-encrypted.";
+        if (skipped) s += L"\n\n" + std::to_wstring(skipped) + L" changed meanwhile: they're sent under the new keys with their next sync.";
+        MessageBoxW(f.wnd, s.c_str(), f.title.c_str(), MB_OK | MB_ICONINFORMATION);
+    };
     auto reload = [&](Form& f) {
         Msg q = syncipc::request("devices"), r;
         q.push_back({ "pair", pair.id });
@@ -1015,8 +1029,21 @@ void devices_form(HWND owner, const syncconf::Pair& pair) {
             Msg q = syncipc::request("remove-device"), r;
             q.push_back({ "pair", pair.id });
             q.push_back({ "device", devs[i].id });
-            if (agent_ok(f, q, r, f.title.c_str(), 600000)) show_code(f.wnd, syncipc::get(r, "code"), true);
+            if (agent_ok(f, q, r, f.title.c_str(), 600000)) {
+                show_code(f.wnd, syncipc::get(r, "code"), true);
+                if (MessageBoxW(f.wnd, L"Re-encrypt the synced files now?\n\nThe removed device can't read anything new, but it still holds the keys "
+                                       L"of what's already on the storage. Re-encrypting uploads every file again under the new keys "
+                                       L"(it takes as long as the first sync did).",
+                                f.title.c_str(), MB_YESNO | MB_ICONQUESTION) == IDYES)
+                    reencrypt(f);
+            }
             reload(f);
+        } else if (id == ID_REENC) {
+            if (MessageBoxW(f.wnd, L"Upload every synced file again under the current keys?\n\nUse it after removing a device: what's on the "
+                                   L"storage from before stays readable with that device's old keys until then.",
+                            f.title.c_str(), MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
+                return false;
+            reencrypt(f);
         } else if (id == ID_NEWREC) {
             if (MessageBoxW(f.wnd, L"Make a new recovery key? The old one stops working as each storage is updated with the new one.",
                             f.title.c_str(), MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
@@ -1068,6 +1095,114 @@ std::wstring status_text(const PairRow& r, bool agentUp) {
     return s;
 }
 
+// Edit a sync folder: its name, left-out folders, the storage's settings and sign-in. A
+// changed location makes it a new pair (a new id, so a first sync against that storage);
+// a blank secret keeps the saved one.
+bool edit_form(HWND owner, const syncconf::Pair& old) {
+    Form f;
+    f.title = L"Edit " + old.name;
+    f.heading = L"Edit " + old.name;
+    f.text = L"Files stay where they are. Pointing it at another storage location syncs this folder with that one from scratch "
+             L"(nothing is deleted on either side).";
+    f.width = 600;
+    FField name;
+    name.key = L"name";
+    name.label = L"Name";
+    name.value = old.name;
+    FField ex;
+    ex.key = L"excluded";
+    ex.label = L"Left out (optional)";
+    ex.help = L"Folders inside it that aren't synced, separated by semicolons (like Videos; Projects/Build).";
+    for (auto& x : old.excluded) ex.value += (ex.value.empty() ? L"" : L"; ") + x;
+    f.fields = { name, ex };
+    for (auto& fl : type_fields(old.type)) {
+        if (fl.kind == F_SECRET) fl.help = L"Leave empty to keep the saved one." + (fl.help.empty() ? L"" : L" " + fl.help);
+        else if (std::wstring v = sync::config_get(old.cfg, fl.key.substr(4)); !v.empty()) fl.value = v;
+        f.fields.push_back(fl);
+    }
+    f.buttons = { { ID_TEST, L"Test connection", true }, { IDOK, L"Save" }, { IDCANCEL, L"Cancel" } };
+    sync::BackendConfig saved = syncconf::full_config(old);
+    // the typed settings, blank secrets filled in from the saved ones
+    auto typed = [&](Form& f) {
+        sync::BackendConfig cfg;
+        for (auto& fl : f.fields) {
+            if (fl.key.compare(0, 4, L"cfg.") != 0) continue;
+            std::wstring v = f.get(fl.key);
+            if (fl.kind == F_SECRET && v.empty()) v = sync::config_get(saved, fl.key.substr(4));
+            cfg.push_back({ fl.key.substr(4), v });
+        }
+        return cfg;
+    };
+    auto test = [&](Form& f) -> std::string {
+        Msg q = syncipc::request("test-connection"), r;
+        q.push_back({ "type", u8(old.type) });
+        for (auto& [k, v] : typed(f)) q.push_back({ "cfg." + u8(k), u8(v) });
+        if (!agent_ok(f, q, r, L"Test connection", 300000)) return {};
+        return syncipc::get(r, "vault");
+    };
+    f.onButton = [&](Form& f, int id) {
+        if (id == IDCANCEL) return true;
+        std::string vault;
+        if (id == ID_TEST) {
+            vault = test(f);
+            if (vault == "exists") MessageBoxW(f.wnd, L"Connected. The location holds Explorer Plus sync data.", L"Test connection", MB_OK | MB_ICONINFORMATION);
+            else if (vault == "none") MessageBoxW(f.wnd, L"Connected. The location is empty: it's set up when you save.", L"Test connection", MB_OK | MB_ICONINFORMATION);
+            else if (vault == "plaintext") MessageBoxW(f.wnd, L"Connected, but the location already holds other files. Sync folders need an empty location (or one another PC of yours set up).", L"Test connection", MB_OK | MB_ICONWARNING);
+            return false;
+        }
+        syncconf::Pair p = old;
+        p.name = f.get(L"name");
+        if (p.name.empty()) p.name = old.name;
+        p.excluded.clear();
+        std::wstring list = f.get(L"excluded") + L";";
+        for (size_t at = 0, e; (e = list.find(L';', at)) != std::wstring::npos; at = e + 1) {
+            std::wstring x = list.substr(at, e - at);
+            std::replace(x.begin(), x.end(), L'\\', L'/');
+            while (!x.empty() && (x.front() == L' ' || x.front() == L'/')) x.erase(0, 1);
+            while (!x.empty() && (x.back() == L' ' || x.back() == L'/')) x.pop_back();
+            if (!x.empty()) p.excluded.push_back(x);
+        }
+        sync::BackendConfig cfg = typed(f), secrets;
+        syncconf::split_secrets(p.type, cfg, secrets);
+        bool moved = false;
+        for (auto& [k, v] : cfg)
+            if (sync::config_get(old.cfg, k) != v) moved = true;
+        for (auto& [k, v] : old.cfg)
+            if (sync::config_get(cfg, k) != v) moved = true;
+        if (moved) {
+            vault = test(f);
+            if (vault.empty()) return false;
+            if (vault == "plaintext") {
+                MessageBoxW(f.wnd, L"The location already holds other files. Sync folders need an empty location (or one another PC of yours set up).", f.title.c_str(), MB_OK | MB_ICONWARNING);
+                return false;
+            }
+            p.id = syncconf::new_id();
+            p.create = vault == "none";
+        }
+        p.cfg = cfg;
+        auto pairs = syncconf::load();
+        auto it = std::find_if(pairs.begin(), pairs.end(), [&](const syncconf::Pair& x) { return x.id == old.id; });
+        if (it == pairs.end()) return true;
+        *it = p;
+        // secrets first: the agent opens the pair as soon as it reloads
+        for (auto& [k, v] : secrets)
+            if (moved || v != sync::config_get(saved, k)) syncconf::set_secret(p.id, k, v);
+        if (!syncconf::save(pairs)) {
+            MessageBoxW(f.wnd, L"The sync settings couldn't be written.", f.title.c_str(), MB_OK | MB_ICONERROR);
+            if (moved) syncconf::forget_secrets(p.id);
+            return false;
+        }
+        Msg q = syncipc::request("reload"), r;
+        if (syncipc::agent_running()) agent_call(f, q, r, 60000);
+        if (moved) {
+            syncconf::forget_secrets(old.id);
+            syncconf::remove_state_dir(old.id);
+        }
+        return true;
+    };
+    return run_form(owner, f) == IDOK;
+}
+
 } // namespace
 
 void sync_folders_dialog(HWND owner) {
@@ -1094,8 +1229,8 @@ void sync_folders_dialog(HWND owner) {
         a.value = autostart_on() ? L"1" : L"0";
         f.fields.push_back(a);
     }
-    f.buttons = { { ID_ADD, L"Add...", true }, { ID_REMOVE, L"Remove", true }, { ID_PAUSE, L"Pause", true }, { ID_SYNCNOW, L"Sync now", true },
-                  { ID_DEVICES, L"Devices and keys...", false }, { IDCANCEL, L"Close", false } };
+    f.buttons = { { ID_ADD, L"Add...", true }, { ID_EDIT, L"Edit...", true }, { ID_REMOVE, L"Remove", true }, { ID_PAUSE, L"Pause", true },
+                  { ID_SYNCNOW, L"Sync now", true }, { ID_DEVICES, L"Devices and keys...", false }, { IDCANCEL, L"Close", false } };
     std::vector<PairRow> rows;
     bool polling = false, agentUp = false;
 
@@ -1105,6 +1240,7 @@ void sync_folders_dialog(HWND owner) {
         f.set_rows(t);
         int i = f.selected();
         bool sel = i >= 0 && i < (int)rows.size();
+        EnableWindow(f.button(ID_EDIT), sel);
         EnableWindow(f.button(ID_REMOVE), sel);
         EnableWindow(f.button(ID_PAUSE), sel);
         EnableWindow(f.button(ID_SYNCNOW), sel);
@@ -1185,6 +1321,10 @@ void sync_folders_dialog(HWND owner) {
                 if (add_form(f.wnd)) { if (f.field(L"autostart")) SendMessageW(f.field(L"autostart")->ctl, BM_SETCHECK, autostart_on() ? BST_CHECKED : BST_UNCHECKED, 0); }
                 poll(f);
                 break;
+            case ID_EDIT:
+                if (sel) edit_form(f.wnd, rows[i].p);
+                poll(f);
+                break;
             case ID_REMOVE: {
                 if (!sel) break;
                 syncconf::Pair p = rows[i].p;
@@ -1220,6 +1360,65 @@ void sync_folders_dialog(HWND owner) {
     open = false;
 }
 
+void sync_version_history(HWND owner, const std::wstring& file) {
+    struct Ver {
+        std::string rev;
+        std::wstring when;
+    };
+    std::vector<Ver> vers;
+    std::wstring name = file.substr(file.find_last_of(L'\\') + 1);
+    Form f;
+    f.title = L"Version history";
+    f.heading = name;
+    f.text = L"The versions the storage keeps, newest first. Restoring one puts it back here as the newest version "
+             L"(and syncs it); the file as it is now goes to the Recycle Bin.";
+    f.width = 600;
+    f.listHeight = 240;
+    f.columns = { L"Saved", L"Size" };
+    f.widths = { 650, 350 };
+    f.buttons = { { IDOK, L"Restore" }, { IDCANCEL, L"Close" } };
+    f.onShown = [&](Form& f) {
+        Msg q = syncipc::request("versions"), r;
+        q.push_back({ "path", u8(file) });
+        if (!agent_ok(f, q, r, f.title.c_str(), 300000)) return;
+        std::vector<std::vector<std::wstring>> rows;
+        for (auto& line : syncipc::all(r, "version")) {
+            std::vector<std::string> part;
+            size_t at = 0;
+            for (size_t t; part.size() < 3 && (t = line.find('\t', at)) != std::string::npos; at = t + 1) part.push_back(line.substr(at, t - at));
+            part.push_back(line.substr(at));
+            if (part.size() < 3) continue;
+            uint64_t t = strtoull(part[1].c_str(), nullptr, 10);
+            FILETIME ft{ (DWORD)t, (DWORD)(t >> 32) }, lt;
+            SYSTEMTIME st{};
+            wchar_t d[64] = L"", tm[64] = L"";
+            if (t && FileTimeToLocalFileTime(&ft, &lt) && FileTimeToSystemTime(&lt, &st)) {
+                GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, &st, nullptr, d, ARRAYSIZE(d), nullptr);
+                GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &st, nullptr, tm, ARRAYSIZE(tm));
+            }
+            std::wstring when = std::wstring(d) + L" " + tm;
+            uint64_t size = strtoull(part[2].c_str(), nullptr, 10);
+            wchar_t sz[64];
+            StrFormatByteSizeEx(size, SFBS_FLAGS_ROUND_TO_NEAREST_DISPLAYED_DIGIT, sz, ARRAYSIZE(sz));
+            rows.push_back({ when, sz });
+            vers.push_back({ part[0], when });
+        }
+        f.set_rows(rows);
+    };
+    f.onButton = [&](Form& f, int id) {
+        if (id != IDOK) return true;
+        int i = f.selected();
+        if (i < 0 || i >= (int)vers.size()) return false;
+        std::wstring ask = L"Restore the version saved " + vers[i].when + L"?\n\nThe file as it is now goes to the Recycle Bin.";
+        if (MessageBoxW(f.wnd, ask.c_str(), f.title.c_str(), MB_OKCANCEL | MB_ICONQUESTION) != IDOK) return false;
+        Msg q = syncipc::request("restore"), r;
+        q.push_back({ "path", u8(file) });
+        q.push_back({ "rev", vers[i].rev });
+        return agent_ok(f, q, r, f.title.c_str(), 600000);
+    };
+    run_form(owner, f);
+}
+
 // ------------------------------------------------------------------
 // the lists' view: status bar text and badges
 // ------------------------------------------------------------------
@@ -1251,10 +1450,8 @@ const std::vector<syncconf::Pair>& pairs_cached() {
     return s_pairs;
 }
 
-std::mutex s_pollMx;
-std::condition_variable s_pollCv;
-std::wstring s_pollPath[kPanes];
-bool s_pollWake = false, s_pollStarted = false;
+// each pane's watch: a thread per folder shown, ended by the next navigation (its generation)
+std::atomic<unsigned> s_watchGen[kPanes];
 
 struct ViewResult {
     int pane;
@@ -1302,29 +1499,24 @@ void apply_view(void* p) {
     status_update();
 }
 
-// asks the agent about the shown sync folders every 2 s (and at once on navigation)
-void poll_views() {
-    std::wstring last[kPanes];
-    std::string lastBody[kPanes];
-    for (;;) {
-        std::wstring paths[kPanes];
-        {
-            std::unique_lock<std::mutex> lk(s_pollMx);
-            s_pollCv.wait_for(lk, std::chrono::seconds(2), [] { return s_pollWake; });
-            s_pollWake = false;
-            for (int i = 0; i < kPanes; ++i) paths[i] = s_pollPath[i];
-        }
-        for (int i = 0; i < kPanes; ++i) {
-            if (paths[i].empty()) { last[i].clear(); continue; }
-            Msg q = syncipc::request("status"), r;
-            q.push_back({ "folder", u8(paths[i]) });
-            bool ok = syncipc::call(q, r, 3000);
-            std::string body = ok ? syncipc::encode(r) : "-";
-            if (paths[i] == last[i] && body == lastBody[i]) continue;
-            last[i] = paths[i];
-            lastBody[i] = body;
-            post_async(apply_view, new ViewResult{ i, paths[i], ok, std::move(r) });
-        }
+// The agent tells a pane what changed in its folder: a long poll ("watch") answered as soon
+// as the folder's states differ from the last answer. Without an agent: asked again every 5 s.
+void watch_view(int pane, std::wstring path, unsigned gen) {
+    std::string since;
+    bool wasOk = true;
+    while (s_watchGen[pane] == gen) {
+        Msg q = syncipc::request("watch"), r;
+        q.push_back({ "folder", u8(path) });
+        q.push_back({ "since", since });
+        q.push_back({ "wait", "20000" });
+        bool ok = syncipc::call(q, r, 30000);
+        if (s_watchGen[pane] != gen) break;
+        std::string h = ok ? syncipc::get(r, "hash") : std::string();
+        if (h != since || ok != wasOk) post_async(apply_view, new ViewResult{ pane, path, ok, r });
+        wasOk = ok;
+        since = h;
+        if (!ok)
+            for (int i = 0; i < 50 && s_watchGen[pane] == gen; ++i) Sleep(100);
     }
 }
 
@@ -1336,16 +1528,8 @@ void sync_view_folder(int pane, const std::wstring& fsPath) {
     if (!p.empty() && !syncconf::pair_of(pairs_cached(), p)) p.clear();
     if (p == s_views[pane].path) return;
     s_views[pane] = PaneView{ p, {}, {} };
-    {
-        std::lock_guard<std::mutex> lk(s_pollMx);
-        s_pollPath[pane] = p;
-        s_pollWake = true;
-    }
-    s_pollCv.notify_all();
-    if (!p.empty() && !s_pollStarted) {
-        s_pollStarted = true;
-        std::thread(poll_views).detach();
-    }
+    unsigned gen = ++s_watchGen[pane];
+    if (!p.empty()) std::thread(watch_view, pane, p, gen).detach();
 }
 
 std::wstring sync_view_status(int pane) { return pane >= 0 && pane < kPanes ? s_views[pane].status : std::wstring(); }
@@ -1398,11 +1582,66 @@ void sync_draw_badge(HDC dc, const RECT& icon, int state, int dpi) {
     DeleteObject(pen);
 }
 
-bool sync_paths_synced(const std::vector<std::wstring>& paths) {
+SyncMenu sync_menu_for(const std::vector<std::wstring>& paths, const std::vector<bool>& folders) {
+    SyncMenu m;
     const auto& pairs = pairs_cached();
-    if (pairs.empty()) return false;
-    for (auto& p : paths) if (syncconf::pair_of(pairs, p)) return true;
-    return false;
+    if (pairs.empty()) return m;
+    for (auto& p : paths) if (syncconf::pair_of(pairs, p)) m.syncNow = true;
+    if (paths.size() != 1 || folders.size() != 1) return m;
+    sync::RelPath rel;
+    const syncconf::Pair* p = syncconf::pair_of(pairs, paths[0], &rel);
+    if (!p || rel.empty()) return m;
+    if (folders[0]) {
+        // left out: itself or a folder above it
+        std::wstring k = lower(rel);
+        bool out = false;
+        for (auto& x : p->excluded) {
+            std::wstring xk = lower(x);
+            if (k == xk || (k.size() > xk.size() && k.compare(0, xk.size(), xk) == 0 && k[xk.size()] == L'/')) out = true;
+        }
+        m.include = out;
+        m.exclude = !out;
+    } else {
+        m.versions = p->type == L"git" || p->type == L"azdo";
+    }
+    return m;
+}
+
+void sync_exclude(const std::wstring& folder, bool exclude) {
+    std::thread([folder, exclude] {
+        if (!sync_agent_start()) return;
+        Msg q = syncipc::request("exclude"), r;
+        q.push_back({ "path", u8(folder) });
+        q.push_back({ "on", exclude ? "1" : "0" });
+        syncipc::call(q, r, 30000);
+    }).detach();
+}
+
+bool sync_in_sync_folder(const std::wstring& path) {
+    static std::mutex mx;
+    static std::vector<syncconf::Pair> pairs;
+    static FILETIME seen{};
+    std::wstring file = syncconf::pairs_file();
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    if (file.empty() || !GetFileAttributesExW(file.c_str(), GetFileExInfoStandard, &a)) return false;
+    std::lock_guard<std::mutex> lk(mx);
+    if (CompareFileTime(&a.ftLastWriteTime, &seen) != 0) {
+        seen = a.ftLastWriteTime;
+        pairs = syncconf::load();
+    }
+    return syncconf::pair_of(pairs, path) != nullptr;
+}
+
+std::wstring sync_status_text(int pane, const std::wstring& fileName) {
+    switch ((sync::ItemState)sync_view_item(pane, fileName)) {
+        case sync::ItemState::Synced: return L"Up to date";
+        case sync::ItemState::Syncing: return L"Syncing";
+        case sync::ItemState::Pending: return L"Waiting";
+        case sync::ItemState::Conflict: return L"Conflict";
+        case sync::ItemState::Error: return L"Error";
+        case sync::ItemState::Excluded: return L"Not synced";
+        default: return {};
+    }
 }
 
 void sync_now_for(const std::vector<std::wstring>& paths) {

@@ -169,6 +169,10 @@ def run_pair(label, type_args, cleanup=None):
         a.sync()
         b.sync()
         a.sync()
+        # (the agents' own watchers sync too: the conflict may be found on either side, a
+        # round later than the script's syncs)
+        b.sync()
+        a.sync()
         copies_a = sorted(n for n in os.listdir(a.root) if n.startswith('both'))
         copies_b = sorted(n for n in os.listdir(b.root) if n.startswith('both'))
         check(len(copies_a) == 2 and copies_a == copies_b, 'conflict: both versions kept on both (%s / %s)' % (copies_a, copies_b))
@@ -179,6 +183,48 @@ def run_pair(label, type_args, cleanup=None):
         r = a.cli('status', 'folder=' + a.root)
         items = dict(x.split('\t', 1) for x in r.get('_all_item', []))
         check(items.get('hello.txt') == 'synced', 'status: hello.txt synced (%s)' % items.get('hello.txt'))
+
+        # watch: answers at once with a new state, waits while nothing changes
+        h = a.cli('watch', 'folder=' + a.root, 'wait=0').get('hash', '')
+        t0 = time.time()
+        r = a.cli('watch', 'folder=' + a.root, 'since=' + h, 'wait=2000')
+        check(r.get('hash') == h and time.time() - t0 >= 1.5, 'watch: waits while nothing changes')
+        write(os.path.join(a.root, 'watched.txt'), 'new')
+        a.sync()
+        r = a.cli('watch', 'folder=' + a.root, 'since=' + h, 'wait=20000')
+        check(r.get('hash') not in ('', h), 'watch: a change answers')
+
+        # a folder left out of sync, then taken back
+        r = a.cli('exclude', 'path=' + os.path.join(a.root, 'docs'), 'on=1')
+        check(r['_rc'] == 0, 'exclude: docs left out (%s)' % r.get('error', ''))
+        write(os.path.join(a.root, 'docs', 'private.md'), 'stays here')
+        a.sync()
+        b.sync()
+        check(read(os.path.join(b.root, 'docs', 'private.md')) is None, 'exclude: B gets nothing of it')
+        items = dict(x.split('\t', 1) for x in a.cli('status', 'folder=' + a.root).get('_all_item', []))
+        check(items.get('docs') == 'excluded', 'exclude: status says so (%s)' % items.get('docs'))
+        a.cli('exclude', 'path=' + os.path.join(a.root, 'docs'), 'on=0')
+        a.sync()
+        b.sync()
+        check(read(os.path.join(b.root, 'docs', 'private.md')) == 'stays here', 'include: it syncs again')
+
+        # version history: git and Azure DevOps keep versions; a Folder store doesn't
+        hello = os.path.join(a.root, 'hello.txt')
+        r = a.cli('versions', 'path=' + hello)
+        vers = [v.split('\t') for v in r.get('_all_version', [])]
+        if 'type=folder' in type_args:
+            check(r['_rc'] != 0 and 'no versions' in r.get('error', ''), 'versions: none on a Folder store')
+        else:
+            check(len(vers) >= 2, 'versions: hello.txt has %d' % len(vers))
+            if len(vers) >= 2:
+                r = a.cli('restore', 'path=' + hello, 'rev=' + vers[-1][0])
+                check(r['_rc'] == 0 and read(hello) == 'hello from A', 'restore: the first version is back (%s)' % r.get('error', ''))
+                a.sync()
+                b.sync()
+                check(read(os.path.join(b.root, 'hello.txt')) == 'hello from A', 'restore: B gets it')
+                write(hello, 'hello changed on B')
+                a.sync()
+                b.sync()
 
         # C joins with a pairing code from A
         r = a.cli('pair-offer')
@@ -209,6 +255,14 @@ def run_pair(label, type_args, cleanup=None):
         check(read(os.path.join(c.root, 'after-removal.txt')) is None, 'C: gets nothing new')
         st, _ = c.state()
         check(st in ('locked', 'error'), 'C: locked out (%s)' % st)
+
+        # re-encrypt everything under the new keys; B goes on reading and writing
+        r = a.cli('reencrypt', 'pair=' + a.cli('pairs').get('p0.id', ''))
+        check(r['_rc'] == 0 and int(r.get('files', '0')) >= 5, 're-encrypt: %s files (%s)' % (r.get('files'), r.get('error', '')))
+        write(os.path.join(b.root, 'hello.txt'), 'after re-encryption')
+        b.sync()
+        a.sync()
+        check(read(os.path.join(a.root, 'hello.txt')) == 'after re-encryption', 're-encrypt: both devices still sync')
     finally:
         for d in devices:
             d.stop()

@@ -17,20 +17,43 @@ is no passphrase. A removed device is locked out of everything written after its
 
 Phases 1–6 are built: the engine, encryption and keys, the Folder, S3, git and Azure
 DevOps Git backends, the agent (`--sync`, tray icon, `--sync-cli`), and the UI (Sync
-folders window, badges, status bar, navigation pane nodes, "Sync now" in the context menu,
-autostart). The stored formats as built are in [sync-format.md](sync-format.md), with
-where they differ from this plan (plain fingerprint, no `ring` object, version prefix on
-names, the file-swap limitation). Tests: `explorer-plus-sync-tests` (engine, crypto, keys,
-git, S3 against an in-process mock, Azure DevOps when its env variables are set) and
-`tools/sync_test.py` (three devices through the agents, over a Folder store and Azure
-DevOps).
+folders window with Add / Edit / Remove / Pause / Sync now, Devices and keys with
+"Re-encrypt files", badges and a "Sync status" column, status bar, navigation pane nodes,
+Sync now / Exclude from sync / Include in sync / Version history... in the context menu,
+autostart). The lists learn about changes from the agent by a long poll (`watch`, below).
+The stored formats as built are in [sync-format.md](sync-format.md), with where they
+differ from this plan (plain fingerprint, no `ring` object, version prefix on names, the
+file-swap limitation). Tests: `explorer-plus-sync-tests` (engine, crypto, keys, git with
+versions / restore / re-encryption, S3 against an in-process mock, Azure DevOps when its
+env variables are set), `tools/sync_test.py` (three devices through the agents, over a
+Folder store and Azure DevOps) and `explorer-plus-sync-tests --bench` ("Benchmark" below).
 
-Not built yet: the Edit button (remove and add the pair again), the "Sync status" list
-column (badges only), version history / restore and exclude from the context menu,
-`subscribe` push updates (the lists poll every 2 s while a sync folder is shown), the
-Windows sign-in prompt before showing the recovery key (it can't be shown again: only "New
-recovery key"), "Re-encrypt everything", the benchmark, and phase 7. The independent
-review of the cryptography is still to be done.
+Not built: the Windows sign-in prompt before showing the recovery key (it isn't kept, so
+it can't be shown again: only "New recovery key"), and phase 7 (each item "later, on its
+own"). The independent review of the cryptography is under way.
+
+### Benchmark
+
+`explorer-plus-sync-tests --bench [small files] [big file MB]` (10,000 files of 1–8 KB and
+one 2 GB file by default) syncs through an encrypted Folder store on the same disk and
+counts the store's calls. On the development PC (NVMe, 20 threads), 2 GB + 47 MB:
+
+| | wall | CPU |
+|---|---|---|
+| copy (`CopyFile`), small files / big file | 0.9 s / 0.8 s | 0.3 s / 0.1 s |
+| sync up: hash, encrypt, write | 20.8 s | 9.8 s |
+| sync down: read, decrypt, check, write | 18.2 s | 9.8 s |
+| a pass with nothing to do | 0.4 s | 0.3 s |
+| XChaCha20-Poly1305 alone, 2 GB in memory | 6.1 s | 3.7 s |
+
+The copy is a floor nothing reaches (the big file's copy comes from the cache). Encryption
+is about 40 % of the CPU time of a pass; the rest is the BLAKE2b fingerprint (a file is
+read once to hash it and once more to encrypt it), the journal, and the per-file flushes
+that make a store write durable (a write isn't recorded as synced before it's on disk). Small files
+cost about 1 ms each. The Folder store first wrote with 4 threads: on this PC concurrent
+small writes from one process were 7–20× slower than one thread (upload 69 s, download
+43 s), so it transfers one file at a time now (S3 keeps 4: network round trips dominate
+there).
 
 ## Ground rules from the codebase
 
@@ -472,6 +495,17 @@ them before. "Re-encrypt everything" (download, encrypt under the new version, u
 offered for that case, and the user should also revoke the storage credentials that device
 had (S3 key, PAT). Removing a device can't wipe it; that's for Windows' own remote wipe.
 
+*As built* ("Re-encrypt files" in Devices and keys, offered right after Remove device): the
+local copies are uploaded again (nothing downloaded) where they still match the last sync,
+each with the version + 1 and its last rev as the precondition; files changed meanwhile are
+skipped (the next pass sends them under the new key anyway). One commit on git stores; a
+commit that loses a race with another device is retried after a pass. Names keep the key
+version they were made with. The other devices download every file once more. One that
+edited a file before it saw the re-encryption gets no conflict: the stored fingerprint still
+matches what it last synced, so its base takes the new rev and its edit goes up. Old
+ciphertext stays in git history and in S3 versions: the removed device can read those as
+long as it can reach them.
+
 ### Effects on the rest of the design
 
 - The engine is unchanged: it sees plaintext paths, sizes and fingerprints. Caps pass
@@ -737,8 +771,11 @@ start it).
 `reload`, `pairs`, `status folder=`, `sync-now [wait=1]`, `pause`, `resume`,
 `confirm-deletes yes=`, `dismiss-conflicts`, `conflicts`, `test-connection`, `set-secret`,
 `keys-status`, `setup-keys`, `new-recovery-key`, `unlock mode=code|recovery`, `pair-offer`,
-`devices`, `remove-device`. No `subscribe` yet: Explorer Plus asks for the shown folder's
-state every 2 s. `explorer-plus.exe --sync-cli <request> [key=value ...]` sends one and
+`devices`, `remove-device`, `versions path=`, `restore path= rev=`, `reencrypt pair=`,
+`exclude path= on=1|0`, and `watch [folder=] since= wait=` instead of `subscribe`: a long
+poll (up to 25 s) answered as soon as the folder's states (or, without a folder, the
+pairs') differ from the reply whose `hash` the caller passes; each pane showing a sync
+folder keeps one open. `explorer-plus.exe --sync-cli <request> [key=value ...]` sends one and
 prints the reply (tests and scripts); `add-pair`, `remove-pair`, `start-agent`,
 `forget-keys` and `pairs-file` run without the agent. A secret given as `cfg.pat=env:NAME`
 is read from the environment, so tokens stay off command lines.

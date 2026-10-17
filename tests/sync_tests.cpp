@@ -292,8 +292,9 @@ static void test_ipc_and_config() {
 }
 
 int run_engine_tests();
+int run_sync_bench(int smallFiles, uint64_t bigMB);
 
-int wmain() {
+int wmain(int argc, wchar_t** argv) {
     // a settings folder of its own: the pipe, Credential Manager names (tests never meet a
     // real agent or the user's keys)
     wchar_t tmp[MAX_PATH];
@@ -301,6 +302,11 @@ int wmain() {
     std::wstring settingsDir = std::wstring(tmp) + L"ep-sync-tests-" + std::to_wstring(GetCurrentProcessId());
     CreateDirectoryW(settingsDir.c_str(), nullptr);
     SetEnvironmentVariableW(L"EXPLORERPLUS_SETTINGS", (settingsDir + L"\\settings.ini").c_str());
+    if (argc > 1 && std::wstring(argv[1]) == L"--bench") {
+        int r = run_sync_bench(argc > 2 ? _wtoi(argv[2]) : 10000, argc > 3 ? _wcstoui64(argv[3], nullptr, 10) : 2048);
+        RemoveDirectoryW(settingsDir.c_str());
+        return r;
+    }
     test_ipc_and_config();
     test_vectors();
     test_encodings();

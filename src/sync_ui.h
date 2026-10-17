@@ -18,9 +18,21 @@ std::wstring sync_view_status(int pane);                       // "" outside syn
 int sync_view_item(int pane, const std::wstring& fileName);    // sync::ItemState (0: none)
 void sync_draw_badge(HDC dc, const RECT& icon, int state, int dpi);
 
-// the context menu's "Sync now" (the pairs the paths are in)
-bool sync_paths_synced(const std::vector<std::wstring>& paths);
+// the context menu's sync entries for the chosen items (folders[i]: paths[i] is a folder)
+struct SyncMenu {
+    bool syncNow = false;           // any item inside a sync folder
+    bool exclude = false;           // one folder, synced: "Exclude from sync"
+    bool include = false;           // one folder, left out: "Include in sync"
+    bool versions = false;          // one file, on a store that keeps versions: "Version history..."
+};
+SyncMenu sync_menu_for(const std::vector<std::wstring>& paths, const std::vector<bool>& folders);
 void sync_now_for(const std::vector<std::wstring>& paths);
+void sync_exclude(const std::wstring& folder, bool exclude);
+void sync_version_history(HWND owner, const std::wstring& file);
+// the "Sync status" column's text for an item of a pane (inside a sync folder)
+std::wstring sync_status_text(int pane, const std::wstring& fileName);
+// a folder inside a sync folder (any thread; the pairs re-read when pairs.ini changes)
+bool sync_in_sync_folder(const std::wstring& path);
 
 // sync folders for the navigation pane: name, folder
 std::vector<std::pair<std::wstring, std::wstring>> sync_roots();

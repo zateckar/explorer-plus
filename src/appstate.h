@@ -17,7 +17,7 @@ void set_view_mode(const View& v, bool persist);
 
 // --- details columns (columns.cpp) ---
 // built-in columns read fixed Item fields; the codes double as g_sortColumn values
-enum ColKind : int { COL_NAME = 0, COL_SIZE = 1, COL_TYPE = 2, COL_DATE = 3, COL_EXTRA = 4 };
+enum ColKind : int { COL_NAME = 0, COL_SIZE = 1, COL_TYPE = 2, COL_DATE = 3, COL_EXTRA = 4, COL_SYNC = 5 };   // COL_SYNC: Sync status (sync_ui)
 
 struct Column {
     PROPERTYKEY  key{};

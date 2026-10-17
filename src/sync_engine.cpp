@@ -346,6 +346,124 @@ Result Engine::do_upload(Ctx& c, const Action& a) {
     return {};
 }
 
+// ------------------------------------------------------------------ versions, re-encryption
+Result Engine::versions(const RelPath& rel, std::vector<RemoteVersion>& out, Progress& prog) {
+    out.clear();
+    return m_backend->list_versions(rel, out, prog);
+}
+
+Result Engine::restore_version(const RelPath& rel, const std::string& rev, Progress& prog) {
+    if (rel.empty() || rev.empty()) return Result::fail(Status::NotFound);
+    RemoteEntry e;
+    e.path = rel;
+    e.rev = rev;
+    std::wstring tmpDir = full(L".~sync-tmp");
+    if (CreateDirectoryW(tmpDir.c_str(), nullptr)) SetFileAttributesW(tmpDir.c_str(), FILE_ATTRIBUTE_HIDDEN);
+    std::wstring tmp = tmpDir + L"\\" + temp_name();
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return Result::fail(Status::Fatal, L"Can't write in the folder.");
+    FileSink fs(h);
+    HashingSink hs(fs);
+    FileMeta meta;
+    Result res = m_backend->download(e, hs, meta, prog);
+    Hash got = hs.h.final();
+    Hash zero{};
+    if (res.ok() && meta.plainHash != zero && meta.plainHash != got)
+        res = Result::fail(Status::Tampered, L"The old version doesn't match its fingerprint.");
+    CloseHandle(h);
+    if (!res.ok()) { DeleteFileW(tmp.c_str()); return res; }
+    // a restore never loses the current file
+    std::wstring target = full(rel);
+    if (GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES && !recycle(target, m_opt.trashDir, rel)) {
+        DeleteFileW(tmp.c_str());
+        return Result::fail(Status::PreconditionFailed, L"The current file couldn't be moved to the Recycle Bin (is it open?).");
+    }
+    make_dirs(target.substr(0, target.find_last_of(L'\\')));
+    if (!MoveFileExW(tmp.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(tmp.c_str());
+        return Result::fail(Status::Fatal, L"The old version couldn't be put in place.");
+    }
+    // its time: now (the newest change, which the next pass uploads)
+    HANDLE t = CreateFileW(target.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (t != INVALID_HANDLE_VALUE) {
+        FILETIME now;
+        GetSystemTimeAsFileTime(&now);
+        SetFileTime(t, nullptr, nullptr, &now);
+        CloseHandle(t);
+    }
+    return {};
+}
+
+// another device's commit in between (a transactional store refuses the whole commit): a pass to
+// catch up, then again
+Result Engine::reencrypt(Progress& prog, Reencrypted& out) {
+    Result r;
+    for (int i = 0; i < 4; ++i) {
+        r = reencrypt_once(prog, out);
+        if (r.st != Status::CommitRaced) return r;
+        if (Result s = sync(prog).result; !s.ok()) return s;
+    }
+    return Result::fail(Status::PreconditionFailed, L"Other devices kept syncing meanwhile: try again later.");
+}
+
+Result Engine::reencrypt_once(Progress& prog, Reencrypted& out) {
+    out = {};
+    std::vector<BaseEntry> files;
+    {
+        std::lock_guard<std::recursive_mutex> lk(m_state.mutex());
+        for (auto& [k, b] : m_state.base_all())
+            if (!b.isDir && !b.rev.empty() && !m_ignore.ignored(b.path, false)) files.push_back(b);
+    }
+    Result r = m_backend->begin(prog);
+    if (!r.ok()) return r;
+    std::vector<std::pair<BaseEntry, uint64_t>> done;          // new base, stored size
+    for (auto& b : files) {
+        if (prog.cancelled()) { m_backend->abort(); return Result::fail(Status::Cancelled); }
+        HANDLE h = open_for_read(full(b.path));
+        if (h == INVALID_HANDLE_VALUE) { ++out.skipped; continue; }
+        uint64_t size = 0, mtime = 0, id = 0;
+        uint32_t attrs = 0;
+        file_identity(h, size, mtime, id, &attrs);
+        if (size != b.size || mtime != b.mtime) { CloseHandle(h); ++out.skipped; continue; }   // changed: the next pass has it
+        FileMeta meta;
+        meta.mtime = ft_of(mtime);
+        meta.attributes = attrs;
+        meta.version = b.version + 1;
+        meta.plainHash = b.hash;
+        FileSource src(h);
+        RemoteEntry stored;
+        Result x = m_backend->upload(b.path, src, meta, b.rev, stored, prog);
+        CloseHandle(h);
+        if (x.st == Status::PreconditionFailed || x.st == Status::NotFound) { ++out.skipped; continue; }   // changed there: the next pass
+        if (!x.ok()) { m_backend->abort(); return x; }
+        BaseEntry e = b;
+        e.rev = stored.rev;
+        e.version = meta.version;
+        done.push_back({ e, stored.size });
+    }
+    std::string cursor;
+    r = m_backend->commit(L"re-encrypt", cursor, prog);
+    if (!r.ok()) return r.st == Status::PreconditionFailed ? Result::fail(Status::CommitRaced) : r;
+    for (auto& [e, sz] : done) {
+        RemoteItem ri;
+        ri.path = e.path;
+        ri.size = sz;
+        ri.rev = e.rev;
+        m_state.put_base(e);
+        m_state.put_remote(ri);
+    }
+    if (!cursor.empty()) {
+        m_state.set_value("cursor", cursor);
+        m_state.set_value("token", cursor);
+    } else if (!done.empty()) {
+        std::string tok;
+        m_backend->touch(tok, prog);
+    }
+    m_state.flush();
+    out.files = done.size();
+    return {};
+}
+
 // the folders above an uploaded item exist in the store now (implied where it has no
 // folders of its own): in the base, so that emptying them later removes them everywhere
 void Engine::remember_parents(const RelPath& path) {
@@ -370,10 +488,23 @@ Result Engine::do_conflict(Ctx& c, const Action& a) {
     e.rev = ri->rev;
     // the same content on both sides: nothing to keep twice
     ContentHash rh;
-    if (l.hashed && m_backend->peek_hash(e, rh, c.prog).ok() && rh == m_backend->hash_of_local(l.hash)) {
+    bool peeked = m_backend->peek_hash(e, rh, c.prog).ok();
+    if (peeked && l.hashed && rh == m_backend->hash_of_local(l.hash)) {
         c.log("adopt", a.path);
         RemoteItem r = *ri;
         record_local(c, a.path, &r, &l.hash, 0);
+        return {};
+    }
+    // the remote content is still what was synced last (only stored again: re-encrypted, say):
+    // just this side changed it. The base takes the new rev; the next pass uploads the edit.
+    const BaseEntry* b = m_state.base(k);
+    if (peeked && b && !b->isDir && rh == m_backend->hash_of_local(b->hash)) {
+        BaseEntry nb = *b;
+        nb.rev = ri->rev;
+        c.record([this, nb] { m_state.put_base(nb); });
+        c.log("rebase", a.path);
+        std::lock_guard<std::mutex> lk(c.mx);
+        c.rep.again = true;
         return {};
     }
     SYSTEMTIME now;

@@ -68,7 +68,19 @@ public:
     void set_paused(bool p);
     bool paused() const { return m_paused; }
 
+    // Version history (stores that keep it: git). Restoring writes the old version over the
+    // local file (the current one goes to the Recycle Bin) with the time now, so the next
+    // pass uploads it as the newest version. Not during a pass (the agent serializes).
+    Result versions(const RelPath& rel, std::vector<RemoteVersion>& out, Progress& prog);
+    Result restore_version(const RelPath& rel, const std::string& rev, Progress& prog);
+    // "Re-encrypt everything" (after removing a device): every synced file uploaded again,
+    // so its content is under the vault's current key. Files changed locally since the last
+    // pass are left to it. Names keep the key version they were made with.
+    struct Reencrypted { size_t files = 0, skipped = 0; };
+    Result reencrypt(Progress& prog, Reencrypted& out);
+
 private:
+    Result reencrypt_once(Progress& prog, Reencrypted& out);
     struct Ctx;
     Result list_remote(Ctx& c);
     void hash_changed(Ctx& c, LocalMap& local);

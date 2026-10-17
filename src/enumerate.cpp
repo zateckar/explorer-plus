@@ -6,6 +6,7 @@
 #include "columns.h"
 #include "searchbox.h"
 #include "foldersizes.h"
+#include "sync_ui.h"
 #include <propsys.h>
 #include "workers.h"
 #include <memory>
@@ -274,6 +275,10 @@ static int cmp_item(const Item* a, const Item* b) {
             // items without a value go last in either direction (as in Explorer)
             if (int e = columns_compare_extra_empty(a, b)) return e;
             r = columns_compare_extra(a, b);
+            break;
+        case COL_SYNC:
+            r = CompareStringEx(LOCALE_NAME_USER_DEFAULT, NORM_IGNORECASE, sync_status_text(g_pane->index, a->fileName).c_str(), -1,
+                                sync_status_text(g_pane->index, b->fileName).c_str(), -1, nullptr, nullptr, 0) - CSTR_EQUAL;
             break;
         default:  // name
             r = StrCmpLogicalW(a->name.c_str(), b->name.c_str());

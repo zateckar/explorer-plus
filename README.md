@@ -69,7 +69,11 @@ A folder on this PC is kept the same as a storage location, and through it on yo
 PCs, like OneDrive or Dropbox but with storage you choose. A small background process
 (`explorer-plus.exe --sync`, in the tray) does the work, also while Explorer Plus is closed;
 tick "Start sync when I sign in to Windows" to have it always running. Files show a badge
-(synced, waiting, conflict, error) and the status bar shows the folder's state.
+(synced, waiting, conflict, error) and a "Sync status" column, and the status bar shows the
+folder's state. Right-click an item for Sync now, Exclude from sync / Include in sync (a
+folder) or Version history... (a file, on Git and Azure DevOps: restore an older version;
+the current one goes to the Recycle Bin). Edit in Sync folders renames a sync folder,
+changes its left-out folders or its storage's settings.
 
 **What the encryption means.** Everything is encrypted on your PC before it's sent: file
 contents, file and folder names, times. The storage (and anyone who gets into it) sees only
@@ -82,7 +86,9 @@ are in [docs/sync-format.md](docs/sync-format.md).
 
 **A second PC**: add the same storage there. It asks for a code: on a PC that's already set
 up, "Devices and keys" ▸ "Add a device" shows one (valid 15 minutes), or type the recovery
-key. **Removing a device** makes new keys it never gets, and a new recovery key.
+key. **Removing a device** makes new keys it never gets, and a new recovery key; "Re-encrypt
+files" then uploads everything again under the new keys (what the device could already read
+stays readable to it in the storage's history: revoke its token too).
 
 Storage:
 
@@ -191,6 +197,7 @@ ctest --test-dir build --output-on-failure                          # unit tests
 python -I tools/smoke_test.py build\explorer-plus.exe build\smoke   # GUI smoke test
 python -I tools/perf.py build\explorer-plus.exe build\perf 5         # startup / 30k files / scroll / sort / views / resize
 python -I tools/sync_test.py build\explorer-plus.exe build\synctest  # three devices syncing through the agents
+build\explorer-plus-sync-tests.exe --bench 10000 2048                # sync benchmark: small files + a 2 GB file, encrypted vs. copied
 ```
 
 `ctest` also runs `explorer-plus-sync-tests`: the sync engine, cryptography (published test

@@ -181,7 +181,7 @@ if(EXPLORERPLUS_TESTS)
     add_test(NAME unit COMMAND explorer-plus-tests)
 
     # the sync feature: crypto (published vectors), file format, names, planner, engine, stores
-    add_executable(explorer-plus-sync-tests tests/sync_tests.cpp tests/sync_engine_tests.cpp tests/sync_crypt_tests.cpp tests/sync_git_tests.cpp tests/sync_azdo_tests.cpp tests/sync_s3_tests.cpp ${EP_SYNC_CORE_SOURCES})
+    add_executable(explorer-plus-sync-tests tests/sync_tests.cpp tests/sync_engine_tests.cpp tests/sync_crypt_tests.cpp tests/sync_git_tests.cpp tests/sync_azdo_tests.cpp tests/sync_s3_tests.cpp tests/sync_bench.cpp ${EP_SYNC_CORE_SOURCES})
     target_include_directories(explorer-plus-sync-tests PRIVATE src)
     target_compile_options(explorer-plus-sync-tests PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
     target_compile_definitions(explorer-plus-sync-tests PRIVATE UNICODE _UNICODE _WIN32_WINNT=0x0A00 NTDDI_VERSION=0x0A000000)

@@ -1,6 +1,9 @@
 #pragma once
 #include <windows.h>
+#include <atomic>
 #include <functional>
+#include <list>
+#include <memory>
 #include <string>
 #include <thread>
 #include <utility>
@@ -41,7 +44,11 @@ private:
     std::function<Msg(const Msg&)> m_handler;
     std::thread m_thread;
     HANDLE m_stop = nullptr;
-    std::vector<std::thread> m_workers;
+    struct Worker {
+        std::thread th;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+    std::list<Worker> m_workers;
 };
 
 } // namespace syncipc

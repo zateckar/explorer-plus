@@ -8,6 +8,7 @@
 #include "sync_ipc.h"
 #include "sync_keys.h"
 #include <shellapi.h>
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <map>
@@ -84,6 +85,7 @@ public:
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        m_stopping = true;                              // (long polls give up)
         m_server.stop();
         stop_all();
         if (!m_headless) { NOTIFYICONDATAW n = icon_data(); Shell_NotifyIconW(NIM_DELETE, &n); }
@@ -102,6 +104,7 @@ private:
             bool same = now && now->root == (*it)->pair.root && now->type == (*it)->pair.type && now->cfg == (*it)->pair.cfg &&
                         now->excluded == (*it)->pair.excluded;
             if (same) {
+                (*it)->pair.name = now->name;
                 if (now->paused != (*it)->pair.paused) {
                     (*it)->pair.paused = now->paused;
                     if ((*it)->eng) (*it)->eng->set_paused(now->paused);
@@ -117,7 +120,7 @@ private:
             bool have = false;
             for (auto& r : m_runners) if (r->pair.id == p.id) have = true;
             if (have) continue;
-            auto r = std::make_unique<Runner>();
+            auto r = std::make_shared<Runner>();
             r->pair = p;
             Runner* rp = r.get();
             r->th = std::thread([this, rp] { loop(*rp); });
@@ -134,6 +137,7 @@ private:
         }
         r.watch.stop();
         if (r.th.joinable()) r.th.join();
+        std::lock_guard<std::mutex> op(r.opMx);         // (a request working on it finishes first)
         r.eng.reset();
         r.state.reset();
     }
@@ -231,8 +235,8 @@ private:
         }
     }
 
-    Runner* find(const std::string& id) {
-        for (auto& r : m_runners) if (r->pair.id == id) return r.get();
+    std::shared_ptr<Runner> find(const std::string& id) {
+        for (auto& r : m_runners) if (r->pair.id == id) return r;
         return nullptr;
     }
 
@@ -255,6 +259,30 @@ private:
             m.push_back({ prefix + "problems", std::to_string(st.problems.size()) });
             m.push_back({ prefix + "lastSync", std::to_string(st.lastSync) });
         }
+    }
+
+    // a folder's status and its children's states (the file list)
+    syncipc::Msg folder_status(const std::wstring& folder) {
+        std::shared_ptr<Runner> r;
+        RelPath rel;
+        if (!(r = runner_of(folder, rel))) return syncipc::error("not in a sync folder");
+        std::lock_guard<std::mutex> lk(m_mx);
+        syncipc::Msg m = syncipc::ok();
+        put_status(m, *r, "");
+        m.push_back({ "rel", u8(rel) });
+        if (r->eng)
+            for (auto& [name, st] : r->eng->children(rel)) m.push_back({ "item", u8(name) + "\t" + u8(item_state_name(st)) });
+        return m;
+    }
+
+    // the runner of the pair a local path is in (shared: a reload may drop it from the list
+    // meanwhile; stop() waits for the request's opMx before the engine goes)
+    std::shared_ptr<Runner> runner_of(const std::wstring& path, RelPath& rel) {
+        std::lock_guard<std::mutex> lk(m_mx);
+        std::vector<syncconf::Pair> ps;
+        for (auto& r : m_runners) ps.push_back(r->pair);
+        const syncconf::Pair* p = syncconf::pair_of(ps, path, &rel);
+        return p ? find(p->id) : nullptr;
     }
 
     // a raw store of the pair (key operations), with the pair's store lock held by the caller
@@ -287,46 +315,111 @@ private:
             m.push_back({ "count", std::to_string(i) });
             return m;
         }
-        if (cmd == "status") {
+        if (cmd == "status") return folder_status(w16(syncipc::get(q, "folder")));
+        if (cmd == "watch") {
+            // a long poll: the folder's status (or every pair's) once it differs from the
+            // one the caller has (`since`, the hash of the last reply), or after `wait` ms
             std::wstring folder = w16(syncipc::get(q, "folder"));
-            std::lock_guard<std::mutex> lk(m_mx);
-            std::vector<syncconf::Pair> ps;
-            for (auto& r : m_runners) ps.push_back(r->pair);
+            std::string since = syncipc::get(q, "since");
+            DWORD wait = (DWORD)std::clamp<unsigned long>(strtoul(syncipc::get(q, "wait", "20000").c_str(), nullptr, 10), 0, 25000);
+            ULONGLONG until = GetTickCount64() + wait;
+            for (;;) {
+                syncipc::Msg m = folder.empty() ? handle(syncipc::request("pairs")) : folder_status(folder);
+                // (lastSync left out: a pass that changed nothing visible isn't news)
+                syncipc::Msg shown;
+                for (auto& kv : m)
+                    if (kv.first.size() < 8 || kv.first.compare(kv.first.size() - 8, 8, "lastSync") != 0) shown.push_back(kv);
+                std::string body = syncipc::encode(shown);
+                crypto::Hash32 h = crypto::blake2b(body.data(), body.size());
+                std::string hx = crypto::hex(h.data(), 8);
+                if (hx != since || GetTickCount64() >= until || m_stopping) {
+                    m.push_back({ "hash", hx });
+                    return m;
+                }
+                Sleep(250);
+            }
+        }
+        if (cmd == "versions" || cmd == "restore") {
+            std::shared_ptr<Runner> r;
             RelPath rel;
-            const syncconf::Pair* p = syncconf::pair_of(ps, folder, &rel);
-            if (!p) return syncipc::error("not in a sync folder");
-            Runner* r = find(p->id);
+            if (!(r = runner_of(w16(syncipc::get(q, "path")), rel)) || rel.empty()) return syncipc::error("not in a sync folder");
+            std::lock_guard<std::mutex> op(r->opMx);
+            if (!r->eng) return syncipc::error(u8(r->openMessage.empty() ? L"The sync folder isn't open." : r->openMessage));
+            if (cmd == "restore") {
+                Result res = r->eng->restore_version(rel, syncipc::get(q, "rev"), np);
+                if (!res.ok()) return fail(res);
+                r->poke();
+                return syncipc::ok();
+            }
+            std::vector<RemoteVersion> vs;
+            Result res = r->eng->versions(rel, vs, np);
+            if (res.st == Status::Unsupported) return syncipc::error("This storage keeps no versions (git and Azure DevOps do).");
+            if (!res.ok()) return fail(res);
             syncipc::Msg m = syncipc::ok();
-            put_status(m, *r, "");
-            m.push_back({ "rel", u8(rel) });
-            if (r->eng)
-                for (auto& [name, st] : r->eng->children(rel)) m.push_back({ "item", u8(name) + "\t" + u8(item_state_name(st)) });
+            for (auto& v : vs) {
+                uint64_t t = ((uint64_t)v.when.dwHighDateTime << 32) | v.when.dwLowDateTime;
+                m.push_back({ "version", v.rev + "\t" + std::to_string(t) + "\t" + std::to_string(v.size) + "\t" + u8(v.note) });
+            }
             return m;
+        }
+        if (cmd == "reencrypt") {
+            std::shared_ptr<Runner> r;
+            {
+                std::lock_guard<std::mutex> lk(m_mx);
+                r = find(syncipc::get(q, "pair"));
+            }
+            if (!r) return syncipc::error("no such pair");
+            std::lock_guard<std::mutex> op(r->opMx);
+            if (!r->eng) return syncipc::error(u8(r->openMessage.empty() ? L"The sync folder isn't open." : r->openMessage));
+            CancelProgress prog(r->cancel);
+            Engine::Reencrypted done;
+            Result res = r->eng->reencrypt(prog, done);
+            if (!res.ok()) return fail(res);
+            syncipc::Msg m = syncipc::ok();
+            m.push_back({ "files", std::to_string(done.files) });
+            m.push_back({ "skipped", std::to_string(done.skipped) });
+            r->poke();
+            return m;
+        }
+        if (cmd == "exclude") {
+            // leaves a folder out of sync (on=1) or takes it back (on=0): pairs.ini, then a reload
+            std::wstring path = w16(syncipc::get(q, "path"));
+            bool on = syncipc::get(q, "on", "1") == "1";
+            auto pairs = syncconf::load();
+            RelPath rel;
+            syncconf::Pair* p = const_cast<syncconf::Pair*>(syncconf::pair_of(pairs, path, &rel));
+            if (!p || rel.empty()) return syncipc::error("not in a sync folder");
+            std::wstring k = key_of(rel);
+            std::erase_if(p->excluded, [&](const std::wstring& x) { return key_of(x) == k; });
+            if (on) p->excluded.push_back(rel);
+            if (!syncconf::save(pairs)) return syncipc::error("pairs.ini couldn't be written");
+            reload();
+            return syncipc::ok();
         }
         if (cmd == "sync-now" || cmd == "pause" || cmd == "resume" || cmd == "confirm-deletes" || cmd == "dismiss-conflicts") {
             std::string id = syncipc::get(q, "pair");
             bool waitIt = syncipc::get(q, "wait") == "1";
-            std::vector<Runner*> targets;
+            std::vector<std::shared_ptr<Runner>> targets;
             {
                 std::lock_guard<std::mutex> lk(m_mx);
-                for (auto& r : m_runners) if (id.empty() || r->pair.id == id) targets.push_back(r.get());
+                for (auto& r : m_runners) if (id.empty() || r->pair.id == id) targets.push_back(r);
             }
             if (targets.empty()) return syncipc::error("no such pair");
             if (cmd == "pause" || cmd == "resume") {
                 auto pairs = syncconf::load();
                 for (auto& p : pairs) if (id.empty() || p.id == id) p.paused = cmd == "pause";
                 syncconf::save(pairs);
-                for (auto* r : targets) { r->pair.paused = cmd == "pause"; if (r->eng) r->eng->set_paused(r->pair.paused); r->poke(); }
+                for (auto& r : targets) { r->pair.paused = cmd == "pause"; if (r->eng) r->eng->set_paused(r->pair.paused); r->poke(); }
                 return syncipc::ok();
             }
-            for (auto* r : targets) {
+            for (auto& r : targets) {
                 if (cmd == "confirm-deletes" && r->eng) r->eng->confirm_deletes(syncipc::get(q, "yes") == "1");
                 if (cmd == "dismiss-conflicts" && r->eng) r->eng->dismiss_conflicts();
                 if (cmd == "sync-now" && !r->eng) r->poke(true);
             }
             // a pass that's running now saw the old state: wait for the first one that begins
             // after this request (rounds run one after another: round n is done when passes >= n)
-            for (auto* r : targets) {
+            for (auto& r : targets) {
                 if (!waitIt) { r->poke(); continue; }
                 uint64_t target;
                 { std::lock_guard<std::mutex> lk(r->mx); target = r->started + 1; }
@@ -375,7 +468,7 @@ private:
             std::string id = syncipc::get(q, "pair");
             syncconf::set_secret(id, w16(syncipc::get(q, "key")), w16(syncipc::get(q, "value")));
             std::lock_guard<std::mutex> lk(m_mx);
-            if (Runner* r = find(id)) r->poke(true);
+            if (auto r = find(id)) r->poke(true);
             return syncipc::ok();
         }
         // ---- keys
@@ -414,11 +507,11 @@ private:
             return m;
         }
         if (cmd == "unlock" || cmd == "pair-offer" || cmd == "devices" || cmd == "remove-device") {
-            Runner* r;
+            std::shared_ptr<Runner> r;
             {
                 std::lock_guard<std::mutex> lk(m_mx);
                 r = find(syncipc::get(q, "pair"));
-                if (!r && !m_runners.empty() && syncipc::get(q, "pair").empty()) r = m_runners.front().get();
+                if (!r && !m_runners.empty() && syncipc::get(q, "pair").empty()) r = m_runners.front();
             }
             if (!r) return syncipc::error("no such pair");
             syncipc::Msg m = syncipc::ok();
@@ -581,9 +674,10 @@ private:
     }
 
     bool m_headless;
+    std::atomic<bool> m_stopping{ false };
     std::unique_ptr<synckeys::KeyStore> m_ks;
     std::mutex m_mx;
-    std::vector<std::unique_ptr<Runner>> m_runners;
+    std::vector<std::shared_ptr<Runner>> m_runners;
     syncipc::Server m_server;
     HWND m_hwnd = nullptr;
     UINT m_taskbarCreated = 0;
