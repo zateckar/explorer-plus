@@ -1129,6 +1129,45 @@ void test_manifest_upgrade(bool tx) {
     CHECK(b.sync().result.ok() && a.sync().result.ok() && tu::read(a.root, L"one.txt") == "1, edited");
 }
 
+// lines the storage adds after the vault object's signature, or a field given twice, aren't
+// read: the object is refused (docs/sync-review.md, I6)
+void test_vault_unsigned_lines() {
+    auto store = std::make_shared<FakeStore>();
+    auto raw = [store] { return std::unique_ptr<Backend>(std::make_unique<FakeBackend>(store, false)); };
+    EDev a(L"sa", raw);
+    CHECK(synckeys::setup_ring(*a.ks, "Sync password 1").ok());
+    CHECK(a.open(true).ok());
+    tu::write(a.root, L"a.txt", "A");
+    CHECK(a.sync().result.ok());
+    std::vector<uint8_t> good;
+    auto put = [&](const std::string& s) {
+        std::lock_guard<std::mutex> lk(store->mx);
+        auto& o = store->objs[L".ep-vault/vault"];
+        o.data.assign(s.begin(), s.end());
+        o.rev = store->next_rev();
+        ++store->gen;
+    };
+    {
+        std::lock_guard<std::mutex> lk(store->mx);
+        good = store->objs[L".ep-vault/vault"].data;
+    }
+    std::string s(good.begin(), good.end());
+    CHECK(s.find("manifest=1\n") != std::string::npos);
+    put(s + "manifest=0\n");                                  // after the signature
+    CHECK(!a.open(false).ok());
+    put(s + "sig=" + s.substr(s.rfind("sig=") + 4));          // a second signature line
+    CHECK(!a.open(false).ok());
+    std::string body = s.substr(0, s.rfind("sig="));          // a field twice, signed by A itself
+    body += "manifest=0\n";
+    uint8_t sig[crypto::kSig];
+    synckeys::sign_as(synckeys::device_key(*a.ks), "ep vault object", (const uint8_t*)body.data(), body.size(), sig);
+    put(body + "sig=" + crypto::base64(sig, crypto::kSig) + "\n");
+    CHECK(!a.open(false).ok());
+    put(s);                                                    // as written: fine again
+    CHECK(a.open(false).ok());
+    CHECK(a.sync().result.ok());
+}
+
 } // namespace
 
 void run_crypt_tests() {
@@ -1147,4 +1186,5 @@ void run_crypt_tests() {
     test_manifest_window();
     test_manifest_upgrade(false);
     test_manifest_upgrade(true);
+    test_vault_unsigned_lines();
 }

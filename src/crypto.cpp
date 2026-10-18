@@ -116,10 +116,12 @@ void xchacha20(const Key& k, const uint8_t nonce[kNonce], const uint8_t* in, uin
 Argon2Params argon2_default() {
     Argon2Params p;
     wchar_t buf[32];
-    // tests only, and only with a settings file of their own (EXPLORERPLUS_SETTINGS): the
-    // parameters travel with each wrap, so smaller ones stay readable, but a stray variable
-    // must not weaken a real recovery wrap or pairing grant
-    if (GetEnvironmentVariableW(L"EXPLORERPLUS_SETTINGS", nullptr, 0) > 0 &&
+    // tests only (EXPLORERPLUS_TEST=1), and only with a settings file of their own
+    // (EXPLORERPLUS_SETTINGS): the parameters travel with each wrap, so smaller ones stay
+    // readable, but a stray variable must not weaken a real recovery wrap or pairing grant
+    wchar_t test[4];
+    if (GetEnvironmentVariableW(L"EXPLORERPLUS_TEST", test, 4) == 1 && test[0] == L'1' &&
+        GetEnvironmentVariableW(L"EXPLORERPLUS_SETTINGS", nullptr, 0) > 0 &&
         GetEnvironmentVariableW(L"EXPLORERPLUS_SYNC_KDF_KIB", buf, 32) > 0) {
         long v = wcstol(buf, nullptr, 10);
         if (v >= 8) p.memKiB = (uint32_t)v;
@@ -292,8 +294,7 @@ bool unbase32(std::string_view s, Bytes& out) {
     int bits = 0;
     for (char c : s) {
         int d;
-        if (c >= 'a' && c <= 'z') d = c - 'a';
-        else if (c >= 'A' && c <= 'Z') d = c - 'A';
+        if (c >= 'a' && c <= 'z') d = c - 'a';             // (small letters only, as written: one spelling)
         else if (c >= '2' && c <= '7') d = c - '2' + 26;
         else return false;
         v = (v << 5) | (uint32_t)d;

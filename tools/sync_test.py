@@ -45,6 +45,7 @@ class Device:
         os.makedirs(self.dir, exist_ok=True)
         self.env = dict(os.environ)
         self.env['EXPLORERPLUS_SETTINGS'] = os.path.join(self.dir, 'settings.ini')
+        self.env['EXPLORERPLUS_TEST'] = '1'                 # the test-only variables count
         self.env['EXPLORERPLUS_SYNC_KDF_KIB'] = '8192'      # Argon2id, cheap for tests
         self.env['EXPLORERPLUS_SYNC_TRASH'] = '1'           # deletions kept in the pair's folder, not the Recycle Bin
         self.started = False

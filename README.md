@@ -179,7 +179,9 @@ Environment variables (diagnostics and tests):
 | `EXPLORERPLUS_SETTINGS=<file>` | use another settings file |
 | `EXPLORERPLUS_THEME=light\|dark` | override the Windows theme |
 | `EXPLORERPLUS_PERF=<log file>` | write timing events (startup, listings, paints, slow UI messages) |
+| `EXPLORERPLUS_TEST=1` | tests: the test-only variables below count (without it they're ignored) |
 | `EXPLORERPLUS_SYNC_KDF_KIB=<KiB>` | tests: a cheaper Argon2id for sync codes (only with `EXPLORERPLUS_SETTINGS`) |
+| `EXPLORERPLUS_SYNC_MANIFEST_GRACE=<s>` | tests: how long the storage and the manifest may disagree before it's reported |
 | `EXPLORERPLUS_SYNC_TRASH=1` | tests: sync keeps deleted files in its own folder, not the Recycle Bin |
 | `EXPLORERPLUS_AZDO_TEST_URL`, `_PAT` | sync tests: run the Azure DevOps end-to-end tests against this repository |
 

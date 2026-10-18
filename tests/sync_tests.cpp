@@ -106,6 +106,7 @@ static void test_encodings() {
     CHECK(crypto::unbase32("mzxw6ytboi", b) && std::string(b.begin(), b.end()) == "foobar");
     CHECK(!crypto::unbase32("mzxw6ytboj", b));                    // non-zero leftover bits
     CHECK(!crypto::unbase32("MZ!", b));
+    CHECK(!crypto::unbase32("MZXW6YTBOI", b));                    // capitals: a second spelling of the same name
     // codes
     std::string c = crypto::new_code();
     CHECK(c.size() == 15);
@@ -347,6 +348,7 @@ int wmain(int argc, wchar_t** argv) {
     std::wstring settingsDir = std::wstring(tmp) + L"ep-sync-tests-" + std::to_wstring(GetCurrentProcessId());
     CreateDirectoryW(settingsDir.c_str(), nullptr);
     SetEnvironmentVariableW(L"EXPLORERPLUS_SETTINGS", (settingsDir + L"\\settings.ini").c_str());
+    SetEnvironmentVariableW(L"EXPLORERPLUS_TEST", L"1");     // (the test-only variables below count)
     // what the storage and the vault's manifest disagree on is reported at once (devices
     // here take turns, so no other device's write is ever under way)
     SetEnvironmentVariableW(L"EXPLORERPLUS_SYNC_MANIFEST_GRACE", L"0");

@@ -420,13 +420,29 @@ struct VaultFile {
     Bytes signedText, sig;                   // the lines up to "sig=", and the signature over them
 };
 
+// The signature is the last line and covers every line before it; the fields are read from
+// those lines only, each once. (A line after the signature, or a field given twice, would
+// otherwise be read without being signed: docs/sync-review.md, I6.)
 bool parse_vault(const Bytes& b, VaultFile& v) {
     std::string s(b.begin(), b.end());
     if (s.compare(0, 5, "EPV2\n") != 0) return false;   // EPV1 (unsigned) is refused
-    size_t at = s.find("\nsig=");
+    size_t at = s.rfind("\nsig=");
     if (at == std::string::npos) return false;
+    std::string sigText = s.substr(at + 5);
+    if (!sigText.empty() && sigText.back() == '\n') sigText.pop_back();
+    if (sigText.find_first_of("\r\n") != std::string::npos) return false;
     v.signedText.assign(b.begin(), b.begin() + at + 1);
-    auto m = parse_lines(b);
+    std::map<std::string, std::string> m;
+    std::string text(v.signedText.begin(), v.signedText.end());
+    for (size_t i = 0; i < text.size();) {
+        size_t e = text.find('\n', i);
+        std::string line = text.substr(i, e - i);
+        i = e + 1;
+        size_t eq = line.find('=');
+        std::string key = line.substr(0, eq), value = eq == std::string::npos ? std::string() : line.substr(eq + 1);
+        if (key.empty() || key == "sig" || !m.emplace(key, value).second) return false;
+    }
+    m["sig"] = sigText;
     v.umk = m["umk"];
     v.gen = (uint32_t)strtoul(m["gen"].c_str(), nullptr, 10);
     v.rparams.memKiB = (uint32_t)strtoul(m["rmem"].c_str(), nullptr, 10);
@@ -641,6 +657,7 @@ static bool take_rotations(Backend& raw, KeyStore& ks, Ring& ring, const DeviceK
         if (get_object(raw, e.path, b, nullptr, prog).ok()) mine.push_back({ e.path, std::move(b) });
     }
     bool changed = false;
+    std::vector<RelPath> done;
     for (bool progress = true; progress;) {             // a chain of rotations: in order, whatever the listing's
         progress = false;
         for (auto it = mine.begin(); it != mine.end();) {
@@ -657,11 +674,14 @@ static bool take_rotations(Backend& raw, KeyStore& ks, Ring& ring, const DeviceK
                     changed = progress = true;
                 }
             }
-            remove_object(raw, it->first, prog);             // taken, or stale / not ours to take
+            done.push_back(it->first);                     // taken, or stale / not ours to take
             it = mine.erase(it);
         }
     }
-    if (changed) ks.save_ring(ring);
+    // the hand-overs go once the ring they gave is kept: a ring that couldn't be saved is
+    // taken again next time, not lost
+    if (changed && !ks.save_ring(ring)) return changed;
+    for (auto& p : done) remove_object(raw, p, prog);
     return changed;
 }
 

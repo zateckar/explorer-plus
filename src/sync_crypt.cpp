@@ -144,11 +144,13 @@ const wchar_t* odd_why(Odd k) {
 
 // how long a disagreement may last before it's reported: a store without transactions
 // shows another device's files before its manifest, and the manifest before the old
-// shards are gone (EXPLORERPLUS_SYNC_MANIFEST_GRACE, seconds: tests)
+// shards are gone (EXPLORERPLUS_SYNC_MANIFEST_GRACE, seconds, 0 to a day: tests only, with
+// EXPLORERPLUS_TEST=1)
 ULONGLONG manifest_grace_ms() {
-    wchar_t s[16];
+    wchar_t s[16], test[4];
     DWORD n = GetEnvironmentVariableW(L"EXPLORERPLUS_SYNC_MANIFEST_GRACE", s, 16);
-    if (n > 0 && n < 16) return (ULONGLONG)_wtoi(s) * 1000;
+    bool tests = GetEnvironmentVariableW(L"EXPLORERPLUS_TEST", test, 4) == 1 && test[0] == L'1';
+    if (tests && n > 0 && n < 16) return (ULONGLONG)std::clamp(_wtoi(s), 0, 86400) * 1000;
     return 15ull * 60 * 1000;
 }
 
@@ -960,8 +962,10 @@ private:
                 se.path = syncman::shard_rel(root.shards[i]);
                 if (auto l = listed.find(se.path); l != listed.end()) se = *l->second;
                 MemorySink s;
+                s.limit = 64u << 20;                // (a storage can't make the agent hold gigabytes)
                 FileMeta ignored;
                 r = m_raw->download(se, s, ignored, prog);
+                if (r.ok() && s.data.size() >= s.limit) r = Result::fail(Status::Tampered, L"A part of the vault's manifest is too big.");
                 if (r.st == Status::NotFound) return Result::fail(Status::NotFound, L"A part of the vault's manifest is missing from the storage.");
                 if (!r.ok()) return r;
                 shards[i] = std::move(s.data);
@@ -1012,8 +1016,10 @@ private:
         Result r;
         for (int attempt = 0; attempt < 3; ++attempt) {
             MemorySink s;
+            s.limit = 1u << 20;                     // (4096 shard hashes and a signature)
             FileMeta ignored;
             r = m_raw->download(root, s, ignored, prog);
+            if (r.ok() && s.data.size() >= s.limit) r = Result::fail(Status::Tampered, L"The vault's manifest is too big.");
             if (r.ok()) r = take_root(s.data, root.rev, attempt == 0 ? &rb : nullptr, prog);
             if (r.st != Status::NotFound) break;
             // a shard gone: another device wrote a newer root meanwhile (and removed the
