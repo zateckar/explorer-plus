@@ -89,8 +89,7 @@ Your devices also sign a list of every file in the folder, so a storage that wit
 file, brings back an old version or slips in one of its own is reported instead of
 believed, and your copy stays as it is. It can still delete everything or stop taking new
 files, and it sees when you sync. All your devices need this version of Explorer Plus: an
-older one doesn't keep the list, and the files it writes are reported, not taken. The
-formats are in [docs/sync-format.md](docs/sync-format.md).
+older one doesn't keep the list, and the files it writes are reported, not taken.
 
 **A second PC**: add the same storage there. It asks for a code: on a PC that's already set
 up, "Devices and keys" ▸ "Add a device" shows one (valid 15 minutes), or type your sync
