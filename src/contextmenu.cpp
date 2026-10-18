@@ -19,6 +19,7 @@
 #include "sync_ui.h"
 #include <algorithm>
 #include <map>
+#include <unordered_set>
 
 // ------------------------------------------------------------------
 // Shell context-menu hosting (classic IContextMenu, which is what Explorer's
@@ -646,15 +647,23 @@ static bool menu_has_id(HMENU m, UINT id) {
 
 // runs a New item and selects the created item in rename mode, like Explorer
 static void invoke_new_item(HWND hwnd, IContextMenu* cm, UINT id, POINT pt) {
-    std::vector<std::wstring> before = folder_names(g_pane->current);
-    invoke_id(hwnd, cm, id, pt, g_pane->current, false);
-    std::vector<std::wstring> after = folder_names(g_pane->current);
-    for (auto& n : after) {
-        if (std::find(before.begin(), before.end(), n) == before.end()) {
-            enum_set_pending_select(n, true);
+    // (the folder's own copy: the command can pump messages, and a navigation meanwhile
+    // frees g_pane->current)
+    PIDLIST_ABSOLUTE folder = pidl_clone(g_pane->current);
+    if (!folder) return;
+    std::vector<std::wstring> was = folder_names(folder);
+    std::unordered_set<std::wstring> before;
+    for (auto& n : was) { CharLowerBuffW(n.data(), (DWORD)n.size()); before.insert(std::move(n)); }
+    invoke_id(hwnd, cm, id, pt, folder, false);
+    for (auto& n : folder_names(folder)) {
+        std::wstring k = n;
+        CharLowerBuffW(k.data(), (DWORD)k.size());
+        if (!before.count(k)) {
+            if (pidl_equal(folder, g_pane->current)) enum_set_pending_select(n, true);
             break;
         }
     }
+    CoTaskMemFree(folder);
     navigation_refresh();
 }
 
@@ -743,6 +752,21 @@ void show_bg_context_menu(HWND hwnd, POINT pt) {
 // which may be stale right after a create)
 static std::vector<std::wstring> folder_names(PCIDLIST_ABSOLUTE folder) {
     std::vector<std::wstring> out;
+    // a folder on disk: its names straight from the file system (the shell reads each item;
+    // a folder of 50,000 files took seconds, twice per New)
+    WCHAR path[MAX_PATH * 4]{};
+    if (SHGetPathFromIDListEx(folder, path, ARRAYSIZE(path), GPFIDL_DEFAULT) && path[0]) {
+        std::wstring pattern = std::wstring(path) + (path[wcslen(path) - 1] == L'\\' ? L"*" : L"\\*");
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (wcscmp(fd.cFileName, L".") && wcscmp(fd.cFileName, L"..")) out.push_back(fd.cFileName);
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+            return out;
+        }
+    }
     com_ptr<IShellFolder> psf;
     if (FAILED(bind_list(folder, IID_PPV_ARGS(psf.put()))) || !psf) return out;
     com_ptr<IEnumIDList> en;

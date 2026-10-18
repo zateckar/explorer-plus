@@ -82,6 +82,8 @@ PITEMID_CHILD pidl_clone_child(PCUITEMID_CHILD child);
 bool pidl_equal(PCIDLIST_ABSOLUTE a, PCIDLIST_ABSOLUTE b);  // canonical shell comparison
 ULONGLONG pidl_sig(PCUIDLIST_RELATIVE pidl);    // stable content hash, works for relative pidls
 std::wstring pidl_folder_path(PCIDLIST_ABSOLUTE abs);       // fs path if possible else parsing name
+std::wstring pidl_fs_path(PCIDLIST_ABSOLUTE abs);           // fs path (long ones too), else empty
+std::wstring module_file();                                 // this exe's path (long ones too)
 std::wstring child_name(IShellFolder* psf, PCUITEMID_CHILD child, SHGDNF flags);
 
 // typed path parsing (address bar)

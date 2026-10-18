@@ -4,6 +4,7 @@
 #include "detailspane.h"
 #include "watcher.h"
 #include "perf.h"
+#include <algorithm>
 #include <unordered_set>
 
 // the watcher waits while an operation runs (they pump messages); deletes and renames
@@ -158,12 +159,17 @@ static bool cut_files_still_there(IDataObject* pdo) {
 
 void fileops_paste_into_current() { fileops_paste_into(g_pane->current); }
 
-void fileops_paste_into(PCIDLIST_ABSOLUTE folder) {
+void fileops_paste_into(PCIDLIST_ABSOLUTE target) {
     com_ptr<IDataObject> pdo;
-    if (FAILED(OleGetClipboard(pdo.put())) || !pdo) return;
+    if (FAILED(OleGetClipboard(pdo.put())) || !pdo || !target) return;
+    // its own copy: the drop can pump messages (a conflict dialog), and a navigation meanwhile
+    // frees the pane's folder that `target` may be
+    PIDLIST_ABSOLUTE folder = pidl_clone(target);
+    if (!folder) return;
     bool move = clipboard_prefers_move(pdo.get());
     if (!drop_into_folder(folder, pdo.get(), move ? DROPEFFECT_MOVE : DROPEFFECT_COPY)) {
         MessageBeep(MB_ICONASTERISK);
+        CoTaskMemFree(folder);
         return;
     }
     if (move && !cut_files_still_there(pdo.get())) {
@@ -171,6 +177,7 @@ void fileops_paste_into(PCIDLIST_ABSOLUTE folder) {
         s_cutSigs.clear();
     }
     for_each_pane([folder] { if (pidl_equal(folder, g_pane->current)) navigation_refresh(); }, true);
+    CoTaskMemFree(folder);
 }
 
 bool fileops_set_clipboard(IShellFolder* parent, const std::vector<PCITEMID_CHILD>& children, bool cut) {
@@ -238,7 +245,15 @@ bool fileops_rename_item(HWND hwnd, IShellFolder* parent, PCITEMID_CHILD child,
     bool renamed = false;
     if (exactFileName) {
         // the name carries an extension Windows hides: the shell's rename would add the
-        // old one again ("b.txt.txt"), so set the file name as it is
+        // old one again ("b.txt.txt"), so set the file name as it is. That path doesn't check
+        // the name the way the shell's rename does: "..\x.txt" or "sub\x.txt" would move it.
+        if (newName.find_first_of(L"\\/:*?\"<>|") != std::wstring::npos ||
+            std::any_of(newName.begin(), newName.end(), [](wchar_t c) { return c < 32; }) ||
+            newName == L"." || newName == L"..") {
+            MessageBoxW(hwnd, L"A file name can't contain any of the following characters:\n\\ / : * ? \" < > |",
+                        L"Rename", MB_OK | MB_ICONWARNING);
+            return false;
+        }
         PITEMID_CHILD out = nullptr;
         {
             WatchHold hold(true);

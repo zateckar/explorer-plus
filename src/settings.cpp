@@ -203,7 +203,7 @@ void settings_load_all() {
     // tabs: [tabs] section with keys tab0..tabN, values "parse \x01 name \x01 viewcode \x01 pinned"
     s_activeTab = get_int(d, L"tabs", L"active", 0);
     s_tabLines.clear();
-    for (int i = 0; i < 200; ++i) {
+    for (int i = 0; i < 100000; ++i) {                  // (every tab saved is read back)
         const std::wstring* v = d.get(L"tabs", L"tab" + std::to_wstring(i));
         if (!v || v->empty()) break;
         s_tabLines.push_back(*v);
@@ -245,6 +245,15 @@ static void put_tabs(IniDoc& d) {
     KeyValues kv{ { L"active", std::to_wstring(s_activeTab) } };
     for (size_t i = 0; i < s_tabLines.size(); ++i) kv.push_back({ L"tab" + std::to_wstring(i), s_tabLines[i] });
     d.replace(L"tabs", kv);
+}
+
+bool settings_dirty() {
+    MainValues now = main_now();
+    const MainValues& was = s_mainLoaded;
+    bool mainChanged = view_to_int(now.defaultView) != view_to_int(was.defaultView) || now.showHidden != was.showHidden ||
+                       now.detailsPane != was.detailsPane || now.split.width != was.split.width ||
+                       now.split.widthRight != was.split.widthRight || now.split.treeVisible != was.split.treeVisible;
+    return mainChanged || s_tabsDirty || s_forgetFs || !s_viewsDirty.empty() || !s_columnsDirty.empty() || !s_prefsDirty.empty();
 }
 
 bool settings_save_all() {

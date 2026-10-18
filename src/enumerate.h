@@ -6,6 +6,7 @@
 // keepView = true for a refresh of the folder already shown: the current items stay
 // visible until the new listing arrives, and selection/focus/scroll are restored.
 void enumerate_start(PCIDLIST_ABSOLUTE folderAbs, bool keepView);
+void enumerate_forget_types();          // file associations changed: type names and icons read again
 
 // Startup: list `folderAbs` in `pane` before the window is there (settings read); the
 // window's enumerate_start of that folder takes the listing over. enum_early_done, once

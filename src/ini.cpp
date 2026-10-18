@@ -24,8 +24,23 @@ std::wstring ini_decode(const std::string& raw) {
         return true;
     };
     std::wstring text;
-    if (raw.size() >= 2 && (unsigned char)raw[0] == 0xFF && (unsigned char)raw[1] == 0xFE) {
-        text.assign(reinterpret_cast<const wchar_t*>(raw.data() + 2), (raw.size() - 2) / sizeof(wchar_t));
+    // UTF-16 without a BOM (some editors and scripts write it): zero bytes at odd places only
+    // (LE) or at even places only (BE), in the first kilobyte
+    int oddZeros = 0, evenZeros = 0;
+    for (size_t i = 0; i < raw.size() && i < 1024; ++i)
+        if (!raw[i]) ++(i & 1 ? oddZeros : evenZeros);
+    size_t sample = std::min<size_t>(raw.size(), 1024);
+    bool le = raw.size() >= 2 && (unsigned char)raw[0] == 0xFF && (unsigned char)raw[1] == 0xFE;
+    bool be = raw.size() >= 2 && (unsigned char)raw[0] == 0xFE && (unsigned char)raw[1] == 0xFF;
+    bool bareLe = !le && !be && sample >= 4 && oddZeros >= (int)sample / 4 && evenZeros == 0;
+    bool bareBe = !le && !be && sample >= 4 && evenZeros >= (int)sample / 4 && oddZeros == 0;
+    if (le || be || bareLe || bareBe) {
+        size_t skip = le || be ? 2 : 0;
+        text.resize((raw.size() - skip) / 2);
+        for (size_t i = 0; i < text.size(); ++i) {
+            unsigned char a = (unsigned char)raw[skip + 2 * i], b = (unsigned char)raw[skip + 2 * i + 1];
+            text[i] = (wchar_t)(be || bareBe ? (a << 8) | b : (b << 8) | a);
+        }
     } else if (raw.size() >= 3 && (unsigned char)raw[0] == 0xEF && (unsigned char)raw[1] == 0xBB &&
                (unsigned char)raw[2] == 0xBF) {
         widen(CP_UTF8, 3, 0, text);

@@ -5,6 +5,7 @@
 #include <structuredquerycondition.h>
 #include <propvarutil.h>
 #include <cwctype>
+#include <unordered_set>
 
 // ------------------------------------------------------------------
 // conditions: IConditionFactory (structuredquery.h, missing from MinGW)
@@ -182,9 +183,18 @@ void search_submit() {
     r.scope = pidl_clone(scope);
     r.query = q;
     s_searches.push_back(r);                               // (cur / scope may dangle from here on)
-    if (s_searches.size() > 64) {                          // oldest first; tabs may still show it
-        CoTaskMemFree(s_searches.front().scope);
-        s_searches.erase(s_searches.begin());
+    if (s_searches.size() > 64) {
+        // oldest first, but none a tab shows or has in its history (Back to it would find
+        // no search box text and no scope, and the tab was saved with a name that doesn't parse)
+        std::vector<PCIDLIST_ABSOLUTE> used;
+        tabmodel_all_folders(used);
+        std::unordered_set<ULONGLONG> held;
+        for (auto p : used) held.insert(pidl_sig(p));
+        for (size_t i = 0; i + 1 < s_searches.size() && s_searches.size() > 64;) {
+            if (held.count(s_searches[i].sig)) { ++i; continue; }
+            CoTaskMemFree(s_searches[i].scope);
+            s_searches.erase(s_searches.begin() + i);
+        }
     }
     if (refining) {
         // refining a search replaces the results in place (no extra history entry)

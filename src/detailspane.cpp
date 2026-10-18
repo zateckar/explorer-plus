@@ -58,6 +58,11 @@ static std::mutex s_reqMx;
 static std::condition_variable s_reqCv;
 static PrevReq* s_reqPending = nullptr;
 static bool s_reqThread = false;
+// a provider that never returns holds the thread: after a while another takes over (the
+// stuck one ends if it ever comes back)
+static int s_reqEpoch = 0;                 // the thread serving requests; older ones end
+static ULONGLONG s_reqBusySince = 0;       // when it took the one it's on (0: waiting)
+static int s_reqThreads = 0;
 
 static void clear_preview() {
     if (s_preview) { DeleteObject(s_preview); s_preview = nullptr; }
@@ -151,15 +156,18 @@ static void free_req(PrevReq* r) {
     delete r;
 }
 
-static void prev_thread() {
+static void prev_thread(int epoch) {
     ComInit ci;
     for (;;) {
         PrevReq* r = nullptr;
         {
             std::unique_lock<std::mutex> lk(s_reqMx);
-            s_reqCv.wait(lk, [] { return s_reqPending != nullptr; });
+            if (epoch == s_reqEpoch) s_reqBusySince = 0;
+            s_reqCv.wait(lk, [&] { return s_reqPending != nullptr || epoch != s_reqEpoch; });
+            if (epoch != s_reqEpoch) return;
             r = s_reqPending;
             s_reqPending = nullptr;
+            s_reqBusySince = std::max<ULONGLONG>(1, GetTickCount64());
         }
         if (r->gen == s_gen.load()) prev_work(r);    // (else the selection moved on meanwhile)
         free_req(r);
@@ -171,9 +179,18 @@ static void submit(PrevReq* r) {
         std::lock_guard<std::mutex> lk(s_reqMx);
         free_req(s_reqPending);        // superseded before it was started
         s_reqPending = r;
-        if (!s_reqThread) { s_reqThread = true; std::thread(prev_thread).detach(); }
+        bool stuck = s_reqBusySince && GetTickCount64() - s_reqBusySince > 20000 && s_reqThreads < 8;
+        if (!s_reqThread || stuck) {
+            try {
+                std::thread(prev_thread, s_reqEpoch + 1).detach();
+                ++s_reqEpoch;
+                s_reqBusySince = 0;
+                s_reqThread = true;
+                ++s_reqThreads;
+            } catch (...) {}
+        }
     }
-    s_reqCv.notify_one();
+    s_reqCv.notify_all();
 }
 
 static void request_thumbnail(PIDLIST_ABSOLUTE abs /*adopted*/, int size) {
@@ -250,9 +267,19 @@ static void load_preview() {
     std::vector<Item*> sel = selected_items(nullptr);
     PIDLIST_ABSOLUTE full = sel.size() == 1 && !sel[0]->isFolder
                           ? ILCombine(g_pane->current, sel[0]->pidl) : nullptr;
+    // a cloud file not on this PC (OneDrive's online-only...) or an offline one: a preview
+    // handler reads it, which downloads it, so arrowing through a folder fetched every file.
+    // Its thumbnail comes from the provider instead.
+    bool remoteOnly = false;
+    if (full) {
+        std::wstring p = !sel[0]->path.empty() ? sel[0]->path : pidl_folder_path(full);
+        DWORD a = p.size() > 2 && p.rfind(L"::", 0) != 0 ? GetFileAttributesW(p.c_str()) : INVALID_FILE_ATTRIBUTES;
+        remoteOnly = a != INVALID_FILE_ATTRIBUTES &&
+                     (a & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_OFFLINE));
+    }
     if (!full) {
         s_message = L"Select a file to preview.";
-    } else if (preview_open(s_hostWnd, full)) {
+    } else if (!remoteOnly && preview_open(s_hostWnd, full)) {
         CoTaskMemFree(full);
     } else {
         RECT rc{};

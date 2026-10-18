@@ -90,6 +90,10 @@ void post_async(AsyncHandler apply, void* payload) {
     }
 }
 
+void post_later(AsyncHandler apply, void* payload) {
+    if (!g_main || !PostMessageW(g_main, WM_RUN_LATER, (WPARAM)apply, (LPARAM)payload)) apply(payload);
+}
+
 void drain_async() {
     std::deque<AsyncEntry> batch;
     {

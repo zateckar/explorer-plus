@@ -120,6 +120,11 @@ static void ini_decoding() {
     CHECK(!ini_decode("k=\xE9t\xE9").empty());             // not UTF-8: read as ANSI
     CHECK(ini_decode("").empty());
     CHECK(ini_decode("\xFF\xFE").empty());
+    CHECK_EQ(ini_decode(utf16.substr(2)), want);           // UTF-16 LE without its BOM
+    std::string be = "\xFE\xFF", bareBe;
+    for (wchar_t c : want) { bareBe += (char)(c >> 8); bareBe += (char)(c & 0xFF); }
+    CHECK_EQ(ini_decode(be + bareBe), want);               // UTF-16 BE, with a BOM and without
+    CHECK_EQ(ini_decode(bareBe), want);
 }
 
 // ------------------------------------------------------------------
@@ -149,6 +154,18 @@ static void command_line() {
     CHECK_EQ(c.path, L"D:\\Notes\\to do.txt");
     c = parse_command_line(L"explorer-plus.exe --notepad");
     CHECK(c.notepad && c.path.empty());
+    // a quoted path ending in a backslash, with more after it: the flags aren't swallowed
+    c = parse_command_line(L"explorer-plus.exe \"C:\\My Folder\\\" --new-window");
+    CHECK(c.newWindow);
+    CHECK_EQ(c.path, L"C:\\My Folder\\");
+    c = parse_command_line(L"explorer-plus.exe \"C:\\\" --play --new-window");
+    CHECK(c.play && c.newWindow);
+    CHECK_EQ(c.path, L"C:\\");
+    // two paths: the first, not both run together
+    c = parse_command_line(L"explorer-plus.exe C:\\a C:\\b");
+    CHECK_EQ(c.path, L"C:\\a");
+    c = parse_command_line(L"explorer-plus.exe \"C:\\a\" \\\\server\\share");
+    CHECK_EQ(c.path, L"C:\\a");
 }
 
 // ------------------------------------------------------------------

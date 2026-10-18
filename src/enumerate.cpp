@@ -99,10 +99,20 @@ static int file_icon_by_type(IShellIcon* icons, PCUITEMID_CHILD child, const std
 }
 
 // extensions Explorer hides when "File name extensions" is off: those of registered types
+static std::unordered_map<std::wstring, bool> s_registeredExt;
+
+void enumerate_forget_types() {
+    std::lock_guard<std::mutex> lk(s_typeMx);
+    s_typeByExt.clear();
+    s_typeIconByExt.clear();
+    s_fileIconByExt.clear();
+    s_registeredExt.clear();
+}
+
 static bool registered_ext(const std::wstring& ext) {
     std::wstring key = ext;
     CharLowerBuffW(key.data(), (DWORD)key.size());
-    static std::unordered_map<std::wstring, bool> known;
+    auto& known = s_registeredExt;
     {
         std::lock_guard<std::mutex> lk(s_typeMx);
         auto it = known.find(key);
@@ -1100,8 +1110,9 @@ static void set_error(HRESULT hr) {
 // A refresh's or a change's new items take over what the old ones with the same key
 // had: the overlay and an icon of its own (until the passes have the new ones: no blinking
 // arrows or icons) and the thumbnail, while the ID is the same (an unchanged file), and a folder its size (until
-// the folder sizes are worked out again). Returns the thumbnails kept.
-static size_t carry_over(const std::vector<Item*>& old, std::vector<Item*>& fresh) {   // (g_pane->itemsMx held)
+// the folder sizes are worked out again). Returns the thumbnails kept. overlays: false when
+// the new items' overlays were read already (a 0 then means the overlay went away).
+static size_t carry_over(const std::vector<Item*>& old, std::vector<Item*>& fresh, bool overlays = true) {   // (g_pane->itemsMx held)
     struct Carry { int overlay; int icon; int thumbIndex; ULONGLONG sig; const Item* folder; };
     std::unordered_map<std::wstring, Carry> carry;
     for (Item* it : old) {
@@ -1115,7 +1126,7 @@ static size_t carry_over(const std::vector<Item*>& old, std::vector<Item*>& fres
     for (Item* it : fresh) {
         auto f = carry.find(it->key);
         if (f == carry.end()) continue;
-        if (!it->overlay) it->overlay = f->second.overlay;
+        if (!it->overlay && overlays) it->overlay = f->second.overlay;
         if (it->iconPending && f->second.icon >= 0) it->icon = f->second.icon;
         if (const Item* folder = f->second.folder; folder && it->isFolder && it->size.empty()) {
             it->bytes = folder->bytes;
@@ -1148,6 +1159,7 @@ struct ChangeResult {
     UINT opId = 0;
     std::vector<std::wstring> keys;   // every name touched (lowercased): its item is replaced or goes
     std::vector<Item*> items;         // the ones that are there (and shown) now
+    bool overlaysRead = false;        // their overlays were read (0: none, not "not yet")
 };
 
 static void change_apply(void* payload);
@@ -1170,6 +1182,7 @@ static void change_worker(ChangeJob* job) {
         psf->QueryInterface(IID_PPV_ARGS(icons.put()));
         com_ptr<IShellIconOverlay> overlays;
         psf->QueryInterface(kIID_IShellIconOverlay, (void**)overlays.put());
+        res->overlaysRead = overlays.get() != nullptr;
         for (auto& name : job->names) {
             std::wstring key = name;
             CharLowerBuffW(key.data(), (DWORD)key.size());
@@ -1230,7 +1243,7 @@ static void change_apply(void* payload) {
         });
         gone.assign(keepEnd, g_pane->items.end());
         g_pane->items.erase(keepEnd, g_pane->items.end());
-        carry_over(gone, r->items);
+        carry_over(gone, r->items, !r->overlaysRead);
         free_items(gone);
         for (Item* it : r->items) it->seq = seq++;
         merge_batch(r->items);                       // (sorted / grouped in)

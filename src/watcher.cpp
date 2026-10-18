@@ -287,7 +287,10 @@ void watcher_on_message(WPARAM wp, LPARAM lp) {
     // system-wide events carry numbers, not items: an icon cache update or an extended
     // event says nothing about this folder; new file associations change type names
     if (event & (SHCNE_UPDATEIMAGE | SHCNE_EXTENDED_EVENT)) { SHChangeNotification_Unlock(lock); return; }
-    if (event & SHCNE_ASSOCCHANGED) pidls = nullptr;   // (refresh, no item)
+    if (event & SHCNE_ASSOCCHANGED) {
+        pidls = nullptr;                                // (refresh, no item)
+        enumerate_forget_types();                       // (type names and icons as they are now)
+    }
     // folder-level changes also touch the tree: remember the parent node to re-list
     if ((event & (SHCNE_MKDIR | SHCNE_RMDIR | SHCNE_RENAMEFOLDER | SHCNE_DRIVEADD |
                   SHCNE_DRIVEREMOVED | SHCNE_MEDIAINSERTED | SHCNE_MEDIAREMOVED)) && pidls && pidls[0]) {

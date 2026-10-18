@@ -40,9 +40,7 @@ static void start_enum_current(bool keepView) {
     enumerate_start(g_pane->current, keepView);
     watcher_register_for(g_pane->current);
     // a folder inside a sync folder: its sync state (status bar, badges)
-    WCHAR fsDir[MAX_PATH]{};
-    if (!g_pane->current || ILIsEmpty(g_pane->current) || !SHGetPathFromIDListW(g_pane->current, fsDir)) fsDir[0] = 0;
-    sync_view_folder(g_pane->index, fsDir);
+    sync_view_folder(g_pane->index, pidl_fs_path(g_pane->current).c_str());
 }
 
 // the active list's folder on everything around the lists: address bar, navigation
@@ -255,18 +253,11 @@ struct TypedNav {
     PIDLIST_ABSOLUTE result = nullptr;
 };
 
-static void typed_apply(void* payload) {
+// not a location: like Explorer, try running it ("cmd", "notepad", URLs). From a message
+// of its own (post_later): the error box's loop would run the rest of the async batch.
+static void typed_run(void* payload) {
     std::unique_ptr<TypedNav> job(static_cast<TypedNav*>(payload));
-    if (job->gen != s_typedGen.load()) {        // superseded by a newer navigation
-        if (job->result) CoTaskMemFree(job->result);
-        return;
-    }
-    if (job->result) {
-        navigation_open_abs(job->result);
-        CoTaskMemFree(job->result);
-        return;
-    }
-    // not a location: like Explorer, try running it ("cmd", "notepad", URLs)
+    if (job->gen != s_typedGen.load()) return;
     SHELLEXECUTEINFOW sei{ sizeof(sei) };
     sei.fMask = SEE_MASK_FLAG_NO_UI;
     sei.hwnd = g_main;
@@ -281,15 +272,36 @@ static void typed_apply(void* payload) {
     MessageBoxW(g_main, msg.c_str(), L"Explorer Plus", MB_ICONERROR | MB_OK);
 }
 
+static void typed_apply(void* payload) {
+    std::unique_ptr<TypedNav> job(static_cast<TypedNav*>(payload));
+    if (job->gen != s_typedGen.load()) {        // superseded by a newer navigation
+        if (job->result) CoTaskMemFree(job->result);
+        return;
+    }
+    if (job->result) {
+        navigation_open_abs(job->result);
+        CoTaskMemFree(job->result);
+        return;
+    }
+    post_later(typed_run, job.release());
+}
+
 static void typed_worker(TypedNav* job) {
     ComInit ci;
     const std::wstring& text = job->text;
     // relative to the current folder first ("..", "subfolder\x"), then as typed
     if (!job->fsDir.empty() && PathIsRelativeW(text.c_str()) && text.find(L"::") != 0 &&
         text.find(L':') == std::wstring::npos) {
-        WCHAR combined[MAX_PATH]{};
-        if (PathCombineW(combined, job->fsDir.c_str(), text.c_str()) && PathFileExistsW(combined))
-            parse_typed(combined, &job->result);
+        // (PathCombine stops at MAX_PATH: a long folder's relative path is joined by hand)
+        std::wstring combined = job->fsDir;
+        if (!combined.empty() && combined.back() != L'\\') combined += L'\\';
+        combined += text;
+        std::wstring full(32768, L'\0');
+        DWORD n = GetFullPathNameW(combined.c_str(), (DWORD)full.size(), full.data(), nullptr);
+        if (n && n < full.size()) {
+            full.resize(n);
+            if (GetFileAttributesW(full.c_str()) != INVALID_FILE_ATTRIBUTES) parse_typed(full, &job->result);
+        }
     }
     if (!job->result && FAILED(parse_typed(text, &job->result))) job->result = nullptr;
     post_async(typed_apply, job);
@@ -297,23 +309,20 @@ static void typed_worker(TypedNav* job) {
 
 void navigate_path_text(const std::wstring& text) {
     auto* job = new TypedNav{ ++s_typedGen, text, {} };
-    WCHAR fsDir[MAX_PATH]{};
-    if (!pidl_is_desktop(g_pane->current) &&
-        SHGetPathFromIDListW(g_pane->current, fsDir))
-        job->fsDir = fsDir;
+    if (!pidl_is_desktop(g_pane->current)) job->fsDir = pidl_fs_path(g_pane->current);
     worker_submit([job] { typed_worker(job); });
 }
 
 // another window on `folder` (a separate process, as each window keeps its own
 // navigation state)
 void navigation_open_new_window(PCIDLIST_ABSOLUTE folder) {
-    WCHAR exe[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring exe = module_file();
+    if (exe.empty()) return;
     std::wstring path = pidl_is_desktop(folder) ? L"::desktop" : pidl_folder_path(folder);
     std::wstring cmd = quote_command_arg(exe) + L" --new-window " + quote_command_arg(path);
     STARTUPINFOW si{ sizeof(si) };
     PROCESS_INFORMATION pi{};
-    if (CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+    if (CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     }

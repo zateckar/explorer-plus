@@ -47,6 +47,7 @@ void   tabmodel_on_navigate(PIDLIST_ABSOLUTE newAbs /*adopted clone*/, bool push
 // info
 TabState* tabmodel_active();
 std::wstring  tabmodel_active_name();
+void tabmodel_all_folders(std::vector<PCIDLIST_ABSOLUTE>& out);   // every tab's folders and history (borrowed)
 bool tabmodel_can_back();                          // (g_pane's history)
 bool tabmodel_can_forward();
 

@@ -167,6 +167,15 @@ void tabmodel_open_in_new_tab(PIDLIST_ABSOLUTE abs) {
 
 void tabmodel_show_active() { show_active(); }
 
+void tabmodel_all_folders(std::vector<PCIDLIST_ABSOLUTE>& out) {
+    for (auto& t : s_tabs)
+        for (auto& n : t.side) {
+            if (n.current) out.push_back(n.current);
+            for (auto p : n.back) out.push_back(p);
+            for (auto p : n.fwd) out.push_back(p);
+        }
+}
+
 bool tabmodel_is_pinned(int idx) {
     return idx >= 0 && idx < (int)s_tabs.size() && s_tabs[idx].pinned;
 }

@@ -79,6 +79,25 @@ ULONGLONG pidl_sig(PCUIDLIST_RELATIVE pidl) {
     return s;
 }
 
+std::wstring pidl_fs_path(PCIDLIST_ABSOLUTE abs) {
+    if (!abs || ILIsEmpty(abs)) return {};
+    std::wstring buf(32768, L'\0');
+    if (!SHGetPathFromIDListEx(abs, buf.data(), (DWORD)buf.size(), GPFIDL_DEFAULT)) return {};
+    buf.resize(wcslen(buf.c_str()));
+    return buf;
+}
+
+std::wstring module_file() {
+    std::wstring buf(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD n = GetModuleFileNameW(nullptr, buf.data(), (DWORD)buf.size());
+        if (!n) return {};
+        if (n < buf.size()) { buf.resize(n); return buf; }
+        if (buf.size() >= 32768) return {};
+        buf.resize(buf.size() * 2);
+    }
+}
+
 std::wstring pidl_folder_path(PCIDLIST_ABSOLUTE abs) {
     if (!abs) return {};
     WCHAR buf[MAX_PATH]{};

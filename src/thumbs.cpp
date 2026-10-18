@@ -1,6 +1,7 @@
 #include "thumbs.h"
 #include <thread>
 #include <condition_variable>
+#include <memory>
 #include <unordered_set>
 
 // Thumbnails for the Medium (48px), Large (96px) and Extra large (256px) icon views,
@@ -74,15 +75,29 @@ static HBITMAP square_bitmap(HBITMAP src, int px) {
 
 static void apply_result(void* payload);
 
-static void pool_worker() {
+// a thumbnail provider that never returns (a damaged file, a share gone dead) holds its
+// worker for good: one busy that long is retired (it ends if it ever comes back) and
+// another takes its place, up to a limit of threads in all
+struct Worker {
+    std::atomic<ULONGLONG> since{ 0 };     // busy since (tick count); 0: waiting
+    std::atomic<bool> retired{ false };
+};
+static std::vector<std::shared_ptr<Worker>> s_workers;     // (s_qMx) the ones not retired
+static unsigned s_threads = 0;                              // (s_qMx) started in all
+static const ULONGLONG kStuckMs = 20000;
+static const unsigned kMaxThreads = 24;
+
+static void pool_worker(std::shared_ptr<Worker> w) {
     ComInit ci;
     for (;;) {
         ThumbReq* r = nullptr;
         {
             std::unique_lock<std::mutex> lk(s_qMx);
-            s_qCv.wait(lk, [] { return !s_queue.empty(); });
+            s_qCv.wait(lk, [&] { return !s_queue.empty() || w->retired; });
+            if (w->retired) return;
             r = s_queue.back();            // newest first
             s_queue.pop_back();
+            w->since = std::max<ULONGLONG>(1, GetTickCount64());
         }
         HBITMAP hbm = nullptr;
         if (r->opId == s_opId[r->pane].load()) {
@@ -102,6 +117,32 @@ static void pool_worker() {
         else if (hbm)
             DeleteObject(hbm);
         delete r;
+        w->since = 0;
+    }
+}
+
+// (s_qMx held) the pool started, and a worker stuck in a provider replaced
+static void staff_pool() {
+    auto start = [] {
+        auto w = std::make_shared<Worker>();
+        try { std::thread(pool_worker, w).detach(); } catch (...) { return; }
+        s_workers.push_back(w);
+        ++s_threads;
+    };
+    if (!s_poolStarted) {
+        s_poolStarted = true;
+        unsigned n = std::max(2u, std::min(4u, std::thread::hardware_concurrency()));
+        for (unsigned i = 0; i < n; ++i) start();
+        return;
+    }
+    ULONGLONG now = GetTickCount64();
+    for (size_t i = 0; i < s_workers.size();) {
+        ULONGLONG since = s_workers[i]->since;
+        if (since && now - since > kStuckMs && s_threads < kMaxThreads) {
+            s_workers[i]->retired = true;
+            s_workers.erase(s_workers.begin() + i);
+            start();
+        } else ++i;
     }
 }
 
@@ -115,11 +156,7 @@ static void enqueue(ThumbReq* r) {
     std::vector<ThumbReq*> dropped;
     {
         std::lock_guard<std::mutex> lk(s_qMx);
-        if (!s_poolStarted) {
-            s_poolStarted = true;
-            unsigned n = std::max(2u, std::min(4u, std::thread::hardware_concurrency()));
-            for (unsigned i = 0; i < n; ++i) std::thread(pool_worker).detach();
-        }
+        staff_pool();
         s_queue.push_back(r);
         if (s_queue.size() > kMaxQueued + kDropSlack) {
             while (s_queue.size() > kMaxQueued) {

@@ -682,6 +682,7 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             perf_event("create.tree");
             watcher_init(hwnd);
             AddClipboardFormatListener(hwnd);       // Paste button state
+            SetTimer(hwnd, TIMER_SETTINGS_SAVE, 3 * 60 * 1000, nullptr);
             perf_event("create.watcher+dnd");
             // apply active tab (its own folders + views)
             tabmodel_show_active();
@@ -744,6 +745,7 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_ASYNC_WAKE: drain_async(); return 0;
+        case WM_RUN_LATER: if (wp) ((AsyncHandler)wp)((void*)lp); return 0;
         case WM_ENUM_DONE: {
             auto* op = (HeapEnumOp*)lp;
             PaneScope ps(op && op->pane >= 0 && op->pane < kPanes ? &g_panes[op->pane] : nullptr);
@@ -753,6 +755,7 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_TIMER: {
             if (wp == TIMER_SEARCH) { search_on_timer(); return 0; }
             if (wp == TIMER_TABS_PERSIST) { tabs_persist_now(); return 0; }
+            if (wp == TIMER_SETTINGS_SAVE) { if (settings_dirty()) settings_save_all(); return 0; }
             // a list's own timers: the base id + 100 * its index (pane_timer)
             if (wp / 100 >= (WPARAM)kPanes) break;
             PaneScope ps(&g_panes[wp / 100]);
@@ -1010,6 +1013,18 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     // file" icons) — on a thread while the tabs are read
     std::thread icons;
     try { icons = std::thread([] { ComInit ci; sys_imagelist_init(); }); } catch (...) { sys_imagelist_init(); }
+    if (!newWindow) {
+        // the saved tab set belongs to one window: a second one started meanwhile opens as a
+        // new window (both saving it, the last to write won and the other's tabs were lost)
+        std::wstring ini = settings_file_path();
+        CharLowerBuffW(ini.data(), (DWORD)ini.size());
+        uint32_t h = 2166136261u;
+        for (wchar_t c : ini) { h ^= (uint32_t)c; h *= 16777619u; }
+        WCHAR name[64];
+        swprintf(name, ARRAYSIZE(name), L"Local\\ExplorerPlus.Tabs.%08x", h);
+        HANDLE owner = CreateMutexW(nullptr, FALSE, name);       // (held for the process' life)
+        if (owner && GetLastError() == ERROR_ALREADY_EXISTS) newWindow = true;
+    }
     tabmodel_init(openPath, !newWindow);          // restored tabs (+ command-line folder)
     if (icons.joinable()) icons.join();
     if (TabState* t = tabmodel_active()) {

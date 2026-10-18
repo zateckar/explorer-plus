@@ -6,7 +6,10 @@ using std::min;
 #include "navigation.h"
 #include "listview.h"
 #include "acc.h"
+#include "workers.h"
 #include <algorithm>
+#include <atomic>
+#include <memory>
 
 struct Crumb {
     PIDLIST_ABSOLUTE abs = nullptr; // owned
@@ -32,13 +35,53 @@ static void free_crumbs() {
     s_crumbs.clear();
 }
 
+static void layout_crumbs(HDC paintDc = nullptr);
+
+// a crumb's name without asking the folder: the path's last part ("Z:" for a drive), or
+// the shell's name for a virtual folder (Network, a server)
+static std::wstring quick_name(PCIDLIST_ABSOLUTE p) {
+    std::wstring fs = pidl_fs_path(p);
+    if (fs.empty()) return pidl_abs_dispname(p);
+    while (fs.size() > 2 && fs.back() == L'\\') fs.pop_back();
+    size_t s = fs.find_last_of(L'\\');
+    return s == std::wstring::npos ? fs : fs.substr(s + 1);
+}
+
+// a share's or a mapped drive's names and icon are read on a worker (the server may be
+// offline: the window waited for its timeout before it even showed). Until then the
+// names come from the path.
+struct CrumbNames {
+    unsigned gen;
+    std::vector<PIDLIST_ABSOLUTE> abs;     // owned, as s_crumbs
+    std::vector<std::wstring> names;
+    PIDLIST_ABSOLUTE current = nullptr;   // owned
+    int icon = -1;
+};
+static std::atomic<unsigned> s_namesGen{ 0 };
+
+static void names_apply(void* payload) {
+    std::unique_ptr<CrumbNames> r(static_cast<CrumbNames*>(payload));
+    if (r->gen == s_namesGen.load() && r->names.size() == s_crumbs.size()) {
+        for (size_t i = 0; i < s_crumbs.size(); ++i)
+            if (!r->names[i].empty()) s_crumbs[i].name = r->names[i];
+        if (r->icon >= 0) s_iconIndex = r->icon;
+        layout_crumbs();
+        if (s_box) InvalidateRect(s_box, nullptr, FALSE);
+    }
+    for (auto a : r->abs) CoTaskMemFree(a);
+    CoTaskMemFree(r->current);
+}
+
 static void rebuild_crumbs() {
     free_crumbs();
+    unsigned gen = ++s_namesGen;
+    std::wstring fs = pidl_fs_path(g_pane->current);
+    bool net = !fs.empty() && path_is_network(fs);
     PIDLIST_ABSOLUTE p = current_clone();
     while (p && !pidl_is_desktop(p)) {
         Crumb c;
         c.abs = pidl_clone(p);
-        c.name = pidl_abs_dispname(p);
+        c.name = net ? quick_name(p) : pidl_abs_dispname(p);
         s_crumbs.insert(s_crumbs.begin(), std::move(c));
         ILRemoveLastID(p);
     }
@@ -49,11 +92,22 @@ static void rebuild_crumbs() {
         s_crumbs.push_back(std::move(c));
     }
     CoTaskMemFree(p);
-    s_iconIndex = sys_icon_index(g_pane->current);
+    if (!net) {
+        s_iconIndex = sys_icon_index(g_pane->current);
+        return;
+    }
+    s_iconIndex = sys_folder_icon_index(false);
+    auto* job = new CrumbNames{ gen, {}, {}, pidl_clone(g_pane->current) };
+    for (auto& c : s_crumbs) job->abs.push_back(pidl_clone(c.abs));
+    worker_submit([job] {
+        for (auto a : job->abs) job->names.push_back(job->gen == s_namesGen.load() ? pidl_abs_dispname(a) : std::wstring());
+        if (job->gen == s_namesGen.load()) job->icon = sys_icon_index(job->current, false, -1);
+        post_async(names_apply, job);
+    });
 }
 
 // measure with the DC we paint with (dc may be null: use a window DC)
-static void layout_crumbs(HDC paintDc = nullptr) {
+static void layout_crumbs(HDC paintDc) {
     if (!s_box) return;
     RECT rc{}; GetClientRect(s_box, &rc);
     HDC dc = paintDc ? paintDc : GetDC(s_box);
@@ -159,9 +213,10 @@ static void clear_menu_entries() {
     s_menuEntries.clear();
 }
 
-static void append_entry(HMENU m, PIDLIST_ABSOLUTE abs, const std::wstring& name, bool bold) {
+// net: on a share (each icon would be asked of the server: the stock folder one instead)
+static void append_entry(HMENU m, PIDLIST_ABSOLUTE abs, const std::wstring& name, bool bold, bool net = false) {
     UINT id = (UINT)s_menuEntries.size() + 1;
-    s_menuEntries.push_back({ abs, sys_icon_index(abs) });
+    s_menuEntries.push_back({ abs, net ? sys_folder_icon_index(false) : sys_icon_index(abs) });
     MENUITEMINFOW mi{ sizeof(mi) };
     mi.fMask = MIIM_ID | MIIM_STRING | MIIM_BITMAP | MIIM_STATE;
     mi.wID = id;
@@ -192,11 +247,13 @@ static void fill_children_menu(HMENU m, PCIDLIST_ABSOLUTE parent, PCIDLIST_ABSOL
     std::sort(kids.begin(), kids.end(), [raw](PITEMID_CHILD a, PITEMID_CHILD b) {
         return (short)HRESULT_CODE(raw->CompareIDs(0, a, b)) < 0;
     });
+    std::wstring fs = pidl_fs_path(parent);
+    bool net = !fs.empty() && path_is_network(fs);
     for (auto k : kids) {
         PIDLIST_ABSOLUTE abs = ILCombine(parent, k);
         std::wstring name = child_name(raw, k, SHGDN_NORMAL);
         bool isCurrent = current && ILIsParent(abs, current, FALSE);
-        append_entry(m, abs, name, isCurrent);
+        append_entry(m, abs, name, isCurrent, net);
         CoTaskMemFree(k);
     }
 }

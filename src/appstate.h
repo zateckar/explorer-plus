@@ -145,6 +145,7 @@ enum : UINT {
     WM_ASYNC_WAKE,                  // drain the async result queue (post_async)
     WM_TREE_SYNC,                   // expand/select current folder in tree (deferred)
     WM_SELECTION_CHANGED,           // coalesced LVN_ITEMCHANGED (status bar + details pane); wp = pane index
+    WM_RUN_LATER,                   // wp = AsyncHandler, lp = its payload (post_later)
 };
 
 // timers on g_main (the per-pane ones: pane_timer)
@@ -155,6 +156,7 @@ enum : UINT_PTR {
     TIMER_TABS_PERSIST = 4,         // save the tab set (debounced: tabs_persist_soon)
     TIMER_ENUM_HELD = 5,            // listing results held while a rename box is open (per pane)
     TIMER_FOLDER_SIZES = 6,         // folders changed inside, waiting to be walked again (per pane)
+    TIMER_SETTINGS_SAVE = 7,        // views, columns, preferences changed: saved every few minutes (not lost in a crash)
 };
 
 // heap op passed via WM_ENUM_DONE
@@ -172,6 +174,9 @@ using AsyncHandler = void (*)(void* payload);
 // Queue a payload for the UI thread; `apply` runs there and owns the payload.
 void post_async(AsyncHandler apply, void* payload);
 void drain_async();                 // WM_ASYNC_WAKE handler
+// UI thread: run `apply` from a message of its own, after the current handler (a modal box
+// shown from an async handler would run the rest of its batch inside the box's loop)
+void post_later(AsyncHandler apply, void* payload);
 
 // --- helpers in appstate.cpp ---
 void  fix_font(HWND h);

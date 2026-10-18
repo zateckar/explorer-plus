@@ -17,6 +17,7 @@ View int_to_view(int x);
 std::wstring settings_file_path();      // settings.ini (or EXPLORERPLUS_SETTINGS'); empty: none
 void settings_load_all();
 bool settings_save_all();               // false: the file couldn't be written (changes kept for a retry)
+bool settings_dirty();                  // changes not saved yet
 View settings_default_view();
 void settings_set_default_view(const View& v);
 const View* settings_view_for(const std::wstring& folderKey);
