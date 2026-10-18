@@ -15,8 +15,10 @@ void sync_folders_dialog(HWND owner);
 // agent for its state now and then; the answers come back as status bar text and badges.
 void sync_view_folder(int pane, const std::wstring& fsPath);   // "" = not a file system folder
 std::wstring sync_view_status(int pane);                       // "" outside sync folders
-int sync_view_item(int pane, const std::wstring& fileName);    // sync::ItemState (0: none)
+int sync_view_item(int pane, const std::wstring& fileName);    // sync::ItemState (0: none); a sync folder's root too
 void sync_draw_badge(HDC dc, const RECT& icon, int state, int dpi);
+// the sync folders' roots (lowercased) with their states; `gen` changes when they do
+std::vector<std::pair<std::wstring, int>> sync_root_states(unsigned* gen);
 
 // the context menu's sync entries for the chosen items (folders[i]: paths[i] is a folder)
 struct SyncMenu {

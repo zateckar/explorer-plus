@@ -1660,10 +1660,73 @@ void watch_view(int pane, std::wstring path, unsigned gen) {
     }
 }
 
+// The sync folders' own states, for their roots' badges where the folder above lists them
+// and in the navigation pane: one watch over every pair (the UI thread's copy).
+std::map<std::wstring, int> s_roots;            // lowercased root -> ItemState
+unsigned s_rootsGen = 0;
+std::wstring s_paneFolder[kPanes];              // the folder each pane shows: lowercased, with a "\" at the end
+bool s_rootWatch = false;
+
+std::wstring folder_key(std::wstring p) {
+    p = lower(p);
+    while (p.size() > 3 && p.back() == L'\\') p.pop_back();
+    return p;
+}
+
+void apply_roots(void* p) {
+    std::unique_ptr<std::map<std::wstring, int>> states((std::map<std::wstring, int>*)p);
+    if (*states == s_roots) return;
+    s_roots = std::move(*states);
+    ++s_rootsGen;
+    for (Pane& pane : g_panes)
+        if (pane.list) InvalidateRect(pane.list, nullptr, FALSE);
+    if (g_tree) InvalidateRect(g_tree, nullptr, FALSE);
+}
+
+void watch_roots() {
+    std::string since;
+    for (;;) {
+        Msg q = syncipc::request("watch"), r;
+        q.push_back({ "since", since });
+        q.push_back({ "wait", "20000" });
+        bool ok = syncipc::call(q, r, 30000);
+        std::string h = ok ? syncipc::get(r, "hash") : std::string();
+        if (h != since || !ok) {
+            auto* states = new std::map<std::wstring, int>;
+            size_t n = ok ? num(syncipc::get(r, "count")) : 0;
+            for (size_t i = 0; i < n; ++i) {
+                std::string at = "p" + std::to_string(i) + ".";
+                std::wstring root = w16(syncipc::get(r, at + "root"));
+                if (!root.empty()) (*states)[folder_key(root)] = item_state_of(syncipc::get(r, at + "rootState"));
+            }
+            post_async(apply_roots, states);           // (no agent: no badges)
+        }
+        since = h;
+        if (!ok) Sleep(5000);
+    }
+}
+
+// (UI thread) the watch runs while there are sync folders to show
+void watch_roots_once() {
+    if (s_rootWatch || pairs_cached().empty()) return;
+    s_rootWatch = true;
+    std::thread(watch_roots).detach();
+}
+
+// a pane's item that is a sync folder's root: its state (0: it isn't one)
+int root_item(int pane, const std::wstring& fileName) {
+    if (s_roots.empty() || s_paneFolder[pane].empty() || fileName.empty()) return 0;
+    auto f = s_roots.find(s_paneFolder[pane] + lower(fileName));
+    return f == s_roots.end() ? 0 : f->second;
+}
+
 } // namespace
 
 void sync_view_folder(int pane, const std::wstring& fsPath) {
     if (pane < 0 || pane >= kPanes) return;
+    s_paneFolder[pane] = fsPath.empty() ? std::wstring() : folder_key(fsPath);
+    if (!s_paneFolder[pane].empty() && s_paneFolder[pane].back() != L'\\') s_paneFolder[pane] += L'\\';
+    watch_roots_once();
     std::wstring p = fsPath;
     if (!p.empty() && !syncconf::pair_of(pairs_cached(), p)) p.clear();
     if (p == s_views[pane].path) return;
@@ -1675,9 +1738,15 @@ void sync_view_folder(int pane, const std::wstring& fsPath) {
 std::wstring sync_view_status(int pane) { return pane >= 0 && pane < kPanes ? s_views[pane].status : std::wstring(); }
 
 int sync_view_item(int pane, const std::wstring& fileName) {
-    if (pane < 0 || pane >= kPanes || s_views[pane].items.empty() || fileName.empty()) return 0;
+    if (pane < 0 || pane >= kPanes || fileName.empty()) return 0;
+    if (s_views[pane].items.empty()) return root_item(pane, fileName);    // (a sync folder in the folder above it)
     auto f = s_views[pane].items.find(lower(fileName));
     return f == s_views[pane].items.end() ? 0 : f->second;
+}
+
+std::vector<std::pair<std::wstring, int>> sync_root_states(unsigned* gen) {
+    if (gen) *gen = s_rootsGen;
+    return { s_roots.begin(), s_roots.end() };
 }
 
 void sync_draw_badge(HDC dc, const RECT& icon, int state, int dpi) {
@@ -1773,6 +1842,8 @@ bool sync_in_sync_folder(const std::wstring& path) {
 }
 
 std::wstring sync_status_text(int pane, const std::wstring& fileName) {
+    if (pane >= 0 && pane < kPanes && s_views[pane].items.empty() && root_item(pane, fileName) == (int)sync::ItemState::Excluded)
+        return L"Paused";                       // (a sync folder's root is grey while it's paused)
     switch ((sync::ItemState)sync_view_item(pane, fileName)) {
         case sync::ItemState::Synced: return L"Up to date";
         case sync::ItemState::Syncing: return L"Syncing";
@@ -1801,6 +1872,7 @@ void sync_now_for(const std::vector<std::wstring>& paths) {
 }
 
 std::vector<std::pair<std::wstring, std::wstring>> sync_roots() {
+    watch_roots_once();
     std::vector<std::pair<std::wstring, std::wstring>> out;
     for (auto& p : pairs_cached()) out.push_back({ p.name, p.root });
     return out;

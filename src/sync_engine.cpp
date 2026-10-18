@@ -120,9 +120,12 @@ ItemState Engine::item_state(const RelPath& rel, bool isDir) const {
     if (m_errors.count(k)) return ItemState::Error;
     if (isDir) for (auto& [e, w] : m_errors) if (under(e, k)) return ItemState::Error;
     if (any(m_active)) return ItemState::Syncing;
-    for (auto& c : m_status.conflicts) if (key_of(c) == k) return ItemState::Conflict;
+    for (auto& c : m_status.conflicts) {
+        std::wstring ck = key_of(c);
+        if (ck == k || (isDir && under(ck, k))) return ItemState::Conflict;
+    }
     if (any(m_pending)) return ItemState::Pending;
-    if (inBase) return ItemState::Synced;
+    if (inBase || k.empty()) return ItemState::Synced;    // (the root has no record of its own)
     return ItemState::Pending;
 }
 
@@ -1042,7 +1045,9 @@ PassReport Engine::sync(Progress& prog) {
         bool onlyBusy = !r.uploads && !r.downloads && !r.conflicts && !r.moves && !r.localDeletes && !r.remoteDeletes;
         if (onlyBusy) Sleep(std::min(m_opt.settleMs, 3000));
     }
-    if (total.result.ok() && !total.again) set_state(PairState::UpToDate);
+    // (a paused pair's pass does nothing: it stays paused, not "up to date")
+    if (m_paused) set_state(PairState::Paused);
+    else if (total.result.ok() && !total.again) set_state(PairState::UpToDate);
     return total;
 }
 

@@ -1352,6 +1352,27 @@ void tree_delete_menu_node(bool permanent) {
 // ------------------------------------------------------------------
 // notifications
 
+// a sync folder's state where its node is one's root (0: it isn't): by the nodes' IDs, the
+// roots' parsing names hashed alike (see parsing_id)
+static int sync_root_state_of(NodeData* d) {
+    static unsigned seen = ~0u;
+    static std::unordered_map<ULONGLONG, int> byId;
+    unsigned gen = 0;
+    auto states = sync_root_states(&gen);
+    if (gen != seen) {
+        seen = gen;
+        byId.clear();
+        for (auto& [root, st] : states) {
+            ULONGLONG h = 1469598103934665603ULL;
+            for (wchar_t c : root) { h ^= (ULONGLONG)c; h *= 1099511628211ULL; }
+            byId[h | 1] = st;
+        }
+    }
+    if (byId.empty() || !d->abs) return 0;
+    auto f = byId.find(node_id(d));
+    return f == byId.end() ? 0 : f->second;
+}
+
 static LRESULT custom_draw(NMTVCUSTOMDRAW* cd) {
     switch (cd->nmcd.dwDrawStage) {
         case CDDS_PREPAINT:
@@ -1366,12 +1387,25 @@ static LRESULT custom_draw(NMTVCUSTOMDRAW* cd) {
                 fill_rect(cd->nmcd.hdc, line, pal().divider);
                 return CDRF_SKIPDEFAULT;
             }
-            return d && d->pinned ? CDRF_NOTIFYPOSTPAINT : CDRF_DODEFAULT;
+            return d && (d->pinned || sync_root_state_of(d)) ? CDRF_NOTIFYPOSTPAINT : CDRF_DODEFAULT;
         }
         case CDDS_ITEMPOSTPAINT: {
-            RECT r = cd->nmcd.rc;
-            RECT g{ r.right - S(28), r.top, r.right - S(8), r.bottom };
-            draw_glyph(cd->nmcd.hdc, L'\xE718', g, pal().textSecondary, 12);   // pin
+            NodeData* d = (NodeData*)cd->nmcd.lItemlParam;
+            if (!d) return CDRF_DODEFAULT;
+            if (d->pinned) {
+                RECT r = cd->nmcd.rc;
+                RECT g{ r.right - S(28), r.top, r.right - S(8), r.bottom };
+                draw_glyph(cd->nmcd.hdc, L'\xE718', g, pal().textSecondary, 12);   // pin
+            }
+            // the sync folder's badge on its icon (left of the name, as the list has it)
+            RECT text{};
+            *(HTREEITEM*)&text = (HTREEITEM)cd->nmcd.dwItemSpec;
+            if (int st = sync_root_state_of(d); st && SendMessageW(g_tree, TVM_GETITEMRECT, TRUE, (LPARAM)&text)) {
+                int cx = 16, cy = 16;
+                ImageList_GetIconSize(TreeView_GetImageList(g_tree, TVSIL_NORMAL), &cx, &cy);
+                int left = text.left - cx - S(3), top = (text.top + text.bottom - cy) / 2;
+                sync_draw_badge(cd->nmcd.hdc, RECT{ left, top, left + cx, top + cy }, st, (int)GetDpiForWindow(g_tree));
+            }
             return CDRF_DODEFAULT;
         }
     }

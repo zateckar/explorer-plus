@@ -293,6 +293,22 @@ private:
             m.push_back({ prefix + "problems", std::to_string(st.problems.size()) });
             m.push_back({ prefix + "lastSync", std::to_string(st.lastSync) });
         }
+        m.push_back({ prefix + "rootState", u8(item_state_name(root_state(r, v))) });
+    }
+
+    // the sync folder's own badge (its root, where the folder above it lists it): red where the
+    // tray has its "!" (a folder that can't sync), grey while paused, else what is inside it
+    static ItemState root_state(Runner& r, const Runner::View& v) {
+        switch (v.state) {
+            case PairState::Error: case PairState::Locked: case PairState::AuthNeeded: case PairState::RootMissing:
+            case PairState::ConfirmDeletes: case PairState::Offline:
+                return ItemState::Error;
+            case PairState::Paused: return ItemState::Excluded;
+            default: break;
+        }
+        ItemState s = ItemState::Pending;                // (being opened)
+        r.with_engine([&](Engine& e) { s = e.item_state(RelPath(), true); });
+        return s;
     }
 
     // a folder's status and its children's states (the file list)
