@@ -112,9 +112,13 @@ ItemState Engine::item_state(const RelPath& rel, bool isDir) const {
     bool inBase = m_state.base(k) != nullptr;          // (the store's lock before ours, never inside it)
     std::lock_guard<std::mutex> lk(m_mx);
     if (m_ignore.ignored(rel, isDir)) return ItemState::Excluded;
-    auto any = [&](const auto& set) {
+    auto any = [&](const auto& set) {               // (a set of keys, or a map by key)
         if (set.count(k)) return true;
-        if (isDir) for (auto& s : set) if (under(s, k)) return true;
+        if (isDir)
+            for (auto& s : set) {
+                if constexpr (std::is_same_v<std::decay_t<decltype(s)>, std::wstring>) { if (under(s, k)) return true; }
+                else if (under(s.first, k)) return true;
+            }
         return false;
     };
     if (m_errors.count(k)) return ItemState::Error;
@@ -124,9 +128,33 @@ ItemState Engine::item_state(const RelPath& rel, bool isDir) const {
         std::wstring ck = key_of(c);
         if (ck == k || (isDir && under(ck, k))) return ItemState::Conflict;
     }
-    if (any(m_pending)) return ItemState::Pending;
+    if (any(m_pending) || any(m_touched) || any(m_unrecorded)) return ItemState::Pending;
     if (inBase || k.empty()) return ItemState::Synced;    // (the root has no record of its own)
     return ItemState::Pending;
+}
+
+// (our own writes don't count: a download in place is recorded as it is; nor does a temp
+// file made and gone again)
+void Engine::touched(const std::wstring& name) {
+    RelPath rel = syncpath::nfc(name);
+    std::replace(rel.begin(), rel.end(), L'\\', L'/');
+    if (rel.empty() || rel.compare(0, 6, L".~sync") == 0) return;
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    bool exists = GetFileAttributesExW(full(rel).c_str(), GetFileExInfoStandard, &a) != 0;
+    bool isDir = exists && (a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+    std::wstring k = key_of(rel);
+    {
+        std::lock_guard<std::recursive_mutex> lk(m_state.mutex());
+        const BaseEntry* b = m_state.base(k);
+        if (!exists && !b) return;
+        if (exists && b && isDir) return;                   // (a folder's time: what changed in it says so)
+        uint64_t size = ((uint64_t)a.nFileSizeHigh << 32) | a.nFileSizeLow;
+        if (exists && b && !b->isDir && b->size == size && b->mtime == ft64(a.ftLastWriteTime)) return;
+    }
+    std::lock_guard<std::mutex> lk(m_mx);
+    for (RelPath p = rel; !p.empty(); p = parent_of(p))
+        if (m_ignore.ignored(p, p == rel ? isDir : true)) return;
+    m_touched[k] = ++m_touches;
 }
 
 std::vector<std::pair<std::wstring, ItemState>> Engine::children(const RelPath& folder) const {
@@ -711,6 +739,14 @@ Result Engine::run_remote_phase(Ctx& c, std::vector<Action>& acts) {
     Result r = m_backend->begin(c.prog);
     if (!r.ok()) return r;
     c.defer = c.caps.transactional;
+    // transactional: what goes into the commit is syncing until it lands (the push is its
+    // transfer), however this phase ends
+    std::set<std::wstring> committing;
+    struct Landed {
+        Engine& e;
+        std::set<std::wstring>& keys;
+        ~Landed() { std::lock_guard<std::mutex> lk(e.m_mx); for (auto& k : keys) e.m_active.erase(k); }
+    } landed{ *this, committing };
     std::vector<Action> uploads;
     Result fatal;
     auto stop_on = [&](const Result& x) {
@@ -727,7 +763,13 @@ Result Engine::run_remote_phase(Ctx& c, std::vector<Action>& acts) {
             std::wstring k = key_of(a.path);
             { std::lock_guard<std::mutex> lk(m_mx); m_active.insert(k); }
             Result x = do_upload(c, a);
-            { std::lock_guard<std::mutex> lk(m_mx); m_active.erase(k); m_pending.erase(k); if (x.ok()) m_errors.erase(k); }
+            {
+                std::lock_guard<std::mutex> lk(m_mx);
+                m_pending.erase(k);
+                if (x.ok()) m_errors.erase(k);
+                if (c.defer && x.ok()) committing.insert(k);
+                else m_active.erase(k);
+            }
             if (x.ok()) { c.log("upload", a.path); std::lock_guard<std::mutex> lk(c.mx); ++c.rep.uploads; }
             else if (!stop_on(x) && x.st != Status::PreconditionFailed) problem(a.path, x.message.empty() ? status_name(x.st) : x.message);
         });
@@ -806,7 +848,11 @@ Result Engine::run_remote_phase(Ctx& c, std::vector<Action>& acts) {
             }
             default: break;
         }
-        { std::lock_guard<std::mutex> lk(m_mx); m_pending.erase(k); }
+        {
+            std::lock_guard<std::mutex> lk(m_mx);
+            m_pending.erase(k);
+            if (c.defer) { m_active.insert(k); committing.insert(k); }
+        }
     }
     flush_uploads();
     if (!fatal.ok()) { m_backend->abort(); c.deferred.clear(); return fatal; }
@@ -884,6 +930,8 @@ PassReport Engine::pass(Progress& prog) {
         return rep;
     }
     uint64_t scanStart = now_ft();
+    uint64_t scanned = 0;                                 // what the watch saw so far: the scan sees it (later ones stay)
+    { std::lock_guard<std::mutex> lk(m_mx); scanned = m_touches; }
     ScanResult scan = scan_local(m_opt.root, ignore);
     if (scan.rootMissing) {
         rep.result = Result::fail(Status::NotFound, L"The sync folder is missing.");
@@ -895,7 +943,10 @@ PassReport Engine::pass(Progress& prog) {
         set_state(PairState::Error, rep.result.message);
         return rep;
     }
-    for (auto& [p, why] : scan.problems) problem(p, why);
+    // the problems the scan and the plan find are this pass's: one it no longer finds (the
+    // item renamed, deleted, readable again) is gone with it
+    std::map<std::wstring, std::wstring> found;
+    for (auto& [p, why] : scan.problems) found[key_of(p)] = why;
     c.local = std::move(scan.items);
     hash_changed(c, c.local);
     if (!c.prog.cancelled()) m_state.set_value("scanned", std::to_string(scanStart));
@@ -921,7 +972,7 @@ PassReport Engine::pass(Progress& prog) {
         std::lock_guard<std::recursive_mutex> lk(m_state.mutex());
         for (auto& [k, it] : m_state.remote_all()) {
             if (hidden(it.path, it.isDir) || frozen(k)) continue;
-            if (!syncpath::windows_valid_path(it.path)) { problem(it.path, L"Windows can't hold this name."); continue; }
+            if (!syncpath::windows_valid_path(it.path)) { found[k] = L"Windows can't hold this name."; continue; }
             remote[k] = it;
         }
         // base items left out by the rules are forgotten: brought back in, the two sides meet
@@ -931,9 +982,18 @@ PassReport Engine::pass(Progress& prog) {
             if (hidden(b.path, b.isDir)) forget.push_back(k);
             else if (!frozen(k)) base[k] = b;
             else if (std::find(unknown.begin(), unknown.end(), k) != unknown.end() && !c.local.count(k))
-                problem(b.path, L"Links aren't synced: what was here stays as it is in the storage.");
+                found[k] = L"Links aren't synced: what was here stays as it is in the storage.";
         }
         for (auto& k : forget) m_state.erase_base(k);
+    }
+    {
+        std::lock_guard<std::mutex> lk(m_mx);
+        for (auto& [k, why] : m_scanErrors) {
+            auto f = m_errors.find(k);
+            if (f != m_errors.end() && f->second == why && !found.count(k)) m_errors.erase(f);
+        }
+        for (auto& [k, why] : found) m_errors[k] = why;
+        m_scanErrors = std::move(found);
     }
     for (auto it = c.local.begin(); it != c.local.end();) {
         if (frozen(it->first)) it = c.local.erase(it);
@@ -981,6 +1041,7 @@ PassReport Engine::pass(Progress& prog) {
     {
         std::lock_guard<std::mutex> lk(m_mx);
         m_pending.clear();
+        std::erase_if(m_touched, [&](const auto& t) { return t.second <= scanned; });   // (the plan has them now)
         m_status.pendingFiles = 0;
         m_status.pendingBytes = 0;
         m_status.pendingDeletes = 0;
@@ -1010,6 +1071,18 @@ PassReport Engine::pass(Progress& prog) {
     r = run_local_phase(c, localActs);
     if (r.ok()) r = run_remote_phase(c, remoteActs);
     m_state.flush();
+    // what's here and still without a record (busy, put off, failed): waiting, for the
+    // folders above it too
+    {
+        std::set<std::wstring> unrecorded;
+        {
+            std::lock_guard<std::recursive_mutex> lk(m_state.mutex());
+            for (auto& [k, l] : c.local)
+                if (!m_state.base(k) && GetFileAttributesW(full(l.path).c_str()) != INVALID_FILE_ATTRIBUTES) unrecorded.insert(k);
+        }
+        std::lock_guard<std::mutex> lk(m_mx);
+        m_unrecorded = std::move(unrecorded);
+    }
     rep.result = r;
     if (!r.ok()) {
         PairState s = r.st == Status::AuthFailed ? PairState::AuthNeeded : r.st == Status::Offline ? PairState::Offline

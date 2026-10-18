@@ -562,7 +562,84 @@ static void engine_robustness() {
     CHECK(a.sync().result.ok() && b.sync().result.ok() && tu::read(b.root, L"tick.txt") == "tick 2");
 }
 
+// a folder's badge, the sync folder's root too, is the worst of what's inside it: an error
+// anywhere, syncing while one file is, waiting while one waits
+static void engine_folder_states(bool tx) {
+    using S = ItemState;
+    auto store = std::make_shared<FakeStore>();
+    Dev a(tx ? L"fsa-tx" : L"fsa", store, tx), b(tx ? L"fsb-tx" : L"fsb", store, tx);
+    auto file = [&](Dev& d, const wchar_t* p) { return d.eng->item_state(p, false); };
+    auto dir = [&](Dev& d, const wchar_t* p) { return d.eng->item_state(p, true); };
+    tu::write(a.root, L"one.txt", "one");
+    tu::write(a.root, L"dir/sub/two.txt", "two");
+    CHECK(a.sync().result.ok() && b.sync().result.ok());
+    CHECK(dir(a, L"") == S::Synced && dir(b, L"") == S::Synced && dir(b, L"dir/sub") == S::Synced);
+
+    // new here, before a pass looks (the watch saw it): waiting, up to the root
+    tu::write(a.root, L"dir/sub/new.txt", "new");
+    a.eng->touched(L"dir\\sub\\new.txt");
+    CHECK(file(a, L"dir/sub/new.txt") == S::Pending && dir(a, L"dir") == S::Pending && dir(a, L"") == S::Pending);
+    CHECK(file(a, L"one.txt") == S::Synced);
+    // syncing while it goes up, and (git) until the commit has it
+    S during = S::None, committing = S::None, fileCommitting = S::None;
+    store->fault = [&](const char* op, const RelPath& p) {
+        std::string o = op;
+        if (o == "upload" && p == L"dir/sub/new.txt") during = dir(a, L"");
+        if (o == "commit") { committing = dir(a, L""); fileCommitting = file(a, L"dir/sub/new.txt"); }
+        return Status::Ok;
+    };
+    CHECK(a.sync().result.ok());
+    store->fault = nullptr;
+    CHECK(during == S::Syncing);
+    if (tx) CHECK(committing == S::Syncing && fileCommitting == S::Syncing);
+    CHECK(dir(a, L"") == S::Synced && file(a, L"dir/sub/new.txt") == S::Synced);
+
+    // what the watch saw that is as recorded (a download put in place), or gone again (a temp
+    // file): nothing waits
+    CHECK(b.sync().result.ok() && tu::read(b.root, L"dir/sub/new.txt") == "new");
+    b.eng->touched(L"dir\\sub\\new.txt");
+    b.eng->touched(L"dir\\gone.tmp");
+    CHECK(dir(b, L"") == S::Synced);
+    // an edit, and a deletion, wait too
+    tu::write(b.root, L"dir/sub/two.txt", "two, edited");
+    b.eng->touched(L"dir\\sub\\two.txt");
+    CHECK(file(b, L"dir/sub/two.txt") == S::Pending && dir(b, L"") == S::Pending);
+    CHECK(b.sync().result.ok() && dir(b, L"") == S::Synced);
+    tu::remove(b.root, L"one.txt");
+    b.eng->touched(L"one.txt");
+    CHECK(dir(b, L"") == S::Pending);
+    CHECK(b.sync().result.ok() && dir(b, L"") == S::Synced);
+    CHECK(a.sync().result.ok());
+
+    // one that a pass couldn't take (in use): still waiting after it, and so is the root
+    tu::write(a.root, L"dir/busy.txt", "busy");
+    HANDLE h = CreateFileW((a.root + L"\\dir\\busy.txt").c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    CHECK(h != INVALID_HANDLE_VALUE);
+    a.sync();
+    CHECK(file(a, L"dir/busy.txt") == S::Pending && dir(a, L"dir") == S::Pending && dir(a, L"") == S::Pending);
+    CloseHandle(h);
+    CHECK(a.sync().result.ok() && dir(a, L"") == S::Synced);
+
+    // one file's error is its folders' and the root's
+    tu::write(a.root, L"dir/sub/bad.txt", "bad");
+    store->fault = [](const char* op, const RelPath& p) { return std::string(op) == "upload" && p == L"dir/sub/bad.txt" ? Status::Fatal : Status::Ok; };
+    a.sync();
+    store->fault = nullptr;
+    CHECK(file(a, L"dir/sub/bad.txt") == S::Error && dir(a, L"dir") == S::Error && dir(a, L"") == S::Error);
+    CHECK(file(a, L"dir/sub/two.txt") == S::Synced);
+    CHECK(a.sync().result.ok() && dir(a, L"") == S::Synced);
+    // one the scan finds (a decomposed name) goes with the item
+    const std::wstring nfd = L"dir/Cafe\x0301.txt";
+    tu::write(a.root, nfd, "nfd");
+    a.sync();
+    CHECK(dir(a, L"dir") == S::Error && dir(a, L"") == S::Error);
+    tu::remove(a.root, nfd);
+    CHECK(a.sync().result.ok() && dir(a, L"") == S::Synced && a.eng->status().problems.empty());
+}
+
 void run_engine_only() {
+    engine_folder_states(false);
+    engine_folder_states(true);
     engine_robustness();
     test_paths();
     test_planner();

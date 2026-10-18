@@ -39,17 +39,19 @@ bool make_dirs(const std::wstring& full);                     // with the parent
 
 // Recursive change watch of a root: `changed` runs (on the watch thread) after a burst of
 // changes settles, or when the buffer overflowed. Paths under ignoredPrefix (the temp
-// folder) don't count.
+// folder) don't count. `touched` (optional) hears each changed path as it comes, relative
+// to the root.
 class DirWatch {
 public:
     DirWatch() = default;
     ~DirWatch() { stop(); }
-    bool start(const std::wstring& root, std::function<void()> changed);
+    bool start(const std::wstring& root, std::function<void()> changed, std::function<void(const std::wstring&)> touched = nullptr);
     void stop();
 private:
     void run();
     std::wstring m_root;
     std::function<void()> m_changed;
+    std::function<void(const std::wstring&)> m_touched;
     HANDLE m_dir = INVALID_HANDLE_VALUE, m_stop = nullptr;
     std::thread m_thread;
 };

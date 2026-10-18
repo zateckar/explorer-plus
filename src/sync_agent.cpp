@@ -202,7 +202,8 @@ private:
             r.eng = std::move(eng);
         }
         Runner* rp = &r;
-        r.watch.start(r.pair.root, [rp] { rp->poke(); });
+        r.watch.start(r.pair.root, [rp] { rp->poke(); },
+                      [rp](const std::wstring& name) { rp->with_engine([&](Engine& e) { e.touched(name); }); });
         return {};
     }
 

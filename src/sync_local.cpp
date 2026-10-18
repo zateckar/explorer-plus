@@ -223,10 +223,11 @@ bool recycle(const std::wstring& full, const std::wstring& trashDir, const RelPa
 }
 
 // ------------------------------------------------------------------ watch
-bool DirWatch::start(const std::wstring& root, std::function<void()> changed) {
+bool DirWatch::start(const std::wstring& root, std::function<void()> changed, std::function<void(const std::wstring&)> touched) {
     stop();
     m_root = root;
     m_changed = std::move(changed);
+    m_touched = std::move(touched);
     m_dir = CreateFileW(syncpath::to_local(root, L"").c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                         nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
     if (m_dir == INVALID_HANDLE_VALUE) return false;
@@ -274,7 +275,10 @@ void DirWatch::run() {
         for (DWORD off = 0; got && off < got;) {
             auto* n = (FILE_NOTIFY_INFORMATION*)(buf.data() + off);
             std::wstring name(n->FileName, n->FileNameLength / sizeof(wchar_t));
-            if (name.compare(0, 6, L".~sync") != 0) counts = true;
+            if (name.compare(0, 6, L".~sync") != 0) {
+                counts = true;
+                if (m_touched) m_touched(name);
+            }
             if (!n->NextEntryOffset) break;
             off += n->NextEntryOffset;
         }

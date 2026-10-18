@@ -62,6 +62,9 @@ public:
     ItemState item_state(const RelPath& rel, bool isDir) const;
     // children of a folder with their states (the file list's badges)
     std::vector<std::pair<std::wstring, ItemState>> children(const RelPath& folder) const;
+    // a change the folder's watch saw (a path under the root, '\'-separated): it waits, and
+    // the folders above it with it, until a pass looks at it
+    void touched(const std::wstring& name);
     void confirm_deletes(bool deleteThem);      // ConfirmDeletes: go ahead, or restore (download / upload back)
     void dismiss_conflicts();
     Backend& backend() { return *m_backend; }
@@ -104,8 +107,12 @@ private:
     EngineStatus m_status;
     std::set<std::wstring> m_active;    // keys being transferred now
     std::set<std::wstring> m_pending;   // keys with work planned
+    std::map<std::wstring, uint64_t> m_touched;     // keys the watch saw change, not yet planned -> when (m_touches)
+    uint64_t m_touches = 0;
+    std::set<std::wstring> m_unrecorded;    // keys here the last pass left without a record (busy, put off)
     std::map<std::wstring, std::wstring> m_errors;   // key -> why
     std::map<std::wstring, std::wstring> m_listErrors;   // the last listing's problems (gone when it no longer has them)
+    std::map<std::wstring, std::wstring> m_scanErrors;   // the last scan's and plan's, alike
     std::atomic<bool> m_paused{ false };
     int m_confirm = 0;                  // 1: delete confirmed, -1: restore (m_mx)
     size_t m_asked = 0;                 // deletions the guard asked about (0: no question open)
