@@ -74,6 +74,7 @@ public:
     void set_audio_track(int k);
 
     Change handle(MediaNote* note);     // the window's `msg`: takes the note
+    static void discard(MediaNote* note);   // one that came after the player was closed: freed
 
 private:
     struct Impl;

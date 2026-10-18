@@ -940,6 +940,10 @@ void MediaPlayer::set_audio_track(int k) {
     open(path, play, at);
 }
 
+void MediaPlayer::discard(MediaNote* n) {
+    if (n) release_note(n);
+}
+
 MediaPlayer::Change MediaPlayer::handle(MediaNote* n) {
     if (!n) return Change::None;
     if (n->gen != d->gen) { release_note(n); return Change::None; }    // an earlier file's

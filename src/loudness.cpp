@@ -30,8 +30,10 @@ double measure(const std::wstring& path) {
     };
     const int kExcerpts = 12;
     const LONGLONG kExcerpt = 30000000, dur = dec.duration();     // 3 s
-    if (dur <= kExcerpt * kExcerpts * 2) {
-        take((size_t)rate * 600);               // short, or of unknown length: all of it (10 min at most)
+    if (dur <= 0) {
+        take((size_t)rate * 120);               // of unknown length (a stream...): its first two minutes
+    } else if (dur <= kExcerpt * kExcerpts * 2) {
+        take((size_t)rate * 600);               // short: all of it (10 min at most)
     } else {
         // spread over the track, its first and last 5 % left out (intro, fade-out)
         for (int k = 0; k < kExcerpts; ++k) {
@@ -44,39 +46,49 @@ double measure(const std::wstring& path) {
     return meter.lufs();
 }
 
+// two lanes, a thread each: the track about to play (urgent) isn't held up behind the
+// next one's measuring (a long file, one on a slow share)
 struct Job { HWND notify; UINT msg; std::wstring path; };
+struct Lane {
+    std::condition_variable cv;
+    std::deque<Job> jobs;
+    bool running = false;
+};
 std::mutex s_mx;
-std::condition_variable s_cv;
-std::deque<Job> s_jobs;
-bool s_running = false;
+Lane s_lanes[2];                            // [0] urgent, [1] the next tracks
 
-void worker() {
+void worker(Lane* lane) {
     HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     for (;;) {
         Job job;
         {
             std::unique_lock<std::mutex> lk(s_mx);
-            s_cv.wait(lk, [] { return !s_jobs.empty(); });
-            job = std::move(s_jobs.front());
-            s_jobs.pop_front();
+            lane->cv.wait(lk, [lane] { return !lane->jobs.empty(); });
+            job = std::move(lane->jobs.front());
+            lane->jobs.pop_front();
         }
-        auto* note = new LoudnessNote{ job.path, measure(job.path) };        if (!PostMessageW(job.notify, job.msg, 0, (LPARAM)note)) delete note;
+        auto* note = new LoudnessNote{ job.path, measure(job.path) };
+        if (!PostMessageW(job.notify, job.msg, 0, (LPARAM)note)) delete note;
     }
-    (void)co;                               // (the thread lives as long as the process)
+    (void)co;                               // (the threads live as long as the process)
 }
 
 } // namespace
 
 void loudness_request(HWND notify, UINT msg, const std::wstring& path, bool urgent) {
     std::lock_guard<std::mutex> lk(s_mx);
-    s_jobs.erase(std::remove_if(s_jobs.begin(), s_jobs.end(), [&](const Job& j) { return j.path == path; }), s_jobs.end());
-    if (urgent) s_jobs.push_front({ notify, msg, path });
-    else s_jobs.push_back({ notify, msg, path });
+    for (Lane& l : s_lanes)
+        l.jobs.erase(std::remove_if(l.jobs.begin(), l.jobs.end(), [&](const Job& j) { return j.path == path; }), l.jobs.end());
+    Lane& lane = s_lanes[urgent ? 0 : 1];
+    if (urgent) lane.jobs.push_front({ notify, msg, path });
+    else lane.jobs.push_back({ notify, msg, path });
     // (skipping through tracks: the first and the latest matter, those between go)
-    while (s_jobs.size() > 4) s_jobs.erase(s_jobs.begin() + 1);
-    if (!s_running) {
-        s_running = true;
-        std::thread(worker).detach();
+    while (lane.jobs.size() > 4) lane.jobs.erase(lane.jobs.begin() + 1);
+    if (!lane.running) {
+        try {
+            std::thread(worker, &lane).detach();
+            lane.running = true;
+        } catch (...) {}
     }
-    s_cv.notify_one();
+    lane.cv.notify_one();
 }

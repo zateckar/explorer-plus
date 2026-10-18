@@ -1390,28 +1390,42 @@ bool keep_now(Player& p) {
     if (h == INVALID_HANDLE_VALUE) return false;
     DWORD put = 0, size = (DWORD)(text.size() * sizeof(wchar_t));
     bool ok = WriteFile(h, "\xFF\xFE", 2, &put, nullptr) && put == 2 && WriteFile(h, text.data(), size, &put, nullptr) && put == size;
+    // on the disk before it replaces the old one (a power cut could leave an empty file),
+    // and the one before kept as .bak
+    if (ok) ok = FlushFileBuffers(h) != 0;
     CloseHandle(h);
-    if (ok) ok = MoveFileExW(tmp.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+    if (ok) {
+        std::wstring bak = file + L".bak";
+        ok = ReplaceFileW(file.c_str(), tmp.c_str(), bak.c_str(), REPLACEFILE_IGNORE_MERGE_ERRORS, nullptr, nullptr) ||
+             MoveFileExW(tmp.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    }
     if (!ok) DeleteFileW(tmp.c_str());
     return ok;
+}
+
+static bool read_session(const std::wstring& file, PlayerSession& s) {
+    HANDLE h = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size{};
+    std::string raw;
+    DWORD got = 0;
+    if (GetFileSizeEx(h, &size) && size.QuadPart > 0 && size.QuadPart < (256 << 20)) {
+        raw.resize((size_t)size.QuadPart);
+        if (ReadFile(h, raw.data(), (DWORD)raw.size(), &got, nullptr) && got == raw.size()) s = player_session_parse(ini_decode(raw));
+    }
+    CloseHandle(h);
+    return !s.queues.empty();
 }
 
 // the tabs as they were left (none: an empty one); before the window is made
 void restore_queues(Player& p) {
     PlayerSession s;
     std::wstring file = queues_file();
-    HANDLE h = file.empty() ? INVALID_HANDLE_VALUE
-                            : CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                                          FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (h != INVALID_HANDLE_VALUE) {
-        LARGE_INTEGER size{};
-        std::string raw;
-        DWORD got = 0;
-        if (GetFileSizeEx(h, &size) && size.QuadPart > 0 && size.QuadPart < (256 << 20)) {
-            raw.resize((size_t)size.QuadPart);
-            if (ReadFile(h, raw.data(), (DWORD)raw.size(), &got, nullptr) && got == raw.size()) s = player_session_parse(ini_decode(raw));
-        }
-        CloseHandle(h);
+    // (empty or unreadable, from a crash or a power cut: the one before)
+    if (!file.empty() && !read_session(file, s) && GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        s = {};
+        read_session(file + L".bak", s);
     }
     for (auto& qs : s.queues) {
         QueueTab* t = add_tab(p, (int)p.tabs.size(), qs.name);
@@ -1560,7 +1574,12 @@ bool media_command(Player& p, int app) {
         case APPCOMMAND_MEDIA_PAUSE: if (playing(p)) command(p, CMD_PLAYPAUSE); return true;
         case APPCOMMAND_MEDIA_STOP:
             if (image_current(p)) set_slideshow(p, false);
-            else p.mp->stop();
+            else {
+                // a start held back for the loudness doesn't come after the stop
+                p.levelWait = 0;
+                KillTimer(p.wnd, TIMER_LEVEL);
+                p.mp->stop();
+            }
             refresh_bar(p);
             return true;
         case APPCOMMAND_MEDIA_NEXTTRACK: command(p, CMD_NEXT); return true;
@@ -3357,6 +3376,7 @@ void view_menu(Player& p, POINT pt) {
     AppendMenuW(m, MF_STRING, CMD_FULL, p.full ? L"Exit full screen\tEsc" : L"Full screen\tF");
     UINT id = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, p.wnd, nullptr);
     DestroyMenu(m);                             // (and its submenus)
+    if (s_p != &p) return;                      // (the window closed meanwhile: p is gone)
     if (id) command(p, id);
 }
 
@@ -3459,6 +3479,7 @@ void queue_menu(Player& p, POINT pt) {
     AppendMenuW(m, MF_STRING | (vq(p).empty() ? MF_GRAYED : 0), CMD_CLEAR, L"Clear queue");
     UINT id = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, p.wnd, nullptr);
     DestroyMenu(m);
+    if (s_p != &p) return;                      // (the window closed meanwhile: p is gone)
     if (id >= CMD_MOVE_TO && id <= CMD_MOVE_TO + (UINT)n) move_selected(p, (int)(id - CMD_MOVE_TO));
     else if (id) command(p, id);
 }
@@ -3480,6 +3501,7 @@ void tab_menu(Player& p, int i, POINT pt) {
     AppendMenuW(m, MF_STRING | (i + 1 < n ? 0 : MF_GRAYED), CMD_TAB_CLOSE_RIGHT, L"Close queues to the right");
     UINT id = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, p.wnd, nullptr);
     DestroyMenu(m);
+    if (s_p != &p) return;                      // (the window closed meanwhile: p is gone)
     i = tab_index(p, t);                        // (where it is now)
     if (!id || i < 0) return;
     switch (id) {
@@ -4016,9 +4038,28 @@ bool frame_message(Player& p, UINT msg, WPARAM wp, LPARAM lp, LRESULT* result) {
     return false;
 }
 
+// notes that came after on_destroy's drain (from a thread that was still at work): freed,
+// the media source shut down (it held the file open while the process lived on)
+static void drop_late_note(UINT msg, LPARAM lp) {
+    if (!lp) return;
+    switch (msg) {
+        case WM_MEDIA_NOTE: MediaPlayer::discard(reinterpret_cast<MediaNote*>(lp)); break;
+        case WM_MEDIA_INFO: delete reinterpret_cast<MediaInfoNote*>(lp); break;
+        case WM_IMAGE: delete reinterpret_cast<ImageNote*>(lp); break;
+        case WM_LOUDNESS: delete reinterpret_cast<LoudnessNote*>(lp); break;
+    }
+}
+
 LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     Player* pp = s_p;
     if (msg == WM_CREATE && pp) { on_create(*pp, hwnd); return 0; }
+    bool note = msg == WM_MEDIA_NOTE || msg == WM_MEDIA_INFO || msg == WM_IMAGE || msg == WM_LOUDNESS;
+    if (note && (!pp || pp->wnd != hwnd || !pp->mp)) { drop_late_note(msg, lp); return 0; }
+    if (msg == WM_NCDESTROY) {                      // (the last ones: after this, posting fails and the sender frees)
+        MSG m;
+        for (UINT k : { (UINT)WM_MEDIA_NOTE, (UINT)WM_MEDIA_INFO, (UINT)WM_IMAGE, (UINT)WM_LOUDNESS })
+            while (PeekMessageW(&m, hwnd, k, k, PM_REMOVE)) drop_late_note(k, m.lParam);
+    }
     if (!pp || pp->wnd != hwnd || !pp->mp) return DefWindowProcW(hwnd, msg, wp, lp);
     Player& p = *pp;
     if (msg == s_taskbarCreated && s_taskbarCreated) { taskbar_created(p); return 0; }
@@ -4441,6 +4482,7 @@ bool player_translate(MSG* m) {
             return true;
         case 'K': case 'P':
             if (ctrl != (vk == 'P')) return false;     // K, Ctrl+P
+            if (vk == 'K' && inList) return false;     // (the queue: type-ahead)
             if (!held) command(p, CMD_PLAYPAUSE);
             return true;
         case VK_LEFT: case VK_RIGHT:
@@ -4458,6 +4500,7 @@ bool player_translate(MSG* m) {
             command(p, CMD_PREV);
             return true;
         case 'F':
+            if (!ctrl && inList) return false;          // (the queue: type-ahead; Ctrl+F still the next)
             if (!ctrl && held) return true;
             command(p, ctrl ? CMD_NEXT : CMD_FULL);
             return true;
@@ -4466,7 +4509,7 @@ bool player_translate(MSG* m) {
             set_volume(p, p.volume + (vk == VK_UP ? 5 : -5));
             return true;
         case 'M':
-            if (ctrl) return false;
+            if (ctrl || inList) return false;       // (the queue: type-ahead)
             if (!held) command(p, CMD_MUTE);
             return true;
         case 'V':
