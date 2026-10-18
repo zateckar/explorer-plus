@@ -5,7 +5,7 @@ three sync agents) share one Folder store under <workdir>. Driven through
 `explorer-plus.exe --sync-cli`, the agents headless:
 
   A  first device: keys made, its folder uploaded (encrypted)
-  B  joins with the recovery key; files go both ways; a conflict
+  B  joins with the sync password; files go both ways; a conflict
   C  joins with a pairing code from A; A then removes C (new keys C never gets)
 
 Optionally the same devices over Azure DevOps Git, through its REST API and through git.exe,
@@ -115,9 +115,11 @@ def run_pair(label, type_args, cleanup=None):
         r = a.cli('add-pair', 'root=' + a.root, *type_args, 'create=1')
         check(r['_rc'] == 0, 'A: pair added')
         check(a.start(), 'A: agent started')
-        r = a.cli('setup-keys')
-        code = r.get('code', '')
-        check(r['_rc'] == 0 and len(code.replace('-', '')) == 15, 'A: keys made, recovery key %s' % ('shown' if code else 'missing'))
+        password = 'Sync ' + secrets.token_hex(6) + ' A1'
+        r = a.cli('setup-keys', 'password=weak')
+        check(r['_rc'] != 0, 'A: a weak password refused')
+        r = a.cli('setup-keys', 'password=' + password)
+        check(r['_rc'] == 0, 'A: keys made under the sync password (%s)' % r.get('error', ''))
         r = a.sync()
         st = r.get('state')
         if st == 'syncing':          # files younger than the settle time wait for the next pass
@@ -145,8 +147,10 @@ def run_pair(label, type_args, cleanup=None):
         check(b.start(), 'B: agent started')
         st = wait_state(b, ('locked',))
         check(st == 'locked', 'B: locked before unlocking (%s)' % st)
-        r = b.cli('unlock', 'mode=recovery', 'code=' + code.lower().replace('-', ' '))
-        check(r['_rc'] == 0, 'B: unlocked with the recovery key (%s)' % r.get('error', ''))
+        r = b.cli('unlock', 'mode=password', 'code=' + password.lower())
+        check(r['_rc'] != 0, 'B: a wrong password refused')
+        r = b.cli('unlock', 'mode=password', 'code=' + password)
+        check(r['_rc'] == 0, 'B: unlocked with the sync password (%s)' % r.get('error', ''))
         r = b.sync()
         check(r.get('state') == 'up to date', 'B: synced (%s %s)' % (r.get('state'), r.get('message', '')))
         check(read(os.path.join(b.root, 'hello.txt')) == 'hello from A', 'B: has hello.txt')
@@ -282,8 +286,11 @@ def run_pair(label, type_args, cleanup=None):
         devs = [d.split('\t') for d in r.get('_all_device', [])]
         check(len(devs) == 3, 'A: three devices listed (%d)' % len(devs))
         cdev = c.cli('keys-status').get('device', '')
-        r = a.cli('remove-device', 'device=' + cdev)
-        check(r['_rc'] == 0 and r.get('code'), 'A: removed C, new recovery key (%s)' % r.get('error', ''))
+        newPassword = 'Sync ' + secrets.token_hex(6) + ' B2'
+        r = a.cli('remove-device', 'device=' + cdev, 'old=' + newPassword, 'password=' + newPassword)
+        check(r['_rc'] != 0, 'A: removing needs the current password')
+        r = a.cli('remove-device', 'device=' + cdev, 'old=' + password, 'password=' + newPassword)
+        check(r['_rc'] == 0, 'A: removed C, new sync password (%s)' % r.get('error', ''))
         r = a.cli('devices')
         check(len(r.get('_all_device', [])) == 2, 'A: two devices left')
         write(os.path.join(a.root, 'after-removal.txt'), 'C must not read this')

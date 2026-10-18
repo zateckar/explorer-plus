@@ -73,17 +73,105 @@ void test_rest_rules() {
     CHECK(azdo_rest_failure(401, "", L"x").st == Status::AuthFailed);
     CHECK(azdo_rest_failure(404, R"({"message":"TF401019: The Git repository with name or identifier nope does not exist."})", L"x").st == Status::Rejected);
     CHECK(azdo_rest_failure(503, "", L"x").st == Status::Throttled && azdo_rest_failure(502, "", L"x").st == Status::Offline);
-    // a file over the push limit is refused before anything is sent
+    // files over the REST push limit go through receive-pack; over its limit, refused before
+    // anything is read or sent
     AzdoRestOptions o;
     o.url = L"https://dev.azure.com/o/p/_git/r";
     o.pat = L"x";
     o.maxPushBytes = 16 * 1024;
     auto b = make_azdo_rest_backend(o);
-    CHECK(b->caps().maxFileSize == (16 * 1024 - 4096) / 4 * 3);
-    MemorySource big(std::vector<uint8_t>((size_t)b->caps().maxFileSize + 1, 'x'));
+    CHECK(b->caps().maxFileSize == 3ull << 30);
+    struct Huge : ByteSource {
+        uint64_t size() override { return (3ull << 30) + 1; }
+        bool read(void*, size_t, size_t* got) override { *got = 0; return true; }
+        bool rewind() override { return true; }
+    } huge;
     RemoteEntry out;
     NoProgress np;
-    CHECK(b->upload(L"big.bin", big, FileMeta{}, "", out, np).st == Status::TooLarge);
+    CHECK(b->upload(L"big.bin", huge, FileMeta{}, "", out, np).st == Status::TooLarge);
+}
+
+// git's push protocol as built here, taken by git itself (receive-pack, as a smart HTTP
+// server runs it): a commit with subfolders and a big blob streamed from a file, one on top
+// of it, and a push made against a stale commit refused as a race
+void test_receive_pack() {
+    std::wstring git = find_git();
+    if (git.empty()) { std::printf("  receive-pack test skipped: no git.exe\n"); return; }
+    std::wstring base = tu::temp_root(L"recvpack"), repo = base + L"\\r.git";
+    CHECK(proc::run(git, { L"init", L"--bare", L"--quiet", repo }).ok());
+    const std::string ref = "refs/heads/sync";
+    auto run_git = [&](std::vector<std::wstring> args, const std::string* in = nullptr) {
+        args.insert(args.begin(), { L"--git-dir", repo });
+        proc::Options po;
+        po.stdinText = in;
+        po.cwd = base;                                           // (never the project's own repository)
+        return proc::run(git, args, po);
+    };
+    auto push = [&](const std::string& oldId, const std::string& newId, std::vector<PackObject> objs) {
+        auto req = git_receive_pack_request(oldId, newId, ref, std::move(objs));
+        NoProgress np;
+        MemorySink a, b;
+        CHECK(pump(*req, a, np).ok() && req->rewind() && pump(*req, b, np).ok());
+        CHECK(a.data.size() == req->size() && a.data == b.data);        // (a rewind sends the same bytes)
+        std::string body(a.data.begin(), a.data.end());
+        proc::Options po;
+        po.stdinText = &body;
+        po.cwd = base;
+        proc::Result r = proc::run(git, { L"receive-pack", L"--stateless-rpc", repo }, po);
+        CHECK(r.started);
+        return git_receive_pack_result(r.out, ref);
+    };
+    // the advertisement, as http-backend sends it (a new repository: no such branch)
+    proc::Result adv = proc::run(git, { L"receive-pack", L"--stateless-rpc", L"--advertise-refs", repo });
+    std::string at = "x";
+    CHECK(adv.ok() && git_advertised_ref("001f# service=git-receive-pack\n0000" + adv.out, ref, at) && at.empty());
+    CHECK(!git_advertised_ref("<html>sign in</html>", ref, at));
+
+    std::string hello = "hello\n", bye = "bye\n";
+    std::vector<uint8_t> big(300000);                            // several stored blocks
+    crypto::random(big.data(), big.size());
+    tu::write(base, L"big.bin", std::string(big.begin(), big.end()));
+    HANDLE h = CreateFileW((base + L"\\big.bin").c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    CHECK(h != INVALID_HANDLE_VALUE);
+    std::map<std::string, GitEntry> files = { { "a.txt", { git_blob_id(hello.data(), hello.size()) } },
+                                              { "d/e/big.bin", { git_blob_id(big.data(), big.size()) } },
+                                              { "d/z", { git_blob_id(hello.data(), hello.size()) } },
+                                              { "d-e", { git_blob_id(hello.data(), hello.size()) } } };   // (sorts between d and d/)
+    std::vector<GitTree> trees;
+    std::string root = git_build_trees(files, trees);
+    CHECK(trees.size() == 3 && trees.back().path.empty() && trees.back().oid == root);
+    std::string c1 = git_commit_object(root, "", "Explorer Plus <sync@localhost>", 1700000000, "first");
+    std::string c1id = git_object_id("commit", c1.data(), c1.size());
+    std::vector<PackObject> objs = { { 1, c1 }, { 3, hello } };
+    for (auto& t : trees) objs.push_back({ 2, t.data });
+    PackObject fo;
+    fo.file = h;
+    fo.size = big.size();
+    objs.push_back(fo);
+    CHECK(push("", c1id, objs).ok());
+    CloseHandle(h);
+    CHECK(run_git({ L"fsck", L"--strict", L"--no-dangling" }).ok());
+    CHECK(run_git({ L"rev-parse", L"sync" }).out == c1id + "\n");
+    CHECK(run_git({ L"cat-file", L"blob", L"sync:d/e/big.bin" }).out == std::string(big.begin(), big.end()));
+    CHECK(run_git({ L"cat-file", L"blob", L"sync:a.txt" }).out == hello);
+    // on top of it: the big file gone, a.txt changed
+    files.erase("d/e/big.bin");
+    files["a.txt"] = { git_blob_id(bye.data(), bye.size()) };
+    root = git_build_trees(files, trees);
+    std::string c2 = git_commit_object(root, c1id, "Explorer Plus <sync@localhost>", 1700000060, "second");
+    std::string c2id = git_object_id("commit", c2.data(), c2.size());
+    objs = { { 1, c2 }, { 3, bye } };
+    for (auto& t : trees) objs.push_back({ 2, t.data });
+    CHECK(push(c1id, c2id, objs).ok());
+    CHECK(run_git({ L"fsck", L"--strict", L"--no-dangling" }).ok());
+    CHECK(run_git({ L"ls-tree", L"-r", L"--name-only", L"sync" }).out == "a.txt\nd-e\nd/z\n");
+    adv = proc::run(git, { L"receive-pack", L"--stateless-rpc", L"--advertise-refs", repo });
+    CHECK(git_advertised_ref(adv.out, ref, at) && at == c2id);
+    // another device's commit made on c1: refused, nothing changed
+    std::string c3 = git_commit_object(root, c1id, "Explorer Plus <sync@localhost>", 1700000120, "late");
+    CHECK(push(c1id, git_object_id("commit", c3.data(), c3.size()), { { 1, c3 } }).st == Status::CommitRaced);
+    CHECK(run_git({ L"rev-parse", L"sync" }).out == c2id + "\n");
+    tu::rmrf(base);
 }
 
 Result put(Backend& b, const RelPath& p, const std::string& text, const std::string& expectedRev, std::string* rev = nullptr) {
@@ -204,9 +292,32 @@ void test_rest_raw(const std::wstring& url, const std::wstring& pat, const std::
     for (int i = 0; i < 3; ++i) CHECK(put(*s, L"parts/" + std::to_wstring(i) + L".bin", std::string(5000, (char)('a' + i)), "").ok());
     CHECK(s->commit(L"sync", cursor, np).ok() && cursor.size() == 40);
     CHECK(a->list(L"parts", lst, np).ok() && lst.size() == 3);
+    // a file over the REST push limit: the pass goes up through receive-pack, one commit
+    // with a small file, a removal and a rename beside it; then a REST push on top of it
+    std::string bigText(40000, '\0');
+    for (size_t i = 0; i < bigText.size(); ++i) bigText[i] = (char)(i * 7 + i / 300);
+    std::string rb;
+    CHECK(s->begin(np).ok());
+    CHECK(put(*s, L"big/huge.bin", bigText, "", &rb).ok() && rb == git_blob_id(bigText.data(), bigText.size()));
+    CHECK(put(*s, L"big/small.txt", "small", "").ok());
+    CHECK(s->remove(L"parts/0.bin", git_blob_id(std::string(5000, 'a').data(), 5000), np).ok());
+    CHECK(s->move(L"parts/1.bin", L"big/one.bin", git_blob_id(std::string(5000, 'b').data(), 5000), mv, np).ok());
+    Result pr = s->commit(L"sync", cursor, np);
+    CHECK(pr.ok() && cursor.size() == 40);
+    if (!pr.ok()) std::printf("  receive-pack push: %ls\n", pr.message.c_str());
+    CHECK(b->changes("", cb, np).ok());
+    const RemoteEntry* eb = find(cb.upserts, L"big/huge.bin");
+    CHECK(eb && eb->rev == rb && eb->size == bigText.size() && get(*b, *eb) == bigText);
+    CHECK(find(cb.upserts, L"big/small.txt") && find(cb.upserts, L"big/one.bin") && !find(cb.upserts, L"parts/0.bin") && !find(cb.upserts, L"parts/1.bin"));
+    CHECK(s->begin(np).ok());
+    CHECK(put(*s, L"big/small.txt", "small, edited", git_blob_id("small", 5)).ok());
+    CHECK(s->commit(L"sync", cursor, np).ok() && cursor.size() == 40);
+    CHECK(a->list(L"parts", lst, np).ok() && lst.size() == 1);
     // the git.exe store agrees about all of it
-    CHECK(g->changes("", gb, np).ok() && gb.upserts.size() == lst.size() + 3);           // + e/two, b-only, f/a
-    for (auto& e : lst) CHECK(find(gb.upserts, e.path) && find(gb.upserts, e.path)->rev == e.rev);
+    std::vector<RemoteEntry> all;
+    CHECK(a->list(L"", all, np).ok());
+    CHECK(g->changes("", gb, np).ok() && gb.upserts.size() == all.size());
+    for (auto& e : all) CHECK(find(gb.upserts, e.path) && find(gb.upserts, e.path)->rev == e.rev);
 }
 
 std::wstring env_of(const wchar_t* n) {
@@ -287,7 +398,7 @@ void test_e2e(bool rest) {
         return r;
     };
 
-    std::string rec;
+    std::string rec = "Sync password 1";
     CHECK(synckeys::setup_ring(*a.ks, rec).ok());
     Result r = open(a, true);
     CHECK(r.ok());
@@ -391,6 +502,7 @@ void test_e2e(bool rest) {
 void run_azdo_tests() {
     test_rules();
     test_rest_rules();
+    test_receive_pack();
     test_e2e(true);
     test_e2e(false);
 }

@@ -125,14 +125,46 @@ void test_ring_codec() {
     CHECK(!x.parse(b));
 }
 
+void test_password_rules() {
+    using synckeys::password_problem;
+    CHECK(password_problem("Sync password 1").empty());
+    CHECK(password_problem("Abcdefghij12").empty());                          // 12: enough
+    CHECK(!password_problem("Abcdefghij1").empty());                          // 11
+    CHECK(!password_problem("abcdefghij123").empty());                        // no capital
+    CHECK(!password_problem("ABCDEFGHIJ123").empty());                        // no small letter
+    CHECK(!password_problem("Abcdefghijklm").empty());                        // no digit
+    CHECK(!password_problem("\xC5\xA0\xC5\xA1\xC5\xA1\xC5\xA1\xC5\xA1\xC5\xA1" "a1").empty());   // 8 characters in 14 bytes
+    auto ks = synckeys::memory_key_store();
+    CHECK(synckeys::setup_ring(*ks, "too weak").st == Status::Rejected);
+    synckeys::Ring none;
+    CHECK(!ks->load_ring(none));
+    CHECK(synckeys::setup_ring(*ks, "Sync password 1").ok());
+    CHECK(synckeys::check_password(*ks, "Sync password 1").ok());
+    CHECK(synckeys::check_password(*ks, "sync password 1").st == Status::Rejected);
+    CHECK(synckeys::change_password(*ks, "weak").st == Status::Rejected);
+    CHECK(synckeys::change_password(*ks, "Sync password 2").ok());
+    CHECK(synckeys::check_password(*ks, "Sync password 2").ok());
+    CHECK(synckeys::check_password(*ks, "Sync password 1").st == Status::Rejected);
+    // a ring from before the password: its generated recovery key, typed as it's written
+    synckeys::Ring r;
+    CHECK(ks->load_ring(r));
+    std::string code = crypto::new_code();
+    CHECK(crypto::argon2id(code, r.recSalt, 16, r.recParams, r.recKek));
+    CHECK(ks->save_ring(r));
+    std::string typed;
+    for (char ch : crypto::format_code(code)) typed += (char)tolower(ch);
+    CHECK(synckeys::check_password(*ks, typed).ok());
+}
+
 void test_two_devices(bool tx) {
     auto store = std::make_shared<FakeStore>();
     auto raw = [store, tx] { return std::unique_ptr<Backend>(std::make_unique<FakeBackend>(store, tx)); };
     EDev a(L"ca", raw), b(L"cb", raw), c(L"cc", raw);
     // first device: keys, a vault in the empty store
-    std::string recovery;
+    std::string recovery = "Sync password 1";
     CHECK(synckeys::setup_ring(*a.ks, recovery).ok());
-    CHECK(crypto::normalize_code(recovery).size() == crypto::kCodeChars);
+    CHECK(synckeys::check_password(*a.ks, recovery).ok());
+    CHECK(synckeys::check_password(*a.ks, "Sync password 2").st == Status::Rejected);
     CHECK(b.open(true).st == Status::Locked);        // no keys on B yet
     CHECK(a.open(true).ok());
     tu::write(a.root, L"Plan Q3 secret.txt", "TOPSECRET-CONTENT-1");
@@ -202,9 +234,13 @@ void test_two_devices(bool tx) {
         synckeys::DeviceKey bk = synckeys::device_key(*b.ks);
         bId = bk.id;
         auto r = raw();
-        std::string newRecovery;
+        std::string newRecovery = "Another password 2";
+        // the password stays someone else's to know: the same one, or a weak one, is refused
+        CHECK(synckeys::remove_device(*r, *a.ks, bId, recovery, p).st == Status::Rejected);
+        CHECK(synckeys::remove_device(*r, *a.ks, bId, "short", p).st == Status::Rejected);
         CHECK(synckeys::remove_device(*r, *a.ks, bId, newRecovery, p).ok());
-        CHECK(!newRecovery.empty() && newRecovery != recovery);
+        CHECK(synckeys::check_password(*a.ks, newRecovery).ok());
+        CHECK(synckeys::check_password(*a.ks, recovery).st == Status::Rejected);
         std::vector<synckeys::DeviceInfo> devs;
         CHECK(synckeys::list_devices(*r, *a.ks, devs, p).ok());
         CHECK(devs.size() == 2);
@@ -228,7 +264,7 @@ void test_tamper() {
     auto store = std::make_shared<FakeStore>();
     auto raw = [store] { return std::unique_ptr<Backend>(std::make_unique<FakeBackend>(store, false)); };
     EDev a(L"ta", raw), b(L"tb", raw);
-    std::string recovery;
+    std::string recovery = "Sync password 1";
     CHECK(synckeys::setup_ring(*a.ks, recovery).ok());
     CHECK(a.open(true).ok());
     tu::write(a.root, L"f.txt", "original content");
@@ -285,7 +321,7 @@ void test_refuse_plaintext() {
         store->objs[L"existing.txt"] = o;
     }
     EDev a(L"ra", [store] { return std::unique_ptr<Backend>(std::make_unique<FakeBackend>(store, false)); });
-    std::string rec;
+    std::string rec = "Sync password 1";
     CHECK(synckeys::setup_ring(*a.ks, rec).ok());
     CHECK(a.open(true).st == Status::Rejected);
 }
@@ -297,7 +333,7 @@ void test_long_names() {
     register_builtin_backends();
     auto raw = [cfg] { std::wstring why; return create_raw_backend(L"folder", cfg, &why); };
     EDev a(L"la", raw), b(L"lb", raw);
-    std::string rec;
+    std::string rec = "Sync password 1";
     CHECK(synckeys::setup_ring(*a.ks, rec).ok());
     CHECK(a.open(true).ok());
     std::wstring longName(200, L'n');
@@ -469,7 +505,7 @@ void test_removal_hardening() {
     EDev a(L"ha", raw), b(L"hb", raw), c(L"hc", raw);
     NoProgress p;
     const std::wstring kVault = L".ep-vault/vault", kRotate = L".ep-vault/rotate/";
-    std::string recovery;
+    std::string recovery = "Sync password 1";
     CHECK(synckeys::setup_ring(*a.ks, recovery).ok());
     CHECK(a.open(true).ok());
     for (EDev* d : { &b, &c }) {
@@ -511,7 +547,7 @@ void test_removal_hardening() {
 
     // A removes B. C keeps running: its next pass reads the changed vault before it
     // writes, so a new file is under the new key version, which B never got
-    std::string newRecovery;
+    std::string newRecovery = "Another password 2";
     {
         auto r = raw();
         CHECK(synckeys::remove_device(*r, *a.ks, bk.id, newRecovery, p).ok());
@@ -732,10 +768,10 @@ void test_removal_hardening() {
     a.sync();
     CHECK(tu::read(a.root, L"moved old2.txt") == "2" && !tu::exists(a.root, L"old2.txt"));
 
-    // a new recovery key starts a new generation: the ring an old copy of the vault gives
-    // to the previous recovery key no longer opens the vault, and C follows
-    std::string thirdRecovery;
-    CHECK(synckeys::new_recovery_key(*a.ks, thirdRecovery).ok());
+    // a new sync password starts a new generation: the ring an old copy of the vault gives
+    // to the previous password no longer opens the vault, and C follows
+    std::string thirdRecovery = "Third password 3";
+    CHECK(synckeys::change_password(*a.ks, thirdRecovery).ok());
     crypto::Bytes gen2Vault = store->objs[kVault].data;
     {
         auto r = raw();
@@ -899,7 +935,7 @@ void test_manifest_attacks(bool tx) {
     auto raw = [store, tx] { return std::unique_ptr<Backend>(std::make_unique<FakeBackend>(store, tx)); };
     EDev a(L"ma", raw), b(L"mb", raw), c(L"mc", raw), d(L"md", raw);
     NoProgress p;
-    std::string recovery;
+    std::string recovery = "Sync password 1";
     CHECK(synckeys::setup_ring(*a.ks, recovery).ok());
     CHECK(a.open(true).ok());
     for (EDev* x : { &b, &c, &d }) {
@@ -1015,7 +1051,7 @@ void test_manifest_window() {
     auto raw = [store] { return std::unique_ptr<Backend>(std::make_unique<FakeBackend>(store, false)); };
     EDev a(L"wa", raw), b(L"wb", raw);
     NoProgress p;
-    std::string recovery;
+    std::string recovery = "Sync password 1";
     CHECK(synckeys::setup_ring(*a.ks, recovery).ok());
     CHECK(a.open(true).ok());
     tu::write(a.root, L"a.txt", "A");
@@ -1051,7 +1087,7 @@ void test_manifest_upgrade(bool tx) {
     auto raw = [store, tx] { return std::unique_ptr<Backend>(std::make_unique<FakeBackend>(store, tx)); };
     EDev a(L"ua", raw), b(L"ub", raw);
     NoProgress p;
-    std::string recovery;
+    std::string recovery = "Sync password 1";
     CHECK(synckeys::setup_ring(*a.ks, recovery).ok());
     a.noManifest = true;
     CHECK(a.open(true).ok());
@@ -1098,6 +1134,7 @@ void test_manifest_upgrade(bool tx) {
 void run_crypt_tests() {
     SetEnvironmentVariableW(L"EXPLORERPLUS_SYNC_KDF_KIB", L"1024");     // Argon2id: 1 MiB, 1 pass (tests)
     test_ring_codec();
+    test_password_rules();
     test_refuse_plaintext();
     test_two_devices(false);
     test_two_devices(true);

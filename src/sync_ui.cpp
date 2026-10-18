@@ -2,13 +2,14 @@
 #include "credstore.h"
 #include "crypto.h"
 #include "resource.h"
+#include "shell_utils.h"
 #include "sync_agent.h"
 #include "sync_config.h"
 #include "sync_engine.h"
 #include "sync_ipc.h"
+#include "sync_keys.h"
 #include "theme.h"
 #include <commctrl.h>
-#include <wincred.h>
 #include <dwmapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
@@ -264,7 +265,34 @@ void apply_fonts(Form& f) {
     f.bold = theme_create_font(f.dpi, FW_SEMIBOLD, 140);
     f.big = theme_create_font(f.dpi, FW_SEMIBOLD, 170);
     EnumChildWindows(f.wnd, [](HWND h, LPARAM lp) { SendMessageW(h, WM_SETFONT, (WPARAM)((Form*)lp)->font, TRUE); return TRUE; }, (LPARAM)&f);
-    for (auto& fl : f.fields) if (fl.kind == F_CODE && fl.ctl) SendMessageW(fl.ctl, WM_SETFONT, (WPARAM)f.big, TRUE);
+    for (auto& fl : f.fields) {
+        if (fl.kind == F_CODE && fl.ctl) SendMessageW(fl.ctl, WM_SETFONT, (WPARAM)f.big, TRUE);
+        if (fl.kind == F_CHOICE && fl.ctl) {
+            SendMessageW(fl.ctl, CB_SETITEMHEIGHT, (WPARAM)-1, f.px(20));      // the closed box
+            SendMessageW(fl.ctl, CB_SETITEMHEIGHT, 0, f.px(24));               // the list's rows
+        }
+    }
+}
+
+// an owner-drawn choice: the box and the dropped-down rows in the theme's colours
+void draw_choice(Form& f, DRAWITEMSTRUCT* di) {
+    bool box = (di->itemState & ODS_COMBOBOXEDIT) != 0;
+    bool sel = (di->itemState & ODS_SELECTED) && !box;
+    fill_rect(di->hDC, di->rcItem, sel ? blend(pal().boxFill, pal().accent, 0.45) : pal().boxFill);
+    if (di->itemID == (UINT)-1) return;
+    int n = (int)SendMessageW(di->hwndItem, CB_GETLBTEXTLEN, di->itemID, 0);
+    if (n <= 0) return;
+    std::wstring s(n, L'\0');
+    SendMessageW(di->hwndItem, CB_GETLBTEXT, di->itemID, (LPARAM)s.data());
+    s.resize(wcslen(s.c_str()));
+    HGDIOBJ of = SelectObject(di->hDC, f.font);
+    SetBkMode(di->hDC, TRANSPARENT);
+    SetTextColor(di->hDC, (di->itemState & ODS_DISABLED) ? pal().textDisabled : pal().text);
+    RECT r = di->rcItem;
+    r.left += f.px(4);
+    r.right -= f.px(4);
+    DrawTextW(di->hDC, s.c_str(), -1, &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+    SelectObject(di->hDC, of);
 }
 
 void apply_theme(Form& f) {
@@ -294,7 +322,8 @@ void create_fields(Form& f) {
                 SendMessageW(fl.ctl, BM_SETCHECK, fl.value == L"1" ? BST_CHECKED : BST_UNCHECKED, 0);
                 break;
             case F_CHOICE: {
-                fl.ctl = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, id);
+                // drawn here (WM_DRAWITEM): the theme's colours, closed and dropped down alike
+                fl.ctl = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP, id);
                 int sel = 0;
                 for (size_t c = 0; c < fl.choices.size(); ++c) {
                     SendMessageW(fl.ctl, CB_ADDSTRING, 0, (LPARAM)fl.choices[c].c_str());
@@ -467,6 +496,16 @@ LRESULT CALLBACK form_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CTLCOLORBTN:
             SetBkColor((HDC)wp, pal().content);
             return (LRESULT)bg_brush();
+        case WM_MEASUREITEM: {                  // (while the combo box is made: the font comes later)
+            auto* mi = (MEASUREITEMSTRUCT*)lp;
+            if (mi->CtlType != ODT_COMBOBOX) break;
+            mi->itemHeight = f.px(mi->itemID == (UINT)-1 ? 20 : 24);
+            return TRUE;
+        }
+        case WM_DRAWITEM:
+            if (((DRAWITEMSTRUCT*)lp)->CtlType != ODT_COMBOBOX) break;
+            draw_choice(f, (DRAWITEMSTRUCT*)lp);
+            return TRUE;
         case DM_GETDEFID:
             return f.button(IDOK) ? MAKELRESULT(IDOK, DC_HASDEFID) : 0;
         case WM_COMMAND: {
@@ -541,8 +580,8 @@ int run_form(HWND owner, Form& f) {
         wc.lpfnWndProc = form_proc;
         wc.lpszClassName = L"ExplorerPlusSyncForm";
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        LoadIconMetric(g_hinst, MAKEINTRESOURCEW(IDI_APP), LIM_SMALL, &wc.hIconSm);
-        LoadIconMetric(g_hinst, MAKEINTRESOURCEW(IDI_APP), LIM_LARGE, &wc.hIcon);
+        LoadIconMetric(g_hinst, MAKEINTRESOURCEW(IDI_SYNC), LIM_SMALL, &wc.hIconSm);
+        LoadIconMetric(g_hinst, MAKEINTRESOURCEW(IDI_SYNC), LIM_LARGE, &wc.hIcon);
         RegisterClassExW(&wc);
     }
     f.owner = owner;
@@ -557,6 +596,7 @@ int run_form(HWND owner, Form& f) {
     int w = MulDiv(f.width, dpi, 96);
     HWND wnd = CreateWindowExW(ex, L"ExplorerPlusSyncForm", f.title.c_str(), style, 0, 0, w, MulDiv(300, dpi, 96), owner, nullptr, g_hinst, &f);
     if (!wnd) return IDCANCEL;
+    if (!owner) window_app_id(wnd, L"RadimZatecka.ExplorerPlus.Sync");     // its own taskbar button, sync's icon
     // the height its contents want, centred on the owner (or on the screen)
     RECT wr{}, cr{};
     GetWindowRect(wnd, &wr);
@@ -584,6 +624,7 @@ int run_form(HWND owner, Form& f) {
         DispatchMessageW(&m);
     }
     if (owner) { EnableWindow(owner, TRUE); SetForegroundWindow(owner); }
+    if (!owner) window_app_id(wnd, nullptr);
     DestroyWindow(wnd);
     f.wnd = nullptr;
     if (quit) PostQuitMessage((int)m.wParam);
@@ -657,157 +698,136 @@ void copy_text(HWND owner, const std::wstring& s) {
     CloseClipboard();
 }
 
-void save_text(HWND owner, const std::wstring& name, const std::wstring& s) {
-    IFileSaveDialog* d = nullptr;
-    if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return;
-    COMDLG_FILTERSPEC spec[] = { { L"Text file", L"*.txt" } };
-    d->SetFileTypes(1, spec);
-    d->SetDefaultExtension(L"txt");
-    d->SetFileName(name.c_str());
-    if (SUCCEEDED(d->Show(owner))) {
-        IShellItem* it = nullptr;
-        PWSTR p = nullptr;
-        if (SUCCEEDED(d->GetResult(&it)) && SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &p)) && p) {
-            std::string body = u8(s);
-            HANDLE h = CreateFileW(p, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-            DWORD wr = 0;
-            if (h != INVALID_HANDLE_VALUE) { WriteFile(h, body.data(), (DWORD)body.size(), &wr, nullptr); CloseHandle(h); }
-            CoTaskMemFree(p);
-        }
-        if (it) it->Release();
-    }
-    d->Release();
-}
-
 // ------------------------------------------------------------------
 // the pages
 // ------------------------------------------------------------------
-enum { ID_COPY = 10, ID_SAVE, ID_TEST, ID_ADD, ID_REMOVE, ID_PAUSE, ID_SYNCNOW, ID_DEVICES, ID_ADDDEV, ID_REMOVEDEV, ID_NEWREC, ID_EDIT, ID_REENC,
-       ID_SHOWREC };
+enum { ID_COPY = 10, ID_TEST, ID_ADD, ID_REMOVE, ID_PAUSE, ID_SYNCNOW, ID_DEVICES, ID_ADDDEV, ID_REMOVEDEV, ID_PASSWORD, ID_EDIT, ID_REENC };
 
-// The recovery key as last shown on this PC, for "Show recovery key" (behind a Windows
-// sign-in): in Credential Manager like the key ring itself, "<code>\t<FILETIME>".
-const wchar_t* kRecoveryCred = L"recovery-key";
+// What earlier versions kept of the generated recovery key (for "Show recovery key"): the
+// sync password took its place and is kept nowhere, so it goes once a password is set.
+const wchar_t* kOldRecoveryCred = L"recovery-key";
 
-// Windows asks for this account's password (or PIN / smart card); true once it's verified
-bool windows_sign_in(HWND owner, const wchar_t* why) {
-    wchar_t user[256] = L"";
-    DWORD n = ARRAYSIZE(user);
-    GetUserNameW(user, &n);
-    CREDUI_INFOW ui{ sizeof(ui), owner, L"Show recovery key", why, nullptr };
-    for (DWORD err = 0;;) {
-        ULONG pkg = 0, outSize = 0;
-        LPVOID out = nullptr;
-        BOOL save = FALSE;
-        DWORD r = CredUIPromptForWindowsCredentialsW(&ui, err, &pkg, nullptr, 0, &out, &outSize, &save, CREDUIWIN_ENUMERATE_CURRENT_USER);
-        if (r != ERROR_SUCCESS) return false;                  // cancelled
-        wchar_t name[514] = L"", domain[256] = L"", pass[512] = L"";
-        DWORD nn = ARRAYSIZE(name), dn = ARRAYSIZE(domain), pn = ARRAYSIZE(pass);
-        BOOL unpacked = CredUnPackAuthenticationBufferW(0, out, outSize, name, &nn, domain, &dn, pass, &pn);
-        SecureZeroMemory(out, outSize);
-        CoTaskMemFree(out);
-        HANDLE tok = nullptr;
-        bool ok = unpacked && LogonUserW(name, dn > 1 ? domain : nullptr, pass, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, &tok);
-        SecureZeroMemory(pass, sizeof(pass));
-        if (tok) CloseHandle(tok);
-        if (ok) return true;
-        err = ERROR_LOGON_FAILURE;                             // asked again, with "incorrect" shown
+const wchar_t* kPasswordRules = L"12 characters or more, with lower and upper case letters and digits.";
+
+// The sync password, typed twice (and the current one first when `current`). send: hands it
+// to the agent; false keeps the form open (it said why). True once a password was taken.
+bool password_form(HWND owner, const std::wstring& title, const std::wstring& heading, const std::wstring& text, bool current,
+                   const std::function<bool(Form&, const std::string& old, const std::string& pw)>& send) {
+    Form f;
+    f.title = title;
+    f.heading = heading;
+    f.text = text;
+    if (current) {
+        FField o;
+        o.key = L"old";
+        o.label = L"Current sync password";
+        o.kind = F_SECRET;
+        f.fields.push_back(o);
     }
+    FField n;
+    n.key = L"pw";
+    n.label = current ? L"New sync password" : L"Sync password";
+    n.kind = F_SECRET;
+    n.help = std::wstring(kPasswordRules) + L" Nobody can reset it - Explorer Plus included - so keep it somewhere safe.";
+    FField a;
+    a.key = L"again";
+    a.label = L"Type it again";
+    a.kind = F_SECRET;
+    f.fields.push_back(n);
+    f.fields.push_back(a);
+    f.buttons = { { IDOK, L"OK" }, { IDCANCEL, L"Cancel" } };
+    f.onButton = [&](Form& f, int id) {
+        if (id != IDOK) return true;
+        std::string pw = u8(f.get(L"pw"));
+        std::wstring why = synckeys::password_problem(pw);
+        if (!why.empty()) {
+            MessageBoxW(f.wnd, why.c_str(), f.title.c_str(), MB_OK | MB_ICONWARNING);
+            return false;
+        }
+        if (f.get(L"again") != f.get(L"pw")) {
+            MessageBoxW(f.wnd, L"The two passwords aren't the same.", f.title.c_str(), MB_OK | MB_ICONWARNING);
+            return false;
+        }
+        if (!send(f, u8(f.get(L"old")), pw)) return false;
+        credstore::erase(kOldRecoveryCred);
+        return true;
+    };
+    return run_form(owner, f) == IDOK;
 }
 
-// A code to write down. recovery: the recovery key, typed back once before the form closes
-// (`again`: shown once more, from what this PC kept; nothing to type back).
-void show_code(HWND owner, const std::string& code, bool recovery, bool again = false) {
+// a pairing code for the other device, to type there
+void show_code(HWND owner, const std::string& code) {
     Form f;
     std::wstring shown = w16(crypto::format_code(code));
-    if (recovery && !again) {
-        FILETIME now;
-        GetSystemTimeAsFileTime(&now);
-        uint64_t t = ((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime;
-        credstore::put_text(kRecoveryCred, w16(crypto::normalize_code(code)) + L"\t" + std::to_wstring(t));
-    }
-    if (recovery) {
-        f.title = L"Recovery key";
-        f.heading = L"Your recovery key";
-        f.text = L"Write it down, or save it somewhere only you can reach. With it, a new PC opens your sync folders "
-                 L"when no other device of yours is at hand. Your files are encrypted before they leave this PC, and "
-                 L"nobody - Explorer Plus included - can open them without this key or one of your devices.";
-    } else {
-        f.title = L"Add a device";
-        f.heading = L"Code for your other device";
-        f.text = L"On the other PC, open Sync folders in Explorer Plus, add a folder with this same storage location and "
-                 L"type this code when it asks. It works once, within 15 minutes.";
-    }
+    f.title = L"Add a device";
+    f.heading = L"Code for your other device";
+    f.text = L"On the other PC, open Sync folders in Explorer Plus, add a folder with this same storage location and "
+             L"type this code when it asks. It works once, within 15 minutes. (Your sync password unlocks it too.)";
     FField c;
     c.key = L"code";
     c.kind = F_CODE;
     c.value = shown;
     f.fields.push_back(c);
-    if (recovery && !again) {
-        FField a;
-        a.key = L"again";
-        a.label = L"Type it again, to be sure it's written down right";
-        f.fields.push_back(a);
-    }
-    f.buttons = { { ID_COPY, L"Copy", true } };
-    if (recovery) f.buttons.push_back({ ID_SAVE, L"Save as...", true });
-    f.buttons.push_back({ IDOK, recovery && !again ? L"Done" : L"Close" });
+    f.buttons = { { ID_COPY, L"Copy", true }, { IDOK, L"Close" } };
     f.onButton = [&](Form& f, int id) {
         if (id == ID_COPY) { copy_text(f.wnd, shown); return false; }
-        if (id == ID_SAVE) {
-            save_text(f.wnd, L"Explorer Plus recovery key", L"Explorer Plus sync - recovery key\r\n\r\n" + shown + L"\r\n");
-            return false;
-        }
-        if (!recovery || again) return true;
-        if (id == IDOK) {
-            std::string typed = crypto::normalize_code(u8(f.get(L"again")));
-            if (!typed.empty() && typed == crypto::normalize_code(code)) return true;
-            MessageBoxW(f.wnd, L"That isn't the same key. Compare it with the one above, character by character.", L"Recovery key", MB_OK | MB_ICONWARNING);
-            return false;
-        }
-        return MessageBoxW(f.wnd, L"Close without typing the key back?\n\nIf it wasn't written down, make a new one: Sync folders > Devices and keys > New recovery key.",
-                           L"Recovery key", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
+        return true;
     };
     run_form(owner, f);
 }
 
-// a pair this device has no key for yet: a code from another device, or the recovery key
+// a pair this device has no key for yet: the sync password, or a code from another device
 bool unlock_form(HWND owner, const std::string& pairId, const std::wstring& name) {
     Form f;
     f.title = L"Unlock " + name;
     f.heading = L"Unlock " + name;
-    f.text = L"Its storage was set up on another device, encrypted with your keys. On that device open Sync folders > "
-             L"Devices and keys > Add a device and type the code it shows here - or type your recovery key.";
-    FField mode;
-    mode.key = L"mode";
-    mode.label = L"Unlock with";
-    mode.kind = F_CHOICE;
-    mode.choices = { L"A code from my other device", L"My recovery key" };
-    mode.values = { L"code", L"recovery" };
-    FField code;
-    code.key = L"code";
-    code.label = L"Code";
-    code.help = L"15 letters and digits; dashes and spaces don't matter.";
-    f.fields = { mode, code };
+    f.text = L"Its storage was set up on another device, encrypted with your keys. Type your sync password - or, on that "
+             L"device, open Sync folders > Devices and keys > Add a device and type the code it shows here.";
+    // the secret's field follows the choice: a hidden password, or a code to read back
+    auto fields = [](const std::wstring& mode) {
+        FField m;
+        m.key = L"mode";
+        m.label = L"Unlock with";
+        m.kind = F_CHOICE;
+        m.choices = { L"My sync password", L"A code from my other device" };
+        m.values = { L"password", L"code" };
+        m.value = mode;
+        FField s;
+        s.key = L"secret";
+        if (mode == L"code") {
+            s.label = L"Code";
+            s.help = L"15 letters and digits; dashes and spaces don't matter.";
+        } else {
+            s.label = L"Sync password";
+            s.kind = F_SECRET;
+            s.help = L"The one chosen when the first sync folder was set up (or a recovery key from an earlier version).";
+        }
+        return std::vector<FField>{ m, s };
+    };
+    f.fields = fields(L"password");
+    f.onChange = [&](Form& f, size_t i) {
+        if (f.fields[i].key != L"mode") return;
+        f.later = [&](Form& f) {
+            set_fields(f, fields(f.get(L"mode")));
+            if (FField* m = f.field(L"mode")) SetFocus(m->ctl);
+        };
+        PostMessageW(f.wnd, WM_FORM_LATER, 0, 0);
+    };
     f.buttons = { { IDOK, L"Unlock" }, { IDCANCEL, L"Cancel" } };
     f.onButton = [&](Form& f, int id) {
         if (id != IDOK) return true;
-        if (crypto::normalize_code(u8(f.get(L"code"))).empty()) {
+        bool code = f.get(L"mode") == L"code";
+        std::string secret = u8(f.get(L"secret"));
+        if (code && crypto::normalize_code(secret).empty()) {
             MessageBoxW(f.wnd, L"That isn't a code: 15 letters and digits.", f.title.c_str(), MB_OK | MB_ICONWARNING);
             return false;
         }
+        if (!code && secret.empty()) return false;
         Msg q = syncipc::request("unlock"), r;
         q.push_back({ "pair", pairId });
-        q.push_back({ "mode", u8(f.get(L"mode")) });
-        q.push_back({ "code", u8(f.get(L"code")) });
-        if (!agent_ok(f, q, r, f.title.c_str())) return false;
-        if (f.get(L"mode") == L"recovery") {                  // (it works: kept for Show recovery key)
-            FILETIME now;
-            GetSystemTimeAsFileTime(&now);
-            uint64_t t = ((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime;
-            credstore::put_text(kRecoveryCred, w16(crypto::normalize_code(u8(f.get(L"code")))) + L"\t" + std::to_wstring(t));
-        }
-        return true;
+        q.push_back({ "mode", code ? "code" : "password" });
+        q.push_back({ "code", secret });
+        return agent_ok(f, q, r, f.title.c_str());
     };
     return run_form(owner, f) == IDOK;
 }
@@ -865,7 +885,7 @@ void secrets_form(HWND owner, const syncconf::Pair& p) {
 }
 
 // Add a sync folder: where, which storage, its settings; then the keys (first time: made
-// here, the recovery key shown; a storage made by another device: unlocked)
+// here, under the sync password chosen; a storage made by another device: unlocked)
 bool add_form(HWND owner) {
     sync::register_builtin_backends();
     Form f;
@@ -961,14 +981,16 @@ bool add_form(HWND owner) {
         if (!agent_ok(f, ks, kr, f.title.c_str())) return false;
         bool haveRing = syncipc::get(kr, "ring") == "1";
         if (!haveRing && vault == "none") {
-            // the first sync folder ever: the user's keys, and the recovery key
-            if (MessageBoxW(f.wnd, L"This is your first sync folder, so Explorer Plus makes your encryption keys now and shows "
-                                   L"your recovery key, to write down.\n\nNobody can open the synced files without it or one of your devices.",
-                            f.title.c_str(), MB_OKCANCEL | MB_ICONINFORMATION) != IDOK)
-                return false;
-            Msg sq = syncipc::request("setup-keys"), sr;
-            if (!agent_ok(f, sq, sr, f.title.c_str())) return false;
-            show_code(f.wnd, syncipc::get(sr, "code"), true);
+            // the first sync folder ever: the user's keys, under the sync password
+            bool made = password_form(f.wnd, L"Sync password", L"Choose your sync password",
+                L"This is your first sync folder, so Explorer Plus makes your encryption keys now. Your files are encrypted "
+                L"before they leave this PC; the sync password unlocks them on a new PC when no other device of yours is at hand.",
+                false, [](Form& pf, const std::string&, const std::string& pw) {
+                    Msg sq = syncipc::request("setup-keys"), sr;
+                    sq.push_back({ "password", pw });
+                    return agent_ok(pf, sq, sr, pf.title.c_str());
+                });
+            if (!made) return false;
         }
         syncconf::Pair p;
         p.id = syncconf::new_id();
@@ -1008,13 +1030,13 @@ void devices_form(HWND owner, const syncconf::Pair& pair) {
     f.title = L"Devices and keys";
     f.heading = L"Devices and keys";
     f.text = L"The devices that hold your sync keys. Add a device shows a one-time code for a new PC; removing one makes "
-             L"new keys it never gets (and a new recovery key). Listed from " + pair.name + L"'s storage.";
-    f.width = 620;
+             L"new keys it never gets (and asks for a new sync password). Listed from " + pair.name + L"'s storage.";
+    f.width = 720;
     f.listHeight = 200;
     f.columns = { L"Device", L"Added", L"" };
     f.widths = { 500, 300, 200 };
-    f.buttons = { { ID_ADDDEV, L"Add a device...", true }, { ID_REMOVEDEV, L"Remove device", true }, { ID_NEWREC, L"New recovery key", true },
-                  { ID_SHOWREC, L"Show recovery key...", true }, { ID_REENC, L"Re-encrypt files", true }, { IDCANCEL, L"Close" } };
+    f.buttons = { { ID_ADDDEV, L"Add a device...", true }, { ID_REMOVEDEV, L"Remove device...", true },
+                  { ID_PASSWORD, L"Change password...", true }, { ID_REENC, L"Re-encrypt files", true }, { IDCANCEL, L"Close" } };
     std::vector<DeviceRow> devs;
     // every synced file uploaded again under the current keys, sync folder by sync folder
     auto reencrypt = [&](Form& f) {
@@ -1060,7 +1082,7 @@ void devices_form(HWND owner, const syncconf::Pair& pair) {
         if (id == ID_ADDDEV) {
             Msg q = syncipc::request("pair-offer"), r;
             q.push_back({ "pair", pair.id });
-            if (agent_ok(f, q, r, f.title.c_str())) show_code(f.wnd, syncipc::get(r, "code"), false);
+            if (agent_ok(f, q, r, f.title.c_str())) show_code(f.wnd, syncipc::get(r, "code"));
             reload(f);
         } else if (id == ID_REMOVEDEV) {
             int i = f.selected();
@@ -1070,15 +1092,23 @@ void devices_form(HWND owner, const syncconf::Pair& pair) {
                 return false;
             }
             std::wstring ask = L"Remove " + devs[i].name + L"?\n\nIt can't read anything synced from now on: new keys are made and passed to your "
-                               L"other devices, and you get a new recovery key (the old one stops working for the new keys). "
+                               L"other devices, and you choose a new sync password (the old one may be known to it). "
                                L"Files it already has stay on it.\n\nRevoke its access to the storage first (its S3 key, its token): "
                                L"a device that can still write there can get around the removal.";
             if (MessageBoxW(f.wnd, ask.c_str(), f.title.c_str(), MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK) return false;
-            Msg q = syncipc::request("remove-device"), r;
-            q.push_back({ "pair", pair.id });
-            q.push_back({ "device", devs[i].id });
-            if (agent_ok(f, q, r, f.title.c_str(), 600000)) {
-                show_code(f.wnd, syncipc::get(r, "code"), true);
+            std::string dev = devs[i].id;
+            bool removed = password_form(f.wnd, L"Remove " + devs[i].name, L"A new sync password",
+                L"The removed device may know the current sync password, so the new keys get a new one. Type the current "
+                L"password first.",
+                true, [&](Form& pf, const std::string& old, const std::string& pw) {
+                    Msg q = syncipc::request("remove-device"), r;
+                    q.push_back({ "pair", pair.id });
+                    q.push_back({ "device", dev });
+                    q.push_back({ "old", old });
+                    q.push_back({ "password", pw });
+                    return agent_ok(pf, q, r, pf.title.c_str(), 600000);
+                });
+            if (removed) {
                 if (MessageBoxW(f.wnd, L"Re-encrypt the synced files now?\n\nThe removed device can't read anything new, but it still holds the keys "
                                        L"of what's already on the storage. Re-encrypting uploads every file again under the new keys "
                                        L"(it takes as long as the first sync did).",
@@ -1086,39 +1116,24 @@ void devices_form(HWND owner, const syncconf::Pair& pair) {
                     reencrypt(f);
             }
             reload(f);
-        } else if (id == ID_SHOWREC) {
-            std::wstring kept = credstore::get_text(kRecoveryCred);
-            size_t tab = kept.find(L'\t');
-            if (tab == std::wstring::npos) {
-                MessageBoxW(f.wnd, L"This PC doesn't have your recovery key: it was made on another of your devices (or before this "
-                                   L"version kept it). Show it there, or make a new one here with New recovery key.",
-                            f.title.c_str(), MB_OK | MB_ICONINFORMATION);
-                return false;
-            }
-            if (!windows_sign_in(f.wnd, L"Sign in with your Windows account to see your sync recovery key.")) return false;
-            uint64_t t = wcstoull(kept.c_str() + tab + 1, nullptr, 10);
-            FILETIME ft{ (DWORD)t, (DWORD)(t >> 32) }, lt;
-            SYSTEMTIME st{};
-            wchar_t date[64] = L"";
-            if (FileTimeToLocalFileTime(&ft, &lt) && FileTimeToSystemTime(&lt, &st))
-                GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_LONGDATE, &st, nullptr, date, ARRAYSIZE(date), nullptr);
-            MessageBoxW(f.wnd, (L"The recovery key this PC showed last, on " + std::wstring(date) + L".\n\nIf another of your devices made a new one "
-                                L"since (New recovery key, or removing a device), that one is the key that works.").c_str(),
-                        f.title.c_str(), MB_OK | MB_ICONINFORMATION);
-            show_code(f.wnd, u8(kept.substr(0, tab)), true, true);
+        } else if (id == ID_PASSWORD) {
+            bool changed = password_form(f.wnd, L"Change password", L"Change your sync password",
+                L"New keys are made too and passed to your other devices. The old password can still open what was synced "
+                L"before - nothing from now on.",
+                true, [](Form& pf, const std::string& old, const std::string& pw) {
+                    Msg q = syncipc::request("change-password"), r;
+                    q.push_back({ "old", old });
+                    q.push_back({ "password", pw });
+                    return agent_ok(pf, q, r, pf.title.c_str(), 600000);
+                });
+            if (changed) MessageBoxW(f.wnd, L"Your sync password is changed. Your other devices take the new keys with their next sync.",
+                                     f.title.c_str(), MB_OK | MB_ICONINFORMATION);
         } else if (id == ID_REENC) {
             if (MessageBoxW(f.wnd, L"Upload every synced file again under the current keys?\n\nUse it after removing a device: what's on the "
                                    L"storage from before stays readable with that device's old keys until then.",
                             f.title.c_str(), MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
                 return false;
             reencrypt(f);
-        } else if (id == ID_NEWREC) {
-            if (MessageBoxW(f.wnd, L"Make a new recovery key? New keys are made too and passed to your other devices: the old "
-                                   L"recovery key can still open what was synced before, nothing from now on.",
-                            f.title.c_str(), MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
-                return false;
-            Msg q = syncipc::request("new-recovery-key"), r;
-            if (agent_ok(f, q, r, f.title.c_str(), 600000)) show_code(f.wnd, syncipc::get(r, "code"), true);
         }
         return false;
     };

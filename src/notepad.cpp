@@ -3,6 +3,7 @@
 #include "ini.h"
 #include "playlist.h"
 #include "resource.h"
+#include "shell_utils.h"
 #include "settings.h"
 #include "syntax.h"
 #include "textfile.h"
@@ -2643,21 +2644,8 @@ LRESULT CALLBACK notepad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// its own taskbar button, with its own icon, not grouped with the file windows' (as the
-// player's); not pinnable (a pin would start the file manager)
-void set_app_id(HWND hwnd, bool on) {
-    IPropertyStore* ps = nullptr;
-    if (FAILED(SHGetPropertyStoreForWindow(hwnd, IID_PPV_ARGS(&ps))) || !ps) return;
-    PROPVARIANT v;
-    if (on) InitPropVariantFromBoolean(TRUE, &v); else PropVariantInit(&v);
-    ps->SetValue(PKEY_AppUserModel_PreventPinning, v);
-    PropVariantClear(&v);
-    if (on) InitPropVariantFromString(kAppId, &v); else PropVariantInit(&v);
-    ps->SetValue(PKEY_AppUserModel_ID, v);
-    PropVariantClear(&v);
-    ps->Commit();
-    ps->Release();
-}
+// its own taskbar button, with its own icon (as the player's)
+void set_app_id(HWND hwnd, bool on) { window_app_id(hwnd, on ? kAppId : nullptr); }
 
 bool create_window() {
     static bool registered = false;

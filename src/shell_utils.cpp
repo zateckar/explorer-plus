@@ -1,6 +1,7 @@
 #include "shell_utils.h"
 #include "cmdline.h"
 #include "pkeys_compat_def.h"
+#include <propvarutil.h>
 #include <winioctl.h>
 #include <cstddef>
 #include <cwctype>
@@ -190,6 +191,20 @@ HRESULT parse_typed(const std::wstring& text, PIDLIST_ABSOLUTE* out) {
         return *out ? S_OK : E_OUTOFMEMORY;
     }
     return FAILED(hr) ? hr : HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+}
+
+void window_app_id(HWND hwnd, const wchar_t* appId) {
+    IPropertyStore* ps = nullptr;
+    if (FAILED(SHGetPropertyStoreForWindow(hwnd, IID_PPV_ARGS(&ps))) || !ps) return;
+    PROPVARIANT v;
+    if (appId) InitPropVariantFromBoolean(TRUE, &v); else PropVariantInit(&v);
+    ps->SetValue(PKEY_AppUserModel_PreventPinning, v);
+    PropVariantClear(&v);
+    if (appId) InitPropVariantFromString(appId, &v); else PropVariantInit(&v);
+    ps->SetValue(PKEY_AppUserModel_ID, v);
+    PropVariantClear(&v);
+    ps->Commit();
+    ps->Release();
 }
 
 void shell_open_abs(HWND hwnd, PCIDLIST_ABSOLUTE abs) {

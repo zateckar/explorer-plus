@@ -3,6 +3,10 @@
 #define IDI_APP 1
 #define IDI_PLAYER 2        // the media player's window (res/player.ico, tools/make_icon.py --player)
 #define IDI_NOTEPAD 3       // the Notepad's window (res/notepad.ico, tools/make_icon.py --notepad)
+#define IDI_SYNC 4          // sync's windows and tray icon (res/sync.ico, tools/make_icon.py --sync)
+#define IDI_SYNC_ALERT 5    // the tray icon when a sync folder needs attention (--sync-alert)
+#define IDI_SYNC_PAUSED 6   // the tray icon when sync is paused (--sync-paused)
+#define IDI_SCREENSHOT 7    // the screenshot editor's window (res/screenshot.ico, --screenshot)
 
 #define IDC_TREE      1001
 #define IDC_LIST      1002

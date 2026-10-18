@@ -79,9 +79,12 @@ changes its left-out folders or its storage's settings.
 contents, file and folder names, times. The storage (and anyone who gets into it) sees only
 scrambled names and data, how big the files are and how the folders nest; it can't read a file or
 change one unnoticed. The keys never leave your devices. Nobody, Explorer Plus included,
-can open your files without either one of your devices or your **recovery key**: 15
-letters and digits shown when you set up the first sync folder. Write it down. "Devices and
-keys" ▸ "Show recovery key..." shows it again after you sign in with your Windows account.
+can open your files without either one of your devices or your **sync password**, which you
+choose when you set up the first sync folder: 12 characters or more, with small and capital
+letters and digits. It's kept nowhere, so nobody can reset it: keep it somewhere safe. The
+storage holds your keys wrapped under it, slowed down with Argon2id (256 MB, about a second
+per guess), so a long password matters; "Devices and keys" ▸ "Change password..." sets a
+new one.
 Your devices also sign a list of every file in the folder, so a storage that withholds a
 file, brings back an old version or slips in one of its own is reported instead of
 believed, and your copy stays as it is. It can still delete everything or stop taking new
@@ -90,21 +93,23 @@ older one doesn't keep the list, and the files it writes are reported, not taken
 formats are in [docs/sync-format.md](docs/sync-format.md).
 
 **A second PC**: add the same storage there. It asks for a code: on a PC that's already set
-up, "Devices and keys" ▸ "Add a device" shows one (valid 15 minutes), or type the recovery
-key. **Removing a device** makes new keys it never gets, and a new recovery key; "Re-encrypt
+up, "Devices and keys" ▸ "Add a device" shows one (valid 15 minutes), or type your sync
+password. **Removing a device** makes new keys it never gets, under a new sync password; "Re-encrypt
 files" then uploads everything again under the new keys (what the device could already read
 stays readable to it in the storage's history). First revoke the storage access that device
 had (its S3 key, its PAT): a removed device that can still write to the storage can get
-around the removal. A **new recovery key** also makes new keys, so the old one opens only
-what was written before.
+around the removal. A **new sync password** also makes new keys, so the old one opens only
+what was written before. (A recovery key from an earlier version keeps working as the
+password until you change it.)
 
 Storage:
 
 - **Azure DevOps Git**: the repository's clone URL and a personal access token (scope Code,
   Read & write). Uses its own branch, `explorerplus-sync` by default; not one with branch
-  policies. "Connect through": the REST API (the default: nothing to install, files up to
-  about 18 MB) or git.exe ([Git for Windows](https://gitforwindows.org) 2.31 or later:
-  bigger files, keeps a copy of the history on the PC). Both keep the same data on the
+  policies. "Connect through": the REST API (the default: nothing to install; files over
+  about 18 MB go up through git's own push protocol, up to 3 GB) or git.exe
+  ([Git for Windows](https://gitforwindows.org) 2.31 or later: keeps a copy of the history
+  on the PC). Both keep the same data on the
   branch, so PCs can use either and the setting can change any time.
 - **Git**: any repository URL git can push to with credentials it already has (an SSH key,
   or ones Git Credential Manager stored); it never asks. Every version of a file is kept whole in the history, so it suits

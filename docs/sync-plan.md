@@ -10,8 +10,8 @@ are a single new file each.
 folder names, modification times (sizes stay visible: format v1 has no padding). The storage only ever
 holds ciphertext; there is no unencrypted mode. **One user's devices share portable
 keys**: a new PC is unlocked with a 15-character code shown on a PC that's already set
-up, or with the 15-character recovery key. Both are short enough to write down, so there
-is no passphrase. A removed device is locked out of everything written after its removal.
+up, or with the user's sync password (12 characters or more, with lower and upper case
+letters and digits). A removed device is locked out of everything written after its removal.
 
 ## Status
 
@@ -41,11 +41,15 @@ plants are reported instead of taken). A short window remains until each vault h
 on from the removal, so a removal should still come with revoking that device's storage
 credentials.
 
-*Recovery key, as built*: the Sync folders window keeps the recovery key it shows (or the
-one typed to unlock this PC) in Credential Manager beside the key ring. "Show recovery
-key..." in Devices and keys shows it again after a Windows sign-in prompt
-(`CredUIPromptForWindowsCredentials`, checked with `LogonUser`), with the date it was kept:
-another device may have made a newer one since. Nothing goes through the agent's pipe.
+*Sync password, as built (2026-10-18)*: the generated 15-character recovery key was hard
+to keep, so the user chooses a password in its place. It's kept nowhere (the ring holds
+its Argon2id result, so any device can write the wrap); "Change password..." asks for the
+current one, and so does removing a device, which needs a new one. A recovery key from an
+earlier version still opens what it wrapped: it's tried as the password, typed as written.
+The trade-off: a chosen password has less entropy than 75 random bits, and its wrap sits
+on the storage, so whoever reads the storage can guess offline at Argon2id's pace (256 MiB,
+3 passes per guess). The rules (12 characters, three character classes) keep out the
+weakest; a long one is what protects.
 
 ### Benchmark
 
@@ -295,7 +299,7 @@ Not protected (documented in the README, shown once at setup):
   history of the vault (new, re-paired) can still be shown an older consistent state;
 - a **compromised device**: whoever controls a PC that has the keys can read everything.
   Removing the device (below) locks it out of everything written afterwards, and only that;
-- **losing every device and the recovery key** means the data is gone for good. Nobody can
+- **losing every device and the sync password** means the data is gone for good. Nobody can
   recover it, by design; setup says so in plain words.
 
 ### Primitives (all Monocypher except the random source)
@@ -338,16 +342,19 @@ User key ring (one per user, the same on all of the user's devices: the portable
 
 Device key:   per device X25519 key pair; the public half is registered in each vault.
               Used to hand a new UMK generation to the remaining devices (rotation).
-Recovery key: 15 random Crockford Base32 characters (75 bits), `7KQM2-XRPA9-HT4WD`.
-              Argon2id(recovery key) wraps UMK_g; the wrap is kept in every vault.
-Pairing code: the same shape, new for each pairing, valid 15 minutes.
+Sync password: the user's (12+ characters, lower and upper case letters, digits).
+              Argon2id(password) wraps the ring; the wrap is kept in every vault.
+              (Before 2026-10-18: a generated 15-character recovery key in its place.)
+Pairing code: 15 random Crockford Base32 characters (75 bits), `7KQM2-XRPA9-HT4WD`,
+              new for each pairing, valid 15 minutes.
 ```
 
-**Why 15 characters are enough.** The codes aren't the key, they unlock a wrap of it.
-Each guess costs one Argon2id run of 256 MiB of memory and about a second, and the codes
-are random, not chosen by the user. Guessing half of 2^75 at a million guesses a second
-(thousands of GPUs, memory-bound) takes about 600 million years, so a passphrase on top
-adds nothing. Crockford Base32 has no I, L, O or U, and reading ignores case, spaces and
+**Why 15 characters are enough for a pairing code.** The codes aren't the key, they unlock
+a wrap of it. Each guess costs one Argon2id run of 256 MiB of memory and about a second,
+and the codes are random. Guessing half of 2^75 at a million guesses a second (thousands of
+GPUs, memory-bound) takes about 600 million years, and a grant lives 15 minutes. The sync
+password gets the same Argon2id cost per guess, but its strength is the user's: see
+"Sync password, as built" above. Crockford Base32 has no I, L, O or U, and reading ignores case, spaces and
 dashes and treats O as 0 and I / L as 1, so a written-down code reads back reliably. A typo
 just fails to unlock and costs a second.
 
@@ -362,7 +369,7 @@ On the device, the key ring and the device's private key are kept in Credential 
 isolation). Keys in memory are wiped with `crypto_wipe`. Keeping them in `VirtualLock`ed
 pages and out of crash minidumps (`MiniDumpWriteDump`'s callback, `crash.cpp`) is planned
 but not built yet *(review I1)*. No secret goes into logs or perf events. The agent's pipe
-carries codes (a new pairing code, the code typed to unlock, a new recovery key) to the
+carries secrets (a new pairing code, the code or password typed to unlock, the sync password) to the
 current user's processes only *(review I4)*.
 Later option: wrap the ring with a TPM-bound key (NCrypt Platform Crypto Provider) or gate
 it behind Windows Hello.
@@ -476,7 +483,7 @@ When a pair is added, the agent connects and looks for `.ep-vault/vault`:
 
 - **No vault, empty location**: a new vault key is created and wrapped under the user key
   (creating the user key first if this is the user's first vault: first-time setup with the
-  recovery key, below).
+  sync password, below).
 - **No vault, but files are there**: refused. Those files would be plaintext, and this
   feature never writes or reads plaintext remotely. The user picks an empty location or a
   new prefix / branch / subfolder.
@@ -488,7 +495,7 @@ When a pair is added, the agent connects and looks for `.ep-vault/vault`:
      countdown, and writes `.ep-vault/pair/<id>`: the key ring wrapped under
      Argon2id(code). The user types the code on the new PC; it unwraps the ring and deletes
      the grant. The code never touches the storage.
-  2. **Recovery key**: opens the recovery wrap in any vault, also when every other device
+  2. **Sync password**: opens the password wrap in any vault, also when every other device
      is gone.
 
   Then the new device registers its public key in the vault (a MACed device record) and
@@ -505,8 +512,9 @@ typed on each device as for any sync client, and never go into the vault.
    reaches; new uploads use the new version from then on;
 2. writes the new ring generation for every *remaining* device, wrapped to each one's
    public key (X25519, KDF, XChaCha20-Poly1305), and deletes the removed device's record;
-3. creates a new recovery key, shows it, and replaces the recovery wraps (the old recovery
-   key only opens generation g and older).
+3. takes a new sync password (the current one is asked first, and the new one must differ:
+   the removed device may know the old one) and replaces the password wraps (the old
+   password only opens generation g and older).
 
 Vaults this device doesn't sync are upgraded by the first remaining device that syncs them
 (the ring's older generations still open them meanwhile). Files written before the removal
@@ -770,8 +778,13 @@ install and no local copy of the history (the git store's mirror holds every ver
   changes, and a rename that touches a name already gathered sends what's gathered first.
 - **Size limit**: the server refuses a push request over 25 MiB ("The maximum request
   size of 26214400 bytes was exceeded"). A pass that would pass 24 MiB goes up as several
-  pushes, each a whole commit; a single file over about 18 MB of ciphertext is reported as
-  too big for the REST API, with a pointer to the git.exe connection.
+  pushes, each a whole commit. A file over about 18 MB of ciphertext (Base64 in JSON) can't
+  go up that way: then the whole pass goes up through git's own smart-HTTP push instead
+  (git-receive-pack on the same URL, sync_gitpack.cpp): the blobs, trees and commit are
+  built here (SHA-1 ids, git's tree order) and streamed as a pack of stored deflate blocks,
+  big files read from a temporary file (deleted on close) rather than held in memory. The
+  advertised tip is checked against the base first; a moved branch or a refused ref update
+  is CommitRaced. Files up to 3 GB; a pass over 3.5 GB goes up as several packs.
 - Commits carry the neutral author and committer (`Explorer Plus <sync@localhost>`); the
   server's push record still names the token's account, as it does for git pushes.
 - Answers: `203` (the sign-in page) and `401` → `AuthFailed`; `TF402455` (branch
@@ -797,14 +810,14 @@ install and no local copy of the history (the git store's mirror holds every ver
   - **Folders**: the pairs (status, last sync, errors) with Add / Edit / Remove / Pause /
     Sync now. Add: pick the local folder, a backend type, a form generated from its
     `ConfigField`s, **Test connection** (through the agent), then the vault step (create,
-    or unlock with a code or the recovery key), "Start sync when I sign in".
+    or unlock with the sync password or a code), "Start sync when I sign in".
   - **Devices and keys**: this device and the others (name, added), **Add a device** (shows
-    the code and a countdown), **Remove device**, **Recovery key** (shows it after a Windows
-    sign-in prompt, `CredUIPromptForWindowsCredentials`; or makes a new one).
+    the code and a countdown), **Remove device...** (asks for the current and a new sync
+    password), **Change password...**, **Re-encrypt files**.
 - **First-time setup** (the first vault ever): explains in a few lines what end-to-end
-  means here (nobody, including us, can recover the files without your key), creates the
-  user key, shows the **recovery key** (copy, print, save as a text file) and asks for it
-  back once (all 15 characters) before going on.
+  means here (nobody, including us, can recover the files without your key) and asks for
+  the **sync password**, twice, with its rules (12+ characters, lower and upper case
+  letters, digits), then creates the user key.
 - **Navigation pane**: each sync root as a node with a cloud icon, beside OneDrive
   (`tree.cpp`), its badge showing the pair's state (a lock when the vault is locked).
 - **File list**: a "Sync status" column and a small badge drawn in the list's custom draw
@@ -827,17 +840,17 @@ Length-prefixed UTF-8 messages of `key=value` lines; the codec is pure and unit-
 Requests: `status <folder>` (child states), `subscribe`, `pairs`, `pause`, `resume`,
 `sync-now`, `reload-config`, `test-connection`, `set-secret` (a new PAT or S3 key, written
 to Credential Manager by the agent), `conflicts`, `versions <path>`, `restore <path> <rev>`,
-and for keys `keys-status`, `setup-keys`, `unlock {code | recovery}`, `pair-offer` (returns
-a code), `devices`, `remove-device`, `recovery-key` (only after the window's Windows sign-in
-prompt succeeded), `new-recovery-key`. The agent pushes `changed <folder>` to subscribers
+and for keys `keys-status`, `setup-keys`, `unlock {code | password}`, `pair-offer` (returns
+a code), `devices`, `remove-device`, `change-password`. The agent pushes `changed <folder>` to subscribers
 so badges update; Explorer Plus works without an agent (no badges, the dialog offers to
 start it).
 
 *As built*: one request and one reply per connection; the requests are `ping`, `quit`,
 `reload`, `pairs`, `status folder=`, `sync-now [wait=1]`, `pause`, `resume`,
 `confirm-deletes yes=`, `dismiss-conflicts`, `conflicts`, `test-connection`, `set-secret`,
-`keys-status`, `setup-keys`, `new-recovery-key`, `unlock mode=code|recovery`, `pair-offer`,
-`devices`, `remove-device`, `versions path=`, `restore path= rev=`, `reencrypt pair=`,
+`keys-status`, `setup-keys password=`, `check-password password=`,
+`change-password old= password=`, `unlock mode=code|password code=`, `pair-offer`,
+`devices`, `remove-device device= old= password=`, `versions path=`, `restore path= rev=`, `reencrypt pair=`,
 `exclude path= on=1|0`, and `watch [folder=] since= wait=` instead of `subscribe`: a long
 poll (up to 25 s) answered as soon as the folder's states (or, without a folder, the
 pairs') differ from the reply whose `hash` the caller passes; each pane showing a sync
@@ -933,9 +946,10 @@ engine takes its clock and file system access through interfaces) also go into
 
 - **Names**: each path component encrypted in place (simpler, faster for uploads and
   listing; see the comparison above).
-- **Unlocking**: a 15-character pairing code from another device, or the 15-character
-  recovery key; no passphrase (both are short enough to write down, and Argon2id makes them
-  strong enough).
+- **Unlocking**: a 15-character pairing code from another device, or the user's sync
+  password (12+ characters, lower and upper case letters, digits). Until 2026-10-18 a
+  generated 15-character recovery key took the password's place; users found it hard to
+  keep, so the password replaced it (the trade-off is under "Sync password, as built").
 - **Cryptography**: Monocypher, vendored.
 - **Backends**: Folder, S3, git, Azure DevOps Git.
 

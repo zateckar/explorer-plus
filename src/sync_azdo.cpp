@@ -31,6 +31,7 @@ GitOptions azdo_git_options(const std::wstring& url, const std::wstring& pat, co
     o.branch = branch.empty() ? L"explorerplus-sync" : branch;
     o.subfolder = subfolder;
     o.mirror = mirror;
+    o.maxFileSize = 4ull << 30;                       // Azure DevOps has no file limit, only 5 GB a push
     std::string token = ":" + to_utf8(pat);
     std::string b64 = crypto::base64(token.data(), token.size());
     crypto::wipe(token.data(), token.size());
@@ -119,7 +120,7 @@ void register_azdo_backend() {
         { L"branch", L"Branch", ConfigField::Text, false, L"explorerplus-sync", {}, L"Created by the first sync. Not one with branch policies." },
         { L"subfolder", L"Folder in the repository", ConfigField::Text, false, L"", {}, L"" },
         { L"via", L"Connect through", ConfigField::Choice, false, kViaRest, { kViaRest, kViaGit },
-          L"REST API: nothing to install, files up to 18 MB. git.exe: Git for Windows 2.31+, bigger files, a copy of the history on this PC.",
+          L"REST API: nothing to install. git.exe: Git for Windows 2.31+, a copy of the history on this PC.",
           false },
     };
     t.validate = [](const BackendConfig& c) -> std::wstring {

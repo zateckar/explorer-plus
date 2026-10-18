@@ -1,16 +1,24 @@
 """Draw the app icon (the familiar yellow file folder with a green plus badge) at every
 size Windows asks for. The folder fills the canvas, so the icon reads at taskbar sizes.
 With --player: the media player's icon, the same folder with an orange play badge; with
---notepad: the Notepad's, a blue badge with lines of text.
+--notepad: the Notepad's, a blue badge with lines of text; with --sync: sync's, a blue
+badge with two circling arrows (--sync-alert: a red badge with "!", --sync-paused: a grey
+one with two bars, for the tray); with --screenshot: the screenshot editor's, a purple
+badge with a camera.
 
 Usage: python -I tools/make_icon.py res/app.ico [preview-dir]
        python -I tools/make_icon.py --player res/player.ico [preview-dir]
        python -I tools/make_icon.py --notepad res/notepad.ico [preview-dir]
+       python -I tools/make_icon.py --sync res/sync.ico [preview-dir]
+       python -I tools/make_icon.py --sync-alert res/sync_alert.ico [preview-dir]
+       python -I tools/make_icon.py --sync-paused res/sync_paused.ico [preview-dir]
+       python -I tools/make_icon.py --screenshot res/screenshot.ico [preview-dir]
 
 No dependencies: shapes are sampled 4x4 per pixel and every size is stored as a PNG
 entry in the .ico (supported since Windows Vista). With a preview dir, each size is
 also written there as a PNG.
 """
+import math
 import os
 import struct
 import sys
@@ -26,8 +34,14 @@ BADGE_A, BADGE_B = (84, 200, 84), (16, 124, 16)        # top -> bottom (Windows'
 PLUS = (255, 255, 255)
 PLAY_A, PLAY_B = (255, 146, 48), (214, 70, 0)         # the player's badge, top -> bottom
 NOTE_A, NOTE_B = (76, 160, 255), (0, 92, 196)         # the Notepad's badge, top -> bottom
-PLAYER = False                                        # --player: a play badge instead of the plus
-NOTEPAD = False                                       # --notepad: lines of text instead
+SYNC_A, SYNC_B = (40, 190, 230), (0, 112, 180)        # sync's badge (teal blue), top -> bottom
+ALERT_A, ALERT_B = (240, 90, 80), (190, 30, 30)       # sync needs attention
+PAUSED_A, PAUSED_B = (160, 160, 160), (100, 100, 100) # sync paused
+SHOT_A, SHOT_B = (190, 120, 255), (120, 50, 210)      # the screenshot editor's badge
+BADGE = 'plus'                                        # plus, play, note, sync, alert, paused, camera
+MODES = {'--player': ('play', 'res/player.ico'), '--notepad': ('note', 'res/notepad.ico'),
+         '--sync': ('sync', 'res/sync.ico'), '--sync-alert': ('alert', 'res/sync_alert.ico'),
+         '--sync-paused': ('paused', 'res/sync_paused.ico'), '--screenshot': ('camera', 'res/screenshot.ico')}
 
 
 def mix(a, b, t):
@@ -65,11 +79,48 @@ def shade(x, y, size):
     bx = by = 32.0 - br - (0.5 if small else 0.8) + (k / 2 if bar % 2 else 0.0)
     d2 = (x - bx) ** 2 + (y - by) ** 2
     if d2 <= br * br:
-        if PLAYER:                          # a play triangle, a little right of centre (optically centred)
+        def fill(a, b):
+            return mix(a, b, (y - by + br) / (2 * br))
+        if BADGE == 'play':                 # a play triangle, a little right of centre (optically centred)
             if in_tri(x, y, (bx - br * 0.36, by - br * 0.52), (bx - br * 0.36, by + br * 0.52), (bx + br * 0.56, by)):
                 return PLUS
             return mix(PLAY_A, PLAY_B, (y - by + br) / (2 * br))
-        if NOTEPAD:                         # three lines, the last one short; whole pixels thick
+        if BADGE == 'sync':                 # two arcs chasing each other clockwise, arrowheads at their ends
+            r0, r1 = br * (0.34 if small else 0.36), br * (0.66 if small else 0.62)
+            rm, d = (r0 + r1) / 2, math.sqrt(d2)
+            a = math.degrees(math.atan2(y - by, x - bx))      # screen coordinates: clockwise grows
+            if r0 <= d <= r1 and (-165 <= a <= -35 or 15 <= a <= 145):
+                return PLUS
+            for end in (-35, 145):                            # the arrowheads, pointing on clockwise
+                t = math.radians(end)
+                ux, uy, tx, ty = math.cos(t), math.sin(t), -math.sin(t), math.cos(t)
+                cx, cy = bx + rm * ux, by + rm * uy
+                hw, ln = br * (0.36 if small else 0.32), br * 0.42
+                if in_tri(x, y, (cx + ux * hw, cy + uy * hw), (cx - ux * hw, cy - uy * hw), (cx + tx * ln, cy + ty * ln)):
+                    return PLUS
+            return fill(SYNC_A, SYNC_B)
+        if BADGE == 'alert':                # "!": a bar and a dot
+            half = max(1, round(br * 0.26 / k)) * k / 2
+            if abs(x - bx) <= half and (by - br * 0.6 <= y <= by + br * 0.14 or by + br * 0.34 <= y <= by + br * 0.34 + 2 * half):
+                return PLUS
+            return fill(ALERT_A, ALERT_B)
+        if BADGE == 'paused':               # two bars
+            w = max(1, round(br * 0.22 / k)) * k
+            gap = max(1, round(br * 0.2 / k)) * k
+            l0 = snap(bx - gap / 2 - w)                      # bar edges on pixel boundaries
+            r0 = l0 + w + gap
+            if abs(y - by) <= br * 0.46 and (l0 <= x < l0 + w or r0 <= x < r0 + w):
+                return PLUS
+            return fill(PAUSED_A, PAUSED_B)
+        if BADGE == 'camera':               # a body with a bump on top and the lens cut out of it
+            lens = br * (0.24 if small else 0.26)
+            ld2 = (x - bx) ** 2 + (y - by - br * 0.08) ** 2
+            body = in_rrect(x, y, bx - br * 0.62, by - br * 0.36, bx + br * 0.62, by + br * 0.48, br * 0.14)
+            bump = in_rrect(x, y, bx - br * 0.28, by - br * 0.56, bx + br * 0.16, by - br * 0.2, br * 0.08)
+            if (body or bump) and not ld2 <= lens * lens:
+                return PLUS
+            return fill(SHOT_A, SHOT_B)
+        if BADGE == 'note':                 # three lines, the last one short; whole pixels thick
             lh = max(1, round(br * 0.2 / k)) * k
             y0 = snap(by - 2.5 * lh)
             w = br * 0.56
@@ -130,15 +181,13 @@ def png(size, raw):
 
 
 def main():
-    global PLAYER, NOTEPAD
+    global BADGE
     args = sys.argv[1:]
-    if args[:1] == ['--player']:
-        PLAYER = True
+    default = 'res/app.ico'
+    if args[:1] and args[0] in MODES:
+        BADGE, default = MODES[args[0]]
         args = args[1:]
-    elif args[:1] == ['--notepad']:
-        NOTEPAD = True
-        args = args[1:]
-    out = args[0] if args else ('res/player.ico' if PLAYER else 'res/notepad.ico' if NOTEPAD else 'res/app.ico')
+    out = args[0] if args else default
     preview = args[1] if len(args) > 1 else None
     images = [render(s) for s in SIZES]
     header = struct.pack('<HHH', 0, 1, len(images))

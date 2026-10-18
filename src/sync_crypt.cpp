@@ -36,7 +36,7 @@ bool sane_name(const std::string& n) {
 }
 
 // ---- retired key versions (docs/sync-review.md, S2). When a vault key version stops being
-// current (a device was removed, or the recovery key replaced), what is on the storage at
+// current (a device was removed, or the sync password changed), what is on the storage at
 // that moment is noted: (stored path, revision) of each file with the lowest content key
 // version it may have, and the stored folders. Content under a retired version opens only
 // as it was then; a folder name under one only if the folder was there then. A removed
@@ -119,7 +119,7 @@ bool write_file(const std::wstring& path, const crypto::Bytes& data) {
     return ok && MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
 }
 
-const wchar_t kRetiredWhy[] = L"Written with a vault key that was retired when a device was removed (or the recovery key replaced), "
+const wchar_t kRetiredWhy[] = L"Written with a vault key that was retired when a device was removed (or the sync password changed), "
                               L"after it was retired: not taken.";
 
 struct HashSink : ByteSink {

@@ -10,33 +10,12 @@
 #include <algorithm>
 #include <cstdio>
 #include <map>
+#include <set>
 #include <mutex>
 
 namespace sync {
 
-std::string git_blob_id(const void* data, size_t n) {
-    static BCRYPT_ALG_HANDLE alg = [] {
-        BCRYPT_ALG_HANDLE a = nullptr;
-        BCryptOpenAlgorithmProvider(&a, BCRYPT_SHA1_ALGORITHM, nullptr, 0);
-        return a;
-    }();
-    std::string head = "blob " + std::to_string(n);
-    head += '\0';
-    BCRYPT_HASH_HANDLE h = nullptr;
-    uint8_t out[20] = {};
-    if (!alg || BCryptCreateHash(alg, &h, nullptr, 0, nullptr, 0, 0) != 0) return {};
-    BCryptHashData(h, (PUCHAR)head.data(), (ULONG)head.size(), 0);
-    const uint8_t* p = (const uint8_t*)data;
-    while (n) {                                    // BCrypt takes 32-bit lengths
-        ULONG k = (ULONG)std::min<size_t>(n, 1u << 30);
-        BCryptHashData(h, (PUCHAR)p, k, 0);
-        p += k;
-        n -= k;
-    }
-    BCryptFinishHash(h, out, 20, 0);
-    BCryptDestroyHash(h);
-    return crypto::hex(out, 20);
-}
+std::string git_blob_id(const void* data, size_t n) { return git_object_id("blob", data, n); }
 
 std::wstring azdo_api_url(const std::wstring& cloneUrl) {
     size_t g = cloneUrl.find(L"/_git/");
@@ -75,6 +54,25 @@ namespace {
 
 constexpr char kZero[] = "0000000000000000000000000000000000000000";
 constexpr const wchar_t* kApi = L"api-version=5.0";      // Azure DevOps Server 2019 and later, and Services
+// files too big for a REST push go up through git's receive-pack, one request of under 4 GiB
+// (WinHTTP's request length is 32 bits; Azure DevOps takes pushes up to 5 GB)
+constexpr uint64_t kPackFileMax = 3ull << 30;
+constexpr uint64_t kPackMax = 3584ull << 20;
+
+// the bytes of a file that goes up through receive-pack, kept until the push in a temporary
+// file (ciphertext; deleted when closed)
+struct Spill {
+    HANDLE h = INVALID_HANDLE_VALUE;
+    Spill() {
+        wchar_t dir[MAX_PATH + 1], name[MAX_PATH + 1];
+        if (GetTempPathW(MAX_PATH + 1, dir) && GetTempFileNameW(dir, L"eps", 0, name))
+            h = CreateFileW(name, GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    }
+    ~Spill() { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+    Spill(const Spill&) = delete;
+    Spill& operator=(const Spill&) = delete;
+};
 
 // "2026-10-17T22:49:15.123Z" -> FILETIME (zero when unreadable)
 FILETIME parse_time(const std::string& s) {
@@ -123,7 +121,7 @@ public:
         c.parallelism = 4;                    // downloads; uploads only gather the push
         c.maxNameLength = 255;
         c.maxPathLength = 4096;
-        c.maxFileSize = max_file();
+        c.maxFileSize = kPackFileMax;         // (over max_file(): through receive-pack)
         c.maxCommitBytes = m_o.maxPushBytes;
         c.hash = HashKind::GitBlobSha1;
         c.pollSeconds = m_o.pollSeconds;
@@ -214,15 +212,16 @@ public:
         m_staging = true;
         m_base = m_tip;
         m_staged.clear();
-        m_bytes = 0;
+        m_bytes = m_packBytes = 0;
         return {};
     }
 
     Result upload(const RelPath& path, ByteSource& in, const FileMeta&, const std::string& expectedRev, RemoteEntry& out,
                   Progress& p) override {
-        if (in.size() > max_file())
-            return Result::fail(Status::TooLarge, L"Azure DevOps' REST API takes files up to " + std::to_wstring(max_file() >> 20) +
-                                                  L" MB. Bigger ones need the git.exe connection (the pair's settings).");
+        if (in.size() > kPackFileMax)
+            return Result::fail(Status::TooLarge, L"Files up to " + std::to_wstring(kPackFileMax >> 30) +
+                                                  L" GB go to Azure DevOps through its REST API. Bigger ones need the git.exe connection (the pair's settings).");
+        if (in.size() > max_file()) return upload_big(path, in, expectedRev, out, p);
         // read and encode outside the lock (several transfer threads gather one push)
         std::vector<uint8_t> data((size_t)in.size());
         size_t at = 0;
@@ -250,12 +249,62 @@ public:
         std::string full = m_prefix + to_utf8(path);
         if (in_rename(full)) if (Result r = push_mid(p); !r.ok()) return r;
         if (Result r = check(full, expectedRev, p); !r.ok()) return r;
-        if (m_bytes + s.b64.size() + 4096 > m_o.maxPushBytes && !m_staged.empty())
+        bool pack = has_spill();
+        if (!m_staged.empty() && (pack ? m_packBytes + s.size > kPackMax : m_bytes + s.b64.size() + 4096 > m_o.maxPushBytes))
             if (Result r = push_mid(p); !r.ok()) return r;        // a big pass goes up in parts
         out = entry_of(full, s.oid, s.size);
         m_bytes += s.b64.size() + 512;
+        m_packBytes += s.size + 64;
         m_staged[full] = std::move(s);
         return {};
+    }
+
+    // a file too big for a REST push: to a temporary file now, up through receive-pack with
+    // the rest of the pass
+    Result upload_big(const RelPath& path, ByteSource& in, const std::string& expectedRev, RemoteEntry& out, Progress& p) {
+        auto sp = std::make_shared<Spill>();
+        if (sp->h == INVALID_HANDLE_VALUE) return Result::fail(Status::Fatal, L"No room for a temporary copy of the file (the TEMP folder).");
+        uint64_t want = in.size(), at = 0;
+        std::string head = "blob " + std::to_string(want);
+        head += '\0';
+        Sha1 h;
+        h.update(head.data(), head.size());
+        std::vector<uint8_t> buf(1 << 20);
+        for (;;) {
+            if (p.cancelled()) return Result::fail(Status::Cancelled);
+            size_t got = 0;
+            if (!in.read(buf.data(), buf.size(), &got)) return Result::fail(Status::Fatal, L"The file couldn't be read.");
+            if (!got) break;
+            if (at + got > want) return Result::fail(Status::Fatal, L"The file changed while it was read.");
+            DWORD w = 0;
+            if (!WriteFile(sp->h, buf.data(), (DWORD)got, &w, nullptr) || w != got)
+                return Result::fail(Status::Fatal, L"No room for a temporary copy of the file (the TEMP folder).");
+            h.update(buf.data(), got);
+            at += got;
+            p.bytes(at, want);
+        }
+        if (at != want) return Result::fail(Status::Fatal, L"The file changed while it was read.");
+        Staged s;
+        s.oid = crypto::hex(h.final());
+        s.size = want;
+        s.spill = sp;
+        std::lock_guard<std::recursive_mutex> lk(m_mx);
+        if (!m_staging) return Result::fail(Status::Fatal, L"upload outside a transaction");
+        std::string full = m_prefix + to_utf8(path);
+        if (in_rename(full)) if (Result r = push_mid(p); !r.ok()) return r;
+        if (Result r = check(full, expectedRev, p); !r.ok()) return r;
+        if (!m_staged.empty() && m_packBytes + want > kPackMax)
+            if (Result r = push_mid(p); !r.ok()) return r;
+        out = entry_of(full, s.oid, s.size);
+        m_bytes += 512;
+        m_packBytes += want + 64;
+        m_staged[full] = std::move(s);
+        return {};
+    }
+
+    bool has_spill() const {
+        for (auto& [path, s] : m_staged) if (s.spill) return true;
+        return false;
     }
 
     Result remove(const RelPath& path, const std::string& expectedRev, Progress& p) override {
@@ -367,12 +416,13 @@ public:
     }
 
 private:
-    struct Blob { std::string oid; uint64_t size = 0; };
+    struct Blob { std::string oid; uint64_t size = 0; std::string mode = "100644"; };
     struct Staged {
         std::string oid;               // "" = removed
         uint64_t size = 0;
         bool content = false;          // b64 holds the bytes
         std::string b64;
+        std::shared_ptr<Spill> spill;  // or this file (too big for a REST push)
         std::string renamedFrom;       // a rename's new name: the old one
         bool renamedAway = false;      // a rename's old name
     };
@@ -460,13 +510,21 @@ private:
         if (!json::parse(std::string_view((const char*)sink.data.data(), sink.data.size()), tv))
             return Result::fail(Status::Fatal, L"Azure DevOps gave an unreadable tree.");
         std::map<std::string, Blob> tree;
+        std::map<std::string, std::string> trees = { { "", cv["treeId"].str() } }, links;
         const json::Value& list = tv["treeEntries"];
         for (size_t i = 0; i < list.size(); ++i) {
             const json::Value& e = list[i];
-            if (e["gitObjectType"].str() != "blob") continue;
-            tree[e["relativePath"].str()] = { e["objectId"].str(), e["size"].u64() };
+            std::string type = e["gitObjectType"].str(), path = e["relativePath"].str();
+            if (type == "tree") trees[path] = e["objectId"].str();
+            else if (type == "commit") links[path] = e["objectId"].str();      // (a submodule: kept as it is)
+            if (type != "blob") continue;
+            Blob b{ e["objectId"].str(), e["size"].u64() };
+            if (std::string mode = e["mode"].str(); !mode.empty()) b.mode = mode;
+            tree[path] = std::move(b);
         }
         m_tree = std::move(tree);
+        m_trees = std::move(trees);
+        m_links = std::move(links);
         m_treeOf = commit;
         return {};
     }
@@ -502,7 +560,7 @@ private:
         if (r.st == Status::CommitRaced) return Result::fail(Status::PreconditionFailed, L"Another device synced meanwhile.");
         if (!r.ok()) return r;
         m_staged.clear();
-        m_bytes = 0;
+        m_bytes = m_packBytes = 0;
         return {};
     }
 
@@ -510,6 +568,7 @@ private:
         newCursor.clear();
         if (m_staged.empty()) return {};
         if (!m_base.empty()) if (Result r = load_tree(m_base, p); !r.ok()) return r;
+        if (has_spill()) return push_pack(summary, newCursor, p);
         auto inBase = [&](const std::string& path) { return !m_base.empty() && m_tree.count(path) != 0; };
         std::string changes;
         auto add = [&](const std::string& c) { if (!changes.empty()) changes += ','; changes += c; };
@@ -538,12 +597,20 @@ private:
         std::string commit;
         if (json::parse(r.body, v)) commit = v["refUpdates"][0]["newObjectId"].str();
         if (commit.size() != 40) return Result::fail(Status::Fatal, L"Azure DevOps accepted the push but gave no commit.");
+        pushed(commit, newCursor);
+        return {};
+    }
+
+    // the branch is at a commit this store made from m_base and m_staged
+    void pushed(const std::string& commit, std::string& newCursor) {
         // the new commit's tree is the old one with what went up (saves asking for it)
         if (m_treeOf == m_base || m_base.empty()) {
-            if (m_base.empty()) m_tree.clear();
+            if (m_base.empty()) { m_tree.clear(); m_trees.clear(); m_links.clear(); }
             for (auto& [path, s] : m_staged) {
-                if (s.oid.empty()) m_tree.erase(path);
-                else m_tree[path] = { s.oid, s.size };
+                if (s.oid.empty()) { m_tree.erase(path); continue; }
+                std::string mode = "100644";
+                if (auto from = m_tree.find(s.renamedFrom); !s.renamedFrom.empty() && from != m_tree.end()) mode = from->second.mode;
+                m_tree[path] = { s.oid, s.size, mode };
             }
             m_treeOf = commit;
         }
@@ -551,7 +618,84 @@ private:
         m_tip = commit;
         m_base = commit;
         if (ours) { m_listed = commit; newCursor = commit; }
+    }
+
+    // A pass with a file too big for a REST push: one commit through git's own protocol
+    // (receive-pack over HTTPS at the clone URL, the same token), the objects made here.
+    Result push_pack(const std::wstring& summary, std::string& newCursor, Progress& p) {
+        // the commit's files: the base's with what's gathered
+        std::map<std::string, GitEntry> files;
+        if (!m_base.empty()) {
+            for (auto& [path, b] : m_tree) files[path] = { b.oid, b.mode };
+            for (auto& [path, oid] : m_links) files[path] = { oid, "160000" };
+        }
+        for (auto& [path, s] : m_staged) {
+            if (s.oid.empty()) { files.erase(path); continue; }
+            std::string mode = "100644";
+            if (auto from = m_tree.find(s.renamedFrom); !s.renamedFrom.empty() && from != m_tree.end()) mode = from->second.mode;
+            files[path] = { s.oid, mode };
+        }
+        std::vector<GitTree> trees;
+        std::string root = git_build_trees(files, trees);
+        std::string who = to_utf8(m_o.author) + " <" + to_utf8(m_o.email) + ">";
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        uint64_t unix = ((((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) - 116444736000000000ull) / 10000000;
+        std::string commitText = git_commit_object(root, m_base, who, unix, to_utf8(summary.empty() ? L"sync" : summary));
+        std::string commit = git_object_id("commit", commitText.data(), commitText.size());
+        // what the server doesn't have yet: the commit, the trees that changed, the new blobs
+        std::vector<PackObject> objs;
+        objs.push_back({ 1, commitText });
+        for (auto& t : trees) {
+            auto had = m_trees.find(t.path);
+            if (m_base.empty() || had == m_trees.end() || had->second != t.oid) objs.push_back({ 2, std::move(t.data) });
+        }
+        std::set<std::string> blobs;
+        for (auto& [path, s] : m_staged) {
+            if (s.oid.empty() || !s.renamedFrom.empty() || !blobs.insert(s.oid).second) continue;
+            PackObject o;
+            if (s.spill) {
+                o.file = s.spill->h;
+                o.size = s.size;
+            } else {
+                crypto::Bytes raw;
+                if (!crypto::unbase64(s.b64, raw)) return Result::fail(Status::Fatal, L"A gathered file couldn't be read back.");
+                o.data.assign((const char*)raw.data(), raw.size());
+            }
+            objs.push_back(std::move(o));
+        }
+        // the branch where this store last saw it (else another device pushed: the engine re-plans)
+        std::string ref = "refs/heads/" + to_utf8(m_o.branch);
+        http::Request q = git_request("GET", L"/info/refs?service=git-receive-pack", p);
+        http::Response adv = http::send(q);
+        if (adv.status != 200) return failure(adv, L"Pushing");
+        std::string at;
+        if (!git_advertised_ref(adv.body, ref, at)) return Result::fail(Status::Fatal, L"Azure DevOps' answer isn't git's (receive-pack).");
+        if (at != m_base) return Result::fail(Status::CommitRaced, L"Another device synced first.");
+        std::unique_ptr<ByteSource> body = git_receive_pack_request(m_base, commit, ref, std::move(objs));
+        http::Request post = git_request("POST", L"/git-receive-pack", p);
+        post.headers.push_back({ "Content-Type", "application/x-git-receive-pack-request" });
+        post.headers.push_back({ "Accept", "application/x-git-receive-pack-result" });
+        post.body = body.get();
+        post.timeoutMs = 1800000;
+        http::Response r = http::send(post);
+        if (r.status != 200) return failure(r, L"Pushing");
+        if (Result res = git_receive_pack_result(r.body, ref); !res.ok()) {
+            res.message = from_utf8(azdo_scrub(to_utf8(res.message), m_pat8));
+            return res;
+        }
+        pushed(commit, newCursor);
         return {};
+    }
+
+    // a request to the repository's git endpoint (the clone URL)
+    http::Request git_request(const char* method, const std::wstring& rel, Progress& p) const {
+        http::Request q;
+        q.method = method;
+        q.url = m_o.url + rel;
+        q.headers = { { "Authorization", m_auth }, { "X-TFS-FedAuthRedirect", "Suppress" } };
+        q.progress = &p;
+        return q;
     }
 
     AzdoRestOptions m_o;
@@ -562,9 +706,12 @@ private:
     std::string m_tip, m_listed, m_base;
     std::string m_treeOf;                          // the commit m_tree is of
     std::map<std::string, Blob> m_tree;            // full path -> blob
+    std::map<std::string, std::string> m_trees;    // folder ("" the root) -> its tree's id, as listed
+    std::map<std::string, std::string> m_links;    // submodule entries (left as they are)
     bool m_staging = false;
     std::map<std::string, Staged> m_staged;        // full path -> what goes up
-    uint64_t m_bytes = 0;
+    uint64_t m_bytes = 0;                          // the REST push gathered (its body)
+    uint64_t m_packBytes = 0;                      // the same as a receive-pack request
 };
 
 } // namespace

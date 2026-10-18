@@ -18,12 +18,17 @@ except the random source (`BCryptGenRandom`).
 | `KDF(K, ctx, salt)` | keyed BLAKE2b-256 with key `K` over `"ep-kdf" \|\| len(ctx) (1 byte) \|\| ctx \|\| salt` (salt optional) |
 | `AEAD(K, nonce, ad, m)` | XChaCha20-Poly1305: `cipher \|\| tag (16)` |
 | `SEAL(K, ad, m)` | `nonce (24, random) \|\| AEAD(K, nonce, ad, m)`; `ad` is an ASCII string |
-| `Argon2id(code, salt, mem, passes)` | Argon2id, 1 lane, 32-byte output; `code` is the normalized code (below) |
+| `Argon2id(code, salt, mem, passes)` | Argon2id, 1 lane, 32-byte output; `code` is a normalized code (below) or the sync password's UTF-8 bytes as typed |
 | `umk_id(UMK)` | the first 8 bytes of `KDF(UMK, "ep umk id")` as 16 lowercase hex digits |
 | `base32` | RFC 4648 alphabet, lowercase, no padding |
 | `SIGN(dev, ctx, m)` | Monocypher EdDSA (Curve25519 with BLAKE2b, not RFC 8032's SHA-512) over `ctx \|\| 0x00 \|\| m`, with the device's signing key; 64 bytes |
 
-**Codes** (recovery key, pairing code): 15 characters of Crockford Base32
+**Sync password**: the user's, 12 characters or more with lower and upper case letters and
+digits (a reader enforces nothing: the rules are for the device that sets it). Rings and
+vaults from before it have a **recovery key** in its place, a code as below; a reader
+tries what is typed as given, then normalized as a code.
+
+**Codes** (pairing code; the recovery key of older rings): 15 characters of Crockford Base32
 (`0123456789ABCDEFGHJKMNPQRSTVWXYZ`), shown as `XXXXX-XXXXX-XXXXX`. Before use they are
 normalized: upper case, spaces and dashes removed, `O` → `0`, `I` and `L` → `1`; anything
 else that isn't 15 alphabet characters is refused. Default Argon2id cost: 256 MiB, 3
@@ -33,7 +38,7 @@ passes (stored with each use, so it can change later).
 
 - **UMK** (user master key): 32 random bytes per *generation* `g` (1, 2, ...). A new
   generation is made when a device is removed.
-- **Ring**: every UMK generation the user has, plus the recovery key's Argon2id salt,
+- **Ring**: every UMK generation the user has, plus the sync password's Argon2id salt,
   parameters and result (`recKek`), the IDs of removed devices, and the **members** (the
   user's devices, with their public keys):
   ```
@@ -43,7 +48,7 @@ passes (stored with each use, so it can change later).
   ```
   The current generation is the **last** entry. A reader refuses a member whose ID isn't
   its X25519 key's. A ring that comes from another device (pairing grant, recovery wrap,
-  hand-over) replaces the device's current generation, recovery key, members and removed
+  hand-over) replaces the device's current generation, password wrap key, members and removed
   list; the device keeps its other generations as older ones, and adds itself as a member
   unless the ring lists it as removed (then, on pairing or recovery, it makes a new device
   key and comes back as a new device).
@@ -82,10 +87,10 @@ EPV2
 umk=<umk_id of the generation the payload is sealed under>
 gen=<that generation's number>
 data=<base64 SEAL(KDF(UMK_gen, "ep vault"), "ep vault", payload)>
-rsalt=<base64 of the recovery key's 16-byte Argon2id salt>
+rsalt=<base64 of the sync password's 16-byte Argon2id salt>
 rmem=<Argon2id memory, KiB>
 rpasses=<Argon2id passes>
-recovery=<base64 SEAL(Argon2id(recovery key, rsalt, rmem, rpasses), "ep recovery", ring)>
+recovery=<base64 SEAL(Argon2id(sync password, rsalt, rmem, rpasses), "ep recovery", ring)>
 manifest=1                      (the vault keeps a manifest; absent in vaults from before them)
 signer=<deviceId of the device that wrote it>
 sig=<base64 SIGN(signer, "ep vault object", every byte of the object before this line)>
@@ -93,7 +98,7 @@ sig=<base64 SIGN(signer, "ep vault object", every byte of the object before this
 
 `payload` = `"EPVP" | vault id (16) | current version (u32) | n (u32) | n × (version (u32) | VK (32))`.
 
-The recovery wrap holds the whole ring, so the recovery key alone opens every generation.
+The password (`recovery`) wrap holds the whole ring, so the sync password alone opens every generation.
 A vault whose `umk` isn't in a device's ring is *locked* for that device. A vault whose
 signer is removed, isn't a member, or whose signature doesn't check is refused as tampered,
 except (removed signer) when it is byte for byte the object this device took before (the
@@ -143,7 +148,7 @@ hand-over only when its sender is a member of its ring, not removed, and the sig
 checks; the new ring lists both the receiver and the sender as members (not removed); and
 it continues the receiver's current generation (sealed under it, or its ring contains it).
 It deletes the hand-over once read, and keeps one whose sender or generation it doesn't
-know yet. "New recovery key" also makes a new generation and hands it over the same way.
+know yet. "Change password" also makes a new generation and hands it over the same way.
 
 ### `.ep-vault/head`
 
@@ -216,7 +221,7 @@ writes manifest 1 and adds `manifest=1` to the vault object (signed again, only 
 still the object it opened). New vaults have `manifest=1` from the start.
 
 **Removed devices.** When a vault moves to a new key version (a device removed, a new
-recovery key), the device that moves it writes the root again under the new version, signed
+sync password), the device that moves it writes the root again under the new version, signed
 by itself, with the same shards and `seq + 1`. It accepts the old root's writer even if it
 was just removed (only the seal is checked then). What the removed device signs afterwards
 is refused.
@@ -289,7 +294,7 @@ subfolder. Commits carry a neutral author `Explorer Plus <sync@localhost>` and t
   A vault with another ID, an older generation or fewer key versions, or no vault at all,
   is refused as tampered (rolled back or swapped).
 - **`Sync\pairs\<id>\retired.dat`**: the note of **retired key versions**. When the
-  vault's current key version moves on (a device removed, a new recovery key), the device
+  vault's current key version moves on (a device removed, a new sync password), the device
   lists the storage and notes what is there, so that what a removed device writes later
   with the keys it still has is refused:
   ```
@@ -333,6 +338,7 @@ subfolder. Commits carry a neutral author `Explorer Plus <sync@localhost>` and t
   that swaps two stored files (or serves an old version of one) isn't detected; each file
   still authenticates on its own. A signed per-vault manifest (plan, phase 7) would close
   this.
-- **Recovery key**: it can't be shown again (only its Argon2id result is kept), so
-  "Devices and keys" offers *New recovery key* instead of a Windows sign-in prompt that
-  shows the old one.
+- **Sync password** in place of the recovery key (2026-10-18): the stored fields keep their
+  names (`rsalt`, `recovery`, `recKek`); only what goes into Argon2id changed. The
+  password is kept nowhere, so it can't be shown again; "Devices and keys" offers *Change
+  password...* (the current one first).

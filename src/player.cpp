@@ -2701,20 +2701,7 @@ void paint_art(Player& p, HDC dc, const RECT& rc) {
 // the taskbar button: its own (the player's icon), the track's progress, and Previous /
 // Play / Next in the thumbnail
 // ------------------------------------------------------------------
-void set_app_id(HWND hwnd, bool on) {
-    IPropertyStore* ps = nullptr;
-    if (FAILED(SHGetPropertyStoreForWindow(hwnd, IID_PPV_ARGS(&ps))) || !ps) return;
-    PROPVARIANT v;
-    // (PreventPinning before the ID, as documented; both cleared before the window goes)
-    if (on) InitPropVariantFromBoolean(TRUE, &v); else PropVariantInit(&v);
-    ps->SetValue(PKEY_AppUserModel_PreventPinning, v);
-    PropVariantClear(&v);
-    if (on) InitPropVariantFromString(kAppId, &v); else PropVariantInit(&v);
-    ps->SetValue(PKEY_AppUserModel_ID, v);
-    PropVariantClear(&v);
-    ps->Commit();
-    ps->Release();
-}
+void set_app_id(HWND hwnd, bool on) { window_app_id(hwnd, on ? kAppId : nullptr); }
 
 // a Segoe Fluent glyph as a small icon (the thumbnail's buttons), for the taskbar's theme
 HICON glyph_icon(wchar_t glyph) {

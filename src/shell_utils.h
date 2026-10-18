@@ -87,6 +87,11 @@ std::wstring child_name(IShellFolder* psf, PCUITEMID_CHILD child, SHGDNF flags);
 // typed path parsing (address bar)
 HRESULT parse_typed(const std::wstring& text, PIDLIST_ABSOLUTE* out);
 
+// A window of its own on the taskbar, with its own icon, not grouped with the file windows
+// (the player, the Notepad, sync, screenshots), and not pinnable (a pin would start the
+// file manager). Set before the window is shown; nullptr when it closes.
+void window_app_id(HWND hwnd, const wchar_t* appId);
+
 // open an item the way Explorer does (default verb on the ID list)
 void shell_open_abs(HWND hwnd, PCIDLIST_ABSOLUTE abs);
 

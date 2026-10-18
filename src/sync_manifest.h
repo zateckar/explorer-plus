@@ -88,7 +88,7 @@ Result read_shard(const crypto::Bytes& b, const Root& root, size_t index, const 
 size_t shard_of(const std::wstring& path, size_t count, const crypto::Key& vk);
 size_t shard_count_for(size_t files);                       // a power of two, about 1,000 files a shard
 
-// After the vault moved to a new key version (a device removed, a new recovery key): the
+// After the vault moved to a new key version (a device removed, a new sync password): the
 // root again, sealed under that version and signed by this device, its shards as they are.
 // What a removed device signed while it was a member stays readable that way; what it
 // signs afterwards is refused.

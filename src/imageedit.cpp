@@ -3,6 +3,7 @@
 #include "shapes.h"
 #include "theme.h"
 #include "resource.h"
+#include "shell_utils.h"
 #include <gdiplus.h>
 #include <commdlg.h>
 #include <dwmapi.h>
@@ -55,6 +56,7 @@ struct Editor {
     int w = 0, h = 0;
     std::wstring path;              // the file it is (saved to); empty: a screenshot not saved yet
     std::wstring name;              // in the title
+    bool shot = false;              // made from a screenshot: the screenshot icon, its own taskbar button
     bool dirty = false;
     bool copied = false;            // (a screenshot copied, nothing changed since: closed without asking)
     // the view: picture pixels to client ones (x * k + ox)
@@ -1300,6 +1302,7 @@ LRESULT CALLBACK editor_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (can_close(e)) DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
+            if (e.shot) window_app_id(hwnd, nullptr);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             on_destroy(e);
             delete pe;
@@ -1337,6 +1340,16 @@ bool open(Editor* e) {
         s_editors.erase(std::remove(s_editors.begin(), s_editors.end(), e), s_editors.end());
         delete e;
         return false;
+    }
+    if (e->shot) {                          // (before it's shown: the taskbar button is made then)
+        static HICON big = nullptr, small = nullptr;
+        if (!big) {
+            LoadIconMetric(g_hinst, MAKEINTRESOURCEW(IDI_SCREENSHOT), LIM_LARGE, &big);
+            LoadIconMetric(g_hinst, MAKEINTRESOURCEW(IDI_SCREENSHOT), LIM_SMALL, &small);
+        }
+        SendMessageW(w, WM_SETICON, ICON_BIG, (LPARAM)big);
+        SendMessageW(w, WM_SETICON, ICON_SMALL, (LPARAM)small);
+        window_app_id(w, L"RadimZatecka.ExplorerPlus.Screenshot");
     }
     // on the monitor with the mouse (its DPI comes with the move), the picture at its own size
     // where that fits, centred
@@ -1393,6 +1406,7 @@ void imageedit_open_pixels(std::vector<uint32_t> pixels, int w, int h, const std
     e->w = w;
     e->h = h;
     e->name = name;
+    e->shot = true;
     e->dirty = true;                        // (not saved anywhere yet)
     // on the clipboard at once, as Windows' own screenshots: pasted anywhere as it is, and closed
     // unchanged without a question

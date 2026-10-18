@@ -176,7 +176,7 @@ static bool ensure_member(Ring& r, const DeviceKey& me) {
 }
 
 // A ring another member made (a hand-over, a pairing grant, a recovery wrap) replaces this
-// device's: its current generation, recovery key, members and removed list. This device's
+// device's: its current generation, password wrap key, members and removed list. This device's
 // other generations stay as older ones (vaults that haven't moved on yet still need them).
 // Members and removals aren't joined with this device's own: a device that was kept in the
 // dark (a removed device suppressing hand-overs) may have taken in members it shouldn't.
@@ -295,16 +295,42 @@ DeviceKey device_key(KeyStore& ks) {
     return d;
 }
 
-static const wchar_t kNoMemory[] = L"There isn't enough free memory to protect the code (Argon2id needs 256 MB).";
+static const wchar_t kNoMemory[] = L"There isn't enough free memory for the password's key (Argon2id needs 256 MB).";
 
-static bool new_recovery(Ring& r, std::string& code) {
-    code = crypto::new_code();
-    crypto::random(r.recSalt, 16);
-    r.recParams = crypto::argon2_default();
-    return crypto::argon2id(code, r.recSalt, 16, r.recParams, r.recKek);
+std::wstring password_problem(const std::string& pw) {
+    size_t chars = 0;
+    bool lower = false, upper = false, digit = false;
+    for (unsigned char c : pw) {
+        if ((c & 0xC0) != 0x80) ++chars;              // (UTF-8: characters, not bytes)
+        lower |= c >= 'a' && c <= 'z';
+        upper |= c >= 'A' && c <= 'Z';
+        digit |= c >= '0' && c <= '9';
+    }
+    if (chars < 12) return L"The password needs at least 12 characters.";
+    if (!lower || !upper || !digit) return L"The password needs small letters, capital letters and digits.";
+    return {};
 }
 
-Result setup_ring(KeyStore& ks, std::string& recoveryCode) {
+// the password wrap of the ring: a fresh salt, the password through Argon2id
+static Result new_recovery(Ring& r, const std::string& password) {
+    if (std::wstring why = password_problem(password); !why.empty()) return Result::fail(Status::Rejected, why);
+    crypto::random(r.recSalt, 16);
+    r.recParams = crypto::argon2_default();
+    if (!crypto::argon2id(password, r.recSalt, 16, r.recParams, r.recKek)) return Result::fail(Status::Fatal, kNoMemory);
+    return {};
+}
+
+// the password is the ring's (one Argon2id run)
+static Result password_matches(const Ring& r, const std::string& password, bool& same) {
+    same = false;
+    if (!crypto::argon2_params_ok(r.recParams)) return {};
+    Key k;
+    if (!crypto::argon2id(password, r.recSalt, 16, r.recParams, k)) return Result::fail(Status::Fatal, kNoMemory);
+    same = k == r.recKek;
+    return {};
+}
+
+Result setup_ring(KeyStore& ks, const std::string& password) {
     DeviceKey me = device_key(ks);
     Ring r;
     Ring::Gen g;
@@ -312,10 +338,20 @@ Result setup_ring(KeyStore& ks, std::string& recoveryCode) {
     g.umk = crypto::random_key();
     r.gens.push_back(g);
     r.members.push_back(me.member());
-    if (!new_recovery(r, recoveryCode)) return Result::fail(Status::Fatal, kNoMemory);
+    if (Result x = new_recovery(r, password); !x.ok()) return x;
     if (!ks.save_ring(r)) return Result::fail(Status::Fatal, L"The keys couldn't be saved in Credential Manager.");
-    recoveryCode = crypto::format_code(recoveryCode);
     return {};
+}
+
+Result check_password(KeyStore& ks, const std::string& password) {
+    Ring ring;
+    if (!ks.load_ring(ring)) return Result::fail(Status::Locked, L"This device has no keys.");
+    bool same = false;
+    if (Result r = password_matches(ring, password, same); !r.ok()) return r;
+    // (an old ring's recovery key, typed as it's written)
+    std::string code = crypto::normalize_code(password);
+    if (!same && !code.empty() && code != password) if (Result r = password_matches(ring, code, same); !r.ok()) return r;
+    return same ? Result{} : Result::fail(Status::Rejected, L"That isn't your sync password.");
 }
 
 // ------------------------------------------------------------------ small objects
@@ -787,8 +823,8 @@ Result open_vault(Backend& raw, KeyStore& ks, bool create, Vault& out, Progress&
         const Ring::Gen* g = haveRing ? ring.find(f.umk) : nullptr;
         if (!g) {
             return Result::fail(Status::Locked, haveRing
-                ? L"This folder is encrypted with keys this device doesn't have. Pair it with a code from another device, or use the recovery key."
-                : L"This folder is encrypted by another of your devices. Pair this device with a code from it, or use the recovery key.");
+                ? L"This folder is encrypted with keys this device doesn't have. Unlock it with your sync password, or a code from another device."
+                : L"This folder is encrypted by another of your devices. Unlock it with your sync password, or a code from that device.");
         }
         Bytes p;
         Vault v;
@@ -959,18 +995,25 @@ Result redeem_pairing(Backend& raw, KeyStore& ks, const std::string& typed, Prog
 }
 
 Result redeem_recovery(Backend& raw, KeyStore& ks, const std::string& typed, Progress& prog) {
-    std::string c = crypto::normalize_code(typed);
-    if (c.empty()) return Result::fail(Status::Rejected, L"That isn't a recovery key: 15 letters and digits.");
+    if (typed.empty()) return Result::fail(Status::Rejected, L"Type your sync password.");
     Bytes vb;
     Result r = get_object(raw, kVaultFile, vb, nullptr, prog);
     if (!r.ok()) return r;
     VaultFile f;
     if (!parse_vault(vb, f)) return Result::fail(Status::Tampered, L"The vault file on the storage is damaged, or from an older version.");
     if (!crypto::argon2_params_ok(f.rparams)) return Result::fail(Status::Tampered, L"The vault file on the storage is damaged.");
-    Key k;
-    if (!crypto::argon2id(c, f.rsalt.data(), 16, f.rparams, k)) return Result::fail(Status::Fatal, kNoMemory);
+    // the password as typed; else, an old ring's recovery key (dashes, case and look-alike
+    // letters don't matter in those)
+    std::vector<std::string> tries = { typed };
+    if (std::string c = crypto::normalize_code(typed); !c.empty() && c != typed) tries.push_back(c);
     Bytes p;
-    if (!crypto::open(k, "ep recovery", f.recovery, p)) return Result::fail(Status::Rejected, L"The recovery key doesn't match.");
+    bool opened = false;
+    for (auto& t : tries) {
+        Key k;
+        if (!crypto::argon2id(t, f.rsalt.data(), 16, f.rparams, k)) return Result::fail(Status::Fatal, kNoMemory);
+        if ((opened = crypto::open(k, "ep recovery", f.recovery, p))) break;
+    }
+    if (!opened) return Result::fail(Status::Rejected, L"That isn't the sync password of this storage.");
     Ring got;
     bool ok = got.parse(p);
     crypto::wipe(p.data(), p.size());
@@ -991,11 +1034,15 @@ Result list_devices(Backend& raw, KeyStore& ks, std::vector<DeviceInfo>& out, Pr
     return {};
 }
 
-Result remove_device(Backend& raw, KeyStore& ks, const std::string& deviceId, std::string& newRecoveryCode, Progress& prog) {
+Result remove_device(Backend& raw, KeyStore& ks, const std::string& deviceId, const std::string& newPassword, Progress& prog) {
     Ring ring;
     if (!ks.load_ring(ring)) return Result::fail(Status::Locked);
     DeviceKey me = device_key(ks);
     if (deviceId == me.id) return Result::fail(Status::Rejected, L"This is the device you're using.");
+    if (std::wstring why = password_problem(newPassword); !why.empty()) return Result::fail(Status::Rejected, why);
+    bool same = false;
+    if (Result x = password_matches(ring, newPassword, same); !x.ok()) return x;
+    if (same) return Result::fail(Status::Rejected, L"Choose a new password: the removed device may know the old one.");
     // the vault must open first (and be on the current generation); it also takes in the
     // members whose records are sealed under it, so they get the new ring
     Vault v;
@@ -1011,8 +1058,7 @@ Result remove_device(Backend& raw, KeyStore& ks, const std::string& deviceId, st
     if (!ring.is_removed(deviceId)) ring.removed.push_back(deviceId);
     ring.members.erase(std::remove_if(ring.members.begin(), ring.members.end(), [&](const Ring::Member& m) { return m.id == deviceId; }),
                        ring.members.end());
-    std::string code;
-    if (!new_recovery(ring, code)) return Result::fail(Status::Fatal, kNoMemory);
+    if (Result x = new_recovery(ring, newPassword); !x.ok()) return x;
     if (!ks.save_ring(ring)) return Result::fail(Status::Fatal, L"The keys couldn't be saved in Credential Manager.");
     // this vault moves on now; the others when this device next opens them
     for (int attempt = 0; attempt < 4; ++attempt) {
@@ -1048,24 +1094,21 @@ Result remove_device(Backend& raw, KeyStore& ks, const std::string& deviceId, st
     hand_over(raw, ring, old, me, prog);
     r = register_device(raw, ring, me, prog);
     if (!r.ok()) return r;
-    newRecoveryCode = crypto::format_code(code);
     return {};
 }
 
-Result new_recovery_key(KeyStore& ks, std::string& code) {
+Result change_password(KeyStore& ks, const std::string& newPassword) {
     Ring ring;
     if (!ks.load_ring(ring)) return Result::fail(Status::Locked, L"This device has no keys.");
-    // a new UMK generation too: the old recovery key opens old recovery wraps (a storage
-    // keeps old copies: git history, S3 versions), and with them the ring of that time. Its
-    // holder must not get the user key that seals vaults from now on.
+    // a new UMK generation too: the old password opens old password wraps (a storage keeps
+    // old copies: git history, S3 versions), and with them the ring of that time. Whoever
+    // knows it must not get the user key that seals vaults from now on.
     Ring::Gen g;
     g.gen = ring.current().gen + 1;
     g.umk = crypto::random_key();
     ring.gens.push_back(g);
-    std::string c;
-    if (!new_recovery(ring, c)) return Result::fail(Status::Fatal, kNoMemory);
+    if (Result x = new_recovery(ring, newPassword); !x.ok()) return x;
     if (!ks.save_ring(ring)) return Result::fail(Status::Fatal, L"The keys couldn't be saved in Credential Manager.");
-    code = crypto::format_code(c);
     return {};
 }
 

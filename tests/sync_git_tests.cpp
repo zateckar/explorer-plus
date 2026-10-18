@@ -210,7 +210,7 @@ void test_encrypted_engine() {
         if (!r.result.ok()) std::printf("  sync: %s\n", to_utf8(r.result.message).c_str());
         return r;
     };
-    std::string rec;
+    std::string rec = "Sync password 1";
     CHECK(synckeys::setup_ring(*a.ks, rec).ok());
     CHECK(open(a, base + L"\\a.git", true).ok());
     tu::write(a.root, L"report.docx", "REPORT-BYTES");

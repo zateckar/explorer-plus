@@ -7,6 +7,7 @@
 #include "sync_engine.h"
 #include "sync_ipc.h"
 #include "sync_keys.h"
+#include "theme.h"
 #include <shellapi.h>
 #include <algorithm>
 #include <atomic>
@@ -14,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 
 using namespace sync;
@@ -77,6 +79,7 @@ public:
             MessageBoxW(nullptr, (L"The encryption self-test failed (" + w16(failed) + L"). Sync stays off.").c_str(), L"Explorer Plus sync", MB_ICONERROR);
             return 3;
         }
+        if (!m_headless) theme_init();      // (the tray menu in the system's light or dark)
         create_window();
         reload();
         m_server.start([this](const syncipc::Msg& m) { return handle(m); });
@@ -486,17 +489,19 @@ private:
         if (cmd == "setup-keys") {
             synckeys::Ring ring;
             if (m_ks->load_ring(ring)) return syncipc::error("This device already has keys.");
-            std::string code;
-            Result r = synckeys::setup_ring(*m_ks, code);
+            Result r = synckeys::setup_ring(*m_ks, syncipc::get(q, "password"));
             if (!r.ok()) return fail(r);
             reopen_all();
-            syncipc::Msg m = syncipc::ok();
-            m.push_back({ "code", code });
-            return m;
+            return syncipc::ok();
         }
-        if (cmd == "new-recovery-key") {
-            std::string code;
-            Result r = synckeys::new_recovery_key(*m_ks, code);
+        if (cmd == "check-password") {
+            Result r = synckeys::check_password(*m_ks, syncipc::get(q, "password"));
+            return r.ok() ? syncipc::ok() : fail(r);
+        }
+        if (cmd == "change-password") {
+            // the current one first: whoever sits at an unlocked PC can't take the user's place
+            if (Result c = synckeys::check_password(*m_ks, syncipc::get(q, "old")); !c.ok()) return fail(c);
+            Result r = synckeys::change_password(*m_ks, syncipc::get(q, "password"));
             if (!r.ok()) return fail(r);
             std::lock_guard<std::mutex> lk(m_mx);
             for (auto& rn : m_runners) {
@@ -505,9 +510,7 @@ private:
                 if (auto b = raw_of(*rn, rr)) synckeys::refresh_vault_recovery(*b, *m_ks, np);
                 rn->poke(true);                              // its encrypting layer: the new key version
             }
-            syncipc::Msg m = syncipc::ok();
-            m.push_back({ "code", code });
-            return m;
+            return syncipc::ok();
         }
         if (cmd == "unlock" || cmd == "pair-offer" || cmd == "devices" || cmd == "remove-device") {
             std::shared_ptr<Runner> r;
@@ -524,8 +527,10 @@ private:
                 auto b = raw_of(*r, res);
                 if (!b) return fail(res);
                 if (cmd == "unlock") {
-                    std::string code = syncipc::get(q, "code");
-                    res = syncipc::get(q, "mode") == "recovery" ? synckeys::redeem_recovery(*b, *m_ks, code, np) : synckeys::redeem_pairing(*b, *m_ks, code, np);
+                    std::string code = syncipc::get(q, "code"), mode = syncipc::get(q, "mode");
+                    // mode=password (an old recovery key too: mode=recovery), or a pairing code
+                    res = mode == "password" || mode == "recovery" ? synckeys::redeem_recovery(*b, *m_ks, code, np)
+                                                                   : synckeys::redeem_pairing(*b, *m_ks, code, np);
                 } else if (cmd == "pair-offer") {
                     std::string code;
                     res = synckeys::create_pairing(*b, *m_ks, code, np);
@@ -538,10 +543,10 @@ private:
                         uint64_t t = ((uint64_t)d.added.dwHighDateTime << 32) | d.added.dwLowDateTime;
                         m.push_back({ "device", d.id + "\t" + u8(d.name) + "\t" + std::to_string(t) + "\t" + (d.thisDevice ? "1" : "0") });
                     }
+                } else if (Result c = synckeys::check_password(*m_ks, syncipc::get(q, "old")); !c.ok()) {
+                    res = c;                                   // (as for change-password)
                 } else {
-                    std::string code;
-                    res = synckeys::remove_device(*b, *m_ks, syncipc::get(q, "device"), code, np);
-                    m.push_back({ "code", code });
+                    res = synckeys::remove_device(*b, *m_ks, syncipc::get(q, "device"), syncipc::get(q, "password"), np);
                 }
             }
             if (!res.ok()) return fail(res);
@@ -589,27 +594,110 @@ private:
         }
     }
 
+    // the tray icon: sync's (up to date, syncing), a red "!" (something needs the user: a
+    // file that didn't sync, a conflict, an error, a locked or offline folder) or paused
+    enum class Look { Normal, Alert, Paused };
+    static HICON look_icon(Look l) {
+        static HICON icons[3]{};
+        int i = (int)l;
+        if (!icons[i])
+            icons[i] = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(l == Look::Alert ? IDI_SYNC_ALERT : l == Look::Paused ? IDI_SYNC_PAUSED : IDI_SYNC),
+                                         IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+        return icons[i];
+    }
+
     void add_icon() {
         NOTIFYICONDATAW n = icon_data();
         n.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
         n.uCallbackMessage = WM_TRAY;
-        n.hIcon = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+        n.hIcon = look_icon(m_look);
         wcscpy_s(n.szTip, L"Explorer Plus sync");
         Shell_NotifyIconW(NIM_ADD, &n);
     }
 
-    std::wstring summary() {
-        std::lock_guard<std::mutex> lk(m_mx);
-        if (m_runners.empty()) return L"No sync folders";
-        size_t pending = 0;
-        std::wstring worst;
-        for (auto& r : m_runners) {
-            PairState s = r->eng ? r->eng->status().state : r->openState;
-            if (r->eng) pending += r->eng->status().pendingFiles;
-            if (s != PairState::UpToDate && s != PairState::Idle && worst.empty()) worst = r->pair.name + L": " + pair_state_name(s);
+    // one pair's state in words ("Up to date, 1 file not synced"); attention: it needs the user
+    static std::wstring pair_text(PairState s, const EngineStatus* st, const std::wstring& openMessage, bool& attention) {
+        std::wstring t;
+        attention = true;
+        switch (s) {
+            case PairState::Error: t = L"Error" + (openMessage.empty() ? std::wstring() : L": " + openMessage); break;
+            case PairState::Locked: t = L"Locked (unlock it in Sync folders)"; break;
+            case PairState::AuthNeeded: t = L"Sign-in needed"; break;
+            case PairState::RootMissing: t = L"Folder missing"; break;
+            case PairState::ConfirmDeletes: t = L"Deletions wait for you"; break;
+            case PairState::Offline: t = L"Offline"; break;
+            default: attention = false; break;
         }
-        if (pending) return L"Syncing " + std::to_wstring(pending) + L" files";
-        return worst.empty() ? L"Up to date" : worst;
+        if (t.empty()) {
+            if (s == PairState::Paused) t = L"Paused";
+            else if (st && st->pendingFiles) t = L"Syncing " + std::to_wstring(st->pendingFiles) + (st->pendingFiles == 1 ? L" file" : L" files");
+            else if (s == PairState::Syncing) t = L"Syncing";
+            else t = L"Up to date";
+        }
+        if (st && !st->problems.empty()) {
+            attention = true;
+            size_t n = st->problems.size();
+            t += L", " + std::to_wstring(n) + (n == 1 ? L" file not synced" : L" files not synced");
+        }
+        if (st && !st->conflicts.empty()) {
+            attention = true;
+            size_t n = st->conflicts.size();
+            t += L", " + std::to_wstring(n) + (n == 1 ? L" conflict" : L" conflicts");
+        }
+        return t;
+    }
+
+    // the tray's tip and icon, and problems not reported before (a notification each round)
+    struct TrayView { Look look = Look::Normal; std::wstring tip, newProblem; };
+    TrayView tray_view() {
+        TrayView v;
+        std::lock_guard<std::mutex> lk(m_mx);
+        if (m_runners.empty()) { v.tip = L"No sync folders"; return v; }
+        size_t pending = 0, paused = 0;
+        std::wstring alerts;
+        std::set<std::wstring> problems;
+        for (auto& r : m_runners) {
+            EngineStatus st;
+            if (r->eng) st = r->eng->status();
+            PairState s = r->eng ? st.state : r->openState;
+            bool attention = false;
+            std::wstring t = pair_text(s, r->eng ? &st : nullptr, r->eng ? st.message : r->openMessage, attention);
+            if (attention) alerts += (alerts.empty() ? L"" : L"\n") + r->pair.name + L": " + t;
+            if (s == PairState::Paused) ++paused;
+            pending += st.pendingFiles;
+            for (auto& [path, why] : st.problems) {
+                std::wstring key = w16(r->pair.id) + L"|" + path;
+                problems.insert(key);
+                if (!m_reported.count(key) && v.newProblem.empty()) v.newProblem = r->pair.name + L"\\" + path + L": " + why;
+            }
+        }
+        m_reported = std::move(problems);           // (one that comes back is reported again)
+        if (!alerts.empty()) { v.look = Look::Alert; v.tip = alerts; }
+        else if (paused == m_runners.size()) { v.look = Look::Paused; v.tip = L"Paused"; }
+        else if (pending) v.tip = L"Syncing " + std::to_wstring(pending) + (pending == 1 ? L" file" : L" files");
+        else v.tip = L"Up to date";
+        return v;
+    }
+
+    void update_tray() {
+        TrayView v = tray_view();
+        NOTIFYICONDATAW n = icon_data();
+        n.uFlags = NIF_TIP;
+        std::wstring tip = L"Explorer Plus sync: " + v.tip;
+        if (tip.size() >= ARRAYSIZE(n.szTip)) tip = tip.substr(0, ARRAYSIZE(n.szTip) - 4) + L"...";
+        wcsncpy_s(n.szTip, tip.c_str(), _TRUNCATE);
+        if (v.look != m_look) {
+            m_look = v.look;
+            n.uFlags |= NIF_ICON;
+            n.hIcon = look_icon(v.look);
+        }
+        if (!v.newProblem.empty()) {
+            n.uFlags |= NIF_INFO;
+            n.dwInfoFlags = NIIF_WARNING;
+            wcsncpy_s(n.szInfoTitle, L"A file didn't sync", _TRUNCATE);
+            wcsncpy_s(n.szInfo, v.newProblem.c_str(), _TRUNCATE);
+        }
+        Shell_NotifyIconW(NIM_MODIFY, &n);
     }
 
     void menu() {
@@ -618,8 +706,11 @@ private:
         {
             std::lock_guard<std::mutex> lk(m_mx);
             for (auto& r : m_runners) {
-                PairState s = r->eng ? r->eng->status().state : r->openState;
-                std::wstring label = r->pair.name + L"\t" + pair_state_name(s);
+                EngineStatus st;
+                if (r->eng) st = r->eng->status();
+                bool attention = false;
+                std::wstring label = r->pair.name + L"\t" +
+                                     pair_text(r->eng ? st.state : r->openState, r->eng ? &st : nullptr, r->eng ? st.message : r->openMessage, attention);
                 AppendMenuW(m, MF_STRING, ID_FOLDER0 + roots.size(), label.c_str());
                 roots.push_back(r->pair.root);
             }
@@ -658,14 +749,12 @@ private:
                     ShellExecuteW(nullptr, nullptr, exe, L"--sync-folders", nullptr, SW_SHOWNORMAL);
                 }
                 return 0;
-            case WM_TIMER: {
-                NOTIFYICONDATAW n = icon_data();
-                n.uFlags = NIF_TIP;
-                std::wstring tip = L"Explorer Plus sync: " + summary();
-                wcsncpy_s(n.szTip, tip.c_str(), _TRUNCATE);
-                Shell_NotifyIconW(NIM_MODIFY, &n);
+            case WM_TIMER:
+                update_tray();
                 return 0;
-            }
+            case WM_SETTINGCHANGE:              // popup menus follow a light / dark switch
+                if (lp && lstrcmpW((LPCWSTR)lp, L"ImmersiveColorSet") == 0) theme_reload();
+                break;
             case WM_CLOSE:
                 DestroyWindow(h);
                 return 0;
@@ -684,6 +773,8 @@ private:
     syncipc::Server m_server;
     HWND m_hwnd = nullptr;
     UINT m_taskbarCreated = 0;
+    Look m_look = Look::Normal;
+    std::set<std::wstring> m_reported;      // "<pair id>|<path>" of the problems notified (tray thread)
 };
 
 // ------------------------------------------------------------------ CLI output
