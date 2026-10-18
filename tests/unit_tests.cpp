@@ -11,6 +11,7 @@
 #include "syntax.h"
 #include "textops.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -382,6 +383,32 @@ static void playlists() {
     CHECK(playlist_parse_any(L"x.mp3\ny.mp3\n", L"C:\\", PlaylistKind::XML).size() == 2);
     CHECK(midi_file(L"a.MID") && midi_file(L"a.kar") && !midi_file(L"a.mp3") && cd_track_file(L"D:\\Track01.cda"));
     CHECK_EQ(playlist_parse(L"..\\..\\..\\x.mp3", L"C:\\a")[0].path, L"C:\\x.mp3");    // (not above the root)
+    // long-path prefixes as the paths they are; devices not at all
+    auto pre = playlist_parse(L"\\\\?\\D:\\a.mp3\n\\\\?\\UNC\\nas\\m\\b.mp3\n\\\\.\\pipe\\x\n\\\\?\\Volume{1}\\c.mp3\n", L"C:\\");
+    CHECK(pre.size() == 2 && pre[0].path == L"D:\\a.mp3" && pre[1].path == L"\\\\nas\\m\\b.mp3");
+    // a downloaded playlist: only its own server's UNC paths
+    auto remote = playlist_parse(L"a.mp3\n\\\\evil\\s\\x.mp3\nfile://evil/s/y.mp3\n\\\\NAS\\m\\z.mp3\nhttp://radio/s\n", L"\\\\nas\\m\\");
+    CHECK(remote.size() == 5);
+    playlist_drop_remote(remote, L"\\\\nas\\m\\");
+    CHECK(remote.size() == 3 && remote[0].path == L"\\\\nas\\m\\a.mp3" && remote[1].path == L"\\\\NAS\\m\\z.mp3");
+    playlist_drop_remote(remote, L"C:\\Downloads\\");
+    CHECK(remote.size() == 1 && remote[0].path == L"http://radio/s");
+    {
+        WCHAR tmp[MAX_PATH];
+        GetTempPathW(MAX_PATH, tmp);
+        std::wstring file = std::wstring(tmp) + L"ep-unit-motw.m3u";
+        auto put = [](const std::wstring& path, const char* text) {
+            HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+            DWORD n = 0;
+            if (h != INVALID_HANDLE_VALUE) { WriteFile(h, text, (DWORD)strlen(text), &n, nullptr); CloseHandle(h); }
+        };
+        put(file, "a.mp3\r\n\\\\203.0.113.9\\s\\x.mp3\r\n");
+        std::vector<PlaylistEntry> got;
+        CHECK(playlist_load(file, got) && got.size() == 2);                 // (made here: as it is)
+        put(file + L":Zone.Identifier", "[ZoneTransfer]\r\nZoneId=3\r\n");
+        CHECK(playlist_load(file, got) && got.size() == 1);                 // (downloaded: no other server)
+        DeleteFileW(file.c_str());
+    }
 
     // written: relative inside the playlist's folder, #EXTINF where something is known
     std::vector<PlaylistEntry> w = {
@@ -1343,7 +1370,68 @@ static void text_operations() {
     CHECK(!url_decode(L"%C5", t));
 }
 
+// damaged and hostile input: the decoders and parsers neither crash nor take quadratic time
+static void fuzz() {
+    uint64_t seed = 0x9E3779B97F4A7C15ull;
+    auto rnd = [&]() { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; };
+    using V = std::vector<uint8_t>;
+    auto be = [](V& v, uint32_t x) { for (int sh = 24; sh >= 0; sh -= 8) v.push_back((uint8_t)(x >> sh)); };
+    // headers that pass the first checks, then random or mutated bytes
+    std::vector<std::pair<const wchar_t*, V>> seeds;
+    { V q = { 'q', 'o', 'i', 'f' }; be(q, 64); be(q, 64); q.push_back(4); q.push_back(0); seeds.push_back({ L".qoi", q }); }
+    { V t = { 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 64, 0, 32, 8 }; seeds.push_back({ L".tga", t }); }
+    { std::string h = "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 16 +X 16\n"; seeds.push_back({ L".hdr", V(h.begin(), h.end()) }); }
+    { V p = { '8', 'B', 'P', 'S', 0, 1, 0, 0, 0, 0, 0, 0, 0, 3 }; be(p, 16); be(p, 16); p.push_back(0); p.push_back(8); p.push_back(0); p.push_back(3);
+      for (int k = 0; k < 3; ++k) be(p, 0);
+      seeds.push_back({ L".psd", p }); }
+    { V x(128, 0); x[0] = 10; x[1] = 5; x[2] = 1; x[3] = 8; x[8] = 15; x[10] = 15; x[65] = 1; x[66] = 16; seeds.push_back({ L".pcx", x }); }
+    { V a = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n' }; be(a, 13); for (char c : std::string("IHDR")) a.push_back((uint8_t)c);
+      be(a, 4); be(a, 4); for (uint8_t b : { 8, 6, 0, 0, 0 }) a.push_back(b); be(a, 0);
+      be(a, 8); for (char c : std::string("acTL")) a.push_back((uint8_t)c); be(a, 2); be(a, 0); be(a, 0);
+      seeds.push_back({ L".png", a }); }
+    RawImage im;
+    int cw = 0, ch = 0;
+    std::vector<ApngFrame> frames;
+    for (int it = 0; it < 4000; ++it) {
+        auto& [ext, base] = seeds[it % seeds.size()];
+        V d = base;
+        size_t extra = rnd() % 600;
+        for (size_t k = 0; k < extra; ++k) d.push_back((uint8_t)rnd());
+        for (int m = (int)(rnd() % 4); m > 0; --m) d[rnd() % d.size()] = (uint8_t)rnd();     // a damaged header
+        if (wcscmp(ext, L".png") == 0) apng_split(d.data(), d.size(), cw, ch, frames);
+        else own_image_decode(ext, d.data(), d.size(), im);
+        std::string s(d.begin(), d.end());
+        double w = 0, h = 0;
+        svg_size(s, w, h);
+        TextFile tf = text_decode(s);
+        std::wstring ws(tf.text.begin(), tf.text.end()), out;
+        size_t err = 0;
+        format_json(ws, (it & 1) != 0, out, &err);
+        format_xml(ws, out, &err);
+        subtitles_parse(ws);
+        playlist_parse_any(ws, L"C:\\x\\", (PlaylistKind)(1 + it % 4));
+    }
+    // texts that took quadratic time: each well under a second
+    auto quick = [](const char* what, auto f) {
+        auto t0 = std::chrono::steady_clock::now();
+        f();
+        double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (s > 1.0) std::printf("  slow: %s %.1f s\n", what, s);
+        CHECK(s <= 1.0);
+    };
+    const size_t big = 400000;
+    quick("xml &", [&] { playlist_parse_xml(L"<media src=\"" + std::wstring(big, L'&') + L"\"/>", L"C:\\"); });
+    quick("srt <", [&] { subtitles_parse(L"00:00:01,000 --> 00:00:02,000\n" + std::wstring(big, L'<') + L"\n"); });
+    quick("srt &", [&] { subtitles_parse(L"00:00:01,000 --> 00:00:02,000\n" + std::wstring(big, L'&') + L"\n"); });
+    quick("ass {", [&] { subtitles_parse(L"[Events]\nDialogue: 0,0:00:01.00,0:00:02.00,D,,0,0,0,," + std::wstring(big, L'{') + L"\n"); });
+    std::string svgs;
+    for (size_t k = 0; k < big / 5; ++k) svgs += "<svgx";
+    quick("svg", [&] { double w, h; svg_size(svgs, w, h); });
+    quick("json [", [&] { std::wstring o; format_json(std::wstring(big, L'['), false, o, nullptr); });
+}
+
 int wmain() {
+    fuzz();
     user_choice();
     text_files();
     note_sessions();

@@ -404,6 +404,7 @@ static long long sub_time(const std::wstring& s) {
             if (inFrac) {
                 if (fracDigits < 7) { frac = frac * 10 + (c - L'0'); ++fracDigits; }
             } else {
+                if (digits >= 9) return -1;         // (no time has more: and no overflow)
                 parts[n] = parts[n] * 10 + (c - L'0');
                 ++digits;
             }
@@ -441,17 +442,22 @@ static void put_entity(std::wstring& out, const std::wstring& name) {
 // a SubRip / WebVTT cue's line: <i>, <font ...>, <c.yellow>, {\an8} taken out, entities read
 static std::wstring srt_clean(const std::wstring& s) {
     std::wstring out;
+    // (once a closing '>' or '}' isn't found, none is further on: not looked for again)
+    bool noGt = false, noBrace = false;
     for (size_t i = 0; i < s.size(); ++i) {
         wchar_t c = s[i];
-        if (c == L'<') {
+        if (c == L'<' && !noGt) {
             size_t e = s.find(L'>', i);
             if (e != std::wstring::npos) { i = e; continue; }
-        } else if (c == L'{' && i + 1 < s.size() && s[i + 1] == L'\\') {
+            noGt = true;
+        } else if (c == L'{' && !noBrace && i + 1 < s.size() && s[i + 1] == L'\\') {
             size_t e = s.find(L'}', i);
             if (e != std::wstring::npos) { i = e; continue; }
+            noBrace = true;
         } else if (c == L'&') {
-            size_t e = s.find(L';', i);
-            if (e != std::wstring::npos && e - i <= 8) {
+            size_t e = s.substr(i, 9).find(L';');               // (looked for close by only)
+            if (e != std::wstring::npos) e += i;
+            if (e != std::wstring::npos) {
                 put_entity(out, s.substr(i + 1, e - i - 1));
                 i = e;
                 continue;
@@ -466,12 +472,13 @@ static std::wstring srt_clean(const std::wstring& s) {
 // and \n line breaks, \h a space
 static std::wstring ass_clean(const std::wstring& s) {
     std::wstring out;
-    bool drawing = false;
+    bool drawing = false, noBrace = false;
     for (size_t i = 0; i < s.size(); ++i) {
         wchar_t c = s[i];
-        if (c == L'{') {
+        if (c == L'{' && !noBrace) {
             size_t e = s.find(L'}', i);
-            if (e != std::wstring::npos) {
+            if (e == std::wstring::npos) noBrace = true;      // (none further on either)
+            else {
                 std::wstring block = s.substr(i, e - i);
                 for (size_t p = block.find(L"\\p"); p != std::wstring::npos; p = block.find(L"\\p", p + 2))
                     if (p + 2 < block.size() && iswdigit(block[p + 2])) drawing = block[p + 2] != L'0';

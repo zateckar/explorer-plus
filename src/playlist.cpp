@@ -344,6 +344,11 @@ static bool resolve(std::wstring p, const std::wstring& dir, bool uri, std::wstr
     p = trim(p);
     if (p.empty()) return false;
     if (media_url(p)) { out = p; return true; }
+    // \\?\C:\... and \\?\UNC\server\... as the paths they are; devices (\\.\..., \\?\Volume...) not at all
+    if (p.rfind(L"\\\\?\\UNC\\", 0) == 0) p = L"\\\\" + p.substr(8);
+    else if (p.rfind(L"\\\\?\\", 0) == 0 && p.size() >= 7 && p[5] == L':' && p[6] == L'\\') p = p.substr(4);
+    else if (p.rfind(L"\\\\?\\", 0) == 0 || p.rfind(L"\\\\.\\", 0) == 0 || p.rfind(L"//./", 0) == 0 || p.rfind(L"//?/", 0) == 0)
+        return false;
     size_t colon = p.find(L':');
     if (colon != std::wstring::npos && colon > 1) {             // (a scheme, not a drive letter)
         if (_wcsnicmp(p.c_str(), L"file:", 5) != 0) return false;
@@ -386,7 +391,7 @@ std::vector<PlaylistEntry> playlist_parse(const std::wstring& text, const std::w
                 pending = {};
                 size_t comma = line.find(L',', 8);
                 double secs = wcstod(line.c_str() + 8, nullptr);
-                if (secs > 0) pending.duration = (long long)(secs * 10000000.0 + 0.5);
+                if (secs > 0 && secs < 1e9) pending.duration = (long long)(secs * 10000000.0 + 0.5);
                 if (comma != std::wstring::npos) pending.title = trim(line.substr(comma + 1));
             }
             continue;
@@ -420,7 +425,7 @@ std::vector<PlaylistEntry> playlist_parse_pls(const std::wstring& text, const st
             e.title = value;
         } else if (_wcsicmp(name.c_str(), L"Length") == 0) {
             double secs = wcstod(value.c_str(), nullptr);
-            if (secs > 0) e.duration = (long long)(secs * 10000000.0 + 0.5);
+            if (secs > 0 && secs < 1e9) e.duration = (long long)(secs * 10000000.0 + 0.5);
         }
     }
     std::vector<PlaylistEntry> out;
@@ -433,8 +438,10 @@ std::vector<PlaylistEntry> playlist_parse_pls(const std::wstring& text, const st
 static std::wstring xml_unescape(const std::wstring& s) {
     std::wstring out;
     for (size_t i = 0; i < s.size(); ++i) {
-        size_t semi = s[i] == L'&' ? s.find(L';', i) : std::wstring::npos;
-        if (semi == std::wstring::npos || semi - i > 10) { out += s[i]; continue; }
+        // (the ';' looked for close by: a text of '&'s isn't searched to its end for each)
+        size_t semi = s[i] == L'&' ? s.substr(i, 11).find(L';') : std::wstring::npos;
+        if (semi == std::wstring::npos) { out += s[i]; continue; }
+        semi += i;
         std::wstring ent = s.substr(i + 1, semi - i - 1);
         unsigned long cp = 0;
         if (ent == L"amp") cp = L'&';
@@ -525,7 +532,7 @@ std::vector<PlaylistEntry> playlist_parse_xml(const std::wstring& text, const st
                     if (!resolve(value, dir, true, cur.path)) cur.path.clear();
                 } else if (name == L"duration" && inEntry && xspf) {
                     double ms = wcstod(value.c_str(), nullptr);
-                    if (ms > 0) cur.duration = (long long)(ms * 10000.0 + 0.5);
+                    if (ms > 0 && ms < 1e12) cur.duration = (long long)(ms * 10000.0 + 0.5);     // (under 30 years)
                 }
                 field.clear();
             }
@@ -611,6 +618,38 @@ std::string playlist_encode(const std::wstring& text, bool m3u8) {
     return narrow(CP_UTF8, 0, nullptr);
 }
 
+// a UNC path's server, lower case; empty: not a UNC path
+static std::wstring unc_server(const std::wstring& p) {
+    if (p.size() < 3 || (p[0] != L'\\' && p[0] != L'/') || (p[1] != L'\\' && p[1] != L'/')) return {};
+    size_t end = p.find_first_of(L"\\/", 2);
+    std::wstring s = p.substr(2, end == std::wstring::npos ? std::wstring::npos : end - 2);
+    for (auto& c : s) c = (wchar_t)towlower(c);
+    return s;
+}
+
+void playlist_drop_remote(std::vector<PlaylistEntry>& entries, const std::wstring& dir) {
+    std::wstring own = unc_server(dir);
+    entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const PlaylistEntry& e) {
+        std::wstring s = unc_server(e.path);
+        return !s.empty() && s != own;
+    }), entries.end());
+}
+
+// downloaded (the Mark of the Web: the Internet or Restricted zone)
+static bool from_internet(const std::wstring& file) {
+    HANDLE h = CreateFileW((file + L":Zone.Identifier").c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    char buf[1024];
+    DWORD got = 0;
+    bool ok = ReadFile(h, buf, sizeof(buf) - 1, &got, nullptr);
+    CloseHandle(h);
+    if (!ok) return true;                       // (marked, unreadable: as downloaded)
+    buf[got] = 0;
+    const char* z = strstr(buf, "ZoneId=");
+    return !z || atoi(z + 7) >= 3;
+}
+
 bool playlist_load(const std::wstring& file, std::vector<PlaylistEntry>& out) {
     HANDLE h = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                            OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
@@ -627,6 +666,7 @@ bool playlist_load(const std::wstring& file, std::vector<PlaylistEntry>& out) {
     if (!ok) return false;
     std::wstring dir = file.substr(0, file.find_last_of(L"\\/") + 1);
     out = playlist_parse_any(ini_decode(raw), dir, playlist_kind(file));
+    if (from_internet(file)) playlist_drop_remote(out, dir);
     return true;
 }
 

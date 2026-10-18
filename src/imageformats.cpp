@@ -702,14 +702,20 @@ bool attr(const std::string& tag, const char* name, std::string& out) {
 
 bool svg_size(const std::string& text, double& w, double& h) {
     size_t at = 0;
-    for (;;) {                                          // the first <svg ...> (not in a comment)
-        at = text.find("<svg", at);
+    for (;;) {                                          // the first <svg ...> (not in a comment), in one pass
+        at = text.find('<', at);
         if (at == std::string::npos) return false;
-        size_t c = text.rfind("<!--", at), ce = c == std::string::npos ? 0 : text.find("-->", c);
-        if (c != std::string::npos && (ce == std::string::npos || ce > at)) { at = ce == std::string::npos ? text.size() : ce; continue; }
-        char after = at + 4 < text.size() ? text[at + 4] : 0;
-        if (isspace((unsigned char)after) || after == '>' || after == '/') break;
-        at += 4;
+        if (text.compare(at, 4, "<!--") == 0) {
+            size_t ce = text.find("-->", at + 4);
+            if (ce == std::string::npos) return false;
+            at = ce + 3;
+            continue;
+        }
+        if (text.compare(at, 4, "<svg") == 0) {
+            char after = at + 4 < text.size() ? text[at + 4] : 0;
+            if (isspace((unsigned char)after) || after == '>' || after == '/') break;
+        }
+        ++at;
     }
     size_t end = text.find('>', at);
     std::string tag = text.substr(at + 4, end == std::string::npos ? std::string::npos : end - at - 4);

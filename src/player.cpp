@@ -1749,12 +1749,17 @@ void walk(const std::wstring& dir, int depth, std::vector<std::wstring>& out) {
 
 // a playlist's files that are there, and its streams (one listed in it: its files, a few
 // levels down); the titles it gives, kept for the queue
-void expand_playlist(const std::wstring& file, int depth, std::vector<std::wstring>& out) {
+// (each playlist read once: one listing itself, or two each other, isn't read without end)
+void expand_playlist(const std::wstring& file, int depth, std::vector<std::wstring>& out, std::vector<std::wstring>& seen) {
     std::vector<PlaylistEntry> entries;
-    if (depth > 3 || !playlist_load(file, entries)) return;
+    if (depth > 3 || seen.size() >= 64) return;
+    for (auto& s : seen)
+        if (lstrcmpiW(s.c_str(), file.c_str()) == 0) return;
+    seen.push_back(file);
+    if (!playlist_load(file, entries)) return;
     for (auto& e : entries) {
         if (out.size() >= kMaxFiles) return;
-        if (playlist_file(e.path)) { expand_playlist(e.path, depth + 1, out); continue; }
+        if (playlist_file(e.path)) { expand_playlist(e.path, depth + 1, out, seen); continue; }
         bool there = media_url(e.path) || (player_file(e.path) && GetFileAttributesW(e.path.c_str()) != INVALID_FILE_ATTRIBUTES);
         if (!there) continue;
         list_title_put(e.path, e.title);
@@ -1769,7 +1774,10 @@ std::vector<std::wstring> expand(const std::vector<MediaItem>& items) {
         DWORD a = GetFileAttributesW(it.path.c_str());
         if (a == INVALID_FILE_ATTRIBUTES) continue;
         if (a & FILE_ATTRIBUTE_DIRECTORY) walk(it.path, 0, out);     // (a folder: its sound and video only)
-        else if (playlist_file(it.path)) expand_playlist(it.path, 0, out);
+        else if (playlist_file(it.path)) {
+            std::vector<std::wstring> seen;
+            expand_playlist(it.path, 0, out, seen);
+        }
         else if (player_file(it.path)) out.push_back(it.path);
     }
     return out;

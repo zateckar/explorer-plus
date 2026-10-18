@@ -108,7 +108,10 @@ std::wstring playlist_write(const std::vector<PlaylistEntry>& entries, const std
 // character (as players of old expect), else UTF-8 too
 std::string playlist_encode(const std::wstring& text, bool m3u8);
 
-// read / write a playlist file (false: couldn't)
+// the entries on another computer (\\server\...) than the playlist's own `dir` taken out: a
+// downloaded playlist doesn't make Windows sign in to a server it names
+void playlist_drop_remote(std::vector<PlaylistEntry>& entries, const std::wstring& dir);
+// read / write a playlist file (false: couldn't; a downloaded one: playlist_drop_remote)
 bool playlist_load(const std::wstring& file, std::vector<PlaylistEntry>& out);
 bool playlist_save(const std::wstring& file, const std::vector<PlaylistEntry>& entries);
 
