@@ -18,6 +18,11 @@ MiniDumpWriteDumpFn s_write = nullptr;
 WCHAR s_dir[MAX_PATH]{};                 // %LOCALAPPDATA%\ExplorerPlus\crashes
 
 constexpr DWORD kTerminateCode = 0xE0000001;   // "uncaught C++ exception" in the dump
+constexpr DWORD kDumpWaitMs = 15000;           // (a dump that hangs, on a broken heap or a held lock: not minutes of a frozen window)
+
+// the sync agent holds vault keys and storage secrets in memory: its dumps keep to the
+// stacks, without the memory they point to
+volatile bool s_lean = false;
 
 struct DumpJob { EXCEPTION_POINTERS* ep; DWORD tid; };
 
@@ -36,9 +41,8 @@ void write_dump(EXCEPTION_POINTERS* ep, DWORD tid) {
     HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return;
     MINIDUMP_EXCEPTION_INFORMATION mei{ tid, ep, FALSE };
-    s_write(GetCurrentProcess(), GetCurrentProcessId(), f,
-            MINIDUMP_TYPE(MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules),
-            &mei, nullptr, nullptr);
+    DWORD type = MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules | (s_lean ? 0 : MiniDumpWithIndirectlyReferencedMemory);
+    s_write(GetCurrentProcess(), GetCurrentProcessId(), f, MINIDUMP_TYPE(type), &mei, nullptr, nullptr);
     CloseHandle(f);
 }
 
@@ -50,17 +54,23 @@ DWORD WINAPI dump_thread(void* p) {
 
 // The dump is written from a fresh thread: the crashing one may have overflowed its
 // stack, and dbghelp walks the faulting thread best from outside it.
+// Another thread faulting meanwhile waits for that dump (returning at once, Windows Error
+// Reporting would end the process halfway through the file).
 void dump_once(EXCEPTION_POINTERS* ep) {
-    static volatile LONG once = 0;
-    if (InterlockedExchange(&once, 1)) return;
+    static volatile LONG once = 0, done = 0;
+    if (InterlockedExchange(&once, 1)) {
+        for (DWORD waited = 0; !done && waited < kDumpWaitMs; waited += 50) Sleep(50);
+        return;
+    }
     DumpJob job{ ep, GetCurrentThreadId() };
     HANDLE t = CreateThread(nullptr, 256 * 1024, dump_thread, &job, 0, nullptr);
     if (t) {
-        WaitForSingleObject(t, 120000);
+        WaitForSingleObject(t, kDumpWaitMs);
         CloseHandle(t);
     } else {
         write_dump(ep, job.tid);
     }
+    done = 1;
 }
 
 LONG WINAPI on_crash(EXCEPTION_POINTERS* ep) {
@@ -130,3 +140,5 @@ void crash_init() {
     SetUnhandledExceptionFilter(on_crash);
     std::set_terminate(on_terminate);
 }
+
+void crash_lean_dumps() { s_lean = true; }

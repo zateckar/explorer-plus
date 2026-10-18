@@ -183,6 +183,8 @@ if(EXPLORERPLUS_TESTS)
     target_link_options(explorer-plus-tests PRIVATE -municode -static -static-libgcc -static-libstdc++)
     target_link_libraries(explorer-plus-tests PRIVATE shell32 shlwapi)
     add_test(NAME unit COMMAND explorer-plus-tests)
+    # the decoders and parsers on damaged input, longer and from another seed than the unit run
+    add_test(NAME fuzz COMMAND explorer-plus-tests --fuzz 400000)
 
     # the sync feature: crypto (published vectors), file format, names, planner, engine, stores
     add_executable(explorer-plus-sync-tests tests/sync_tests.cpp tests/sync_engine_tests.cpp tests/sync_crypt_tests.cpp tests/sync_git_tests.cpp tests/sync_azdo_tests.cpp tests/sync_s3_tests.cpp tests/sync_bench.cpp ${EP_SYNC_CORE_SOURCES})

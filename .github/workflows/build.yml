@@ -123,6 +123,14 @@ jobs:
         shell: pwsh
         run: python -I tools/smoke_test.py build-release/explorer-plus.exe build-smoke
 
+      - name: Sync end to end (three agents, one Folder store)
+        # a signal for now: it needs Credential Manager, which a runner's account may not
+        # have (a failure here shows in the log, it doesn't fail the build)
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: pwsh
+        run: python -I tools/sync_test.py build-release/explorer-plus.exe build-sync-e2e
+
       - name: Smoke test screenshots
         if: always() && steps.smoke.outcome == 'failure'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -937,6 +937,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     {
         // the sync agent and its command line: no windows of the app's own
         CommandLine sc = parse_command_line(GetCommandLineW());
+        if (sc.sync || sc.syncCli) crash_lean_dumps();
         if (sc.sync) std::_Exit(sync_agent_main(sc.headless));
         if (sc.syncCli) std::_Exit(sync_cli_main(sc.syncArgs));
     }

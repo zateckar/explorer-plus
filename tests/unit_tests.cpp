@@ -1389,8 +1389,8 @@ static void text_operations() {
 }
 
 // damaged and hostile input: the decoders and parsers neither crash nor take quadratic time
-static void fuzz() {
-    uint64_t seed = 0x9E3779B97F4A7C15ull;
+// (--fuzz N [seed]: N rounds alone, the longer run ctest makes as well)
+static void fuzz(int rounds = 4000, uint64_t seed = 0x9E3779B97F4A7C15ull) {
     auto rnd = [&]() { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; };
     using V = std::vector<uint8_t>;
     auto be = [](V& v, uint32_t x) { for (int sh = 24; sh >= 0; sh -= 8) v.push_back((uint8_t)(x >> sh)); };
@@ -1410,7 +1410,7 @@ static void fuzz() {
     RawImage im;
     int cw = 0, ch = 0;
     std::vector<ApngFrame> frames;
-    for (int it = 0; it < 4000; ++it) {
+    for (int it = 0; it < rounds; ++it) {
         auto& [ext, base] = seeds[it % seeds.size()];
         V d = base;
         size_t extra = rnd() % 600;
@@ -1448,7 +1448,12 @@ static void fuzz() {
     quick("json [", [&] { std::wstring o; format_json(std::wstring(big, L'['), false, o, nullptr); });
 }
 
-int wmain() {
+int wmain(int argc, wchar_t** argv) {
+    if (argc >= 3 && wcscmp(argv[1], L"--fuzz") == 0) {
+        fuzz(_wtoi(argv[2]), argc >= 4 ? _wcstoui64(argv[3], nullptr, 0) : 0x2545F4914F6CDD1Dull);
+        std::printf("%d/%d checks passed\n", s_run - s_failed, s_run);
+        return s_failed ? 1 : 0;
+    }
     fuzz();
     user_choice();
     text_files();
