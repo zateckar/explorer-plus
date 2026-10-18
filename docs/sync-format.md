@@ -86,6 +86,7 @@ rsalt=<base64 of the recovery key's 16-byte Argon2id salt>
 rmem=<Argon2id memory, KiB>
 rpasses=<Argon2id passes>
 recovery=<base64 SEAL(Argon2id(recovery key, rsalt, rmem, rpasses), "ep recovery", ring)>
+manifest=1                      (the vault keeps a manifest; absent in vaults from before them)
 signer=<deviceId of the device that wrote it>
 sig=<base64 SIGN(signer, "ep vault object", every byte of the object before this line)>
 ```
@@ -149,6 +150,76 @@ know yet. "New recovery key" also makes a new generation and hands it over the s
 16 random bytes, rewritten after every pass that changed something. Stores without a change
 feed (S3, Folder) poll its revision (ETag / time) instead of listing everything. Git
 backends don't use it (`ls-remote` does the same).
+
+### `.ep-vault/manifest` and `.ep-vault/m/<32 hex>` (the manifest)
+
+Every file of the vault, signed by the member device that wrote the list. A device takes
+the storage as the manifest says, so the storage can't withhold, roll back, replace or
+plant files unnoticed, across the whole tree (`sync_manifest.cpp`).
+
+```
+root  = "EPM1" | key version v (u32) | signer deviceId (16 ASCII) | n (u32)
+        | SEAL(KDF(VK_v, "ep manifest"), the 24 bytes before n, body) (n bytes)
+        | SIGN(signer, "ep manifest", every byte before this)
+body  = vault id (16) | seq (u64) | written (u64 FILETIME) | placement version p (u32)
+        | count (u32, a power of two) | count × BLAKE2b-256 of shard i
+shard = "EPMS" | key version w (u32) | index i (u32)
+        | SEAL(KDF(VK_w, "ep manifest"), "EPMS" | w | i | vault id, entries)
+entries = n (u32) | n × (path length (u16) | plaintext path, '/'-separated UTF-8
+        | size (u64) | version counter (u64) | BLAKE2b-256 of the plaintext (32)
+        | revision length (u16) | the stored object's revision)
+```
+
+A shard is stored under the first 16 bytes of its BLAKE2b-256, in hex. A path is in shard
+`BLAKE2b-256 keyed with KDF(VK_p, "ep manifest shard") over the path, first 4 bytes (LE)
+mod count`; about 1,000 files a shard. A new manifest keeps the bytes (and name) of every
+shard whose files didn't change, keeps the placement version while the shard count stays,
+and deletes the shards the old root named and the new one doesn't. `seq` grows by one with
+each manifest; the hash is zero for files taken in from a listing (below).
+
+**Reading.** The root's signer must be a member of the reader's ring, not removed, and the
+signature must check, except when the root is byte for byte the one this device took
+before (`manifest.pin`): what a device since removed wrote while it was a member. A root
+with a lower `seq` than the pin is rolled back. Each shard must hash to the root's entry,
+open, and hold only paths that belong in it. Then the plaintext listing is what the manifest
+lists, at its sizes and revisions:
+
+| the storage shows | the device sees | reported as |
+|---|---|---|
+| the listed revision | the file | — |
+| no file (withheld, deleted) | the file at the listed revision: not deleted here | "the storage doesn't have it" |
+| another revision (rolled back, replaced) | the file at the listed revision: not downloaded | "isn't the version the manifest lists" |
+| a file the manifest doesn't list (planted, brought back) | nothing | "the manifest doesn't list it" |
+
+A disagreement is reported once it has stood 15 minutes (`EXPLORERPLUS_SYNC_MANIFEST_GRACE`,
+seconds): on stores without transactions another device's files are on the storage a moment
+before its manifest. A download of the listed revision must hash to the listed BLAKE2b
+(Folder revisions can be put back; contents can't); within the grace period a mismatch is a
+quiet retry, after it tampered. The next upload of such a file goes over what the storage
+has, which repairs it. Versions restored from the history aren't in the manifest and aren't
+checked against it.
+
+**Writing.** Every commit with uploads, deletions or moves writes the next manifest: this
+device's changes over the manifest it read, a change replacing an entry only when that
+entry's version counter isn't higher (another device's later write wins).
+- Transactional stores (git, Azure DevOps): the new shards, the root (conditional on the
+  root that was read) and the removal of the old shards go into the same commit as the files.
+- Other stores: after the files, a conditional write of the root; when another device wrote
+  one meanwhile, this device reads it and applies its changes again (up to 6 times). Until a
+  manifest with them is written, the changes stay in `manifest.own` (On the PC), are counted
+  as listed, and are written at the next pass.
+
+**No manifest.** If this device has seen one (pin), or the vault object says `manifest=1`
+and there are files, the vault is tampered. A vault from before manifests (no `manifest=1`):
+the first device with them takes the files there as the start (hash unknown, version 0),
+writes manifest 1 and adds `manifest=1` to the vault object (signed again, only if it is
+still the object it opened). New vaults have `manifest=1` from the start.
+
+**Removed devices.** When a vault moves to a new key version (a device removed, a new
+recovery key), the device that moves it writes the root again under the new version, signed
+by itself, with the same shards and `seq + 1`. It accepts the old root's writer even if it
+was just removed (only the seal is checked then). What the removed device signs afterwards
+is refused.
 
 ### Names
 
@@ -234,6 +305,13 @@ subfolder. Commits carry a neutral author `Explorer Plus <sync@localhost>` and t
   if it is noted. A file that may hold retired content is uploaded again under the
   current version rather than moved. The first time a device sees a vault with retired
   versions it notes everything there (trust on first use).
+- **`Sync\pairs\<id>\manifest.pin`**: the manifest this device last took or wrote, as text:
+  `EPMP`, then `seq=` and `hash=` (BLAKE2b-256 of the root, hex). A root with a lower `seq`,
+  or no root at all, is refused as tampered.
+- **`Sync\pairs\<id>\manifest.own`** (stores without transactions): this device's writes not
+  in a manifest yet. Records `kind (1 written, 2 removed) | entry (as in a shard) | first 8
+  bytes of BLAKE2b-256 of the record`, appended and flushed after each upload, deletion or
+  move; a torn last record is dropped. Deleted once a manifest with them is written.
 
 ## Differences from the plan
 

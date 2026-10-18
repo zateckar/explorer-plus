@@ -174,7 +174,22 @@ Result Engine::list_remote(Ctx& c) {
         it.rev = e.rev;
         m_state.put_remote(it);
     }
-    for (auto& [p, why] : b.problems) problem(p, why);
+    {
+        // a full listing says all the store's problems: the earlier listing's that it
+        // doesn't repeat are over (the storage put things right)
+        std::lock_guard<std::mutex> elk(m_mx);
+        if (b.full) {
+            for (auto& [k, why] : m_listErrors) {
+                auto f = m_errors.find(k);
+                if (f != m_errors.end() && f->second == why) m_errors.erase(f);
+            }
+            m_listErrors.clear();
+        }
+        for (auto& [p, why] : b.problems) {
+            m_errors[key_of(p)] = why;
+            m_listErrors[key_of(p)] = why;
+        }
+    }
     m_state.set_value("cursor", b.cursor);
     m_state.set_value("token", newToken);
     m_state.set_value("listed", "1");

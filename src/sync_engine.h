@@ -104,6 +104,7 @@ private:
     std::set<std::wstring> m_active;    // keys being transferred now
     std::set<std::wstring> m_pending;   // keys with work planned
     std::map<std::wstring, std::wstring> m_errors;   // key -> why
+    std::map<std::wstring, std::wstring> m_listErrors;   // the last listing's problems (gone when it no longer has them)
     std::atomic<bool> m_paused{ false };
     int m_confirm = 0;                  // 1: delete confirmed, -1: restore
 };

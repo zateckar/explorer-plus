@@ -29,15 +29,17 @@ env variables are set), `tools/sync_test.py` (three devices through the agents, 
 Folder store and Azure DevOps) and `explorer-plus-sync-tests --bench` ("Benchmark" below).
 
 Deferred, out of this plan's scope (decided 2026-10-17): phase 7, each item "later, on its
-own", except two asked for on 2026-10-18: Azure DevOps over its REST API (built) and the
+own", except two asked for on 2026-10-18 and built: Azure DevOps over its REST API and the
 signed per-vault manifest.
 
 The independent review of the cryptography is in [sync-review.md](sync-review.md). Its
 clear-cut findings are fixed. S1 and S2 (a removed device that keeps write access to the
 storage) are fixed as far as the format allows: a member list in the ring, device-signed
-key objects, and a note of retired key versions. A short window remains until each device
-has caught up with the removal, so a removal should still come with revoking that device's
-storage credentials.
+key objects, a note of retired key versions, and the signed per-vault manifest (every file
+with its revision and hash, signed by a member; files the storage withholds, rolls back or
+plants are reported instead of taken). A short window remains until each vault has moved
+on from the removal, so a removal should still come with revoking that device's storage
+credentials.
 
 *Recovery key, as built*: the Sync folders window keeps the recovery key it shows (or the
 one typed to unlock this PC) in Credential Manager beside the key ring. "Show recovery
@@ -286,9 +288,11 @@ Not protected (documented in the README, shown once at setup):
 
 - **metadata shape**: how many files and folders there are, the folder nesting, each
   file's size rounded up to 64 KiB, and when and how often things change;
-- the storage **withholding, deleting or rolling back** individual files to an older
-  version it kept (it can't forge new ones). Rollback of a file we've already seen a newer
-  version of is detected and reported (the base remembers each file's version counter);
+- the storage **withholding, deleting or rolling back** files: it can't make it pass
+  unnoticed, but it can do it. Since the signed manifest (sync-format.md) such files are
+  reported, kept as they are locally, and not taken by a device that doesn't have them yet;
+  a whole vault rolled back is refused by every device that saw it later. A device with no
+  history of the vault (new, re-paired) can still be shown an older consistent state;
 - a **compromised device**: whoever controls a PC that has the keys can read everything.
   Removing the device (below) locks it out of everything written afterwards, and only that;
 - **losing every device and the recovery key** means the data is gone for good. Nobody can
@@ -901,8 +905,9 @@ by tests only.
      loaded at run time; the few declarations in a compat header (like `pkeys_compat.h`).
      Needs a spike: registering the root in Explorer's navigation pane may need package
      identity for an unpackaged exe.
-   - Size padding beyond 64 KiB steps (hides sizes better, costs space), and a signed
-     per-vault manifest to detect withheld or rolled-back files across the whole tree.
+   - Size padding beyond 64 KiB steps (hides sizes better, costs space).
+   - A signed per-vault manifest to detect withheld or rolled-back files across the whole
+     tree. *Built 2026-10-18*, see sync-format.md "Manifest".
    - TPM / Windows Hello protection of the local key ring.
    - Azure DevOps over its REST API (no git.exe needed). *Built 2026-10-18*, see "Azure
      DevOps Git".
@@ -913,8 +918,9 @@ by tests only.
 
 `third_party/monocypher/` (`monocypher.c`, `monocypher.h`, licence), `src/crypto,
 crypto_file, credstore, proc, http, sigv4, sync_backend.h, sync_paths, sync_ignore,
-sync_state, sync_local, sync_plan, sync_engine, sync_crypt, sync_keys, sync_folder,
-sync_s3, sync_git, sync_azdo, sync_ipc, sync_agent, sync_ui` (+ `.h`),
+sync_state, sync_local, sync_plan, sync_engine, sync_crypt, sync_keys, sync_manifest,
+sync_folder, sync_s3, sync_git, sync_azdo, sync_azdo_rest, json, sync_ipc, sync_agent,
+sync_ui` (+ `.h`),
 `docs/sync-format.md`, `tests/` additions, `tools/sync_test.py`; `project(... LANGUAGES C
 CXX RC)`; libraries `winhttp bcrypt advapi32` (Credential Manager) `credui`
 (re-authentication prompt). The pure ones (`crypto*` with Monocypher, `sigv4`,

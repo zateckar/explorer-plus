@@ -79,12 +79,22 @@ Result setup_ring(KeyStore& ks, std::string& recoveryCode);
 // this device's key pair (created on first use, named after the computer)
 DeviceKey device_key(KeyStore& ks);
 
+// signatures of the user's devices (EdDSA over the context string and the message)
+void sign_as(const DeviceKey& me, const char* ctx, const uint8_t* msg, size_t n, uint8_t sig[crypto::kSig]);
+bool signed_by(const crypto::Key& spub, const char* ctx, const uint8_t* msg, size_t n, const uint8_t sig[crypto::kSig]);
+
 // An open vault: what the encrypting layer needs. Shared by the pair's backend objects.
 struct Vault {
     std::string id;                          // 32 hex
     uint32_t current = 0;                    // VK version new uploads and names use
     std::map<uint32_t, crypto::Key> vks;
     std::string rev;                         // the vault object's revision when it was read (not stored)
+    // the manifest (sync_manifest.h): the vault object says the vault keeps one (then a
+    // missing manifest is the storage's doing); who signs and who is believed
+    bool manifest = false;
+    DeviceKey me;                            // this device: signs the manifests it writes
+    std::vector<Ring::Member> members;
+    std::vector<std::string> removed;
     bool key(uint32_t version, crypto::Key& out) const {
         auto f = vks.find(version);
         if (f == vks.end()) return false;
@@ -122,6 +132,11 @@ struct VaultPin {
     bool save(const std::wstring& file) const;
 };
 Result open_vault(sync::Backend& raw, KeyStore& ks, bool create, Vault& out, sync::Progress& prog, VaultPin* pin = nullptr);
+
+// the vault object says the vault keeps a manifest (set once its first manifest is written;
+// new vaults have it from the start): from then on a missing manifest is the storage's doing.
+// Only the object this device opened (v.rev) is re-signed.
+Result mark_manifest(sync::Backend& raw, const Vault& v, sync::Progress& prog);
 
 // "Add a device": a pairing grant in the vault (the ring under Argon2id(code)), valid 15
 // minutes; the code is returned for display.

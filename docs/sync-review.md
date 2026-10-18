@@ -32,7 +32,7 @@ objects are refused. Nothing had been released, so no migration is needed.
 | # | severity | finding | status |
 |---|---|---|---|
 | S1 | **critical** | A removed device that can still write to the storage gets the next ring back (forged hand-over, planted device record, rolled-back vault) | **fixed** (members, signatures; key objects v2); the window before a device hears of the removal stays |
-| S2 | high | A removed device can still write files and names that the remaining devices accept | **narrowed** (retired key versions); what stays open is listed |
+| S2 | high | A removed device can still write files and names that the remaining devices accept | **narrowed** (retired key versions), then mostly **closed** by the signed manifest; what stays open is listed |
 | S3 | high | Retried uploads re-encrypted under the same salt: nonce reuse when the file changed between attempts | **fixed** |
 | S4 | high | "New recovery key" left the old key able to open everything, including what is written later | **fixed** |
 | S5 | medium | The vault object can be rolled back, swapped for another vault of the user's, or deleted | **fixed** (pin) |
@@ -143,7 +143,7 @@ forgeries for (a)), plus `test_ring_codec`.
   that exact object. A device that first meets the location after the removal refuses it
   until a pinned device moves it on.
 
-### S2 (high, narrowed): a removed device can still write accepted content
+### S2 (high, narrowed, then mostly closed): a removed device can still write accepted content
 
 Vault key versions from before a removal must stay readable, because old files use
 them. Nothing marked them as superseded for *writing*. A removed device that can still
@@ -177,20 +177,35 @@ or new files) is refused as `Tampered`, or reported as a problem. Local copies s
 they were. Test: `test_removal_hardening`, the S2 part, which also restarts a device to
 check that the note persists.
 
-**What stays open (the signed per-vault manifest of phase 7 closes all of it; member
-signing keys now exist for it):**
-- **Until each device notes the storage.** Writes D makes between the removal and a
-  device's next listing after the vault changed are noted as legitimate *by that device*.
-  For a running device that's one poll; for one that is off, until it next starts.
-- **Trust on first use.** A device that first sees the vault after the removal (a new pair,
-  a re-paired device) notes everything there.
-- **Folder revisions.** On a Folder store the revision is size + time + file ID. D can
-  overwrite a noted file in place with the same size and put the time back; the revision
-  is then unchanged and the content accepted. Git, S3 and Azure DevOps revisions follow
-  the content.
-- **Deleting, withholding, rolling back.** D (like the storage) can delete files, or put
-  back an older ciphertext of a file that was written under the current version. These
-  are the known limitations (I9).
+**Then the signed per-vault manifest (2026-10-18, sync-format.md "Manifest").** Every file
+of the vault, with its revision and plaintext hash, in a list signed by the member device
+that wrote it; the devices take the storage as the list says. That closes most of what the
+note left open:
+- **Writes after the removal.** What D writes isn't in any manifest a member wrote: hidden
+  and reported, on every device, a new or re-paired one too (the note only covered devices
+  that had listed the storage). D can't write a manifest of its own: a root signed by a
+  removed device is refused.
+- **Deleting, withholding, rolling back** (I9), by D or by the storage: a file the manifest
+  lists stays as it is locally and is reported. A device that doesn't have it yet doesn't
+  take an older ciphertext for it (the download must hash to the listed BLAKE2b). A whole
+  vault put back to an earlier state, manifest and all, is refused by every device that saw
+  a later manifest (`manifest.pin`).
+- **Folder revisions.** A file overwritten in place with its revision put back fails the
+  hash check.
+Tests: `test_manifest_attacks` (both store kinds), `test_manifest_window`,
+`test_manifest_upgrade`, and the forged root in `test_removal_hardening`.
+
+**What stays open:**
+- **The other vaults' window.** The device that moves a vault to the new key version signs
+  its root again, and takes the root it finds whoever wrote it (the writer may be the
+  device just removed). For the vault "Remove device" works on, that's the removal itself.
+  For the user's other vaults it's when a device next opens them, so a root D forges under
+  the old key version before then is taken.
+- **Trust on first use.** A vault from before manifests takes the files there when its
+  first manifest is written. A device with no pin (new, re-paired) can be shown an older
+  but consistent state of the whole vault.
+- **Availability.** D, like the storage, can still delete everything or refuse writes; the
+  devices report it, and keep their copies.
 - **Devices that were behind.** A device that wrote under the old version before it
   learned of the rotation sees its files refused by the others until they are edited
   again, or until "Re-encrypt" rewrites them.
@@ -354,10 +369,11 @@ current generation's.
   compromised device is out of scope) but is noted for I1.
 - **I9, known limitations, confirmed.**
   - Content isn't bound to its path: the storage can swap files or serve an old version
-    of a file when this device hasn't seen a newer one.
+    of a file when this device hasn't seen a newer one. *Since the signed manifest:* a
+    swapped or older file doesn't hash to what the manifest lists for its path, and is
+    reported instead of taken (S2).
   - Sizes are exact.
   - The fingerprint is the plain BLAKE2b, inside the encrypted meta block.
-  - None of these is affected by the fixes above.
 
 ## Checked and found sound
 
@@ -435,4 +451,22 @@ current generation's.
       content, all written by the removed device, are refused by both remaining devices
       (also after a restart); an old file renamed is uploaded again and arrives;
     - after "New recovery key", the ring from an old copy of the vault no longer opens it,
-      and the other devices follow.
+      and the other devices follow;
+    - the manifest: signed again by the remover at the removal; one the removed device
+      writes (under VK_old, listing its file) is refused by both remaining devices.
+  - the signed manifest (S2, later):
+    - `test_manifest_codec`: round trip with 2,500 files in 4 shards; one changed file
+      rewrites one shard; a swapped shard, a flipped byte, another vault, an unknown,
+      removed or impersonated signer, a missing key; the merge rule; the own-writes log
+      with a torn tail; the pin;
+    - `test_manifest_attacks` (transactional store and object store): a withheld file is
+      kept and reported, and fine again when it's back; a rolled-back file is kept on a
+      device that has the newer one, not taken by a new device, and repaired by the next
+      edit; a deleted file brought back isn't taken; the whole storage rolled back is
+      refused; a deleted manifest is refused by a device that saw it and by a new one; a
+      move and a deletion leave no problems anywhere;
+    - `test_manifest_window`: files before their manifest (the manifest write failed, the
+      device restarted) are neither taken nor reported, and arrive with the manifest the
+      own-writes log brings about;
+    - `test_manifest_upgrade` (both store kinds): a vault from before manifests gets its
+      first one and `manifest=1`, and a second device syncs with it.

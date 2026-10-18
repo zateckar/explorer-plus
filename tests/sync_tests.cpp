@@ -347,14 +347,19 @@ int wmain(int argc, wchar_t** argv) {
     std::wstring settingsDir = std::wstring(tmp) + L"ep-sync-tests-" + std::to_wstring(GetCurrentProcessId());
     CreateDirectoryW(settingsDir.c_str(), nullptr);
     SetEnvironmentVariableW(L"EXPLORERPLUS_SETTINGS", (settingsDir + L"\\settings.ini").c_str());
+    // what the storage and the vault's manifest disagree on is reported at once (devices
+    // here take turns, so no other device's write is ever under way)
+    SetEnvironmentVariableW(L"EXPLORERPLUS_SYNC_MANIFEST_GRACE", L"0");
     if (argc > 1 && wcscmp(argv[1], L"--bench") == 0) {
         int r = run_sync_bench(argc > 2 ? _wtoi(argv[2]) : 10000, argc > 3 ? _wcstoui64(argv[3], nullptr, 10) : 2048);
         RemoveDirectoryW(settingsDir.c_str());
         return r;
     }
-    if (argc > 1 && wcscmp(argv[1], L"--azdo") == 0) {        // the Azure DevOps tests alone
+    if (argc > 1 && (wcscmp(argv[1], L"--azdo") == 0 || wcscmp(argv[1], L"--crypt") == 0)) {   // one group alone
         extern void run_azdo_tests();
-        run_azdo_tests();
+        extern void run_crypt_tests();
+        if (wcscmp(argv[1], L"--azdo") == 0) run_azdo_tests();
+        else run_crypt_tests();
         RemoveDirectoryW((settingsDir + L"\\Sync").c_str());
         RemoveDirectoryW(settingsDir.c_str());
         std::printf("%d checks, %d failed\n", t_run, t_failed);

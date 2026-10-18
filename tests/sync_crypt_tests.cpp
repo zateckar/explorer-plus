@@ -6,12 +6,15 @@
 #include "sync_engine.h"
 #include "sync_crypt.h"
 #include "sync_keys.h"
+#include "sync_manifest.h"
 #include "crypto.h"
 #include "crypto_file.h"
 #include "crypto_names.h"
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <set>
 
@@ -26,6 +29,7 @@ struct EDev {
     std::unique_ptr<StateStore> st;
     std::unique_ptr<Engine> eng;
     std::function<std::unique_ptr<Backend>()> raw;
+    bool noManifest = false;                         // an encrypting layer from before manifests
     explicit EDev(const std::wstring& name, std::function<std::unique_ptr<Backend>()> r) : raw(std::move(r)) {
         root = tu::temp_root(name);
         stateDir = tu::temp_root(name + L"-state");
@@ -40,6 +44,7 @@ struct EDev {
         synckeys::Vault v;
         Result r = synckeys::open_vault(*rb, *ks, create, v, p);
         if (!r.ok()) return r;
+        if (noManifest) v.me = {};
         synckeys::KeyStore* k = ks.get();
         auto enc = make_encrypting(std::move(rb), v, [k](Backend& b, synckeys::Vault& nv) { NoProgress np; return synckeys::open_vault(b, *k, false, nv, np); },
                                    stateDir + L"\\retired.dat");
@@ -53,10 +58,10 @@ struct EDev {
         eng = std::make_unique<Engine>(o, std::move(enc), *st);
         return {};
     }
-    PassReport sync() {
+    PassReport sync(bool quiet = false) {
         NoProgress p;
         PassReport r = eng->sync(p);
-        if (!r.result.ok()) std::printf("  sync: %s\n", to_utf8(r.result.message).c_str());
+        if (!r.result.ok() && !quiet) std::printf("  sync: %s\n", to_utf8(r.result.message).c_str());
         if (_wgetenv(L"SYNC_TEST_VERBOSE")) {
             std::printf("  [%ls]\n", root.substr(root.find_last_of(L'\\') + 1).c_str());
             for (auto& l : r.log) std::printf("    %s\n", l.c_str());
@@ -511,6 +516,8 @@ void test_removal_hardening() {
         auto r = raw();
         CHECK(synckeys::remove_device(*r, *a.ks, bk.id, newRecovery, p).ok());
     }
+    // the manifest moved on with the vault: signed by A, under key version 2
+    CHECK(syncman::root_signer(store->objs[syncman::kRootRel].data) == synckeys::device_key(*a.ks).id);
     auto before = object_names(*store);
     tu::write(c.root, L"after.txt", "TOPSECRET-AFTER");
     CHECK(c.sync().result.ok());
@@ -679,7 +686,9 @@ void test_removal_hardening() {
     // version 1 was retired, so what B writes now is refused: a new file, a new folder, an
     // old file overwritten, and a new file's content replaced by one under version 1
     {
-        auto benc = make_encrypting(raw(), bVault);           // B's encrypting layer, as it was
+        synckeys::Vault bOld = bVault;
+        bOld.me = {};                                         // writes no manifest (it'd be refused)
+        auto benc = make_encrypting(raw(), bOld);             // B's encrypting layer, as it was
         CHECK(upload_text(*benc, L"evil.txt", "EVIL-NEW").ok());
         CHECK(upload_text(*benc, L"evil dir/x.txt", "EVIL-DIR").ok());
         CHECK(upload_text(*benc, L"before.txt", "EVIL-OVERWRITE").ok());
@@ -693,6 +702,28 @@ void test_removal_hardening() {
         CHECK(!tu::exists(d->root, L"evil.txt") && !tu::exists(d->root, L"evil dir"));
         CHECK(tu::read(d->root, L"before.txt") == "1" && tu::read(d->root, L"after.txt") == "TOPSECRET-AFTER");
         CHECK(has_problem(*d, L"retired"));
+    }
+    // and a manifest of B's own (under key version 1, listing B's file): refused, whoever
+    // reads it, as long as it stands
+    {
+        crypto::Bytes cur = store->objs[syncman::kRootRel].data;
+        syncman::Manifest m;
+        m.seq = 1000;
+        syncman::Entry e;
+        e.size = 8;
+        e.rev = "x";
+        m.files[L"evil.txt"] = e;
+        syncman::Encoded enc;
+        CHECK(syncman::encode(m, bVault.id, [&](uint32_t v, crypto::Key& k) { return bVault.key(v, k); }, 1, bVault.me, nullptr, enc).ok());
+        for (size_t i = 0; i < enc.shards.size(); ++i) put_raw(*store, syncman::shard_rel(enc.hashes[i]), enc.shards[i]);
+        put_raw(*store, syncman::kRootRel, enc.root);
+        for (EDev* d : { &a, &c }) {
+            PassReport r = d->sync(true);
+            CHECK(r.result.st == Status::Tampered && r.result.message.find(L"removed") != std::wstring::npos);
+            CHECK(!tu::exists(d->root, L"evil.txt") && tu::read(d->root, L"before.txt") == "1");
+        }
+        put_raw(*store, syncman::kRootRel, cur);
+        CHECK(a.sync().result.ok() && c.sync().result.ok());
     }
     // what the remaining devices write still goes through: an old file renamed (uploaded
     // again under the current key, not moved with its old content)
@@ -732,6 +763,336 @@ void test_removal_hardening() {
     CHECK(!tu::exists(a.root, L"evil.txt") && tu::read(a.root, L"before.txt") == "1");
 }
 
+// ------------------------------------------------------------------ the manifest
+void test_manifest_codec() {
+    synckeys::DeviceKey me = synckeys::new_device_key(L"me"), other = synckeys::new_device_key(L"other");
+    synckeys::Vault v;
+    v.id = "00112233445566778899aabbccddeeff";
+    v.current = 1;
+    v.vks[1] = crypto::random_key();
+    v.vks[2] = crypto::random_key();
+    syncman::KeyLookup keys = [&](uint32_t ver, crypto::Key& k) { return v.key(ver, k); };
+    std::vector<synckeys::Ring::Member> members = { me.member() };
+    syncman::MemberLookup member = [&](const std::string& id) -> const synckeys::Ring::Member* {
+        for (auto& m : members) if (m.id == id) return &m;
+        return nullptr;
+    };
+    std::vector<std::string> removedIds;
+    syncman::RemovedLookup removed = [&](const std::string& id) { return std::find(removedIds.begin(), removedIds.end(), id) != removedIds.end(); };
+    syncman::Manifest m;
+    m.seq = 7;
+    for (int i = 0; i < 2500; ++i) {
+        syncman::Entry e;
+        e.size = i;
+        e.version = i % 5;
+        e.hash[0] = (uint8_t)i;
+        e.rev = "r" + std::to_string(i);
+        m.files[L"dir " + std::to_wstring(i % 9) + L"/f\x0160" + std::to_wstring(i) + L".txt"] = e;
+    }
+    syncman::Encoded enc;
+    CHECK(syncman::encode(m, v.id, keys, 1, me, nullptr, enc).ok());
+    CHECK(enc.shards.size() == 4 && syncman::shard_count_for(2500) == 4 && syncman::shard_count_for(1000) == 1);
+    auto read_all = [&](const syncman::Encoded& x, syncman::Root& root, std::map<std::wstring, syncman::Entry>& files) {
+        files.clear();
+        Result r = syncman::read_root(x.root, v.id, keys, member, removed, root);
+        for (size_t i = 0; r.ok() && i < root.shards.size(); ++i) r = syncman::read_shard(x.shards[i], root, i, v.id, keys, files);
+        return r;
+    };
+    syncman::Root root;
+    std::map<std::wstring, syncman::Entry> files;
+    CHECK(read_all(enc, root, files).ok() && root.seq == 7 && root.signer == me.id && files == m.files);
+    // one file changed: one shard written again, the others kept as they were
+    syncman::Manifest m2 = m;
+    m2.seq = 8;
+    m2.files.begin()->second.version = 99;
+    syncman::Previous prev{ &m, root.placement, enc.shards };
+    syncman::Encoded enc2;
+    CHECK(syncman::encode(m2, v.id, keys, 2, me, &prev, enc2).ok());
+    int same = 0;
+    for (size_t i = 0; i < 4; ++i) same += enc2.hashes[i] == enc.hashes[i];
+    CHECK(same == 3);
+    CHECK(read_all(enc2, root, files).ok() && root.version == 2 && root.placement == 1 && files == m2.files);
+    // the shard named in the root, and no other
+    std::swap(enc2.shards[0], enc2.shards[1]);
+    CHECK(read_all(enc2, root, files).st == Status::Tampered);
+    std::swap(enc2.shards[0], enc2.shards[1]);
+    // a flipped byte, another vault, an unknown or removed writer, a missing key
+    auto flipped = enc.root;
+    flipped[40] ^= 1;
+    CHECK(syncman::read_root(flipped, v.id, keys, member, removed, root).st == Status::Tampered);
+    CHECK(syncman::read_root(enc.root, "ffeeddccbbaa99887766554433221100", keys, member, removed, root).st == Status::Tampered);
+    syncman::Encoded byOther;
+    CHECK(syncman::encode(m, v.id, keys, 1, other, nullptr, byOther).ok());
+    CHECK(syncman::read_root(byOther.root, v.id, keys, member, removed, root).st == Status::Tampered);
+    CHECK(syncman::read_root(byOther.root, v.id, keys, member, removed, root, true).ok());       // lenient: the seal decides
+    removedIds.push_back(me.id);
+    CHECK(syncman::read_root(enc.root, v.id, keys, member, removed, root).st == Status::Tampered);
+    removedIds.clear();
+    syncman::KeyLookup none = [](uint32_t, crypto::Key&) { return false; };
+    CHECK(syncman::read_root(enc.root, v.id, none, member, removed, root).st == Status::Locked);
+    // a writer can't pass a signature off under another member's ID
+    auto forged = byOther.root;
+    std::memcpy(forged.data() + 8, me.id.data(), 16);
+    CHECK(syncman::read_root(forged, v.id, keys, member, removed, root).st == Status::Tampered);
+
+    // a later write by another device wins over this device's older one
+    syncman::Manifest base;
+    syncman::Entry newer;
+    newer.version = 5;
+    base.files[L"a"] = newer;
+    base.files[L"b"] = newer;
+    syncman::OwnLog own;
+    syncman::Entry older;
+    older.version = 4;
+    own.put(L"a", older);
+    own.removed(L"b", older);
+    syncman::Entry mine;
+    mine.version = 1;
+    own.put(L"c", mine);
+    syncman::fold(base, own);
+    CHECK(base.files.size() == 3 && base.files[L"a"].version == 5 && base.files.count(L"b") && base.files.count(L"c"));
+    own.items.clear();
+    own.removed(L"a", newer);
+    syncman::fold(base, own);
+    CHECK(!base.files.count(L"a"));
+
+    // the log of own writes survives a torn tail; the pin round-trips
+    std::wstring dir = tu::temp_root(L"mlog");
+    syncman::OwnLog log;
+    log.file = dir + L"\\manifest.own";
+    log.put(L"x/\x0160.txt", newer);
+    log.removed(L"y", older);
+    {
+        HANDLE h = CreateFileW(log.file.c_str(), FILE_APPEND_DATA, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        DWORD n;
+        WriteFile(h, "\x01\x05\x00garb", 8, &n, nullptr);
+        CloseHandle(h);
+    }
+    syncman::OwnLog again;
+    again.file = log.file;
+    again.load();
+    CHECK(again.items.size() == 2 && again.items[L"x/\x0160.txt"].second == newer && again.items[L"y"].first);
+    again.clear();
+    CHECK(!tu::exists(dir, L"manifest.own"));
+    syncman::Pin pin{ 42, "abc" }, pin2;
+    CHECK(pin.save(dir + L"\\manifest.pin") && pin2.load(dir + L"\\manifest.pin") && pin2.seq == 42 && pin2.hash == "abc");
+    tu::rmrf(dir);
+}
+
+// the storage as it is (a copy), and changed as only the storage can: the devices look
+using Objs = std::map<std::wstring, FakeStore::Obj>;
+Objs snapshot(FakeStore& s) {
+    std::lock_guard<std::mutex> lk(s.mx);
+    return s.objs;
+}
+void storage_does(FakeStore& s, const std::function<void(Objs&)>& f) {
+    std::lock_guard<std::mutex> lk(s.mx);
+    f(s.objs);
+    ++s.gen;
+    s.objs[L".ep-vault/head"].rev = s.next_rev();
+}
+
+// A storage that withholds, rolls back, brings back or loses files, or the manifest itself
+// (docs/sync-review.md, S2: what the per-file checks couldn't see)
+void test_manifest_attacks(bool tx) {
+    auto store = std::make_shared<FakeStore>();
+    auto raw = [store, tx] { return std::unique_ptr<Backend>(std::make_unique<FakeBackend>(store, tx)); };
+    EDev a(L"ma", raw), b(L"mb", raw), c(L"mc", raw), d(L"md", raw);
+    NoProgress p;
+    std::string recovery;
+    CHECK(synckeys::setup_ring(*a.ks, recovery).ok());
+    CHECK(a.open(true).ok());
+    for (EDev* x : { &b, &c, &d }) {
+        auto r = raw();
+        CHECK(synckeys::redeem_recovery(*r, *x->ks, recovery, p).ok());
+    }
+    CHECK(b.open(false).ok());
+    tu::write(a.root, L"keep.txt", "KEEP");
+    tu::write(a.root, L"sub/x.txt", "X");
+    tu::write(a.root, L"old.txt", "OLD");
+    CHECK(a.sync().result.ok());
+    auto stored_of = [&](const std::wstring& plain, const std::string& content) {
+        auto before = object_names(*store);
+        tu::write(a.root, plain, content);
+        CHECK(a.sync().result.ok());
+        auto n = new_files(*store, before);
+        CHECK(n.size() == 1);
+        return n.empty() ? std::wstring() : n[0];
+    };
+    std::wstring docStored = stored_of(L"doc.txt", "DOC v1");
+    CHECK(b.sync().result.ok() && same_tree(a, b));
+    CHECK(store->objs.count(syncman::kRootRel) && !objects_under(*store, L".ep-vault/m/").empty());
+    Objs early = snapshot(*store);
+
+    // withheld: the storage hides a file. B keeps it (it used to take that for a deletion
+    // and move its copy to the Recycle Bin) and says so
+    FakeStore::Obj docObj = store->objs[docStored];
+    storage_does(*store, [&](Objs& o) { o.erase(docStored); });
+    b.sync();
+    CHECK(tu::read(b.root, L"doc.txt") == "DOC v1" && has_problem(b, L"doesn't have it"));
+    storage_does(*store, [&](Objs& o) { o[docStored] = docObj; });
+    CHECK(b.sync().result.ok() && !has_problem(b, L"doesn't have it"));
+
+    // rolled back: an edit, then the storage brings the old bytes back. B keeps the edit;
+    // C, new, doesn't take the old bytes for the current version
+    tu::write(a.root, L"doc.txt", "DOC v2");
+    CHECK(a.sync().result.ok() && b.sync().result.ok() && tu::read(b.root, L"doc.txt") == "DOC v2");
+    put_raw(*store, docStored, docObj.data);
+    b.sync();
+    CHECK(tu::read(b.root, L"doc.txt") == "DOC v2" && has_problem(b, L"isn't the version"));
+    CHECK(c.open(false).ok());
+    c.sync();
+    CHECK(!tu::exists(c.root, L"doc.txt") && tu::read(c.root, L"keep.txt") == "KEEP" && has_problem(c, L"isn't the version"));
+    // the next edit repairs it, over what the storage shows
+    tu::write(a.root, L"doc.txt", "DOC v3");
+    CHECK(a.sync().result.ok());
+    for (EDev* x : { &b, &c }) {
+        CHECK(x->sync().result.ok());
+        CHECK(tu::read(x->root, L"doc.txt") == "DOC v3" && !has_problem(*x, L"isn't the version"));
+    }
+
+    // brought back: a deleted file's old object reappears. Not taken again.
+    FakeStore::Obj oldObj;
+    std::wstring oldStored;
+    {
+        auto before = snapshot(*store);
+        tu::remove(a.root, L"old.txt");
+        CHECK(a.sync().result.ok() && b.sync().result.ok() && !tu::exists(b.root, L"old.txt"));
+        for (auto& [path, o] : before)
+            if (!o.isDir && !synckeys::is_vault_path(path) && !store->objs.count(path)) { oldStored = path; oldObj = o; }
+    }
+    CHECK(!oldStored.empty());
+    storage_does(*store, [&](Objs& o) { o[oldStored] = oldObj; });
+    b.sync();
+    CHECK(!tu::exists(b.root, L"old.txt") && has_problem(b, L"doesn't list it"));
+    CHECK(tu::exists(a.root, L"keep.txt"));
+    storage_does(*store, [&](Objs& o) { o.erase(oldStored); });
+    CHECK(b.sync().result.ok() && !has_problem(b, L"doesn't list it"));
+
+    // the whole storage as it was earlier, manifest and all: B has seen a later manifest
+    Objs now = snapshot(*store);
+    storage_does(*store, [&](Objs& o) { o = early; });
+    {
+        PassReport r = b.sync(true);
+        CHECK(r.result.st == Status::Tampered && r.result.message.find(L"rolled back") != std::wstring::npos);
+        CHECK(tu::read(b.root, L"doc.txt") == "DOC v3" && !tu::exists(b.root, L"old.txt"));
+    }
+    storage_does(*store, [&](Objs& o) { o = now; });
+    CHECK(b.sync().result.ok());
+
+    // the manifest gone: B saw it; D, new, finds a vault that says it keeps one
+    storage_does(*store, [&](Objs& o) {
+        for (auto it = o.begin(); it != o.end();)
+            it = it->first == syncman::kRootRel || it->first.compare(0, 12, L".ep-vault/m/") == 0 ? o.erase(it) : std::next(it);
+    });
+    {
+        PassReport r = b.sync(true);
+        CHECK(r.result.st == Status::Tampered && r.result.message.find(L"missing") != std::wstring::npos);
+        CHECK(tu::read(b.root, L"doc.txt") == "DOC v3" && tu::read(b.root, L"keep.txt") == "KEEP");
+        CHECK(d.open(false).ok());
+        r = d.sync(true);
+        CHECK(r.result.st == Status::Tampered && tu::tree(d.root).empty());
+    }
+    storage_does(*store, [&](Objs& o) { o = now; });
+    CHECK(b.sync().result.ok() && d.sync().result.ok() && same_tree(b, d));
+
+    // a moved file and a removed one keep the manifest right (no problems on any device)
+    CHECK(tu::rename(b.root, L"sub/x.txt", L"sub/y.txt"));
+    tu::remove(b.root, L"keep.txt");
+    CHECK(b.sync().result.ok());
+    for (EDev* x : { &a, &c, &d }) {
+        CHECK(x->sync().result.ok());
+        CHECK(same_tree(b, *x) && x->eng->status().problems.empty());
+    }
+}
+
+// a store without transactions: B's files go up, its manifest doesn't (the write fails, B
+// restarts). A meanwhile doesn't take B's files, nor reports them while they may still be
+// on their way; B's log of its own writes gets them into the next manifest.
+void test_manifest_window() {
+    SetEnvironmentVariableW(L"EXPLORERPLUS_SYNC_MANIFEST_GRACE", L"3600");
+    auto store = std::make_shared<FakeStore>();
+    auto raw = [store] { return std::unique_ptr<Backend>(std::make_unique<FakeBackend>(store, false)); };
+    EDev a(L"wa", raw), b(L"wb", raw);
+    NoProgress p;
+    std::string recovery;
+    CHECK(synckeys::setup_ring(*a.ks, recovery).ok());
+    CHECK(a.open(true).ok());
+    tu::write(a.root, L"a.txt", "A");
+    CHECK(a.sync().result.ok());
+    {
+        auto r = raw();
+        CHECK(synckeys::redeem_recovery(*r, *b.ks, recovery, p).ok());
+    }
+    CHECK(b.open(false).ok());
+    CHECK(b.sync().result.ok());
+    store->fault = [](const char* op, const RelPath& path) {
+        return std::strcmp(op, "upload") == 0 && path == syncman::kRootRel ? Status::Offline : Status::Ok;
+    };
+    tu::write(b.root, L"b.txt", "B");
+    tu::write(b.root, L"a.txt", "A, edited on B");
+    b.sync(true);
+    store->fault = nullptr;
+    CHECK(tu::exists(b.stateDir, L"manifest.own"));
+    CHECK(a.sync().result.ok());
+    CHECK(!tu::exists(a.root, L"b.txt") && tu::read(a.root, L"a.txt") == "A" && a.eng->status().problems.empty());
+    CHECK(b.open(false).ok());                                // restarted: the log is all it has
+    CHECK(b.sync().result.ok());
+    CHECK(!tu::exists(b.stateDir, L"manifest.own"));
+    CHECK(a.sync().result.ok());
+    CHECK(tu::read(a.root, L"b.txt") == "B" && tu::read(a.root, L"a.txt") == "A, edited on B" && a.eng->status().problems.empty());
+    SetEnvironmentVariableW(L"EXPLORERPLUS_SYNC_MANIFEST_GRACE", L"0");
+}
+
+// a vault from before manifests: the first device with them takes what's there as the
+// start, and the vault says from then on that it keeps one
+void test_manifest_upgrade(bool tx) {
+    auto store = std::make_shared<FakeStore>();
+    auto raw = [store, tx] { return std::unique_ptr<Backend>(std::make_unique<FakeBackend>(store, tx)); };
+    EDev a(L"ua", raw), b(L"ub", raw);
+    NoProgress p;
+    std::string recovery;
+    CHECK(synckeys::setup_ring(*a.ks, recovery).ok());
+    a.noManifest = true;
+    CHECK(a.open(true).ok());
+    tu::write(a.root, L"one.txt", "1");
+    tu::write(a.root, L"two/three.txt", "3");
+    CHECK(a.sync().result.ok());
+    CHECK(!store->objs.count(syncman::kRootRel));
+    // the vault object as an older version wrote it: no "manifest=1" (signed again by A)
+    {
+        std::lock_guard<std::mutex> lk(store->mx);
+        auto& o = store->objs[L".ep-vault/vault"];
+        std::string s(o.data.begin(), o.data.end());
+        size_t m = s.find("manifest=1\n");
+        CHECK(m != std::string::npos);
+        s.erase(m, 11);
+        s.erase(s.find("sig="));
+        uint8_t sig[crypto::kSig];
+        synckeys::sign_as(synckeys::device_key(*a.ks), "ep vault object", (const uint8_t*)s.data(), s.size(), sig);
+        s += "sig=" + crypto::base64(sig, crypto::kSig) + "\n";
+        o.data.assign(s.begin(), s.end());
+        o.rev = store->next_rev();
+        ++store->gen;
+    }
+    a.noManifest = false;
+    CHECK(a.open(false).ok());
+    CHECK(a.sync().result.ok());
+    CHECK(store->objs.count(syncman::kRootRel));
+    {
+        auto& o = store->objs[L".ep-vault/vault"];
+        CHECK(std::string(o.data.begin(), o.data.end()).find("manifest=1\n") != std::string::npos);
+    }
+    {
+        auto r = raw();
+        CHECK(synckeys::redeem_recovery(*r, *b.ks, recovery, p).ok());
+    }
+    CHECK(b.open(false).ok());
+    CHECK(b.sync().result.ok() && same_tree(a, b) && b.eng->status().problems.empty());
+    tu::write(b.root, L"one.txt", "1, edited");
+    CHECK(b.sync().result.ok() && a.sync().result.ok() && tu::read(a.root, L"one.txt") == "1, edited");
+}
+
 } // namespace
 
 void run_crypt_tests() {
@@ -743,4 +1104,10 @@ void run_crypt_tests() {
     test_tamper();
     test_long_names();
     test_removal_hardening();
+    test_manifest_codec();
+    test_manifest_attacks(false);
+    test_manifest_attacks(true);
+    test_manifest_window();
+    test_manifest_upgrade(false);
+    test_manifest_upgrade(true);
 }

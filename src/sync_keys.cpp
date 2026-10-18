@@ -1,5 +1,6 @@
 #include "sync_keys.h"
 #include "credstore.h"
+#include "sync_manifest.h"
 #include <algorithm>
 #include <cstring>
 #include <set>
@@ -91,6 +92,13 @@ void append_sig(Bytes& b, const DeviceKey& me, const char* ctx) {
     putn(b, sig, crypto::kSig);
 }
 } // namespace
+
+void sign_as(const DeviceKey& me, const char* ctx, const uint8_t* msg, size_t n, uint8_t sig[crypto::kSig]) {
+    sign(me, ctx, msg, n, sig);
+}
+bool signed_by(const Key& spub, const char* ctx, const uint8_t* msg, size_t n, const uint8_t sig[crypto::kSig]) {
+    return check(spub, ctx, msg, n, sig);
+}
 
 // ------------------------------------------------------------------ ring
 std::string umk_id(const Key& umk) {
@@ -372,6 +380,7 @@ struct VaultFile {
     Bytes rsalt, recovery;
     crypto::Argon2Params rparams;
     std::string signer;                      // the device that wrote it
+    bool manifest = false;                   // the vault keeps a manifest (sync_manifest.h)
     Bytes signedText, sig;                   // the lines up to "sig=", and the signature over them
 };
 
@@ -387,6 +396,7 @@ bool parse_vault(const Bytes& b, VaultFile& v) {
     v.rparams.memKiB = (uint32_t)strtoul(m["rmem"].c_str(), nullptr, 10);
     v.rparams.passes = (uint32_t)strtoul(m["rpasses"].c_str(), nullptr, 10);
     v.signer = m["signer"];
+    v.manifest = m["manifest"] == "1";
     return !v.umk.empty() && v.signer.size() == 16 && crypto::unbase64(m["data"], v.data) && crypto::unbase64(m["rsalt"], v.rsalt) &&
            crypto::unbase64(m["recovery"], v.recovery) && crypto::unbase64(m["sig"], v.sig) && v.rsalt.size() == 16 &&
            v.sig.size() == crypto::kSig;
@@ -401,6 +411,7 @@ Bytes write_vault(const VaultFile& v, const DeviceKey& me) {
     s += "rmem=" + std::to_string(v.rparams.memKiB) + "\n";
     s += "rpasses=" + std::to_string(v.rparams.passes) + "\n";
     s += "recovery=" + crypto::base64(v.recovery) + "\n";
+    if (v.manifest) s += "manifest=1\n";
     s += "signer=" + me.id + "\n";
     uint8_t sig[crypto::kSig];
     sign(me, "ep vault object", (const uint8_t*)s.data(), s.size(), sig);
@@ -466,6 +477,7 @@ VaultFile seal_vault(const Vault& v, const Ring& ring) {
     Bytes rb = ring.serialize();
     f.recovery = crypto::seal(ring.recKek, "ep recovery", rb.data(), rb.size());
     crypto::wipe(rb.data(), rb.size());
+    f.manifest = v.manifest;
     return f;
 }
 
@@ -725,6 +737,12 @@ Result open_vault(Backend& raw, KeyStore& ks, bool create, Vault& out, Progress&
         pin->gen = std::max(pin->gen, gen);
         pin->version = std::max(pin->version, v.vks.rbegin()->first);
     };
+    // who signs this device's manifests, and whose it believes
+    auto signers = [&](Vault& v) {
+        v.me = me;
+        v.members = ring.members;
+        v.removed = ring.removed;
+    };
     for (int attempt = 0; attempt < 4; ++attempt) {
         Bytes vb;
         std::string rev;
@@ -747,6 +765,7 @@ Result open_vault(Backend& raw, KeyStore& ks, bool create, Vault& out, Progress&
             v.id = crypto::hex(id, 16);
             v.current = 1;
             v.vks[1] = crypto::random_key();
+            v.manifest = true;
             Bytes vo = write_vault(seal_vault(v, ring), me);
             r = put_object(raw, kVaultFile, vo, "", prog, &v.rev);
             if (r.st == Status::PreconditionFailed) continue;          // another device was quicker
@@ -754,6 +773,7 @@ Result open_vault(Backend& raw, KeyStore& ks, bool create, Vault& out, Progress&
             r = register_device(raw, ring, me, prog);
             if (!r.ok()) return r;
             seen(v, ring.current().gen, vo);
+            signers(v);
             out = v;
             return {};
         }
@@ -777,6 +797,7 @@ Result open_vault(Backend& raw, KeyStore& ks, bool create, Vault& out, Progress&
             return Result::fail(Status::Tampered, L"The vault file on the storage doesn't authenticate.");
         }
         crypto::wipe(p.data(), p.size());
+        v.manifest = f.manifest;
         // written by a member: a vault a removed device made up (its own keys, an old
         // generation to make this device hand the new ring over) is refused. What it wrote
         // while it was a member, and this device took then (the pin), still opens.
@@ -806,14 +827,36 @@ Result open_vault(Backend& raw, KeyStore& ks, bool create, Vault& out, Progress&
             if (!r.ok()) return r;
             hand_over(raw, ring, old, me, prog);
             gen = ring.current().gen;
+            // the manifest moves on with it (its writer may be the removed device)
+            signers(v);
+            syncman::resign_root(raw, v, prog);
         }
         r = register_device(raw, ring, me, prog);
         if (!r.ok()) return r;
         seen(v, gen, vb);
+        signers(v);
         out = v;
         return {};
     }
     return Result::fail(Status::PreconditionFailed, L"The vault kept changing while it was opened.");
+}
+
+Result mark_manifest(Backend& raw, const Vault& v, Progress& prog) {
+    Bytes vb;
+    std::string rev;
+    Result r = get_object(raw, kVaultFile, vb, &rev, prog);
+    if (!r.ok()) return r;
+    if (rev != v.rev) return Result::fail(Status::PreconditionFailed);   // not the object this device opened
+    VaultFile f;
+    if (!parse_vault(vb, f)) return Result::fail(Status::Tampered);
+    if (f.manifest) return {};
+    Ring signers;
+    signers.members = v.members;
+    signers.removed = v.removed;
+    if (Result s = check_vault_signer(f, signers); !s.ok()) return s;
+    f.manifest = true;
+    r = put_object(raw, kVaultFile, write_vault(f, v.me), rev, prog);
+    return r;
 }
 
 // ------------------------------------------------------------------ pairing, recovery
@@ -984,6 +1027,7 @@ Result remove_device(Backend& raw, KeyStore& ks, const std::string& deviceId, st
         Bytes p;
         if (!crypto::open(crypto::kdf(vg->umk, "ep vault"), "ep vault", f.data, p) || !parse_payload(p, v)) return Result::fail(Status::Tampered);
         crypto::wipe(p.data(), p.size());
+        v.manifest = f.manifest;
         if (Result s = check_vault_signer(f, vg->gen == ring.current().gen ? ring : before); !s.ok()) return s;
         if (vg->gen == ring.current().gen) break;
         uint32_t nv = v.vks.rbegin()->first + 1;
@@ -995,6 +1039,12 @@ Result remove_device(Backend& raw, KeyStore& ks, const std::string& deviceId, st
         if (!r.ok()) return r;
         break;
     }
+    // the manifest, signed by this device under the new key version: what the removed
+    // device signed is taken until now, and not after
+    v.me = me;
+    v.members = ring.members;
+    v.removed = ring.removed;
+    syncman::resign_root(raw, v, prog);
     hand_over(raw, ring, old, me, prog);
     r = register_device(raw, ring, me, prog);
     if (!r.ok()) return r;
@@ -1040,6 +1090,7 @@ Result refresh_vault_recovery(Backend& raw, KeyStore& ks, Progress& prog) {
         Vault v;
         if (!crypto::open(crypto::kdf(g->umk, "ep vault"), "ep vault", f.data, p) || !parse_payload(p, v)) return Result::fail(Status::Tampered);
         crypto::wipe(p.data(), p.size());
+        v.manifest = f.manifest;
         if (Result s = check_vault_signer(f, ring); !s.ok()) return s;
         r = put_object(raw, kVaultFile, write_vault(seal_vault(v, ring), me), rev, prog);
         if (r.st == Status::PreconditionFailed) continue;

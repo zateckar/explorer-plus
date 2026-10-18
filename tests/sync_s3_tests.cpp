@@ -368,7 +368,7 @@ void test_encrypted() {
         eo.deviceName = L"DEV";
         eo.trashDir = d.stateDir + L"\\trash";
         eo.settleMs = 0;
-        d.eng = std::make_unique<Engine>(eo, make_encrypting(std::move(raw), v), *d.st);
+        d.eng = std::make_unique<Engine>(eo, make_encrypting(std::move(raw), v, reopen_with(*d.ks), d.stateDir + L"\\retired.dat"), *d.st);
         return {};
     };
     auto sync = [](Dev& d) {

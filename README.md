@@ -81,9 +81,13 @@ scrambled names and data, how big the files are and how the folders nest; it can
 change one unnoticed. The keys never leave your devices. Nobody, Explorer Plus included,
 can open your files without either one of your devices or your **recovery key**: 15
 letters and digits shown when you set up the first sync folder. Write it down. "Devices and
-keys" ▸ "Show recovery key..." shows it again after you sign in with your Windows account. A
-storage can still delete files or withhold new ones, and it sees when you sync. The formats
-are in [docs/sync-format.md](docs/sync-format.md).
+keys" ▸ "Show recovery key..." shows it again after you sign in with your Windows account.
+Your devices also sign a list of every file in the folder, so a storage that withholds a
+file, brings back an old version or slips in one of its own is reported instead of
+believed, and your copy stays as it is. It can still delete everything or stop taking new
+files, and it sees when you sync. All your devices need this version of Explorer Plus: an
+older one doesn't keep the list, and the files it writes are reported, not taken. The
+formats are in [docs/sync-format.md](docs/sync-format.md).
 
 **A second PC**: add the same storage there. It asks for a code: on a PC that's already set
 up, "Devices and keys" ▸ "Add a device" shows one (valid 15 minutes), or type the recovery

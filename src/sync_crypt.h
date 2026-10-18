@@ -14,7 +14,13 @@ namespace sync {
 // new uploads must use the new key version at once): refreshes the vault from the store
 using VaultReopen = std::function<Result(Backend& raw, synckeys::Vault& v)>;
 // retiredFile: where the note of retired key versions is kept (docs/sync-format.md,
-// "Retired key versions"); empty: in memory only (tests)
+// "Retired key versions"); the manifest's pin (manifest.pin) and, for stores without
+// transactions, the log of this device's writes not in a manifest yet (manifest.own) go
+// beside it. Empty: in memory only (tests).
+//
+// The vault's manifest (sync_manifest.h) is kept when the vault came from open_vault (it
+// carries this device's signing key): the listing is the manifest's, files the storage
+// withholds, rolls back or plants are reported, and every commit writes the next manifest.
 std::unique_ptr<Backend> make_encrypting(std::unique_ptr<Backend> raw, const synckeys::Vault& vault, VaultReopen reopen = {},
                                          const std::wstring& retiredFile = {});
 

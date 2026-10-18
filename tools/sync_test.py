@@ -164,6 +164,35 @@ def run_pair(label, type_args, cleanup=None):
         b.sync()
         check(not os.path.exists(os.path.join(b.root, 'from-b.txt')), 'B: the deletion arrived')
 
+        # the storage withholds a file: the vault's manifest still lists it, so B keeps its
+        # copy (it used to take that for a deletion)
+        if 'type=folder' in type_args:
+            store = [t.split('=', 1)[1] for t in type_args if t.startswith('cfg.path=')][0]
+            def stored_files():
+                out = set()
+                for dp, dn, fn in os.walk(store):
+                    if '.ep-vault' not in os.path.relpath(dp, store).split(os.sep):
+                        out |= {os.path.join(dp, n) for n in fn}
+                return out
+            check(os.path.exists(os.path.join(store, '.ep-vault', 'manifest')), 'store: the vault keeps a manifest')
+            before = stored_files()
+            write(os.path.join(a.root, 'withheld.txt'), 'kept')
+            a.sync()
+            b.sync()
+            new = sorted(stored_files() - before)
+            check(len(new) == 1 and read(os.path.join(b.root, 'withheld.txt')) == 'kept', 'withheld: B has the file first')
+            if len(new) == 1:
+                aside = os.path.join(work, 'withheld.bin')
+                shutil.move(new[0], aside)
+                write(os.path.join(store, '.ep-vault', 'head'), secrets.token_hex(8))     # B looks
+                b.sync()
+                check(read(os.path.join(b.root, 'withheld.txt')) == 'kept', 'withheld: B keeps its copy')
+                shutil.move(aside, new[0])
+                write(os.path.join(store, '.ep-vault', 'head'), secrets.token_hex(8))
+                r = b.sync()
+                check(r.get('state') == 'up to date' and read(os.path.join(b.root, 'withheld.txt')) == 'kept',
+                      'withheld: back, B up to date (%s)' % r.get('state'))
+
         # a conflict: both change the same file before syncing
         write(os.path.join(a.root, 'both.txt'), 'base')
         a.sync()
