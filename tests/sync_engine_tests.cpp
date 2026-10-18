@@ -490,7 +490,80 @@ static void engine_commit_race() {
     CHECK(same(a, b));
 }
 
+static bool has_problem(Dev& d, const std::wstring& path, const wchar_t* text) {
+    for (auto& [p, why] : d.eng->status().problems)
+        if (p == path && why.find(text) != std::wstring::npos) return true;
+    return false;
+}
+
+static void engine_robustness() {
+    auto store = std::make_shared<FakeStore>();
+    Dev a(L"ra", store), b(L"rb", store);
+    // a decomposed name (as a Mac writes it): not synced, and reported
+    const std::wstring nfd = L"Cafe\x0301.txt";
+    tu::write(a.root, nfd, "nfd");
+    tu::write(a.root, L"plain.txt", "plain");
+    CHECK(a.sync().result.ok());
+    CHECK(store->objs.count(L"plain.txt") == 1 && store->objs.size() == 1);
+    CHECK(has_problem(a, L"caf\x00E9.txt", L"decomposed"));                // (problems: by key, lower case)
+    CHECK(b.sync().result.ok() && tu::read(b.root, L"plain.txt") == "plain" && !tu::exists(b.root, L"Caf\x00E9.txt"));
+    CHECK(tu::read(a.root, nfd) == "nfd");
+    tu::remove(a.root, nfd);
+
+    // a read-only file is replaced by a download, and stays read-only
+    std::wstring ro = b.root + L"\\plain.txt";
+    SetFileAttributesW(ro.c_str(), FILE_ATTRIBUTE_READONLY);
+    tu::write(a.root, L"plain.txt", "plain, edited");
+    CHECK(a.sync().result.ok());
+    b.sync();
+    CHECK(tu::read(b.root, L"plain.txt") == "plain, edited");
+    CHECK((GetFileAttributesW(ro.c_str()) & FILE_ATTRIBUTE_READONLY) != 0);
+    SetFileAttributesW(ro.c_str(), FILE_ATTRIBUTE_NORMAL);
+
+    // deleted and made anew on A between two of B's passes: the storage's version starts over,
+    // which isn't a rollback here
+    tu::write(a.root, L"v.txt", "v1");
+    a.sync();
+    for (int i = 2; i <= 4; ++i) { tu::write(a.root, L"v.txt", "v" + std::to_string(i) + std::string(i, '.')); a.sync(); }
+    CHECK(b.sync().result.ok() && tu::read(b.root, L"v.txt") == "v4....");
+    tu::remove(a.root, L"v.txt");
+    a.sync();
+    tu::write(a.root, L"v.txt", "made anew");
+    a.sync();
+    CHECK(b.sync().result.ok());
+    CHECK(tu::read(b.root, L"v.txt") == "made anew" && !has_problem(b, L"v.txt", L""));
+    tu::write(b.root, L"v.txt", "edited on B after");             // (B's next upload: newer than any seen)
+    CHECK(b.sync().result.ok() && a.sync().result.ok() && tu::read(a.root, L"v.txt") == "edited on B after");
+
+    // a download a crash left in the temp folder: swept once it is an hour old
+    std::wstring tmpDir = b.root + L"\\.~sync-tmp";
+    CreateDirectoryW(tmpDir.c_str(), nullptr);
+    tu::write(b.root, L".~sync-tmp/.~sync-dead.tmp", "half");
+    tu::write(b.root, L".~sync-tmp/.~sync-live.tmp", "now");
+    HANDLE h = CreateFileW((tmpDir + L"\\.~sync-dead.tmp").c_str(), FILE_WRITE_ATTRIBUTES, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    FILETIME old = ft_of(now_ft() - 2 * 3600ull * 10000000);
+    SetFileTime(h, nullptr, nullptr, &old);
+    CloseHandle(h);
+    b.sync();
+    CHECK(!tu::exists(b.root, L".~sync-tmp/.~sync-dead.tmp") && tu::exists(b.root, L".~sync-tmp/.~sync-live.tmp"));
+    CHECK(same(a, b));
+
+    // written again right after a pass, same size, within the same clock tick (the time
+    // stays): the edit still goes up
+    tu::write(a.root, L"tick.txt", "tick 1");
+    CHECK(a.sync().result.ok());
+    std::wstring tick = a.root + L"\\tick.txt";
+    WIN32_FILE_ATTRIBUTE_DATA fa{};
+    GetFileAttributesExW(tick.c_str(), GetFileExInfoStandard, &fa);
+    tu::write(a.root, L"tick.txt", "tick 2");
+    h = CreateFileW(tick.c_str(), FILE_WRITE_ATTRIBUTES, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    SetFileTime(h, nullptr, nullptr, &fa.ftLastWriteTime);
+    CloseHandle(h);
+    CHECK(a.sync().result.ok() && b.sync().result.ok() && tu::read(b.root, L"tick.txt") == "tick 2");
+}
+
 void run_engine_only() {
+    engine_robustness();
     test_paths();
     test_planner();
     test_state();

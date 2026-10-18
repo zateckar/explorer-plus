@@ -127,9 +127,14 @@ void test_ring_codec() {
 
 void test_password_rules() {
     using synckeys::password_problem;
-    CHECK(password_problem("Sync password 1").empty());
-    CHECK(password_problem("Abcdefghij12").empty());                          // 12: enough
-    CHECK(!password_problem("Abcdefghij1").empty());                          // 11
+    CHECK(password_problem("Tidal Walrus 1").empty());
+    CHECK(!password_problem("Password1234").empty());                         // guessable: a word and a run
+    CHECK(!password_problem("Qwerty123456").empty());
+    CHECK(!password_problem("Aaaaaaaaaaa1").empty());                         // one character again and again
+    CHECK(!password_problem("Welcome2024!").empty());
+    CHECK(password_problem("Abcd Kq7mWz2p").empty());                         // a run among enough else
+    CHECK(password_problem("Kq7mWz2pLx9r").empty());                          // 12: enough
+    CHECK(!password_problem("Kq7mWz2pLx9").empty());                          // 11
     CHECK(!password_problem("abcdefghij123").empty());                        // no capital
     CHECK(!password_problem("ABCDEFGHIJ123").empty());                        // no small letter
     CHECK(!password_problem("Abcdefghijklm").empty());                        // no digit
@@ -138,13 +143,13 @@ void test_password_rules() {
     CHECK(synckeys::setup_ring(*ks, "too weak").st == Status::Rejected);
     synckeys::Ring none;
     CHECK(!ks->load_ring(none));
-    CHECK(synckeys::setup_ring(*ks, "Sync password 1").ok());
-    CHECK(synckeys::check_password(*ks, "Sync password 1").ok());
-    CHECK(synckeys::check_password(*ks, "sync password 1").st == Status::Rejected);
+    CHECK(synckeys::setup_ring(*ks, "Tidal Walrus 1").ok());
+    CHECK(synckeys::check_password(*ks, "Tidal Walrus 1").ok());
+    CHECK(synckeys::check_password(*ks, "tidal walrus 1").st == Status::Rejected);
     CHECK(synckeys::change_password(*ks, "weak").st == Status::Rejected);
-    CHECK(synckeys::change_password(*ks, "Sync password 2").ok());
-    CHECK(synckeys::check_password(*ks, "Sync password 2").ok());
-    CHECK(synckeys::check_password(*ks, "Sync password 1").st == Status::Rejected);
+    CHECK(synckeys::change_password(*ks, "Tidal Walrus 2").ok());
+    CHECK(synckeys::check_password(*ks, "Tidal Walrus 2").ok());
+    CHECK(synckeys::check_password(*ks, "Tidal Walrus 1").st == Status::Rejected);
     // a ring from before the password: its generated recovery key, typed as it's written
     synckeys::Ring r;
     CHECK(ks->load_ring(r));
@@ -161,10 +166,10 @@ void test_two_devices(bool tx) {
     auto raw = [store, tx] { return std::unique_ptr<Backend>(std::make_unique<FakeBackend>(store, tx)); };
     EDev a(L"ca", raw), b(L"cb", raw), c(L"cc", raw);
     // first device: keys, a vault in the empty store
-    std::string recovery = "Sync password 1";
+    std::string recovery = "Tidal Walrus 1";
     CHECK(synckeys::setup_ring(*a.ks, recovery).ok());
     CHECK(synckeys::check_password(*a.ks, recovery).ok());
-    CHECK(synckeys::check_password(*a.ks, "Sync password 2").st == Status::Rejected);
+    CHECK(synckeys::check_password(*a.ks, "Tidal Walrus 2").st == Status::Rejected);
     CHECK(b.open(true).st == Status::Locked);        // no keys on B yet
     CHECK(a.open(true).ok());
     tu::write(a.root, L"Plan Q3 secret.txt", "TOPSECRET-CONTENT-1");
@@ -264,7 +269,7 @@ void test_tamper() {
     auto store = std::make_shared<FakeStore>();
     auto raw = [store] { return std::unique_ptr<Backend>(std::make_unique<FakeBackend>(store, false)); };
     EDev a(L"ta", raw), b(L"tb", raw);
-    std::string recovery = "Sync password 1";
+    std::string recovery = "Tidal Walrus 1";
     CHECK(synckeys::setup_ring(*a.ks, recovery).ok());
     CHECK(a.open(true).ok());
     tu::write(a.root, L"f.txt", "original content");
@@ -321,7 +326,7 @@ void test_refuse_plaintext() {
         store->objs[L"existing.txt"] = o;
     }
     EDev a(L"ra", [store] { return std::unique_ptr<Backend>(std::make_unique<FakeBackend>(store, false)); });
-    std::string rec = "Sync password 1";
+    std::string rec = "Tidal Walrus 1";
     CHECK(synckeys::setup_ring(*a.ks, rec).ok());
     CHECK(a.open(true).st == Status::Rejected);
 }
@@ -333,7 +338,7 @@ void test_long_names() {
     register_builtin_backends();
     auto raw = [cfg] { std::wstring why; return create_raw_backend(L"folder", cfg, &why); };
     EDev a(L"la", raw), b(L"lb", raw);
-    std::string rec = "Sync password 1";
+    std::string rec = "Tidal Walrus 1";
     CHECK(synckeys::setup_ring(*a.ks, rec).ok());
     CHECK(a.open(true).ok());
     std::wstring longName(200, L'n');
@@ -505,7 +510,7 @@ void test_removal_hardening() {
     EDev a(L"ha", raw), b(L"hb", raw), c(L"hc", raw);
     NoProgress p;
     const std::wstring kVault = L".ep-vault/vault", kRotate = L".ep-vault/rotate/";
-    std::string recovery = "Sync password 1";
+    std::string recovery = "Tidal Walrus 1";
     CHECK(synckeys::setup_ring(*a.ks, recovery).ok());
     CHECK(a.open(true).ok());
     for (EDev* d : { &b, &c }) {
@@ -935,7 +940,7 @@ void test_manifest_attacks(bool tx) {
     auto raw = [store, tx] { return std::unique_ptr<Backend>(std::make_unique<FakeBackend>(store, tx)); };
     EDev a(L"ma", raw), b(L"mb", raw), c(L"mc", raw), d(L"md", raw);
     NoProgress p;
-    std::string recovery = "Sync password 1";
+    std::string recovery = "Tidal Walrus 1";
     CHECK(synckeys::setup_ring(*a.ks, recovery).ok());
     CHECK(a.open(true).ok());
     for (EDev* x : { &b, &c, &d }) {
@@ -1040,6 +1045,27 @@ void test_manifest_attacks(bool tx) {
         CHECK(x->sync().result.ok());
         CHECK(same_tree(b, *x) && x->eng->status().problems.empty());
     }
+
+    // C, which joined with the sync password and only read so far, writes a manifest: B takes it
+    tu::write(c.root, L"from-c.txt", "C");
+    CHECK(c.sync().result.ok());
+    CHECK(b.sync().result.ok() && tu::read(b.root, L"from-c.txt") == "C");
+
+    // forked: the storage shows B one history and C another, each manifest numbered the same
+    Objs before = snapshot(*store);
+    tu::write(a.root, L"fork.txt", "A's");
+    CHECK(a.sync().result.ok() && b.sync().result.ok() && tu::read(b.root, L"fork.txt") == "A's");
+    Objs seenByB = snapshot(*store);
+    storage_does(*store, [&](Objs& o) { o = before; });
+    tu::write(c.root, L"fork.txt", "C's other");
+    CHECK(c.sync().result.ok());
+    {
+        PassReport r = b.sync(true);
+        CHECK(r.result.st == Status::Tampered && r.result.message.find(L"forked") != std::wstring::npos);
+        CHECK(tu::read(b.root, L"fork.txt") == "A's");
+    }
+    storage_does(*store, [&](Objs& o) { o = seenByB; });
+    CHECK(b.sync().result.ok());
 }
 
 // a store without transactions: B's files go up, its manifest doesn't (the write fails, B
@@ -1051,7 +1077,7 @@ void test_manifest_window() {
     auto raw = [store] { return std::unique_ptr<Backend>(std::make_unique<FakeBackend>(store, false)); };
     EDev a(L"wa", raw), b(L"wb", raw);
     NoProgress p;
-    std::string recovery = "Sync password 1";
+    std::string recovery = "Tidal Walrus 1";
     CHECK(synckeys::setup_ring(*a.ks, recovery).ok());
     CHECK(a.open(true).ok());
     tu::write(a.root, L"a.txt", "A");
@@ -1087,7 +1113,7 @@ void test_manifest_upgrade(bool tx) {
     auto raw = [store, tx] { return std::unique_ptr<Backend>(std::make_unique<FakeBackend>(store, tx)); };
     EDev a(L"ua", raw), b(L"ub", raw);
     NoProgress p;
-    std::string recovery = "Sync password 1";
+    std::string recovery = "Tidal Walrus 1";
     CHECK(synckeys::setup_ring(*a.ks, recovery).ok());
     a.noManifest = true;
     CHECK(a.open(true).ok());
@@ -1135,7 +1161,7 @@ void test_vault_unsigned_lines() {
     auto store = std::make_shared<FakeStore>();
     auto raw = [store] { return std::unique_ptr<Backend>(std::make_unique<FakeBackend>(store, false)); };
     EDev a(L"sa", raw);
-    CHECK(synckeys::setup_ring(*a.ks, "Sync password 1").ok());
+    CHECK(synckeys::setup_ring(*a.ks, "Tidal Walrus 1").ok());
     CHECK(a.open(true).ok());
     tu::write(a.root, L"a.txt", "A");
     CHECK(a.sync().result.ok());

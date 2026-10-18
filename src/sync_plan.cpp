@@ -46,7 +46,7 @@ void add_implied_dirs(RemoteMap& remote) {
 static bool local_changed(const LocalItem& l, const BaseEntry& b) {
     if (l.isDir != b.isDir) return true;
     if (l.isDir) return false;
-    if (l.size == b.size && l.mtime == b.mtime && l.fileId == b.fileId) return false;
+    if (!l.racy && l.size == b.size && l.mtime == b.mtime && l.fileId == b.fileId) return false;
     return !l.hashed || l.hash != b.hash;
 }
 static bool local_meta_changed(const LocalItem& l, const BaseEntry& b) {

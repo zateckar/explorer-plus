@@ -398,7 +398,7 @@ void test_e2e(bool rest) {
         return r;
     };
 
-    std::string rec = "Sync password 1";
+    std::string rec = "Tidal Walrus 1";
     CHECK(synckeys::setup_ring(*a.ks, rec).ok());
     Result r = open(a, true);
     CHECK(r.ok());

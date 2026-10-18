@@ -96,17 +96,54 @@ std::vector<Pair> parse(const std::string& text) {
     return out;
 }
 
-std::vector<Pair> load() {
+std::vector<Pair> load(bool* ok) {
+    if (ok) *ok = true;
     std::wstring f = pairs_file();
     if (f.empty()) return {};
-    HANDLE h = CreateFileW(f.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return {};
-    std::string text;
-    char buf[65536];
-    DWORD n;
-    while (ReadFile(h, buf, sizeof(buf), &n, nullptr) && n) text.append(buf, n);
-    CloseHandle(h);
-    return parse(text);
+    // (a scanner or a backup holding it a moment: tried again before giving up)
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        if (attempt) Sleep(100);
+        HANDLE h = CreateFileW(f.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+            DWORD e = GetLastError();
+            if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) return {};      // (none yet)
+            continue;
+        }
+        std::string text;
+        char buf[65536];
+        DWORD n = 0;
+        BOOL read = TRUE;
+        while ((read = ReadFile(h, buf, sizeof(buf), &n, nullptr)) && n) text.append(buf, n);
+        CloseHandle(h);
+        if (read) return parse(text);
+    }
+    if (ok) *ok = false;
+    return {};
+}
+
+bool update(const std::function<void(std::vector<Pair>&)>& change) {
+    std::wstring f = pairs_file();
+    if (f.empty()) return false;
+    // one process at a time (the agent and the settings window both write it): named by the file
+    uint32_t h = 2166136261u;
+    for (wchar_t c : f) h = (h ^ (uint32_t)towlower(c)) * 16777619u;
+    wchar_t name[64];
+    swprintf(name, 64, L"Local\\ExplorerPlus.SyncPairs.%08x", h);
+    HANDLE mx = CreateMutexW(nullptr, FALSE, name);
+    DWORD w = mx ? WaitForSingleObject(mx, 10000) : WAIT_FAILED;
+    bool locked = w == WAIT_OBJECT_0 || w == WAIT_ABANDONED;
+    bool ok = false;
+    if (locked) {
+        bool read = false;
+        std::vector<Pair> pairs = load(&read);
+        if (read) {
+            change(pairs);
+            ok = save(pairs);
+        }
+        ReleaseMutex(mx);
+    }
+    if (mx) CloseHandle(mx);
+    return ok;
 }
 
 bool save(const std::vector<Pair>& pairs) {

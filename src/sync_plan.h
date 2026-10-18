@@ -15,6 +15,7 @@ struct LocalItem {
     Hash     hash{};
     bool     hashed = false;       // hash is valid (files that differ from the base get hashed)
     bool     busy = false;         // still being written / couldn't be read: leave it alone this pass
+    bool     racy = false;         // the base's size and time were taken within a clock tick of a write: the hash decides
 };
 
 enum class Act {

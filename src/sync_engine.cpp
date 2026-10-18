@@ -205,10 +205,16 @@ Result Engine::list_remote(Ctx& c) {
 // ------------------------------------------------------------------ hashing
 void Engine::hash_changed(Ctx& c, LocalMap& local) {
     uint64_t now = now_ft();
+    // a base taken within a clock tick (or a FAT file's two seconds) of the scan before
+    // could match a file written again right after it, same size and same time: those are
+    // hashed. lastScan: when the last scan that got this far started.
+    uint64_t lastScan = strtoull(m_state.value("scanned").c_str(), nullptr, 10);
+    const uint64_t kTick = 3ull * 10000000;
     for (auto& [k, l] : local) {
         if (l.isDir) continue;
         const BaseEntry* b = m_state.base(k);
-        if (b && !b->isDir && b->size == l.size && b->mtime == l.mtime && b->fileId == l.fileId) continue;
+        l.racy = b && lastScan && (b->mtime + kTick >= lastScan || b->mtime > now);
+        if (b && !b->isDir && !l.racy && b->size == l.size && b->mtime == l.mtime && b->fileId == l.fileId) continue;
         if (now > l.mtime && now - l.mtime < (uint64_t)m_opt.settleMs * 10000) { l.busy = true; continue; }
         HANDLE h = open_for_read(full(l.path));
         if (h == INVALID_HANDLE_VALUE) { l.busy = true; continue; }
@@ -287,13 +293,13 @@ Result Engine::do_download(Ctx& c, const RelPath& path, const RelPath& saveAs, b
     FileMeta meta;
     Result res = m_backend->download(e, hs, meta, c.prog);
     Hash got = hs.h.final();
+    uint64_t seenVersion = 0;               // non-zero: the storage's version is older than this one seen here
     if (res.ok()) {
         Hash zero{};
         if (meta.plainHash != zero && meta.plainHash != got)
             res = Result::fail(Status::Tampered, L"The downloaded file doesn't match its fingerprint.");
         const BaseEntry* b = m_state.base(key_of(path));
-        if (res.ok() && b && meta.version && b->version && meta.version < b->version)
-            res = Result::fail(Status::Tampered, L"The storage returned an older version of the file than one already seen (rolled back).");
+        if (res.ok() && b && meta.version && b->version && meta.version < b->version) seenVersion = b->version;
     }
     if (res.ok() && ft64(meta.mtime)) SetFileTime(h, nullptr, nullptr, &meta.mtime);
     CloseHandle(h);
@@ -312,15 +318,26 @@ Result Engine::do_download(Ctx& c, const RelPath& path, const RelPath& saveAs, b
     }
     size_t s = target.find_last_of(L'\\');
     make_dirs(target.substr(0, s));
+    // a read-only file is replaced too, and stays read-only
+    DWORD oldAttrs = now.exists ? GetFileAttributesW(target.c_str()) : INVALID_FILE_ATTRIBUTES;
+    bool readOnly = oldAttrs != INVALID_FILE_ATTRIBUTES && (oldAttrs & FILE_ATTRIBUTE_READONLY);
+    if (readOnly) SetFileAttributesW(target.c_str(), oldAttrs & ~FILE_ATTRIBUTE_READONLY);
     if (!MoveFileExW(tmp.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         DWORD err = GetLastError();
         DeleteFileW(tmp.c_str());
+        if (readOnly) SetFileAttributesW(target.c_str(), oldAttrs);
         std::lock_guard<std::mutex> lk(c.mx);
         c.rep.again = true;
         return Result::fail(err == ERROR_SHARING_VIOLATION || err == ERROR_ACCESS_DENIED ? Status::PreconditionFailed : Status::Fatal,
                             L"The file is in use.");
     }
-    if (record) record_local(c, saveAs, &r, &got, meta.version);
+    if (readOnly) SetFileAttributesW(target.c_str(), GetFileAttributesW(target.c_str()) | FILE_ATTRIBUTE_READONLY);
+    // An older version than one seen: deleted and made anew on another device between two passes
+    // here, or rolled back by the storage (which the signed manifest catches before this). Taken,
+    // as a download replaces only a file unchanged here (the one before it: in the storage's
+    // history), and the version seen kept, so that the next upload is the newest.
+    if (seenVersion) c.log("older-version", saveAs);
+    if (record) record_local(c, saveAs, &r, &got, std::max(meta.version, seenVersion));
     return {};
 }
 
@@ -824,6 +841,21 @@ PassReport Engine::pass(Progress& prog) {
         return rep;
     }
     if (known.empty()) m_state.set_value("rootId", id);
+    // downloads a crash or a power cut left half written (an hour old: none of this pass's)
+    {
+        std::wstring tmpDir = full(L".~sync-tmp");
+        WIN32_FIND_DATAW fd;
+        HANDLE f = FindFirstFileW((tmpDir + L"\\.~sync-*.tmp").c_str(), &fd);
+        if (f != INVALID_HANDLE_VALUE) {
+            uint64_t hourAgo = now_ft() - 3600ull * 10000000;
+            do {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && ft64(fd.ftLastWriteTime) < hourAgo)
+                    DeleteFileW((tmpDir + L"\\" + fd.cFileName).c_str());
+            } while (FindNextFileW(f, &fd));
+            FindClose(f);
+            RemoveDirectoryW(tmpDir.c_str());           // (when empty)
+        }
+    }
     // rules: built-in, the folder's .syncignore, folders left out
     syncpath::Ignore ignore;
     {
@@ -848,6 +880,7 @@ PassReport Engine::pass(Progress& prog) {
         set_state(s, r.message.empty() ? status_name(r.st) : r.message);
         return rep;
     }
+    uint64_t scanStart = now_ft();
     ScanResult scan = scan_local(m_opt.root, ignore);
     if (scan.rootMissing) {
         rep.result = Result::fail(Status::NotFound, L"The sync folder is missing.");
@@ -862,6 +895,7 @@ PassReport Engine::pass(Progress& prog) {
     for (auto& [p, why] : scan.problems) problem(p, why);
     c.local = std::move(scan.items);
     hash_changed(c, c.local);
+    if (!c.prog.cancelled()) m_state.set_value("scanned", std::to_string(scanStart));
 
     // what the scan couldn't see (an unreadable folder, a link): left as it is on both sides
     std::vector<std::wstring> unknown;

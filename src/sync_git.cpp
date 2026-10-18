@@ -404,12 +404,17 @@ private:
             { L"GIT_COMMITTER_NAME", m_o.author },
             { L"GIT_COMMITTER_EMAIL", m_o.email },
             { L"GIT_OPTIONAL_LOCKS", L"0" },
+            // a connection that stalls (under 1 KB/s for a minute) fails instead of hanging the pass
+            { L"GIT_HTTP_LOW_SPEED_LIMIT", L"1000" },
+            { L"GIT_HTTP_LOW_SPEED_TIME", L"60" },
         };
         for (auto& x : m_o.env) e.push_back(x);
         return e;
     }
 
     proc::Result git(const std::vector<std::wstring>& args, Progress& p, bool inMirror = true, const std::string* stdinText = nullptr) {
+        // (a URL git would take for an option: never run)
+        if (!m_o.url.empty() && m_o.url[0] == L'-') { proc::Result r; r.started = true; r.exitCode = 1; r.err = "fatal: bad URL"; return r; }
         proc::Options o;
         if (inMirror) o.env = env();
         else o.env = m_o.env;
@@ -418,7 +423,16 @@ private:
         return proc::run(m_o.gitExe, args, o);
     }
 
-    std::string scrub(const std::string& s) const { return m_o.scrub ? m_o.scrub(s) : s; }
+    // git's messages without secrets: the backend's own, and any URL's user:password@
+    std::string scrub(const std::string& text) const {
+        std::string s = m_o.scrub ? m_o.scrub(text) : text;
+        for (size_t i = 0; (i = s.find("://", i)) != std::string::npos;) {
+            i += 3;
+            size_t end = s.find_first_of("/ \t\r\n'\"", i), at = s.find('@', i);
+            if (at != std::string::npos && (end == std::string::npos || at < end)) s.replace(i, at - i, "***");
+        }
+        return s;
+    }
 
     Result fail(const proc::Result& r, const std::wstring& what) const {
         if (r.cancelled) return Result::fail(Status::Cancelled);
@@ -638,7 +652,11 @@ void register_git_backend() {
         { L"maxFileMB", L"Largest file (MB)", ConfigField::Number, false, L"50", {}, L"Hosts refuse big files (GitHub: 100 MB)." },
     };
     t.validate = [](const BackendConfig& c) -> std::wstring {
-        if (config_get(c, L"url").empty()) return L"Enter the repository's URL.";
+        std::wstring url = config_get(c, L"url");
+        if (url.empty()) return L"Enter the repository's URL.";
+        if (url[0] == L'-') return L"The URL can't start with '-'.";        // (git would read it as an option)
+        std::wstring branch = config_get(c, L"branch");
+        if (!branch.empty() && branch[0] == L'-') return L"The branch can't start with '-'.";
         return {};
     };
     t.create = [](const BackendConfig& c) -> std::unique_ptr<Backend> {

@@ -40,10 +40,31 @@ BackendConfig pair_config(const syncconf::Pair& p) {
 
 struct Runner {
     syncconf::Pair pair;
+    // set and dropped on the runner's thread (and by stop()), with opMx and liveMx held; read
+    // by others with either (liveMx: the quick calls, status and such, while a pass runs)
     std::unique_ptr<StateStore> state;
     std::unique_ptr<Engine> eng;
     PairState openState = PairState::Idle;          // while there's no engine
     std::wstring openMessage;
+    std::mutex liveMx;
+
+    // what the tray and the requests show: the engine's status, else why it isn't open
+    struct View { bool open = false; EngineStatus st; PairState state = PairState::Idle; std::wstring message; };
+    View view() {
+        std::lock_guard<std::mutex> lk(liveMx);
+        View v;
+        v.open = eng != nullptr;
+        if (eng) { v.st = eng->status(); v.state = v.st.state; v.message = v.st.message; }
+        else { v.state = openState; v.message = openMessage; }
+        return v;
+    }
+    // f(engine) when it is open (a quick call: the engine's own lock does the rest)
+    template <class F> bool with_engine(F f) {
+        std::lock_guard<std::mutex> lk(liveMx);
+        if (!eng) return false;
+        f(*eng);
+        return true;
+    }
     DirWatch watch;
     std::thread th;
     std::mutex mx;                                  // the fields below
@@ -110,7 +131,7 @@ private:
                 (*it)->pair.name = now->name;
                 if (now->paused != (*it)->pair.paused) {
                     (*it)->pair.paused = now->paused;
-                    if ((*it)->eng) (*it)->eng->set_paused(now->paused);
+                    (*it)->with_engine([&](Engine& e) { e.set_paused(now->paused); });
                     (*it)->poke();
                 }
                 ++it;
@@ -141,6 +162,7 @@ private:
         r.watch.stop();
         if (r.th.joinable()) r.th.join();
         std::lock_guard<std::mutex> op(r.opMx);         // (a request working on it finishes first)
+        std::lock_guard<std::mutex> live(r.liveMx);
         r.eng.reset();
         r.state.reset();
     }
@@ -158,23 +180,27 @@ private:
                                        sd.empty() ? sd : sd + L"\\vault.pin");     // what it saw of its vault
         if (!res.ok()) return res;
         if (r.pair.create) {                            // the vault exists now: never make another
-            auto pairs = syncconf::load();
-            for (auto& p : pairs) if (p.id == r.pair.id) p.create = false;
-            syncconf::save(pairs);
+            syncconf::update([&](std::vector<syncconf::Pair>& pairs) { for (auto& p : pairs) if (p.id == r.pair.id) p.create = false; });
             r.pair.create = false;
         }
         r.pollSeconds = std::max(15, b->caps().pollSeconds);
         CreateDirectoryW(r.pair.root.c_str(), nullptr);
-        r.state = std::make_unique<StateStore>(syncconf::state_dir(r.pair.id));
-        r.state->load();
+        auto state = std::make_unique<StateStore>(syncconf::state_dir(r.pair.id));
+        if (!state->load() && state->unreadable())         // (in use, a disk error: tried again later)
+            return Result::fail(Status::Offline, L"The sync folder's state couldn't be read.");
         EngineOptions o;
         o.root = r.pair.root;
         o.deviceName = computer_name();
         for (auto& x : r.pair.excluded) o.excluded.push_back(x);
         wchar_t trash[64];
         if (GetEnvironmentVariableW(L"EXPLORERPLUS_SYNC_TRASH", trash, 64)) o.trashDir = syncconf::state_dir(r.pair.id) + L"\\trash";   // tests: no Recycle Bin
-        r.eng = std::make_unique<Engine>(o, std::move(b), *r.state);
-        r.eng->set_paused(r.pair.paused);
+        auto eng = std::make_unique<Engine>(o, std::move(b), *state);
+        eng->set_paused(r.pair.paused);
+        {
+            std::lock_guard<std::mutex> live(r.liveMx);
+            r.state = std::move(state);
+            r.eng = std::move(eng);
+        }
         Runner* rp = &r;
         r.watch.start(r.pair.root, [rp] { rp->poke(); });
         return {};
@@ -192,6 +218,7 @@ private:
                     lk.unlock();
                     std::lock_guard<std::mutex> op(r.opMx);
                     r.watch.stop();
+                    std::lock_guard<std::mutex> live(r.liveMx);
                     r.eng.reset();
                     r.state.reset();
                     retryAt = 0;
@@ -202,6 +229,7 @@ private:
             if (!r.eng && GetTickCount64() >= retryAt) {
                 std::lock_guard<std::mutex> op(r.opMx);
                 Result res = open(r);
+                std::lock_guard<std::mutex> live(r.liveMx);
                 if (!res.ok()) {
                     r.openState = res.st == Status::Locked ? PairState::Locked : res.st == Status::AuthFailed ? PairState::AuthNeeded
                                 : res.st == Status::Offline || res.st == Status::Throttled ? PairState::Offline : PairState::Error;
@@ -247,16 +275,17 @@ private:
 
     // ------------------------------------------------------------------ requests
     static void put_status(syncipc::Msg& m, Runner& r, const std::string& prefix) {
-        PairState s = r.eng ? r.eng->status().state : r.openState;
-        std::wstring msg = r.eng ? r.eng->status().message : r.openMessage;
+        Runner::View v = r.view();
+        PairState s = v.state;
+        std::wstring msg = v.message;
         m.push_back({ prefix + "id", r.pair.id });
         m.push_back({ prefix + "name", u8(r.pair.name) });
         m.push_back({ prefix + "root", u8(r.pair.root) });
         m.push_back({ prefix + "type", u8(r.pair.type) });
         m.push_back({ prefix + "state", u8(pair_state_name(s)) });
         m.push_back({ prefix + "message", u8(msg) });
-        if (r.eng) {
-            EngineStatus st = r.eng->status();
+        if (v.open) {
+            const EngineStatus& st = v.st;
             m.push_back({ prefix + "pendingFiles", std::to_string(st.pendingFiles) });
             m.push_back({ prefix + "pendingBytes", std::to_string(st.pendingBytes) });
             m.push_back({ prefix + "pendingDeletes", std::to_string(st.pendingDeletes) });
@@ -275,8 +304,9 @@ private:
         syncipc::Msg m = syncipc::ok();
         put_status(m, *r, "");
         m.push_back({ "rel", u8(rel) });
-        if (r->eng)
-            for (auto& [name, st] : r->eng->children(rel)) m.push_back({ "item", u8(name) + "\t" + u8(item_state_name(st)) });
+        r->with_engine([&](Engine& e) {
+            for (auto& [name, st] : e.children(rel)) m.push_back({ "item", u8(name) + "\t" + u8(item_state_name(st)) });
+        });
         return m;
     }
 
@@ -390,14 +420,18 @@ private:
             // leaves a folder out of sync (on=1) or takes it back (on=0): pairs.ini, then a reload
             std::wstring path = w16(syncipc::get(q, "path"));
             bool on = syncipc::get(q, "on", "1") == "1";
-            auto pairs = syncconf::load();
-            RelPath rel;
-            syncconf::Pair* p = const_cast<syncconf::Pair*>(syncconf::pair_of(pairs, path, &rel));
-            if (!p || rel.empty()) return syncipc::error("not in a sync folder");
-            std::wstring k = key_of(rel);
-            std::erase_if(p->excluded, [&](const std::wstring& x) { return key_of(x) == k; });
-            if (on) p->excluded.push_back(rel);
-            if (!syncconf::save(pairs)) return syncipc::error("pairs.ini couldn't be written");
+            bool inPair = false;
+            bool saved = syncconf::update([&](std::vector<syncconf::Pair>& pairs) {
+                RelPath rel;
+                syncconf::Pair* p = const_cast<syncconf::Pair*>(syncconf::pair_of(pairs, path, &rel));
+                if (!p || rel.empty()) return;
+                inPair = true;
+                std::wstring k = key_of(rel);
+                std::erase_if(p->excluded, [&](const std::wstring& x) { return key_of(x) == k; });
+                if (on) p->excluded.push_back(rel);
+            });
+            if (saved && !inPair) return syncipc::error("not in a sync folder");
+            if (!saved) return syncipc::error("pairs.ini couldn't be read or written");
             reload();
             return syncipc::ok();
         }
@@ -411,16 +445,18 @@ private:
             }
             if (targets.empty()) return syncipc::error("no such pair");
             if (cmd == "pause" || cmd == "resume") {
-                auto pairs = syncconf::load();
-                for (auto& p : pairs) if (id.empty() || p.id == id) p.paused = cmd == "pause";
-                syncconf::save(pairs);
-                for (auto& r : targets) { r->pair.paused = cmd == "pause"; if (r->eng) r->eng->set_paused(r->pair.paused); r->poke(); }
+                syncconf::update([&](std::vector<syncconf::Pair>& pairs) {
+                    for (auto& p : pairs) if (id.empty() || p.id == id) p.paused = cmd == "pause";
+                });
+                for (auto& r : targets) { r->pair.paused = cmd == "pause"; r->with_engine([&](Engine& e) { e.set_paused(r->pair.paused); }); r->poke(); }
                 return syncipc::ok();
             }
             for (auto& r : targets) {
-                if (cmd == "confirm-deletes" && r->eng) r->eng->confirm_deletes(syncipc::get(q, "yes") == "1");
-                if (cmd == "dismiss-conflicts" && r->eng) r->eng->dismiss_conflicts();
-                if (cmd == "sync-now" && !r->eng) r->poke(true);
+                bool open = r->with_engine([&](Engine& e) {
+                    if (cmd == "confirm-deletes") e.confirm_deletes(syncipc::get(q, "yes") == "1");
+                    if (cmd == "dismiss-conflicts") e.dismiss_conflicts();
+                });
+                if (cmd == "sync-now" && !open) r->poke(true);
             }
             // a pass that's running now saw the old state: wait for the first one that begins
             // after this request (rounds run one after another: round n is done when passes >= n)
@@ -440,8 +476,8 @@ private:
             std::lock_guard<std::mutex> lk(m_mx);
             syncipc::Msg m = syncipc::ok();
             for (auto& r : m_runners)
-                if (r->eng) {
-                    EngineStatus st = r->eng->status();
+                if (Runner::View v = r->view(); v.open) {
+                    const EngineStatus& st = v.st;
                     for (auto& c : st.conflicts) m.push_back({ "conflict", r->pair.id + "\t" + u8(c) });
                     for (auto& [p, why] : st.problems) m.push_back({ "problem", r->pair.id + "\t" + u8(p) + "\t" + u8(why) });
                 }
@@ -657,11 +693,11 @@ private:
         std::wstring alerts;
         std::set<std::wstring> problems;
         for (auto& r : m_runners) {
-            EngineStatus st;
-            if (r->eng) st = r->eng->status();
-            PairState s = r->eng ? st.state : r->openState;
+            Runner::View rv = r->view();
+            const EngineStatus& st = rv.st;
+            PairState s = rv.state;
             bool attention = false;
-            std::wstring t = pair_text(s, r->eng ? &st : nullptr, r->eng ? st.message : r->openMessage, attention);
+            std::wstring t = pair_text(s, rv.open ? &st : nullptr, rv.message, attention);
             if (attention) alerts += (alerts.empty() ? L"" : L"\n") + r->pair.name + L": " + t;
             if (s == PairState::Paused) ++paused;
             pending += st.pendingFiles;
@@ -706,11 +742,9 @@ private:
         {
             std::lock_guard<std::mutex> lk(m_mx);
             for (auto& r : m_runners) {
-                EngineStatus st;
-                if (r->eng) st = r->eng->status();
+                Runner::View rv = r->view();
                 bool attention = false;
-                std::wstring label = r->pair.name + L"\t" +
-                                     pair_text(r->eng ? st.state : r->openState, r->eng ? &st : nullptr, r->eng ? st.message : r->openMessage, attention);
+                std::wstring label = r->pair.name + L"\t" + pair_text(rv.state, rv.open ? &rv.st : nullptr, rv.message, attention);
                 AppendMenuW(m, MF_STRING, ID_FOLDER0 + roots.size(), label.c_str());
                 roots.push_back(r->pair.root);
             }
@@ -866,9 +900,10 @@ int sync_cli_main(const std::vector<std::wstring>& args) {
             }
             syncconf::set_secret(p.id, k, val);
         }
-        auto pairs = syncconf::load();
-        pairs.push_back(p);
-        if (!syncconf::save(pairs)) { out("error=pairs.ini couldn't be written\n"); return 1; }
+        if (!syncconf::update([&](std::vector<syncconf::Pair>& pairs) { pairs.push_back(p); })) {
+            out("error=pairs.ini couldn't be read or written\n");
+            return 1;
+        }
         CreateDirectoryW(p.root.c_str(), nullptr);
         syncipc::Msg r;
         syncipc::call(syncipc::request("reload"), r, 5000);
@@ -877,9 +912,10 @@ int sync_cli_main(const std::vector<std::wstring>& args) {
     }
     if (cmd == "remove-pair") {
         std::string id = syncipc::get(q, "pair");
-        auto pairs = syncconf::load();
-        std::erase_if(pairs, [&](const syncconf::Pair& p) { return p.id == id; });
-        syncconf::save(pairs);
+        if (!syncconf::update([&](std::vector<syncconf::Pair>& pairs) { std::erase_if(pairs, [&](const syncconf::Pair& p) { return p.id == id; }); })) {
+            out("error=pairs.ini couldn't be read or written\n");
+            return 1;
+        }
         syncconf::forget_secrets(id);
         syncipc::Msg r;
         syncipc::call(syncipc::request("reload"), r, 60000);

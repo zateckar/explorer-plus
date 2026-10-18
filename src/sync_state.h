@@ -36,7 +36,10 @@ public:
     ~StateStore();
     StateStore(const StateStore&) = delete;
     StateStore& operator=(const StateStore&) = delete;
-    bool load();                                 // false: unreadable (starts empty)
+    // false: damaged (what could be read is loaded), or unreadable() (in use, a disk error:
+    // nothing loaded, and the store mustn't be used, as it would start over as if empty)
+    bool load();
+    bool unreadable() const { return m_unreadable; }
     const std::wstring& dir() const { return m_dir; }
 
     // all keys are syncpath::case_key(path)
@@ -69,6 +72,7 @@ private:
     std::map<std::string, std::string> m_values;
     HANDLE m_log = INVALID_HANDLE_VALUE;
     uint64_t m_logBytes = 0, m_snapBytes = 0;
+    bool m_unreadable = false;
     mutable std::recursive_mutex m_mx;
 };
 

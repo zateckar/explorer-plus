@@ -308,6 +308,28 @@ std::wstring password_problem(const std::string& pw) {
     }
     if (chars < 12) return L"The password needs at least 12 characters.";
     if (!lower || !upper || !digit) return L"The password needs small letters, capital letters and digits.";
+    // what guessing tries first doesn't count: common words, runs on the keyboard or in the
+    // alphabet (1234, abcd, qwer, and backwards), one character three times or more
+    std::string low = pw;
+    for (auto& c : low) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    std::vector<bool> used(low.size(), false);
+    auto mark = [&](const std::string& w) {
+        for (size_t i = low.find(w); i != std::string::npos; i = low.find(w, i + 1))
+            for (size_t k = 0; k < w.size(); ++k) used[i + k] = true;
+    };
+    for (const char* w : { "password", "passwort", "heslo", "letmein", "welcome", "admin", "iloveyou", "explorer", "monkey", "dragon" }) mark(w);
+    for (std::string row : { "abcdefghijklmnopqrstuvwxyz", "01234567890", "qwertyuiop", "qwertzuiop", "asdfghjkl", "zxcvbnm", "yxcvbnm" }) {
+        for (int dir = 0; dir < 2; ++dir) {
+            for (size_t i = 0; i + 4 <= row.size(); ++i) mark(row.substr(i, 4));
+            std::reverse(row.begin(), row.end());
+        }
+    }
+    for (size_t i = 0; i + 3 <= low.size(); ++i)
+        if (low[i] == low[i + 1] && low[i] == low[i + 2]) used[i] = used[i + 1] = used[i + 2] = true;
+    size_t left = 0;
+    for (size_t i = 0; i < low.size(); ++i)
+        if (!used[i] && ((unsigned char)low[i] & 0xC0) != 0x80) ++left;
+    if (left < 8) return L"The password is too easy to guess (common words, 1234, abcd, qwer, repeated characters): make it longer or less regular.";
     return {};
 }
 

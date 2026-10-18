@@ -377,7 +377,7 @@ void test_encrypted() {
         if (!r.result.ok()) std::printf("  sync: %s\n", to_utf8(r.result.message).c_str());
         return r;
     };
-    std::string rec = "Sync password 1";
+    std::string rec = "Tidal Walrus 1";
     CHECK(synckeys::setup_ring(*a.ks, rec).ok());
     CHECK(open(a, true).ok());
     for (int i = 0; i < 8; ++i) tu::write(a.root, L"docs/file " + std::to_wstring(i) + L".txt", "S3-SECRET " + std::to_string(i));

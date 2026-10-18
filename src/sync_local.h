@@ -28,7 +28,7 @@ std::string root_identity(const std::wstring& root);
 
 // BLAKE2b of a file's content, read through `h` from the start (false: read failed)
 bool hash_handle(HANDLE h, Hash& out, uint64_t* size = nullptr);
-// open for reading, other writers kept out (FILE_SHARE_READ only)
+// open for reading, other writers kept out (FILE_SHARE_READ | FILE_SHARE_DELETE)
 HANDLE open_for_read(const std::wstring& full);
 // size, mtime, file ID of an open file
 bool file_identity(HANDLE h, uint64_t& size, uint64_t& mtime, uint64_t& fileId, uint32_t* attrs = nullptr);

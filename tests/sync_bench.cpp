@@ -204,7 +204,7 @@ int run_sync_bench(int smallFiles, uint64_t bigMB) {
     tu::rmrf(copy);
 
     std::unique_ptr<synckeys::KeyStore> ks = synckeys::memory_key_store();
-    std::string rec = "Sync password 1";
+    std::string rec = "Tidal Walrus 1";
     BackendConfig cfg = { { L"path", store } };
     int failed = 0;
     if (!synckeys::setup_ring(*ks, rec).ok() || !a.open(cfg, *ks, true).ok() || !b.open(cfg, *ks, false).ok()) {

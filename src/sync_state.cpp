@@ -81,18 +81,24 @@ std::string record(uint8_t type, const std::string& payload) {
     return out;
 }
 
-bool read_file(const std::wstring& path, std::string& out) {
+// false: not there, or (`failed`) there but not read whole
+bool read_file(const std::wstring& path, std::string& out, bool* failed = nullptr) {
     out.clear();
+    if (failed) *failed = false;
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD e = GetLastError();
+        if (failed) *failed = e != ERROR_FILE_NOT_FOUND && e != ERROR_PATH_NOT_FOUND;
+        return false;
+    }
     LARGE_INTEGER sz{};
     GetFileSizeEx(h, &sz);
     out.resize((size_t)sz.QuadPart);
     DWORD got = 0;
     size_t done = 0;
     while (done < out.size() && ReadFile(h, out.data() + done, (DWORD)std::min<size_t>(out.size() - done, 1 << 30), &got, nullptr) && got) done += got;
-    out.resize(done);
     CloseHandle(h);
+    if (done != out.size()) { out.clear(); if (failed) *failed = true; return false; }
     return true;
 }
 } // namespace
@@ -133,8 +139,9 @@ bool StateStore::load() {
     if (m_dir.empty()) return true;
     CreateDirectoryW(m_dir.c_str(), nullptr);
     std::string snap, log;
-    bool ok = true;
-    if (read_file(m_dir + L"\\base.dat", snap)) {
+    bool ok = true, failed = false;
+    m_unreadable = false;
+    if (read_file(m_dir + L"\\base.dat", snap, &failed)) {
         if (snap.compare(0, 6, "EPSB1\n") != 0) ok = false;
         else {
             std::string body = snap.substr(6);
@@ -142,8 +149,15 @@ bool StateStore::load() {
             if (used != body.size()) ok = false;
             m_snapBytes = snap.size();
         }
+        // damaged: what could be read is used (a smaller base only ever adopts or keeps both, never
+        // deletes); the file kept beside for a look
+        if (!ok) CopyFileW((m_dir + L"\\base.dat").c_str(), (m_dir + L"\\base.dat.damaged").c_str(), FALSE);
+    } else if (failed) {
+        m_unreadable = true;                            // (in use, a disk error: not as if empty)
+        return false;
     }
-    read_file(m_dir + L"\\base.log", log);
+    read_file(m_dir + L"\\base.log", log, &failed);
+    if (failed) { m_unreadable = true; m_base.clear(); m_remote.clear(); m_values.clear(); return false; }
     size_t used = parse_records(log, [&](uint8_t t, const std::string& p) { return apply(t, p); });
     m_log = CreateFileW((m_dir + L"\\base.log").c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, 0, nullptr);
     if (m_log != INVALID_HANDLE_VALUE) {
@@ -152,6 +166,9 @@ bool StateStore::load() {
         SetFilePointerEx(m_log, at, nullptr, FILE_BEGIN);
         SetEndOfFile(m_log);
         m_logBytes = used;
+    } else {
+        m_unreadable = true;                            // (changes couldn't be kept)
+        return false;
     }
     return ok;
 }

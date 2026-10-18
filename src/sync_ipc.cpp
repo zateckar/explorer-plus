@@ -77,7 +77,30 @@ static std::wstring user_sid() {
 }
 
 std::wstring pipe_name() { return L"\\\\.\\pipe\\ExplorerPlus.Sync." + user_sid() + L"." + sync_namespace(); }
-std::wstring agent_mutex_name() { return L"Local\\ExplorerPlus.Sync." + sync_namespace(); }
+// (the user's: another account in the same session, a runas, has its own)
+std::wstring agent_mutex_name() { return L"Local\\ExplorerPlus.Sync." + user_sid() + L"." + sync_namespace(); }
+
+// the pipe's server runs as this user: a pipe of that name made first by another account (pipe
+// names are machine-wide) never gets the requests, which carry secrets
+static bool server_is_this_user(HANDLE pipe) {
+    ULONG pid = 0;
+    if (!GetNamedPipeServerProcessId(pipe, &pid)) return false;
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc) return false;
+    HANDLE tok = nullptr;
+    bool same = false;
+    if (OpenProcessToken(proc, TOKEN_QUERY, &tok)) {
+        BYTE buf[256];
+        DWORD n = 0;
+        if (GetTokenInformation(tok, TokenUser, buf, sizeof(buf), &n)) {
+            LPWSTR s = nullptr;
+            if (ConvertSidToStringSidW(((TOKEN_USER*)buf)->User.Sid, &s)) { same = user_sid() == s; LocalFree(s); }
+        }
+        CloseHandle(tok);
+    }
+    CloseHandle(proc);
+    return same;
+}
 
 // ------------------------------------------------------------------ framing
 static bool write_all(HANDLE h, const void* p, DWORD n) {
@@ -128,6 +151,7 @@ bool call(const Msg& req, Msg& reply, DWORD timeoutMs) {
         if (GetLastError() != ERROR_PIPE_BUSY || GetTickCount64() - start > timeoutMs) return false;
         WaitNamedPipeW(name.c_str(), 200);
     }
+    if (!server_is_this_user(h)) { CloseHandle(h); return false; }
     DWORD mode = PIPE_READMODE_BYTE;
     SetNamedPipeHandleState(h, &mode, nullptr, nullptr);
     // a reply that never comes (a hung agent) mustn't hang the caller

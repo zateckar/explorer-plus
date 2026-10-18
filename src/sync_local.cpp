@@ -47,9 +47,16 @@ static void scan_dir(const std::wstring& root, const RelPath& rel, const syncpat
                     DWORD tag = p->EaSize;                   // holds the reparse tag for reparse points
                     link = tag == IO_REPARSE_TAG_SYMLINK || tag == IO_REPARSE_TAG_MOUNT_POINT || tag == 0x80000023 /* AF_UNIX */;
                 }
-                RelPath child = join_path(rel, syncpath::nfc(name));
+                std::wstring nfcName = syncpath::nfc(name);
+                RelPath child = join_path(rel, nfcName);
                 if (link && !ig.ignored(child, isDir)) out.unknown.push_back(child);   // (what it replaced stays as it is)
-                else if (!link && !ig.ignored(child, isDir)) {
+                else if (nfcName != name && !ig.ignored(child, isDir)) {
+                    // a name not in the composed form (NFD: from a Mac): its paths here aren't the
+                    // ones the storage has, so it isn't synced, and neither side is touched there
+                    out.problems.push_back({ child, L"The name's accents are stored decomposed (as a Mac writes them): "
+                                                    L"not synced. Renaming it here fixes that." });
+                    out.unknown.push_back(child);
+                } else if (!link && !ig.ignored(child, isDir)) {
                     LocalItem it;
                     it.path = child;
                     it.isDir = isDir;
@@ -91,7 +98,9 @@ std::string root_identity(const std::wstring& root) {
 }
 
 HANDLE open_for_read(const std::wstring& full) {
-    return CreateFileW(full.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    // (deleting or renaming it meanwhile stays possible: the next pass sees that)
+    return CreateFileW(full.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN,
+                       nullptr);
 }
 
 bool file_identity(HANDLE h, uint64_t& size, uint64_t& mtime, uint64_t& fileId, uint32_t* attrs) {

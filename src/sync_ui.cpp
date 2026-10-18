@@ -707,7 +707,8 @@ enum { ID_COPY = 10, ID_TEST, ID_ADD, ID_REMOVE, ID_PAUSE, ID_SYNCNOW, ID_DEVICE
 // sync password took its place and is kept nowhere, so it goes once a password is set.
 const wchar_t* kOldRecoveryCred = L"recovery-key";
 
-const wchar_t* kPasswordRules = L"12 characters or more, with lower and upper case letters and digits.";
+const wchar_t* kPasswordRules = L"12 characters or more, with lower and upper case letters and digits, and not easy to guess "
+                                L"(no common words, 1234 or qwer).";
 
 // The sync password, typed twice (and the current one first when `current`). send: hands it
 // to the agent; false keeps the form open (it said why). True once a password was taken.
@@ -1003,9 +1004,8 @@ bool add_form(HWND owner) {
         syncconf::split_secrets(p.type, cfg, secrets);
         p.cfg = cfg;
         for (auto& [k, v] : secrets) syncconf::set_secret(p.id, k, v);
-        pairs.push_back(p);
-        if (!syncconf::save(pairs)) {
-            MessageBoxW(f.wnd, L"The sync settings couldn't be written.", f.title.c_str(), MB_OK | MB_ICONERROR);
+        if (!syncconf::update([&](std::vector<syncconf::Pair>& now) { now.push_back(p); })) {
+            MessageBoxW(f.wnd, L"The sync settings couldn't be read or written.", f.title.c_str(), MB_OK | MB_ICONERROR);
             syncconf::forget_secrets(p.id);
             return false;
         }
@@ -1270,15 +1270,18 @@ bool edit_form(HWND owner, const syncconf::Pair& old) {
             p.create = vault == "none";
         }
         p.cfg = cfg;
-        auto pairs = syncconf::load();
-        auto it = std::find_if(pairs.begin(), pairs.end(), [&](const syncconf::Pair& x) { return x.id == old.id; });
-        if (it == pairs.end()) return true;
-        *it = p;
+        {
+            bool there = false;
+            for (auto& x : syncconf::load()) if (x.id == old.id) there = true;
+            if (!there) return true;
+        }
         // secrets first: the agent opens the pair as soon as it reloads
         for (auto& [k, v] : secrets)
             if (moved || v != sync::config_get(saved, k)) syncconf::set_secret(p.id, k, v);
-        if (!syncconf::save(pairs)) {
-            MessageBoxW(f.wnd, L"The sync settings couldn't be written.", f.title.c_str(), MB_OK | MB_ICONERROR);
+        if (!syncconf::update([&](std::vector<syncconf::Pair>& pairs) {
+                for (auto& x : pairs) if (x.id == old.id) x = p;
+            })) {
+            MessageBoxW(f.wnd, L"The sync settings couldn't be read or written.", f.title.c_str(), MB_OK | MB_ICONERROR);
             if (moved) syncconf::forget_secrets(p.id);
             return false;
         }
@@ -1420,9 +1423,12 @@ void sync_folders_dialog(HWND owner) {
                 syncconf::Pair p = rows[i].p;
                 std::wstring ask = L"Stop syncing " + p.name + L"?\n\nIts files stay in " + p.root + L" and on the storage; nothing is deleted.";
                 if (MessageBoxW(f.wnd, ask.c_str(), f.title.c_str(), MB_OKCANCEL | MB_ICONQUESTION) != IDOK) break;
-                auto pairs = syncconf::load();
-                std::erase_if(pairs, [&](const syncconf::Pair& x) { return x.id == p.id; });
-                syncconf::save(pairs);
+                if (!syncconf::update([&](std::vector<syncconf::Pair>& pairs) {
+                        std::erase_if(pairs, [&](const syncconf::Pair& x) { return x.id == p.id; });
+                    })) {
+                    MessageBoxW(f.wnd, L"The sync settings couldn't be read or written.", f.title.c_str(), MB_OK | MB_ICONERROR);
+                    break;
+                }
                 syncconf::forget_secrets(p.id);
                 Msg q = syncipc::request("reload"), r;
                 if (syncipc::agent_running()) agent_call(f, q, r, 60000);

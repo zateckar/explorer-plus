@@ -940,6 +940,10 @@ private:
         if (!r.ok()) return r;
         if (root.seq < pinSeq)
             return Result::fail(Status::Tampered, L"The vault's manifest on the storage is older than one this device already saw (rolled back).");
+        // the same number, another root: the storage shows devices different histories (every
+        // write of a root is conditional, and a new one always takes the next number)
+        if (root.seq == pinSeq && !pinHash.empty() && root.hash != pinHash)
+            return Result::fail(Status::Tampered, L"The vault's manifest on the storage isn't the one this device saw under the same number (forked).");
         // the shards: the ones already read are kept
         std::map<crypto::Hash32, const crypto::Bytes*> had;
         std::vector<crypto::Bytes> old;

@@ -1,5 +1,6 @@
 #pragma once
 #include "sync_backend.h"
+#include <functional>
 
 // The sync pairs of this settings folder: Sync\pairs.ini beside settings.ini (UTF-8), one
 // section per pair. Fields of kind Secret (a PAT, an S3 secret) never go into the file:
@@ -24,8 +25,11 @@ struct Pair {
 };
 
 std::wstring pairs_file();                 // "" without a settings folder
-std::vector<Pair> load();
+// `ok` false: the file is there but couldn't be read (then nothing must be saved over it)
+std::vector<Pair> load(bool* ok = nullptr);
 bool save(const std::vector<Pair>& pairs);
+// load, change, save, with other processes' updates kept out (false: not read, or not written)
+bool update(const std::function<void(std::vector<Pair>&)>& change);
 std::string new_id();
 
 // the backend config with the pair's secrets filled in from Credential Manager

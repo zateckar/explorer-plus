@@ -64,11 +64,22 @@ static bool spawn(const std::wstring& exe, const std::vector<std::wstring>& args
     SetHandleInformation(c.err, HANDLE_FLAG_INHERIT, 0);
     std::wstring cmd = quote_arg(exe);
     for (auto& a : args) { cmd += L' '; cmd += quote_arg(a); }
-    STARTUPINFOW si{ sizeof(si) };
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = inR;
-    si.hStdOutput = outW;
-    si.hStdError = errW;
+    STARTUPINFOEXW si{};
+    si.StartupInfo.cb = sizeof(si);
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = inR;
+    si.StartupInfo.hStdOutput = outW;
+    si.StartupInfo.hStdError = errW;
+    // only its own three pipe ends are inherited: not another thread's child's at the same moment
+    // (which would keep that child's pipes open, and its reader waiting, as long as this one runs)
+    HANDLE inherit[3] = { inR, outW, errW };
+    SIZE_T attrSize = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
+    std::vector<uint8_t> attrBuf(attrSize);
+    auto* attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)attrBuf.data();
+    bool listed = attrSize && InitializeProcThreadAttributeList(attrs, 1, 0, &attrSize) &&
+                  UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit, sizeof(inherit), nullptr, nullptr);
+    if (listed) si.lpAttributeList = attrs;
     std::vector<wchar_t> env = env_block(o.env);
     PROCESS_INFORMATION pi{};
     c.job = CreateJobObjectW(nullptr, nullptr);
@@ -76,8 +87,10 @@ static bool spawn(const std::wstring& exe, const std::vector<std::wstring>& args
     li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     SetInformationJobObject(c.job, JobObjectExtendedLimitInformation, &li, sizeof(li));
     BOOL ok = CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, TRUE,
-                             CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
-                             env.data(), o.cwd.empty() ? nullptr : o.cwd.c_str(), &si, &pi);
+                             CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED |
+                                 (listed ? EXTENDED_STARTUPINFO_PRESENT : 0),
+                             env.data(), o.cwd.empty() ? nullptr : o.cwd.c_str(), &si.StartupInfo, &pi);
+    if (listed) DeleteProcThreadAttributeList(attrs);
     SecureZeroMemory(env.data(), env.size() * sizeof(wchar_t));
     CloseHandle(inR);
     CloseHandle(outW);
@@ -190,13 +203,16 @@ bool Session::fill() {
 
 bool Session::read_line(std::string& line) {
     line.clear();
+    size_t searched = 0;                                   // (past m_pos: not searched again)
     for (;;) {
-        for (size_t i = m_pos; i < m_buf.size(); ++i)
+        for (size_t i = m_pos + searched; i < m_buf.size(); ++i)
             if (m_buf[i] == '\n') {
                 line.assign(m_buf.data() + m_pos, i - m_pos);
                 m_pos = i + 1;
                 return true;
             }
+        searched = m_buf.size() - m_pos;
+        if (searched > (16u << 20)) return false;          // (no line is that long)
         if (!fill()) return false;
     }
 }
