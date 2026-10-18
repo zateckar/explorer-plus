@@ -157,7 +157,8 @@ bool base64_decode(const std::wstring& coded, std::wstring& text) {
         }
     }
     if (bits >= 6 || pad > 2) return false;         // (a lone sixth of a byte left: not Base64)
-    return from_utf8(bytes, text);
+    // (a NUL isn't text: put in, the file saved would open as binary, and the editor cuts there)
+    return bytes.find('\0') == std::string::npos && from_utf8(bytes, text);
 }
 
 std::wstring url_encode(const std::wstring& text) {
@@ -189,5 +190,5 @@ bool url_decode(const std::wstring& coded, std::wstring& text) {
         }
     }
     bytes += utf8(coded.substr(std::min(plain, coded.size())));
-    return from_utf8(bytes, text);
+    return bytes.find('\0') == std::string::npos && from_utf8(bytes, text);    // (%00: not text, as above)
 }

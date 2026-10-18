@@ -1,4 +1,5 @@
 #include "screenshot.h"
+#include "appstate.h"
 #include "imageedit.h"
 #include "settings.h"
 #include "theme.h"
@@ -296,7 +297,23 @@ bool try_hotkey() {
     return s_hotkey;
 }
 
+// Alt+Q not to be had, and no other Explorer Plus is there to hold it: another program has
+// it. Said once (it used to go unnoticed: Alt+Q simply did nothing here).
+void hotkey_taken_elsewhere(HWND self) {
+    if (settings_pref(L"screenshotHotkeyTaken", 0)) return;
+    for (HWND w = nullptr; (w = FindWindowExW(HWND_MESSAGE, w, L"ExplorerPlusScreenshotMsg", nullptr));)
+        if (w != self) return;                  // (one of ours: it's taken over when that one ends)
+    HWND owner = g_main;
+    if (!owner || !IsWindowVisible(owner)) return;      // (the file manager's window says it, not the player alone)
+    settings_set_pref(L"screenshotHotkeyTaken", 1);
+    MessageBoxW(owner, L"Alt+Q, the shortcut for a screenshot, is taken by another program, so it doesn't work here.\n\n"
+                       L"The Screenshot command in the menu still does. Close the other program, or change its shortcut, "
+                       L"and Alt+Q works again (Explorer Plus keeps trying).",
+                L"Explorer Plus", MB_OK | MB_ICONINFORMATION);
+}
+
 LRESULT CALLBACK msg_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    static int retries = 0;
     switch (msg) {
         case WM_HOTKEY:
             if (wp == kHotkey) start_now();
@@ -304,6 +321,7 @@ LRESULT CALLBACK msg_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_TIMER:
             if (wp == TIMER_DELAY) { KillTimer(h, TIMER_DELAY); start_now(); }
             else if (wp == TIMER_RETRY && try_hotkey()) KillTimer(h, TIMER_RETRY);
+            else if (wp == TIMER_RETRY && ++retries == 2) hotkey_taken_elsewhere(h);
             return 0;
     }
     return DefWindowProcW(h, msg, wp, lp);

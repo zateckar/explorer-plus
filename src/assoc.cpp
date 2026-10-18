@@ -170,7 +170,9 @@ bool write_choice(const std::wstring& ext, const std::wstring& prog, bool verify
         RegCloseKey(k);
         if (!ok) break;
         auto minute = [](const FILETIME& f) { return ((ULONGLONG)f.dwHighDateTime << 32 | f.dwLowDateTime) / 600000000ull; };
-        if (minute(t) == minute(after)) return !verify || assoc_text(ASSOCSTR_PROGID, ext) == prog;
+        if (minute(t) != minute(after)) continue;
+        if (!verify || assoc_text(ASSOCSTR_PROGID, ext) == prog) return true;
+        break;              // (written, but Windows doesn't take it: not left behind as an invalid choice)
     }
     RegDeleteTreeW(HKEY_CURRENT_USER, key.c_str());
     return false;

@@ -1385,6 +1385,7 @@ static void text_operations() {
     CHECK(url_decode(L"a%20b%26c%3D%C5%A1%2F~+%zz%", t) && t == L"a b&c=\u0161/~+%zz%");
     CHECK(url_decode(L"\U0001F600%20", t) && t == L"\U0001F600 ");
     CHECK(!url_decode(L"%C5", t));
+    CHECK(!base64_decode(L"AA==", t) && !url_decode(L"a%00b", t));   // (a NUL isn't text)
 }
 
 // damaged and hostile input: the decoders and parsers neither crash nor take quadratic time

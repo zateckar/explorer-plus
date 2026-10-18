@@ -149,6 +149,20 @@ const std::wstring& notepad_class() {
     return name;
 }
 
+// One Notepad window across processes: they would share the kept notes and each write its
+// own session over the other's. Start: held while a process looks for the window and makes
+// its own. Owner: held by the process whose window is open.
+static HANDLE s_ownerMx = nullptr;
+static std::wstring instance_mutex(const wchar_t* what) {
+    return L"Local\\" + notepad_class() + L"." + what;
+}
+static void release_instance() {
+    if (!s_ownerMx) return;
+    ReleaseMutex(s_ownerMx);
+    CloseHandle(s_ownerMx);
+    s_ownerMx = nullptr;
+}
+
 // ------------------------------------------------------------------
 // files
 // ------------------------------------------------------------------
@@ -486,6 +500,9 @@ void colour(Tab& t) {
         int state = it->second;
         if (a - from > kFar) {                      // (from a line a little before, as if nothing were open there)
             from = line_start(t, std::max(0L, a - 4096));
+            // (one huge line, minified JSON or JS: its start is as far as the states were;
+            // from a little before what's shown, mid-line, rather than all of it each scroll)
+            if (a - from > kFar) from = std::max(0L, a - 4096);
             state = 0;
             t.guessed = true;
         }
@@ -2693,6 +2710,7 @@ LRESULT CALLBACK notepad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             s_np = nullptr;
             delete pn;
+            release_instance();
             app_window_closed();
             return 0;
     }
@@ -2776,11 +2794,33 @@ bool hand_over(const std::vector<std::wstring>& files) {
 
 } // namespace
 
-void notepad_open(const std::vector<std::wstring>& files) {
-    if (!s_np) {
-        if (hand_over(files)) return;
-        if (!create_window()) return;
+// no window here: handed to another process's, or one of this process' own (false: neither)
+static bool open_instance(const std::vector<std::wstring>& files) {
+    if (hand_over(files)) return false;
+    HANDLE start = CreateMutexW(nullptr, FALSE, instance_mutex(L"Start").c_str());
+    if (start) WaitForSingleObject(start, 10000);           // (one started a moment ago: its window)
+    bool made = false;
+    if (!hand_over(files)) {
+        HANDLE owner = CreateMutexW(nullptr, FALSE, instance_mutex(L"Owner").c_str());
+        DWORD w = owner ? WaitForSingleObject(owner, 0) : WAIT_FAILED;
+        if (w == WAIT_TIMEOUT) {
+            // another process has the Notepad open, and it didn't answer
+            CloseHandle(owner);
+            MessageBoxW(nullptr, L"The Notepad is open in another window that isn't responding. Try again in a moment.",
+                        L"Notepad", MB_OK | MB_ICONINFORMATION);
+        } else {
+            if (w == WAIT_OBJECT_0 || w == WAIT_ABANDONED) s_ownerMx = owner;
+            else if (owner) CloseHandle(owner);
+            made = create_window();
+            if (!made) release_instance();
+        }
     }
+    if (start) { ReleaseMutex(start); CloseHandle(start); }
+    return made;
+}
+
+void notepad_open(const std::vector<std::wstring>& files) {
+    if (!s_np && !open_instance(files)) return;
     Notepad& n = *s_np;
     for (auto& f : files) {
         if (!s_np) return;
@@ -2795,7 +2835,6 @@ void notepad_open(const std::vector<std::wstring>& files) {
 bool notepad_open_file(const std::wstring& path) {
     std::vector<std::wstring> files;
     if (!path.empty()) files.push_back(path);
-    if (!s_np && hand_over(files)) return false;
     notepad_open(files);
     return s_np != nullptr;
 }
