@@ -53,7 +53,7 @@ set(EP_SYNC_CORE_SOURCES
     src/sync_ipc.cpp
     src/sigv4.cpp
 )
-set(EP_SYNC_LIBS bcrypt winhttp advapi32 credui normaliz shell32 ole32)
+set(EP_SYNC_LIBS bcrypt winhttp advapi32 credui normaliz shell32 ole32 uuid)
 set_source_files_properties(third_party/monocypher/monocypher.c src/crypto.cpp src/crypto_file.cpp src/crypto_names.cpp
     PROPERTIES COMPILE_OPTIONS -O2)
 

@@ -355,10 +355,15 @@ int wmain(int argc, wchar_t** argv) {
         RemoveDirectoryW(settingsDir.c_str());
         return r;
     }
-    if (argc > 1 && (wcscmp(argv[1], L"--azdo") == 0 || wcscmp(argv[1], L"--crypt") == 0)) {   // one group alone
+    if (argc > 1 && (wcscmp(argv[1], L"--azdo") == 0 || wcscmp(argv[1], L"--crypt") == 0 || wcscmp(argv[1], L"--engine") == 0 ||
+                     wcscmp(argv[1], L"--recycle") == 0)) {   // one group alone
         extern void run_azdo_tests();
         extern void run_crypt_tests();
+        extern void run_engine_only();
+        extern void run_recycle_test();
         if (wcscmp(argv[1], L"--azdo") == 0) run_azdo_tests();
+        else if (wcscmp(argv[1], L"--engine") == 0) run_engine_only();
+        else if (wcscmp(argv[1], L"--recycle") == 0) run_recycle_test();     // (the real Recycle Bin: by hand only)
         else run_crypt_tests();
         RemoveDirectoryW((settingsDir + L"\\Sync").c_str());
         RemoveDirectoryW(settingsDir.c_str());

@@ -175,8 +175,9 @@ private:
             }
             out.push_back(std::move(e));
         } while (FindNextFileW(h, &fd));
+        bool complete = GetLastError() == ERROR_NO_MORE_FILES;      // (a share that dropped: not a short listing)
         FindClose(h);
-        if (p.cancelled()) return false;
+        if (!complete || p.cancelled()) return false;
         for (auto& d : dirs) if (!walk(d, out, p)) return false;
         return true;
     }

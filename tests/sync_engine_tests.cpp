@@ -5,6 +5,7 @@
 #include "sync_engine.h"
 #include "sync_paths.h"
 #include "crypto.h"
+#include <sddl.h>
 #include <cstdio>
 #include <set>
 
@@ -163,6 +164,8 @@ struct Dev {
     std::unique_ptr<Engine> eng;
     std::shared_ptr<FakeStore> store;
     bool tx;
+    std::vector<RelPath> excluded;              // (options for the next open())
+    size_t massFiles = 50, massMax = 250;
     Dev(const std::wstring& name, std::shared_ptr<FakeStore> s, bool transactional = false) : store(std::move(s)), tx(transactional) {
         root = tu::temp_root(name);
         stateDir = tu::temp_root(name + L"-state");
@@ -178,6 +181,9 @@ struct Dev {
         o.deviceName = L"DEV";
         o.trashDir = trash;
         o.settleMs = 0;
+        o.excluded = excluded;
+        o.massDeleteFiles = massFiles;
+        o.massDeleteMax = massMax;
         eng = std::make_unique<Engine>(o, backend ? std::move(backend) : std::make_unique<FakeBackend>(store, tx), *st);
     }
     PassReport sync() {
@@ -342,6 +348,120 @@ static void engine_faults() {
     CHECK(a.sync().result.ok());
 }
 
+// a folder nobody may list (an ACL change, a filter driver): the scan can't see into it
+static bool deny_list(const std::wstring& dir, bool deny) {
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    const wchar_t* sddl = deny ? L"D:P(D;;0x1;;;WD)(A;OICI;FA;;;WD)" : L"D:(A;OICI;FA;;;WD)";
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &sd, nullptr)) return false;
+    bool ok = SetFileSecurityW(dir.c_str(), DACL_SECURITY_INFORMATION, sd) != 0;
+    LocalFree(sd);
+    return ok;
+}
+
+static bool make_junction(const std::wstring& link, const std::wstring& target) {
+    std::wstring cmd = L"mklink /J \"" + link + L"\" \"" + target + L"\" >nul";
+    return _wsystem(cmd.c_str()) == 0;
+}
+
+// what the scan can't see, what the rules leave out, what a yes covers: never a deletion
+// the user didn't make
+static void engine_no_false_deletes() {
+    auto store = std::make_shared<FakeStore>();
+    Dev a(L"ua", store), b(L"ub", store);
+    tu::write(a.root, L"locked/x.txt", "x");
+    tu::write(a.root, L"locked/sub/y.txt", "y");
+    tu::write(a.root, L"j/z.txt", "z");
+    tu::write(a.root, L"ex/f.txt", "f");
+    tu::write(a.root, L"mv.txt", "move me");
+    for (int i = 0; i < 60; ++i) tu::write(a.root, L"many/" + std::to_wstring(i) + L".txt", "m");
+    CHECK(a.sync().result.ok());
+    CHECK(b.sync().result.ok());
+    CHECK(same(a, b));
+
+    // an unreadable folder: its files aren't taken for deleted
+    std::wstring locked = a.root + L"\\locked";
+    CHECK(deny_list(locked, true));
+    PassReport r = a.sync();
+    CHECK(r.remoteDeletes == 0);
+    CHECK(store->objs.count(L"locked/x.txt") == 1 && store->objs.count(L"locked/sub/y.txt") == 1);
+    bool seen = false;                              // (the scan really couldn't read it)
+    for (auto& [p, why] : a.eng->status().problems) if (p == L"locked") seen = true;
+    CHECK(seen);
+    CHECK(deny_list(locked, false));
+    r = a.sync();
+    CHECK(r.remoteDeletes == 0 && r.uploads == 0);
+    b.sync();
+    CHECK(tu::read(b.root, L"locked/sub/y.txt") == "y");
+
+    // a folder replaced by a junction (moved elsewhere): what it held stays in the storage
+    std::wstring away = a.root + L"-jtarget";
+    CHECK(MoveFileW((a.root + L"\\j").c_str(), away.c_str()));
+    CHECK(make_junction(a.root + L"\\j", away));
+    r = a.sync();
+    CHECK(r.remoteDeletes == 0 && store->objs.count(L"j/z.txt") == 1);
+    RemoveDirectoryW((a.root + L"\\j").c_str());
+    CHECK(MoveFileW(away.c_str(), (a.root + L"\\j").c_str()));
+    r = a.sync();
+    CHECK(r.remoteDeletes == 0 && r.uploads == 0);
+
+    // left out, deleted here to make room, brought back in: it comes back, nothing is deleted
+    a.excluded = { L"ex" };
+    a.open();
+    CHECK(a.sync().result.ok());
+    tu::remove(a.root, L"ex");
+    CHECK(a.sync().remoteDeletes == 0);
+    a.excluded.clear();
+    a.open();
+    r = a.sync();
+    CHECK(r.remoteDeletes == 0);
+    CHECK(tu::read(a.root, L"ex/f.txt") == "f");
+    b.sync();
+    CHECK(tu::read(b.root, L"ex/f.txt") == "f");
+
+    // a yes nobody was asked for approves nothing
+    a.eng->confirm_deletes(true);
+    tu::remove(a.root, L"many");
+    r = a.sync();
+    CHECK(r.result.st == Status::Rejected && a.eng->status().state == PairState::ConfirmDeletes);
+    a.eng->confirm_deletes(false);                  // restore them
+    a.sync();
+    CHECK(tu::exists(a.root, L"many/59.txt"));
+    // a yes covers the deletions asked about, not more
+    for (int i = 0; i < 55; ++i) tu::remove(a.root, L"many/" + std::to_wstring(i) + L".txt");
+    r = a.sync();
+    CHECK(r.result.st == Status::Rejected);
+    a.eng->confirm_deletes(true);
+    tu::remove(a.root, L"many");                    // 5 more since the question
+    r = a.sync();
+    CHECK(r.result.st == Status::Rejected && a.eng->status().pendingDeletes == 60);
+    a.eng->confirm_deletes(false);
+    a.sync();
+    CHECK(tu::exists(a.root, L"many/0.txt"));
+    // many files but a small share: a lot is still a lot
+    a.massFiles = 5;
+    a.massMax = 10;
+    a.open();
+    for (int i = 0; i < 12; ++i) tu::remove(a.root, L"many/" + std::to_wstring(i) + L".txt");
+    r = a.sync();
+    CHECK(r.result.st == Status::Rejected);
+    a.eng->confirm_deletes(false);
+    a.sync();
+
+    // no server-side move and the upload under the new name fails: the old one stays
+    store->fault = [](const char* op, const RelPath& p) {
+        std::string o = op;
+        return o == "move" || (o == "upload" && p == L"mv2.txt") ? Status::Fatal : Status::Ok;
+    };
+    CHECK(tu::rename(a.root, L"mv.txt", L"mv2.txt"));
+    a.sync();
+    CHECK(store->objs.count(L"mv.txt") == 1);
+    store->fault = nullptr;
+    a.sync();
+    b.sync();
+    CHECK(store->objs.count(L"mv.txt") == 0 && store->objs.count(L"mv2.txt") == 1);
+    CHECK(same(a, b));
+}
+
 static void engine_commit_race() {
     // transactional store (git-like): two devices commit at once; the later one re-plans
     auto store = std::make_shared<FakeStore>();
@@ -370,14 +490,38 @@ static void engine_commit_race() {
     CHECK(same(a, b));
 }
 
-int run_engine_tests() {
+void run_engine_only() {
     test_paths();
     test_planner();
     test_state();
     engine_scenarios(false);
     engine_scenarios(true);
     engine_faults();
+    engine_no_false_deletes();
     engine_commit_race();
+}
+
+// the shell's Recycle Bin takes a local file; a network share has none, and the file stays
+// (never deleted for good). Touches the real Recycle Bin: run by hand (--recycle).
+void run_recycle_test() {
+    std::wstring dir = tu::temp_root(L"recycle");
+    tu::write(dir, L"bin.txt", "to the Recycle Bin");
+    CHECK(recycle(dir + L"\\bin.txt", L"", L"bin.txt"));
+    CHECK(!tu::exists(dir, L"bin.txt"));
+    // \\localhost\C$\...: the same file through the admin share, which has no Recycle Bin
+    tu::write(dir, L"share.txt", "stays");
+    if (dir.size() > 2 && dir[1] == L':') {
+        std::wstring unc = L"\\\\localhost\\" + dir.substr(0, 1) + L"$" + dir.substr(2) + L"\\share.txt";
+        if (GetFileAttributesW(unc.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            CHECK(!recycle(unc, L"", L"share.txt"));
+            CHECK(tu::read(dir, L"share.txt") == "stays");
+        } else std::printf("  (admin share not reachable: share case skipped)\n");
+    }
+    tu::rmrf(dir);
+}
+
+int run_engine_tests() {
+    run_engine_only();
     extern void run_crypt_tests();
     run_crypt_tests();
     extern void run_git_tests();

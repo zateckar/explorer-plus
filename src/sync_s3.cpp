@@ -257,7 +257,8 @@ private:
             bool truncated = false;
             std::string next;
             if (!parse_list_objects(r.body, out, truncated, next)) return Result::fail(Status::Fatal, L"The storage's listing couldn't be read.");
-            if (!truncated || next.empty() || maxKeys == 1) return {};
+            if (!truncated || maxKeys == 1) return {};
+            if (next.empty()) return Result::fail(Status::Fatal, L"The storage's listing couldn't be read.");   // (truncated, no way on)
             token = next;
             if (p.cancelled()) return Result::fail(Status::Cancelled);
         }

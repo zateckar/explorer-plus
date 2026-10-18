@@ -89,7 +89,13 @@ void Engine::set_paused(bool p) {
     else set_state(PairState::Idle);
 }
 
-void Engine::confirm_deletes(bool deleteThem) { m_confirm = deleteThem ? 1 : -1; }
+// (only while the question is open: a stray yes doesn't approve the next big deletion)
+void Engine::confirm_deletes(bool deleteThem) {
+    std::lock_guard<std::mutex> lk(m_mx);
+    if (!m_asked) return;
+    m_confirmed = m_asked;
+    m_confirm = deleteThem ? 1 : -1;
+}
 
 void Engine::dismiss_conflicts() {
     std::lock_guard<std::mutex> lk(m_mx);
@@ -741,9 +747,17 @@ Result Engine::run_remote_phase(Ctx& c, std::vector<Action>& acts) {
                     RemoteItem ri; ri.path = a.path; ri.size = out.size; ri.rev = out.rev;
                     c.record([this, e, ri, fk] { m_state.erase_base(fk); m_state.erase_remote(fk); m_state.put_base(e); m_state.put_remote(ri); remember_parents(e.path); });
                 } else if (!stop_on(x)) {
-                    // no server-side move: upload under the new name, delete the old one
-                    uploads.push_back({ Act::Upload, a.path, {}, "" });
-                    flush_uploads();
+                    // no server-side move: upload under the new name; the old one goes once that's stored
+                    { std::lock_guard<std::mutex> lk(m_mx); m_active.insert(k); }
+                    Result u = do_upload(c, { Act::Upload, a.path, {}, "" });
+                    { std::lock_guard<std::mutex> lk(m_mx); m_active.erase(k); if (u.ok()) m_errors.erase(k); }
+                    if (!u.ok()) {
+                        if (!stop_on(u) && u.st != Status::PreconditionFailed) problem(a.path, u.message.empty() ? status_name(u.st) : u.message);
+                        c.rep.again = true;
+                        break;
+                    }
+                    c.log("upload", a.path);
+                    ++c.rep.uploads;
                     Result d = m_backend->remove(a.from, a.expectedRev, c.prog);
                     std::wstring fk = key_of(a.from);
                     if (d.ok() || d.st == Status::NotFound) c.record([this, fk] { m_state.erase_base(fk); m_state.erase_remote(fk); });
@@ -840,45 +854,80 @@ PassReport Engine::pass(Progress& prog) {
         set_state(PairState::RootMissing, rep.result.message);
         return rep;
     }
+    if (scan.rootIncomplete) {                            // (what's missing from a listing isn't deleted)
+        rep.result = Result::fail(Status::Fatal, L"The sync folder couldn't be listed completely.");
+        set_state(PairState::Error, rep.result.message);
+        return rep;
+    }
     for (auto& [p, why] : scan.problems) problem(p, why);
     c.local = std::move(scan.items);
     hash_changed(c, c.local);
+
+    // what the scan couldn't see (an unreadable folder, a link): left as it is on both sides
+    std::vector<std::wstring> unknown;
+    for (auto& u : scan.unknown) unknown.push_back(key_of(u));
+    auto frozen = [&](const std::wstring& k) {
+        for (auto& u : unknown) if (k == u || under(k, u)) return true;
+        return false;
+    };
+    // left out by the rules: the item, or a folder above it
+    auto hidden = [&](const RelPath& path, bool isDir) {
+        if (ignore.ignored(path, isDir)) return true;
+        for (RelPath p = parent_of(path); !p.empty(); p = parent_of(p))
+            if (ignore.ignored(p, true)) return true;
+        return false;
+    };
 
     RemoteMap remote;
     BaseMap base;
     {
         std::lock_guard<std::recursive_mutex> lk(m_state.mutex());
-        base = m_state.base_all();
         for (auto& [k, it] : m_state.remote_all()) {
-            if (ignore.ignored(it.path, it.isDir)) continue;
-            bool skip = false;
-            for (RelPath p = it.path; !p.empty(); p = parent_of(p))
-                if (ignore.ignored(p, true) && p != it.path) { skip = true; break; }
-            if (skip) continue;
+            if (hidden(it.path, it.isDir) || frozen(k)) continue;
             if (!syncpath::windows_valid_path(it.path)) { problem(it.path, L"Windows can't hold this name."); continue; }
             remote[k] = it;
         }
-        // base items under an excluded folder stay as they are (neither side touched)
-        for (auto it = base.begin(); it != base.end();) {
-            if (ignore.ignored(it->second.path, it->second.isDir)) it = base.erase(it);
-            else ++it;
+        // base items left out by the rules are forgotten: brought back in, the two sides meet
+        // as new (same content adopted, different kept both), never as "deleted here"
+        std::vector<std::wstring> forget;
+        for (auto& [k, b] : m_state.base_all()) {
+            if (hidden(b.path, b.isDir)) forget.push_back(k);
+            else if (!frozen(k)) base[k] = b;
+            else if (std::find(unknown.begin(), unknown.end(), k) != unknown.end() && !c.local.count(k))
+                problem(b.path, L"Links aren't synced: what was here stays as it is in the storage.");
         }
+        for (auto& k : forget) m_state.erase_base(k);
+    }
+    for (auto it = c.local.begin(); it != c.local.end();) {
+        if (frozen(it->first)) it = c.local.erase(it);
+        else ++it;
     }
     add_implied_dirs(remote);
     Plan plan = make_plan(base, c.local, remote, c.caps);
     if (plan.deferred) rep.again = true;
 
-    // the mass-delete guard
+    // the mass-delete guard: many files, and a good share of the pair or simply a lot. A
+    // confirmation covers the deletions it was asked for, not more.
     size_t deletes = plan.localDeletes + plan.remoteDeletes;
-    if (m_confirm == 0 && deletes > m_opt.massDeleteFiles && (double)deletes > m_opt.massDeleteShare * (double)plan.files) {
+    int confirm = 0;
+    {
         std::lock_guard<std::mutex> lk(m_mx);
-        m_status.state = PairState::ConfirmDeletes;
-        m_status.pendingDeletes = deletes;
-        m_status.message = std::to_wstring(deletes) + L" files would be deleted.";
-        rep.result = Result::fail(Status::Rejected, m_status.message);
-        return rep;
+        confirm = m_confirm;
+        if (confirm == 1 && deletes > m_confirmed) confirm = 0;
+        m_confirm = 0;
+        m_asked = 0;
+        bool many = deletes > m_opt.massDeleteFiles &&
+                    ((double)deletes > m_opt.massDeleteShare * (double)plan.files || deletes > m_opt.massDeleteMax);
+        if (confirm == 0 && many) {
+            m_asked = deletes;
+            m_status.state = PairState::ConfirmDeletes;
+            m_status.pendingDeletes = deletes;
+            m_status.message = std::to_wstring(deletes) + L" files would be deleted.";
+            rep.result = Result::fail(Status::Rejected, m_status.message);
+            return rep;
+        }
     }
-    if (m_confirm == -1) {                                // "Restore them": deletions become copies back
+    if (confirm == -1) {                                  // "Restore them": deletions become copies back
         for (auto& a : plan.actions) {
             if (a.act == Act::DeleteLocal) { a.act = Act::Upload; a.expectedRev.clear(); }
             else if (a.act == Act::DeleteRemote) a.act = Act::Download;
@@ -890,7 +939,6 @@ PassReport Engine::pass(Progress& prog) {
             if (a.act == Act::Upload && !c.local.count(key_of(a.path))) a.act = Act::Forget;
         order_actions(plan.actions);
     }
-    m_confirm = 0;
 
     // what's waiting, for the badges and the status
     {

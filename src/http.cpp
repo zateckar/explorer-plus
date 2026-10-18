@@ -102,16 +102,18 @@ Response send(const Request& r) {
     std::string cl = resp.header("Content-Length");
     if (!cl.empty()) total = _strtoui64(cl.c_str(), nullptr, 10);
     std::vector<char> buf(256 * 1024);
+    // (a body cut short is no response: a 200 with half a listing must never pass for a whole one)
     for (;;) {
-        if (r.progress && r.progress->cancelled()) { resp.error = ERROR_CANCELLED; return resp; }
+        if (r.progress && r.progress->cancelled()) { resp.error = ERROR_CANCELLED; resp.status = 0; return resp; }
         DWORD n = 0;
-        if (!WinHttpReadData(req.h, buf.data(), (DWORD)buf.size(), &n)) { resp.error = GetLastError(); return resp; }
+        if (!WinHttpReadData(req.h, buf.data(), (DWORD)buf.size(), &n)) { resp.error = GetLastError(); resp.status = 0; return resp; }
         if (!n) break;
         got += n;
         if (toSink) {
             if (!r.sink->write(buf.data(), n)) { resp.sinkStopped = true; break; }
             if (r.progress) r.progress->bytes(got, total);
-        } else if (resp.body.size() < (16u << 20)) resp.body.append(buf.data(), n);
+        } else if (resp.body.size() < (64u << 20)) resp.body.append(buf.data(), n);
+        else { resp.error = ERROR_BUFFER_OVERFLOW; resp.status = 0; return resp; }   // (not cut short silently)
     }
     return resp;
 }

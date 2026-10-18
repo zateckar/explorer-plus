@@ -21,7 +21,8 @@ struct EngineOptions {
     std::vector<RelPath> excluded;      // selective sync
     int settleMs = 2000;                // files changed more recently wait
     size_t massDeleteFiles = 50;        // a pass deleting more than this many files...
-    double massDeleteShare = 0.25;      // ...and this share of the pair waits for confirmation
+    double massDeleteShare = 0.25;      // ...and this share of the pair (or more than massDeleteMax
+    size_t massDeleteMax = 250;         // files whatever the share) waits for confirmation
     int maxPasses = 5;                  // repeats of a pass that left work behind
 };
 
@@ -106,7 +107,9 @@ private:
     std::map<std::wstring, std::wstring> m_errors;   // key -> why
     std::map<std::wstring, std::wstring> m_listErrors;   // the last listing's problems (gone when it no longer has them)
     std::atomic<bool> m_paused{ false };
-    int m_confirm = 0;                  // 1: delete confirmed, -1: restore
+    int m_confirm = 0;                  // 1: delete confirmed, -1: restore (m_mx)
+    size_t m_asked = 0;                 // deletions the guard asked about (0: no question open)
+    size_t m_confirmed = 0;             // how many the yes covers
 };
 
 } // namespace sync

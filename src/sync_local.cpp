@@ -1,6 +1,7 @@
 #include "sync_local.h"
 #include "crypto.h"
 #include <shellapi.h>
+#include <shobjidl.h>
 #include <vector>
 
 namespace sync {
@@ -15,7 +16,10 @@ static void scan_dir(const std::wstring& root, const RelPath& rel, const syncpat
                            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
         if (rel.empty()) out.rootMissing = true;
-        else out.problems.push_back({ rel, L"The folder can't be read." });
+        else {
+            out.problems.push_back({ rel, L"The folder can't be read." });
+            out.unknown.push_back(rel);
+        }
         return;
     }
     std::vector<uint8_t> buf(64 * 1024);
@@ -23,8 +27,13 @@ static void scan_dir(const std::wstring& root, const RelPath& rel, const syncpat
     FILE_INFO_BY_HANDLE_CLASS cls = FileIdBothDirectoryRestartInfo;
     for (;;) {
         if (!GetFileInformationByHandleEx(h, cls, buf.data(), (DWORD)buf.size())) {
-            DWORD e = GetLastError();
-            if (e != ERROR_NO_MORE_FILES && !rel.empty()) out.problems.push_back({ rel, L"The folder couldn't be listed completely." });
+            if (GetLastError() != ERROR_NO_MORE_FILES) {
+                if (rel.empty()) out.rootIncomplete = true;
+                else {
+                    out.problems.push_back({ rel, L"The folder couldn't be listed completely." });
+                    out.unknown.push_back(rel);
+                }
+            }
             break;
         }
         cls = FileIdBothDirectoryInfo;
@@ -39,7 +48,8 @@ static void scan_dir(const std::wstring& root, const RelPath& rel, const syncpat
                     link = tag == IO_REPARSE_TAG_SYMLINK || tag == IO_REPARSE_TAG_MOUNT_POINT || tag == 0x80000023 /* AF_UNIX */;
                 }
                 RelPath child = join_path(rel, syncpath::nfc(name));
-                if (!link && !ig.ignored(child, isDir)) {
+                if (link && !ig.ignored(child, isDir)) out.unknown.push_back(child);   // (what it replaced stays as it is)
+                else if (!link && !ig.ignored(child, isDir)) {
                     LocalItem it;
                     it.path = child;
                     it.isDir = isDir;
@@ -121,6 +131,68 @@ bool make_dirs(const std::wstring& full) {
     return CreateDirectoryW(full.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS;
 }
 
+namespace {
+// refuses what the shell would delete for good instead of recycling (no Recycle Bin on that
+// drive, a policy, a file too big for it): with FOF_NO_UI it would do so without asking
+struct RecycleOnly : IFileOperationProgressSink {
+    bool refused = false;
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IUnknown || riid == IID_IFileOperationProgressSink) { *ppv = this; return S_OK; }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return 2; }          // (on the stack)
+    STDMETHODIMP_(ULONG) Release() override { return 1; }
+    STDMETHODIMP PreDeleteItem(DWORD flags, IShellItem*) override {
+        if (flags & TSF_DELETE_RECYCLE_IF_POSSIBLE) return S_OK;
+        refused = true;
+        return E_ABORT;
+    }
+    STDMETHODIMP StartOperations() override { return S_OK; }
+    STDMETHODIMP FinishOperations(HRESULT) override { return S_OK; }
+    STDMETHODIMP PreRenameItem(DWORD, IShellItem*, LPCWSTR) override { return S_OK; }
+    STDMETHODIMP PostRenameItem(DWORD, IShellItem*, LPCWSTR, HRESULT, IShellItem*) override { return S_OK; }
+    STDMETHODIMP PreMoveItem(DWORD, IShellItem*, IShellItem*, LPCWSTR) override { return S_OK; }
+    STDMETHODIMP PostMoveItem(DWORD, IShellItem*, IShellItem*, LPCWSTR, HRESULT, IShellItem*) override { return S_OK; }
+    STDMETHODIMP PreCopyItem(DWORD, IShellItem*, IShellItem*, LPCWSTR) override { return S_OK; }
+    STDMETHODIMP PostCopyItem(DWORD, IShellItem*, IShellItem*, LPCWSTR, HRESULT, IShellItem*) override { return S_OK; }
+    STDMETHODIMP PostDeleteItem(DWORD, IShellItem*, HRESULT, IShellItem*) override { return S_OK; }
+    STDMETHODIMP PreNewItem(DWORD, IShellItem*, LPCWSTR) override { return S_OK; }
+    STDMETHODIMP PostNewItem(DWORD, IShellItem*, LPCWSTR, LPCWSTR, DWORD, HRESULT, IShellItem*) override { return S_OK; }
+    STDMETHODIMP UpdateProgress(UINT, UINT) override { return S_OK; }
+    STDMETHODIMP ResetTimer() override { return S_OK; }
+    STDMETHODIMP PauseTimer() override { return S_OK; }
+    STDMETHODIMP ResumeTimer() override { return S_OK; }
+};
+
+// (on a thread of its own: IFileOperation wants a single-threaded apartment)
+bool shell_recycle(const std::wstring& path) {
+    bool ok = false;
+    std::thread([&] {
+        if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE))) return;
+        IFileOperation* op = nullptr;
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&op))) &&
+            SUCCEEDED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&item)))) {
+            RecycleOnly sink;
+            DWORD cookie = 0;
+            op->SetOperationFlags(FOF_ALLOWUNDO | FOF_NO_UI | FOFX_RECYCLEONDELETE);
+            if (SUCCEEDED(op->Advise(&sink, &cookie))) {
+                BOOL aborted = FALSE;
+                bool done = SUCCEEDED(op->DeleteItem(item, nullptr)) && SUCCEEDED(op->PerformOperations()) &&
+                            SUCCEEDED(op->GetAnyOperationsAborted(&aborted)) && !aborted;
+                op->Unadvise(cookie);
+                ok = done && !sink.refused && GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES;
+            }
+        }
+        if (item) item->Release();
+        if (op) op->Release();
+        CoUninitialize();
+    }).join();
+    return ok;
+}
+} // namespace
+
 bool recycle(const std::wstring& full, const std::wstring& trashDir, const RelPath& rel) {
     if (!trashDir.empty()) {
         SYSTEMTIME t;
@@ -131,19 +203,11 @@ bool recycle(const std::wstring& full, const std::wstring& trashDir, const RelPa
         make_dirs(dest.substr(0, dest.find_last_of(L'\\')));
         return MoveFileExW(full.c_str(), dest.c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING) != 0;
     }
-    // the shell's Recycle Bin: SHFileOperation takes ordinary paths (up to MAX_PATH)
+    // the shell's Recycle Bin: shell items take ordinary paths (up to MAX_PATH)
     std::wstring p = full;
     if (p.compare(0, 8, L"\\\\?\\UNC\\") == 0) p = L"\\\\" + p.substr(8);
     else if (p.compare(0, 4, L"\\\\?\\") == 0) p = p.substr(4);
-    if (p.size() < MAX_PATH) {
-        std::wstring from = p;
-        from.push_back(0);
-        SHFILEOPSTRUCTW op{};
-        op.wFunc = FO_DELETE;
-        op.pFrom = from.c_str();
-        op.fFlags = FOF_ALLOWUNDO | FOF_NO_UI;
-        if (SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted) return GetFileAttributesW(full.c_str()) == INVALID_FILE_ATTRIBUTES;
-    }
+    if (p.size() < MAX_PATH && shell_recycle(p)) return true;
     // too long for the shell, or no Recycle Bin on that drive: a deleted file is gone for
     // good only through the pair's trash folder, never straight away
     return false;

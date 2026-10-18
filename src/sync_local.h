@@ -14,6 +14,11 @@ struct ScanResult {
     LocalMap items;
     bool rootMissing = false;
     std::vector<std::pair<RelPath, std::wstring>> problems;   // unreadable folders...
+    // what the scan couldn't see: folders it couldn't open or list completely, links (a
+    // folder replaced by a junction). Neither side is touched at or under these: absent from
+    // the scan isn't deleted.
+    std::vector<RelPath> unknown;
+    bool rootIncomplete = false;        // the root itself couldn't be listed completely
 };
 // symlinks and junctions are not followed (nor listed); cloud placeholders are real files
 ScanResult scan_local(const std::wstring& root, const syncpath::Ignore& ignore);
