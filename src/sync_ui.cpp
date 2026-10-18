@@ -14,6 +14,7 @@
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <uxtheme.h>
+#include <vssym32.h>
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -274,6 +275,46 @@ void apply_fonts(Form& f) {
     }
 }
 
+// a checkbox, drawn here (NM_CUSTOMDRAW): the dark theme's box, but its label would be black
+LRESULT draw_check(Form& f, NMCUSTOMDRAW* cd) {
+    if (cd->dwDrawStage != CDDS_PREPAINT) return CDRF_DODEFAULT;
+    HWND h = cd->hdr.hwndFrom;
+    HDC dc = cd->hdc;
+    RECT rc = cd->rc;
+    FillRect(dc, &rc, bg_brush());
+    bool on = SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    bool off = (cd->uItemState & CDIS_DISABLED) || !IsWindowEnabled(h);
+    int state = (on ? CBS_CHECKEDNORMAL : CBS_UNCHECKEDNORMAL) +
+                (off ? 3 : (cd->uItemState & CDIS_SELECTED) ? 2 : (cd->uItemState & CDIS_HOT) ? 1 : 0);
+    SIZE sz{ f.px(13), f.px(13) };
+    HTHEME th = OpenThemeData(h, L"Button");
+    if (th) GetThemePartSize(th, dc, BP_CHECKBOX, state, nullptr, TS_DRAW, &sz);
+    RECT b{ rc.left, (rc.top + rc.bottom - sz.cy) / 2, 0, 0 };
+    b.right = b.left + sz.cx;
+    b.bottom = b.top + sz.cy;
+    if (th) DrawThemeBackground(th, dc, BP_CHECKBOX, state, &b, nullptr);
+    else DrawFrameControl(dc, &b, DFC_BUTTON, DFCS_BUTTONCHECK | (on ? DFCS_CHECKED : 0) | (off ? DFCS_INACTIVE : 0));
+    if (th) CloseThemeData(th);
+
+    wchar_t s[256] = {};
+    GetWindowTextW(h, s, 256);
+    HGDIOBJ of = SelectObject(dc, (HFONT)SendMessageW(h, WM_GETFONT, 0, 0));
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, off ? pal().textDisabled : pal().text);
+    RECT t{ b.right + f.px(6), rc.top, rc.right, rc.bottom };
+    DrawTextW(dc, s, -1, &t, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+    if ((cd->uItemState & CDIS_FOCUS) && !(SendMessageW(h, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS)) {
+        RECT m = t;                         // (the focus rectangle hugs the label)
+        DrawTextW(dc, s, -1, &m, DT_SINGLELINE | DT_NOPREFIX | DT_CALCRECT);
+        int dy = ((t.bottom - t.top) - (m.bottom - m.top)) / 2;
+        OffsetRect(&m, 0, dy);
+        InflateRect(&m, f.px(2), 1);
+        DrawFocusRect(dc, &m);
+    }
+    SelectObject(dc, of);
+    return CDRF_SKIPDEFAULT;
+}
+
 // an owner-drawn choice: the box and the dropped-down rows in the theme's colours
 void draw_choice(Form& f, DRAWITEMSTRUCT* di) {
     bool box = (di->itemState & ODS_COMBOBOXEDIT) != 0;
@@ -530,6 +571,9 @@ LRESULT CALLBACK form_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_NOTIFY: {
             auto* hdr = (NMHDR*)lp;
+            if (hdr->code == NM_CUSTOMDRAW)
+                for (auto& fl : f.fields)
+                    if (fl.kind == F_BOOL && hdr->hwndFrom == fl.ctl) return draw_check(f, (NMCUSTOMDRAW*)lp);
             if (hdr->hwndFrom == f.list) {
                 if (hdr->code == LVN_ITEMCHANGED && (((NMLISTVIEW*)lp)->uChanged & LVIF_STATE) && f.onSelect) f.onSelect(f);
                 if ((hdr->code == NM_DBLCLK || hdr->code == NM_RETURN) && f.onActivate && f.selected() >= 0 && !f.busy) f.onActivate(f);
