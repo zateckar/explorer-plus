@@ -15,12 +15,16 @@ struct TextFile {
     TextEncoding enc = TextEncoding::Utf8;
     LineEnding eol = LineEnding::CrLf;   // the file's own (the most used, CRLF when none)
     bool binary = false;            // NUL characters: not a text file
+    bool lossy = false;             // written back as read, some bytes would differ (an odd byte at the
+                                    // end of UTF-16, bytes the ANSI code page has no character for)
+    bool mixedEol = false;          // more than one kind of line ending (saving makes them all `eol`)
 };
 // the bytes of a file: the BOM, else UTF-16 by its zero bytes, else UTF-8 where it is valid,
-// else the ANSI code page
+// else the ANSI code page (a UTF-8 BOM before bytes that aren't UTF-8: ANSI, the BOM included,
+// so that saving gives back the same bytes)
 TextFile text_decode(const std::string& bytes);
 // the text (any of CR, LF, CRLF ending its lines) as a file's bytes; `lossy`: the encoding
-// (ANSI) can't hold some of its characters
+// (ANSI) can't hold some of its characters. Empty for a non-empty text: the conversion failed.
 std::string text_encode(const std::wstring& text, TextEncoding enc, LineEnding eol, bool* lossy = nullptr);
 
 // the tabs the Notepad had, with what wasn't saved (kept in its own folder)

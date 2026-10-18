@@ -27,6 +27,7 @@ struct ImageNote {
     std::vector<std::shared_ptr<const std::vector<uint32_t>>> frames;
     std::vector<int> delays;
     int page = 0, pages = 1;         // a TIFF's pages: the one decoded, of how many
+    bool partial = false;            // image_decode_full: the file holds more than was decoded (frames, pages, a bigger size)
 };
 
 // the whole picture at its own size, upright (COM initialised on the calling thread); an

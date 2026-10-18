@@ -541,6 +541,7 @@ bool image_decode_full(const std::wstring& path, ImageNote& out) {
     bool ok = decode(wic, path, 1 << 15, 1 << 15, 0, out, 1.0);      // (a drawing at its own size)
     wic->Release();
     out.path = path;
+    out.partial = out.frames.size() > 1 || out.pages > 1 || out.drawing || out.w < out.fullW || out.h < out.fullH;
     out.frames.clear();                     // (the first frame: what's edited)
     out.delays.clear();
     return ok;

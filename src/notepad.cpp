@@ -72,6 +72,7 @@ struct Tab {
     std::wstring cache;                     // the file with its unsaved text, in the notes folder
     bool cacheStale = false;                // changed since that was written
     ULONGLONG fileTime = 0;                 // its file's write time when read or saved
+    std::wstring caveat;                    // what saving changes in the file as read (asked once before it is)
     int pendingTop = -1;                    // (restored: the first line to show, once it is shown)
     CHARRANGE pendingSel{ -1, -1 };         // (restored: the selection, once its text is in)
     bool loading = false;                   // (text or look set here: no change of the user's)
@@ -157,16 +158,25 @@ ULONGLONG write_time(const std::wstring& path) {
     return (ULONGLONG)a.ftLastWriteTime.dwHighDateTime << 32 | a.ftLastWriteTime.dwLowDateTime;
 }
 
+// what saving a file as read would change in it (empty: nothing)
+std::wstring caveat_of(const TextFile& f) {
+    std::wstring s;
+    if (f.lossy) s += std::wstring(L"Some bytes of this file aren't text in its encoding (") + encoding_name(f.enc) + L"): saving changes them.\n";
+    if (f.mixedEol) s += std::wstring(L"This file mixes line endings: saving makes them all ") + line_ending_name(f.eol) + L".\n";
+    return s;
+}
+
 enum class Read { Ok, Failed, TooBig };
 
-Read read_bytes(const std::wstring& path, std::string& out) {
+// (`limit`: the kept text of a file at the limit is UTF-16, twice its size)
+Read read_bytes(const std::wstring& path, std::string& out, ULONGLONG limit = kMaxBytes) {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                            OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (h == INVALID_HANDLE_VALUE) return Read::Failed;
     LARGE_INTEGER size{};
     Read r = Read::Failed;
     if (GetFileSizeEx(h, &size)) {
-        if ((ULONGLONG)size.QuadPart > kMaxBytes) {
+        if ((ULONGLONG)size.QuadPart > limit) {
             r = Read::TooBig;
         } else {
             out.resize((size_t)size.QuadPart);
@@ -178,37 +188,44 @@ Read read_bytes(const std::wstring& path, std::string& out) {
     return r;
 }
 
-// (the bytes: in parts, as they are held)
-bool write_new(const std::wstring& path, std::string_view data, std::string_view more = {}) {
+enum class Wrote { Ok, Failed, NotCreated };
+
+// (the bytes: in parts, as they are held; on the disk before it returns, so that a crash or a
+// power cut after the move never leaves an empty file in its place)
+Wrote write_new(const std::wstring& path, std::string_view data, std::string_view more = {}) {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
+    if (h == INVALID_HANDLE_VALUE) return Wrote::NotCreated;
     bool ok = true;
     for (std::string_view part : { data, more }) {
         DWORD done = 0;
         ok = ok && (part.empty() || (WriteFile(h, part.data(), (DWORD)part.size(), &done, nullptr) && done == part.size()));
     }
+    ok = ok && FlushFileBuffers(h);
     CloseHandle(h);
     if (!ok) DeleteFileW(path.c_str());
-    return ok;
+    return ok ? Wrote::Ok : Wrote::Failed;
 }
 
 // (written beside it, then put in its place: a failed write leaves the old one; the file keeps
-// its attributes and permissions. A folder that takes no new files: written over in place.)
+// its attributes and permissions. Only a folder that takes no new files has it written over in
+// place; a write that failed (a full disk) never goes on to the file itself.)
 bool write_file(const std::wstring& path, const std::string& data) {
     std::wstring tmp = path + L".saving~";
-    if (write_new(tmp, data)) {
+    Wrote w = write_new(tmp, data);
+    if (w == Wrote::Ok) {
         bool ok = GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES
                       ? ReplaceFileW(path.c_str(), tmp.c_str(), nullptr, REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS,
                                      nullptr, nullptr)
-                      : MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
-        if (ok) return true;
-        DeleteFileW(tmp.c_str());
+                      : MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+        if (!ok) DeleteFileW(tmp.c_str());
+        return ok;
     }
+    if (w == Wrote::Failed || GetLastError() != ERROR_ACCESS_DENIED) return false;
     HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
     DWORD done = 0;
     bool ok = (data.empty() || (WriteFile(h, data.data(), (DWORD)data.size(), &done, nullptr) && done == data.size())) &&
-              SetEndOfFile(h);
+              SetEndOfFile(h) && FlushFileBuffers(h);
     CloseHandle(h);
     return ok;
 }
@@ -216,7 +233,7 @@ bool write_file(const std::wstring& path, const std::string& data) {
 // ours (the session, kept text): written beside, then moved over
 bool write_own(const std::wstring& path, std::string_view data, std::string_view more = {}) {
     std::wstring tmp = path + L".tmp";
-    return write_new(tmp, data, more) && MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+    return write_new(tmp, data, more) == Wrote::Ok && MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
 }
 
 // next to the settings file (tests: theirs)
@@ -962,6 +979,7 @@ bool open_path(Notepad& n, const std::wstring& path) {
     t->path = path;
     t->enc = f.enc;
     t->eol = f.eol;
+    t->caveat = caveat_of(f);
     t->fileTime = write_time(path);
     t->langChosen = false;
     t->lang = lang_for_file(path);
@@ -1057,7 +1075,23 @@ bool save(Notepad& n, Tab& t, bool as) {
         file = ask_save(n, t, enc);
         if (file.empty()) return false;
     }
+    if (same_file(file, t.path)) {
+        // changed by another program since read here: its changes aren't lost unasked
+        ULONGLONG now = write_time(file);
+        if (now && t.fileTime && now != t.fileTime &&
+            MessageBoxW(n.wnd, (L"This file was changed by another program since it was opened here:\n" + file +
+                                L"\n\nSave over it? Its changes would be lost.").c_str(),
+                        L"Notepad", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+            return false;
+        if (!t.caveat.empty() &&
+            MessageBoxW(n.wnd, (t.caveat + L"\nSave anyway?").c_str(), L"Notepad", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+            return false;
+    }
     std::wstring text = doc_text(t, 0, -1);
+    if (text.empty() && text_length(t.edit) > 0) {
+        MessageBoxW(n.wnd, L"The text couldn't be read from the window: nothing was saved.", L"Notepad", MB_OK | MB_ICONWARNING);
+        return false;
+    }
     bool lossy = false;
     std::string bytes = text_encode(text, enc, t.eol, &lossy);
     if (lossy) {
@@ -1069,6 +1103,11 @@ bool save(Notepad& n, Tab& t, bool as) {
             bytes = text_encode(text, enc, t.eol);
         }
     }
+    if (bytes.empty() && !text.empty()) {                   // (never an empty file for a text)
+        MessageBoxW(n.wnd, (std::wstring(L"The text couldn't be converted to ") + encoding_name(enc) + L": nothing was saved.").c_str(),
+                    L"Notepad", MB_OK | MB_ICONWARNING);
+        return false;
+    }
     HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
     bool ok = write_file(file, bytes);
     SetCursor(old);
@@ -1078,6 +1117,7 @@ bool save(Notepad& n, Tab& t, bool as) {
     }
     t.path = file;
     t.enc = enc;
+    t.caveat.clear();
     t.fileTime = write_time(file);
     if (!t.langChosen && t.lang != lang_for_file(file)) {   // (saved under another name: its language)
         t.lang = lang_for_file(file);
@@ -1107,6 +1147,7 @@ void check_files(Notepad& n) {
         int top = t.pendingTop >= 0 ? t.pendingTop : (int)SendMessageW(t.edit, EM_GETFIRSTVISIBLELINE, 0, 0);
         t.enc = f.enc;
         t.eol = f.eol;
+        t.caveat = caveat_of(f);
         t.fileTime = now;
         set_text(n, t, f.text);
         t.pendingSel = cr;
@@ -1201,7 +1242,13 @@ void restore(Notepad& n, NoteSession& s) {
     std::wstring dir = notes_dir();
     if (dir.empty()) return;
     std::string raw;
-    if (read_bytes(dir + L"\\session.ini", raw) == Read::Ok) s = note_session_parse(ini_decode(raw));
+    Read sr = read_bytes(dir + L"\\session.ini", raw);
+    std::wstring ini = sr == Read::Ok ? ini_decode(raw) : std::wstring();
+    if (sr == Read::Ok) s = note_session_parse(ini);
+    // a session that couldn't be read (locked, empty, [tab] sections that gave no tabs): its kept
+    // texts aren't swept as orphans
+    bool sessionRead = sr == Read::Ok ? !s.tabs.empty() || (!ini.empty() && ini.find(L"[tab") == std::wstring::npos)
+                                      : GetFileAttributesW((dir + L"\\session.ini").c_str()) == INVALID_FILE_ATTRIBUTES;
     n.wrap = s.wrap;
     n.statusBar = s.statusBar;
     n.zoom = s.zoom;
@@ -1213,7 +1260,7 @@ void restore(Notepad& n, NoteSession& s) {
         TextFile f;
         bool ok = false, kept = false;
         std::string bytes;
-        if (st.dirty && !st.cache.empty() && read_bytes(dir + L"\\" + st.cache, bytes) == Read::Ok) {
+        if (st.dirty && !st.cache.empty() && read_bytes(dir + L"\\" + st.cache, bytes, 2 * kMaxBytes + 2) == Read::Ok) {
             f = text_decode(bytes);
             f.enc = st.enc;
             f.eol = st.eol;
@@ -1240,18 +1287,26 @@ void restore(Notepad& n, NoteSession& s) {
             caches.push_back(st.cache);
         } else {
             t->fileTime = st.path.empty() ? 0 : write_time(st.path);
+            t->caveat = caveat_of(f);
         }
         t->pendingSel = { st.selStart, st.selEnd };
         t->pendingTop = st.top;
         apply_pending(n, *t);
         if (i <= s.active) active = (int)n.tabs.size() - 1;
     }
-    // text kept for tabs no longer there
+    // text kept for tabs no longer there: only when the session said so, and only a week after it
+    // was last written (another Notepad's, or one this session failed to read, isn't lost at once)
+    for (auto& st : s.tabs) if (!st.cache.empty()) caches.push_back(st.cache);
     WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW((dir + L"\\note-*.txt").c_str(), &fd);
+    HANDLE h = sessionRead ? FindFirstFileW((dir + L"\\note-*.txt").c_str(), &fd) : INVALID_HANDLE_VALUE;
     if (h != INVALID_HANDLE_VALUE) {
+        FILETIME now;
+        GetSystemTimeAsFileTime(&now);
+        ULONGLONG weekAgo = ((ULONGLONG)now.dwHighDateTime << 32 | now.dwLowDateTime) - 7ull * 24 * 3600 * 10000000;
         do {
-            if (std::none_of(caches.begin(), caches.end(), [&](const std::wstring& c) { return lstrcmpiW(c.c_str(), fd.cFileName) == 0; }))
+            ULONGLONG written = (ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32 | fd.ftLastWriteTime.dwLowDateTime;
+            if (written < weekAgo &&
+                std::none_of(caches.begin(), caches.end(), [&](const std::wstring& c) { return lstrcmpiW(c.c_str(), fd.cFileName) == 0; }))
                 DeleteFileW((dir + L"\\" + fd.cFileName).c_str());
         } while (FindNextFileW(h, &fd));
         FindClose(h);

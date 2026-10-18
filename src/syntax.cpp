@@ -1309,6 +1309,7 @@ bool format_json(const std::wstring& in, bool compact, std::wstring& out, size_t
     out.reserve(in.size() + in.size() / 2);
     std::vector<wchar_t> stack;
     size_t i = 0, n = in.size(), lastEnd = 0;
+    bool afterValue = false;                // a value just ended: a comma, a colon or a bracket comes next
     auto fail = [&](size_t at) {
         if (errorAt) *errorAt = at;
         return false;
@@ -1341,6 +1342,7 @@ bool format_json(const std::wstring& in, bool compact, std::wstring& out, size_t
             continue;
         }
         if (c == L'"' || c == L'\'') {
+            if (afterValue) return fail(i);
             size_t j = i + 1;
             while (j < n && in[j] != c) {
                 if (in[j] == L'\\') ++j;
@@ -1350,9 +1352,11 @@ bool format_json(const std::wstring& in, bool compact, std::wstring& out, size_t
             if (j >= n) return fail(i);
             out.append(in, i, j + 1 - i);
             i = lastEnd = j + 1;
+            afterValue = true;
             continue;
         }
         if (c == L'{' || c == L'[') {
+            if (afterValue || stack.size() >= 1000) return fail(i);   // (each level indents every line below it)
             stack.push_back(c == L'{' ? L'}' : L']');
             out += c;
             size_t k = i + 1;
@@ -1361,10 +1365,12 @@ bool format_json(const std::wstring& in, bool compact, std::wstring& out, size_t
                 out += in[k];
                 stack.pop_back();
                 i = lastEnd = k + 1;
+                afterValue = true;
                 continue;
             }
             if (!compact) new_line(out, stack.size());
             i = lastEnd = i + 1;
+            afterValue = false;
             continue;
         }
         if (c == L'}' || c == L']') {
@@ -1373,17 +1379,20 @@ bool format_json(const std::wstring& in, bool compact, std::wstring& out, size_t
             if (!compact) new_line(out, stack.size());
             out += c;
             i = lastEnd = i + 1;
+            afterValue = true;
             continue;
         }
         if (c == L',') {
-            if (stack.empty()) return fail(i);
+            if (stack.empty() || !afterValue) return fail(i);
+            afterValue = false;
             out += L',';
             if (!compact) new_line(out, stack.size());
             i = lastEnd = i + 1;
             continue;
         }
         if (c == L':') {
-            if (stack.empty() || stack.back() != L'}') return fail(i);
+            if (stack.empty() || stack.back() != L'}' || !afterValue) return fail(i);
+            afterValue = false;
             out += compact ? L":" : L": ";
             i = lastEnd = i + 1;
             continue;
@@ -1391,9 +1400,10 @@ bool format_json(const std::wstring& in, bool compact, std::wstring& out, size_t
         // a number, true, false, null (JSON5: a bare name)
         size_t j = i;
         while (j < n && !ws(in[j]) && !has_char(L"{}[],:\"'/", in[j])) ++j;
-        if (j == i) return fail(i);
+        if (j == i || afterValue) return fail(i);
         out.append(in, i, j - i);
         i = lastEnd = j;
+        afterValue = true;
     }
     if (!stack.empty()) return fail(n);
     while (!out.empty() && ws(out.back())) out.pop_back();

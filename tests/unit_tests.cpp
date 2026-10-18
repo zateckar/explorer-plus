@@ -197,6 +197,21 @@ static void text_files() {
     std::string utf16 = text_encode(L"x\r\ny", TextEncoding::Utf16Le, LineEnding::Lf);
     f = text_decode(utf16);
     CHECK(f.enc == TextEncoding::Utf16Le && f.eol == LineEnding::Lf && text_encode(f.text, f.enc, f.eol) == utf16);
+    CHECK(!f.lossy && !f.mixedEol);
+    // ANSI comes back byte for byte (never written empty, whatever the system's code page)
+    std::string ansi = "caf\xE9 na \xE8" "e\r\n";
+    f = text_decode(ansi);
+    CHECK(f.enc == TextEncoding::Ansi && !f.text.empty() && !f.lossy);
+    CHECK(text_encode(f.text, f.enc, f.eol) == ansi);
+    // a UTF-8 BOM before bytes that aren't UTF-8: read as ANSI, so saving gives back the same bytes
+    std::string bad = "\xEF\xBB\xBFok \xE9 end";
+    f = text_decode(bad);
+    CHECK(f.enc == TextEncoding::Ansi && text_encode(f.text, f.enc, f.eol) == bad);
+    // what can't come back the same is said: an odd byte after UTF-16, mixed line endings
+    f = text_decode(std::string("\xFF\xFEh\0i\0!", 7));
+    CHECK(f.enc == TextEncoding::Utf16Le && f.lossy);
+    f = text_decode("a\r\nb\nc\r\n");
+    CHECK(f.mixedEol && !f.lossy);
 }
 
 static void note_sessions() {
@@ -1267,6 +1282,14 @@ static void formatting() {
     CHECK(!format_json(L"{\"a\": [1, 2}", false, out, &err) && err == 11);
     CHECK(!format_json(L"{\"a\": 1", false, out, &err) && err == 7);
     CHECK(!format_json(L"{\"a\": \"open}", false, out, &err) && err == 6);
+    // values need their commas and colons: plain text isn't JSON (no "Buy milk" -> "Buymilk")
+    CHECK(!format_json(L"Buy milk", false, out, &err) && err == 4);
+    CHECK(!format_json(L"[1 2]", false, out, &err) && err == 3);
+    CHECK(!format_json(L"{\"a\" \"b\"}", false, out, &err) && err == 5);
+    CHECK(!format_json(L"[,1]", false, out, &err) && err == 1);
+    CHECK(!format_json(L"{} {}", false, out, &err) && err == 3);
+    CHECK(format_json(L"[1, 2,]", true, out, &err) && out == L"[1,2,]");        // (JSON5's trailing comma)
+    CHECK(!format_json(std::wstring(2000, L'['), false, out, &err));          // too deep: refused, not gigabytes of indent
 
     CHECK(format_xml(L"<?xml version=\"1.0\"?><a x=\"1>\"><b>text</b><c/><d></d><e><f/></e><!-- c --></a>", out, &err));
     CHECK_EQ(out, L"<?xml version=\"1.0\"?>\r\n<a x=\"1>\">\r\n    <b>text</b>\r\n    <c/>\r\n    <d></d>\r\n    <e>\r\n        <f/>\r\n    </e>\r\n    <!-- c -->\r\n</a>");

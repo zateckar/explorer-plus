@@ -57,6 +57,7 @@ struct Editor {
     std::wstring path;              // the file it is (saved to); empty: a screenshot not saved yet
     std::wstring name;              // in the title
     bool shot = false;              // made from a screenshot: the screenshot icon, its own taskbar button
+    bool partial = false;           // its file holds more than is edited (frames, pages, a bigger size): Save asks for a new file
     bool dirty = false;
     bool copied = false;            // (a screenshot copied, nothing changed since: closed without asking)
     // the view: picture pixels to client ones (x * k + ox)
@@ -326,10 +327,12 @@ bool save_as(Editor& e) {
     return true;
 }
 
-// Save: over its file where it is a type written here; else (a screenshot, a WebP...) Save as
+// Save: over its file where it is a type written here and the picture edited is all the file has;
+// else (a screenshot, a WebP, an animation, a TIFF's page...) Save as. Unchanged: nothing to write.
 bool save(Editor& e) {
     if (e.edit) end_text(e, true);
-    if (e.path.empty() || !mime_for(e.path)) return save_as(e);
+    if (!e.dirty && !e.path.empty()) return true;
+    if (e.path.empty() || e.partial || !mime_for(e.path)) return save_as(e);
     HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
     bool ok = write_file(e, e.path);
     SetCursor(old);
@@ -1396,6 +1399,7 @@ void imageedit_open_file(const std::wstring& path) {
     e->h = img.h;
     e->path = path;
     e->name = title_of(path);
+    e->partial = img.partial;
     open(e);
 }
 
