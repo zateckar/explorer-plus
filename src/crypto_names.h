@@ -23,10 +23,12 @@ bool stored_version(const std::string& stored, uint16_t& version);   // false: n
 // false: not a name these keys made for this parent (tampered, or another vault's)
 bool decrypt(const NameKeys& k, const std::string& parentUtf8, const std::string& stored, std::string& nameUtf8);
 
-// stored names longer than a store allows are kept as "<hash>.epn" with the full stored
-// name in a sidecar object "<hash>.epn.name" beside it
+// stored names longer than a store allows are kept as "<hash>.0" with the full stored
+// name in a sidecar object "<hash>.0.1" beside it (stored names are base32: never a dot)
+constexpr char kShortExt[] = ".0";
+constexpr wchar_t kSidecarExt[] = L".1";                      // after the short name
 std::string shortened(const std::string& stored);
-inline bool is_short(const std::string& n) { return n.size() > 4 && n.compare(n.size() - 4, 4, ".epn") == 0; }
-inline bool is_sidecar(const std::string& n) { return n.size() > 9 && n.compare(n.size() - 9, 9, ".epn.name") == 0; }
+inline bool is_short(const std::string& n) { return n.size() > 2 && n.compare(n.size() - 2, 2, ".0") == 0; }
+inline bool is_sidecar(const std::string& n) { return n.size() > 4 && n.compare(n.size() - 4, 4, ".0.1") == 0; }
 
 } // namespace cnames

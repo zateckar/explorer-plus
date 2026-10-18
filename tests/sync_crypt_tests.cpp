@@ -288,14 +288,14 @@ void test_tamper() {
     {
         std::lock_guard<std::mutex> lk(store->mx);
         std::vector<std::wstring> files;
-        for (auto& [path, o] : store->objs) if (!o.isDir && path.compare(0, 9, L".ep-vault") != 0) files.push_back(path);
+        for (auto& [path, o] : store->objs) if (!o.isDir && !synckeys::is_vault_path(path)) files.push_back(path);
         CHECK(files.size() == 2);
         auto& f = store->objs[files[0]];
         f.data[f.data.size() - 20] ^= 1;
         f.rev = store->next_rev();
         ++store->gen;
         store->changelog.push_back({ store->gen, files[0] });
-        store->objs[L".ep-vault/head"].rev = store->next_rev();      // the storage can move the marker too
+        store->objs[L".0/5"].rev = store->next_rev();      // the storage can move the marker too
     }
     std::string beforeF = tu::read(b.root, L"f.txt"), beforeG = tu::read(b.root, L"g.txt");
     b.sync();
@@ -311,7 +311,7 @@ void test_tamper() {
         store->objs[L"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] = o;
         ++store->gen;
         store->changelog.push_back({ store->gen, L"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
-        store->objs[L".ep-vault/head"].rev = store->next_rev();
+        store->objs[L".0/5"].rev = store->next_rev();
     }
     b.sync();
     CHECK(tu::tree(b.root).size() == 2);
@@ -428,12 +428,12 @@ void put_raw(FakeStore& s, const std::wstring& path, const crypto::Bytes& data) 
     o.isDir = false;
     o.rev = s.next_rev();
     s.changelog.push_back({ ++s.gen, path });
-    s.objs[L".ep-vault/head"].rev = s.next_rev();
+    s.objs[L".0/5"].rev = s.next_rev();
 }
 
 void bump_head(FakeStore& s) {
     std::lock_guard<std::mutex> lk(s.mx);
-    s.objs[L".ep-vault/head"].rev = s.next_rev();
+    s.objs[L".0/5"].rev = s.next_rev();
     ++s.gen;
 }
 
@@ -509,7 +509,7 @@ void test_removal_hardening() {
     auto raw = [store] { return std::unique_ptr<Backend>(std::make_unique<FakeBackend>(store, false)); };
     EDev a(L"ha", raw), b(L"hb", raw), c(L"hc", raw);
     NoProgress p;
-    const std::wstring kVault = L".ep-vault/vault", kRotate = L".ep-vault/rotate/";
+    const std::wstring kVault = synckeys::kVaultFileRel, kRotate = L".0/4/";
     std::string recovery = "Tidal Walrus 1";
     CHECK(synckeys::setup_ring(*a.ks, recovery).ok());
     CHECK(a.open(true).ok());
@@ -528,7 +528,7 @@ void test_removal_hardening() {
         CHECK(synckeys::open_vault(*r, *ks, ks == a.ks.get(), v, p).ok());
     }
     crypto::Bytes xOldVault = xstore->objs[kVault].data;
-    const std::wstring bRecord = L".ep-vault/devices/" + wid(bk.id);
+    const std::wstring bRecord = L".0/2/" + wid(bk.id);
     crypto::Bytes xbRecord = xstore->objs[bRecord].data;
     synckeys::VaultPin pin;                                   // C's view of the vault
     {
@@ -635,7 +635,7 @@ void test_removal_hardening() {
         auto r = xraw();
         synckeys::Vault v;
         CHECK(synckeys::open_vault(*r, *fks, false, v, p).ok());
-        CHECK(xstore->objs.count(L".ep-vault/devices/" + wid(fk.id)));
+        CHECK(xstore->objs.count(L".0/2/" + wid(fk.id)));
     }
     {
         auto r = xraw();
@@ -930,7 +930,7 @@ void storage_does(FakeStore& s, const std::function<void(Objs&)>& f) {
     std::lock_guard<std::mutex> lk(s.mx);
     f(s.objs);
     ++s.gen;
-    s.objs[L".ep-vault/head"].rev = s.next_rev();
+    s.objs[L".0/5"].rev = s.next_rev();
 }
 
 // A storage that withholds, rolls back, brings back or loses files, or the manifest itself
@@ -962,7 +962,7 @@ void test_manifest_attacks(bool tx) {
     };
     std::wstring docStored = stored_of(L"doc.txt", "DOC v1");
     CHECK(b.sync().result.ok() && same_tree(a, b));
-    CHECK(store->objs.count(syncman::kRootRel) && !objects_under(*store, L".ep-vault/m/").empty());
+    CHECK(store->objs.count(syncman::kRootRel) && !objects_under(*store, L".0/7/").empty());
     Objs early = snapshot(*store);
 
     // withheld: the storage hides a file. B keeps it (it used to take that for a deletion
@@ -1024,7 +1024,7 @@ void test_manifest_attacks(bool tx) {
     // the manifest gone: B saw it; D, new, finds a vault that says it keeps one
     storage_does(*store, [&](Objs& o) {
         for (auto it = o.begin(); it != o.end();)
-            it = it->first == syncman::kRootRel || it->first.compare(0, 12, L".ep-vault/m/") == 0 ? o.erase(it) : std::next(it);
+            it = it->first == syncman::kRootRel || it->first.compare(0, 5, L".0/7/") == 0 ? o.erase(it) : std::next(it);
     });
     {
         PassReport r = b.sync(true);
@@ -1124,7 +1124,7 @@ void test_manifest_upgrade(bool tx) {
     // the vault object as an older version wrote it: no "manifest=1" (signed again by A)
     {
         std::lock_guard<std::mutex> lk(store->mx);
-        auto& o = store->objs[L".ep-vault/vault"];
+        auto& o = store->objs[synckeys::kVaultFileRel];
         std::string s(o.data.begin(), o.data.end());
         size_t m = s.find("manifest=1\n");
         CHECK(m != std::string::npos);
@@ -1142,7 +1142,7 @@ void test_manifest_upgrade(bool tx) {
     CHECK(a.sync().result.ok());
     CHECK(store->objs.count(syncman::kRootRel));
     {
-        auto& o = store->objs[L".ep-vault/vault"];
+        auto& o = store->objs[synckeys::kVaultFileRel];
         CHECK(std::string(o.data.begin(), o.data.end()).find("manifest=1\n") != std::string::npos);
     }
     {
@@ -1168,14 +1168,14 @@ void test_vault_unsigned_lines() {
     std::vector<uint8_t> good;
     auto put = [&](const std::string& s) {
         std::lock_guard<std::mutex> lk(store->mx);
-        auto& o = store->objs[L".ep-vault/vault"];
+        auto& o = store->objs[synckeys::kVaultFileRel];
         o.data.assign(s.begin(), s.end());
         o.rev = store->next_rev();
         ++store->gen;
     };
     {
         std::lock_guard<std::mutex> lk(store->mx);
-        good = store->objs[L".ep-vault/vault"].data;
+        good = store->objs[synckeys::kVaultFileRel].data;
     }
     std::string s(good.begin(), good.end());
     CHECK(s.find("manifest=1\n") != std::string::npos);

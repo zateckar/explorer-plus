@@ -65,7 +65,7 @@ bool decrypt(const NameKeys& k, const std::string& parent, const std::string& st
 
 std::string shortened(const std::string& stored) {
     crypto::Hash32 h = crypto::blake2b(stored.data(), stored.size());
-    return crypto::base32(h.data(), 20) + ".epn";
+    return crypto::base32(h.data(), 20) + kShortExt;
 }
 
 } // namespace cnames

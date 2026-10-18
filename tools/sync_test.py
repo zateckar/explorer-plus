@@ -176,10 +176,10 @@ def run_pair(label, type_args, cleanup=None):
             def stored_files():
                 out = set()
                 for dp, dn, fn in os.walk(store):
-                    if '.ep-vault' not in os.path.relpath(dp, store).split(os.sep):
+                    if '.0' not in os.path.relpath(dp, store).split(os.sep):
                         out |= {os.path.join(dp, n) for n in fn}
                 return out
-            check(os.path.exists(os.path.join(store, '.ep-vault', 'manifest')), 'store: the vault keeps a manifest')
+            check(os.path.exists(os.path.join(store, '.0', '6')), 'store: the vault keeps a manifest')
             before = stored_files()
             write(os.path.join(a.root, 'withheld.txt'), 'kept')
             a.sync()
@@ -189,11 +189,11 @@ def run_pair(label, type_args, cleanup=None):
             if len(new) == 1:
                 aside = os.path.join(work, 'withheld.bin')
                 shutil.move(new[0], aside)
-                write(os.path.join(store, '.ep-vault', 'head'), secrets.token_hex(8))     # B looks
+                write(os.path.join(store, '.0', '5'), secrets.token_hex(8))     # B looks
                 b.sync()
                 check(read(os.path.join(b.root, 'withheld.txt')) == 'kept', 'withheld: B keeps its copy')
                 shutil.move(aside, new[0])
-                write(os.path.join(store, '.ep-vault', 'head'), secrets.token_hex(8))
+                write(os.path.join(store, '.0', '5'), secrets.token_hex(8))
                 r = b.sync()
                 check(r.get('state') == 'up to date' and read(os.path.join(b.root, 'withheld.txt')) == 'kept',
                       'withheld: back, B up to date (%s)' % r.get('state'))

@@ -81,9 +81,22 @@ static int type_icon_for(const std::wstring& name, bool folder) {
 // A file's icon goes by its type, unless the type gives each file its own (programs,
 // shortcuts, icon files). Asking the folder costs ~0.1 ms a file (half of System32's
 // listing), so it is asked once per extension. -1: the type's files have icons of their own.
+// (The folder answers S_OK for a program too, with whatever its icon cache holds for that
+// one file: only a type whose icon location is per class may lend its first file's icon
+// to the rest, else every program showed the first one's — Explorer Plus' own, often.)
 static std::unordered_map<std::wstring, int> s_fileIconByExt;
 
-static int file_icon_by_type(IShellIcon* icons, PCUITEMID_CHILD child, const std::wstring& name) {
+static bool icon_per_class(IShellFolder* psf, PCUITEMID_CHILD child) {
+    com_ptr<IExtractIconW> x;
+    if (FAILED(psf->GetUIObjectOf(nullptr, 1, &child, IID_IExtractIconW, nullptr, (void**)x.put())) || !x) return false;
+    WCHAR loc[MAX_PATH]{};
+    int at = 0;
+    UINT flags = 0;
+    if (FAILED(x->GetIconLocation(GIL_FORSHELL, loc, ARRAYSIZE(loc), &at, &flags))) return false;
+    return (flags & GIL_PERCLASS) && !(flags & GIL_PERINSTANCE);
+}
+
+static int file_icon_by_type(IShellFolder* psf, IShellIcon* icons, PCUITEMID_CHILD child, const std::wstring& name) {
     std::wstring ext = PathFindExtensionW(name.c_str());
     CharLowerBuffW(ext.data(), (DWORD)ext.size());
     {
@@ -92,7 +105,7 @@ static int file_icon_by_type(IShellIcon* icons, PCUITEMID_CHILD child, const std
         if (it != s_fileIconByExt.end()) return it->second;
     }
     int idx = -1;
-    if (icons->GetIconOf(child, GIL_FORSHELL, &idx) != S_OK) idx = -1;
+    if (!icon_per_class(psf, child) || icons->GetIconOf(child, GIL_FORSHELL, &idx) != S_OK) idx = -1;
     std::lock_guard<std::mutex> lk(s_typeMx);
     s_fileIconByExt[ext] = idx;
     return idx;
@@ -231,7 +244,7 @@ static Item* make_item(IShellFolder* psf, IShellIcon* icons, PCIDLIST_ABSOLUTE f
     int idx = -1;
     const std::wstring& fname = it->fileName.empty() ? it->name : it->fileName;
     bool byType = deferIcon && icons && fsItem && !it->driveType;
-    if (byType && !plainFolder) idx = file_icon_by_type(icons, child, fname);
+    if (byType && !plainFolder) idx = file_icon_by_type(psf, icons, child, fname);
     else if (!icons || icons->GetIconOf(child, GIL_FORSHELL, &idx) != S_OK) idx = -1;
     if (idx < 0) {
         if (byType) {

@@ -15,7 +15,7 @@ namespace sync {
 
 namespace {
 
-const RelPath kHead = L".ep-vault/head";
+const RelPath kHead = L".0/5";               // (the names: sync_keys.h, kVaultDir)
 
 std::vector<std::wstring> split(const RelPath& p) {
     std::vector<std::wstring> v;
@@ -631,7 +631,7 @@ private:
     bool comp_version_locked(const RelPath& storedParent, const std::wstring& comp, uint32_t& v) {
         std::string full = to_utf8(comp);
         if (cnames::is_short(full)) {
-            auto f = m_sidecar.find(join_path(storedParent, comp + L".name"));
+            auto f = m_sidecar.find(join_path(storedParent, comp + cnames::kSidecarExt));
             if (f == m_sidecar.end() || cnames::shortened(f->second) != full) return false;
             full = f->second;
         }
@@ -673,7 +673,7 @@ private:
     Dec decrypt_component(const std::wstring& storedParent, const RelPath& plainParent, const std::wstring& comp, std::wstring& name) {
         std::string full = to_utf8(comp);
         if (cnames::is_short(full)) {
-            auto f = m_sidecar.find(join_path(storedParent, comp + L".name"));
+            auto f = m_sidecar.find(join_path(storedParent, comp + cnames::kSidecarExt));
             if (f == m_sidecar.end()) return Dec::NeedSidecar;
             // the sidecar must be the one this short name was made from: otherwise the
             // storage could swap two long-named siblings' sidecars (both authentic here)
@@ -1266,7 +1266,7 @@ private:
             if ((int)enc.size() > m_rawCaps.maxNameLength) {
                 std::string sh = cnames::shortened(enc);
                 comp = from_utf8(sh);
-                t.sidecars.push_back({ join_path(sp, comp + L".name"), enc });
+                t.sidecars.push_back({ join_path(sp, comp + cnames::kSidecarExt), enc });
             } else comp = from_utf8(enc);
             RelPath nsp = join_path(sp, comp);
             if (i + 1 < comps.size()) t.newDirs.push_back({ np, nsp });
@@ -1296,7 +1296,7 @@ private:
 
     void drop_sidecar(const RelPath& stored, Progress& prog) {
         if (!cnames::is_short(to_utf8(leaf_of(stored)))) return;
-        RelPath sc = stored + L".name";
+        RelPath sc = stored + cnames::kSidecarExt;
         m_raw->remove(sc, "*", prog);
         std::lock_guard<std::mutex> lk(m_mx);
         m_sidecar.erase(sc);

@@ -495,7 +495,7 @@ private:
             Result r = b->connect(np);
             if (!r.ok()) return fail(r);
             crypto::Bytes vb;
-            Result v = synckeys::get_object(*b, L".ep-vault/vault", vb, nullptr, np);
+            Result v = synckeys::get_object(*b, synckeys::kVaultFileRel, vb, nullptr, np);
             syncipc::Msg m = syncipc::ok();
             if (v.ok()) m.push_back({ "vault", "exists" });
             else if (v.st == Status::NotFound) {

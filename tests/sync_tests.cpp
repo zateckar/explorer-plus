@@ -277,7 +277,7 @@ static void test_names() {
     CHECK(cnames::decrypt(k, "a/b", cnames::encrypt(k, 1, "a/b", u), n) && n == u);
     // shortening
     std::string sh = cnames::shortened(s);
-    CHECK(cnames::is_short(sh) && !cnames::is_sidecar(sh) && cnames::is_sidecar(sh + ".name"));
+    CHECK(cnames::is_short(sh) && !cnames::is_sidecar(sh) && cnames::is_sidecar(sh + ".1"));
 }
 
 // ------------------------------------------------------------------ agent plumbing

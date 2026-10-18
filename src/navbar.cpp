@@ -5,12 +5,10 @@
 #include "acc.h"
 #include "kbdrow.h"
 
-// Segoe Fluent Icons / MDL2 share these code points; 0: the app's own icon (the Notepad's, the
-// player's: as on their taskbar buttons). The last one, "...", holds the command bar's
-// commands while that row is hidden.
-static const wchar_t  kGlyph[] = { L'\xE72B', L'\xE72A', L'\xE74A', L'\xE72C', 0, 0, L'\xE712' };
+// Segoe Fluent Icons / MDL2 share these code points (the Notepad's and the player's as in the
+// "..." menu). The last one, "...", holds the command bar's commands while that row is hidden.
+static const wchar_t  kGlyph[] = { L'\xE72B', L'\xE72A', L'\xE74A', L'\xE72C', L'\xE70B', L'\xE768', L'\xE712' };
 static const int      kCmd[]   = { IDM_NAV_BACK, IDM_NAV_FORWARD, IDM_NAV_UP, IDM_NAV_REFRESH, IDM_NOTEPAD, IDM_PLAYER, IDM_TOOLS_MENU };
-static const int      kIcon[]  = { 0, 0, 0, 0, IDI_NOTEPAD, IDI_PLAYER, 0 };
 static const wchar_t* kTip[]   = { L"Back (Alt+Left Arrow)", L"Forward (Alt+Right Arrow)",
                                    L"Up to parent folder (Alt+Up Arrow)", L"Refresh (F5)", L"Notepad", L"Player",
                                    L"New, Cut, Copy, Paste, Sort, View and more" };
@@ -23,19 +21,6 @@ static KbdRow s_kbd;
 
 static int btn_w() { return S(36); }
 
-// the apps' icons, at the size of the glyphs (loaded again when the DPI changes)
-static HICON s_icons[kMax]{};
-static int s_iconSize = 0;
-static HICON app_icon(int i) {
-    int size = S(16);
-    if (size != s_iconSize) {
-        for (HICON& h : s_icons)
-            if (h) { DestroyIcon(h); h = nullptr; }
-        s_iconSize = size;
-    }
-    if (!s_icons[i] && kIcon[i]) LoadIconWithScaleDown(g_hinst, MAKEINTRESOURCEW(kIcon[i]), size, size, &s_icons[i]);
-    return s_icons[i];
-}
 int navbar_width() { return count() * btn_w() + (count() - 1) * S(4); }
 
 static RECT btn_rect(int i, int h) {
@@ -133,12 +118,7 @@ static LRESULT CALLBACK bar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 RECT r = btn_rect(i, bp.rc.bottom);
                 if (en && (s_hover == i || s_pressed == i))
                     fill_rrect(bp.dc, r, S(4), s_pressed == i ? p.pressed : p.hover);
-                if (HICON icon = kIcon[i] ? app_icon(i) : nullptr) {
-                    int sz = s_iconSize;
-                    DrawIconEx(bp.dc, (r.left + r.right - sz) / 2, (r.top + r.bottom - sz) / 2, icon, sz, sz, 0, nullptr, DI_NORMAL);
-                } else {
-                    draw_glyph(bp.dc, kGlyph[i], r, en ? p.text : p.textDisabled, 16);
-                }
+                draw_glyph(bp.dc, kGlyph[i], r, en ? p.text : p.textDisabled, 16);
                 if (s_kbd.focus == i) kbdrow_ring(bp.dc, r, S(4));
             }
             return 0;

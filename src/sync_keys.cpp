@@ -59,10 +59,11 @@ uint64_t now_ft() {
 }
 constexpr uint64_t kPairLifetime = 15ull * 60 * 10000000;   // 15 minutes in FILETIME units
 
-const RelPath kVaultFile = L".ep-vault/vault";
-const RelPath kDevices = L".ep-vault/devices";
-const RelPath kPair = L".ep-vault/pair";
-const RelPath kRotate = L".ep-vault/rotate";
+// (the names: sync_keys.h, kVaultDir)
+const RelPath kVaultFile = kVaultFileRel;
+const RelPath kDevices = L".0/2";
+const RelPath kPair = L".0/3";
+const RelPath kRotate = L".0/4";
 
 std::wstring w(const std::string& s) { return std::wstring(s.begin(), s.end()); }
 

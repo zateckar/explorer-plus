@@ -10,9 +10,9 @@
 // member device that wrote it. A device takes the storage as the manifest says, so files
 // the storage withholds, rolls back, replaces or plants are told apart from real changes.
 //
-//   .ep-vault/manifest       the root: sequence number, the shards' hashes; sealed under a
+//   .0/6                     the root: sequence number, the shards' hashes; sealed under a
 //                            vault key version, signed (EdDSA) by its writer
-//   .ep-vault/m/<32 hex>     the shards: the files, split by a keyed hash of their path;
+//   .0/7/<32 hex>            the shards: the files, split by a keyed hash of their path;
 //                            named after their own hash, so a pass rewrites only the shards
 //                            it touched
 namespace syncman {
@@ -46,9 +46,9 @@ struct Root {
     std::string hash;                           // BLAKE2b of the root object (hex): the pin
 };
 
-constexpr wchar_t kRootRel[] = L".ep-vault/manifest";
-constexpr wchar_t kShardDir[] = L".ep-vault/m";
-std::wstring shard_rel(const crypto::Hash32& h);            // ".ep-vault/m/<32 hex>"
+constexpr wchar_t kRootRel[] = L".0/6";                  // (the names: sync_keys.h, kVaultDir)
+constexpr wchar_t kShardDir[] = L".0/7";
+std::wstring shard_rel(const crypto::Hash32& h);            // ".0/7/<32 hex>"
 
 using KeyLookup = std::function<bool(uint32_t version, crypto::Key& out)>;
 using MemberLookup = std::function<const synckeys::Ring::Member*(const std::string& id)>;

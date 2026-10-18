@@ -34,6 +34,7 @@ using std::min;
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 namespace {
 
@@ -3397,6 +3398,9 @@ bool image_wheel(Player& p, WPARAM wp) {
     return true;
 }
 
+bool s_clickActivates = false;      // the click coming brings the window forward
+bool s_clickToggled = false;        // the last click on the video paused or played it
+
 LRESULT CALLBACK video_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     Player* pp = s_p;
     if (!pp || !pp->mp) return DefWindowProcW(hwnd, msg, wp, lp);
@@ -3422,7 +3426,13 @@ LRESULT CALLBACK video_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (image_current(p)) image_sharpen(p, image_view(p));     // (zoomed: as big again now)
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
-        case WM_LBUTTONDOWN:
+        case WM_MOUSEACTIVATE:
+            // (a click that only brings the window forward doesn't pause it)
+            s_clickActivates = GetForegroundWindow() != GetAncestor(hwnd, GA_ROOT);
+            break;
+        case WM_LBUTTONDOWN: {
+            bool activates = std::exchange(s_clickActivates, false);
+            s_clickToggled = false;
             SetFocus(p.wnd);
             if (image_pannable(p)) {               // (zoomed in: dragged about)
                 p.panning = true;
@@ -3430,13 +3440,22 @@ LRESULT CALLBACK video_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 p.panX = p.zoomX;
                 p.panY = p.zoomY;
                 SetCapture(hwnd);
+            } else if (!activates && !image_current(p) && p.mp->has_video() && p.message.empty() && loaded(p)) {
+                // a click on the video: paused / playing again (at once: a double-click
+                // gives it back as it was, see below)
+                command(p, CMD_PLAYPAUSE);
+                s_clickToggled = true;
             }
             return 0;
+        }
         case WM_LBUTTONUP:
             if (p.panning) ReleaseCapture();
             return 0;
         case WM_CAPTURECHANGED: p.panning = false; return 0;
-        case WM_LBUTTONDBLCLK: command(p, CMD_FULL); return 0;
+        case WM_LBUTTONDBLCLK:
+            if (std::exchange(s_clickToggled, false)) command(p, CMD_PLAYPAUSE);    // (its first click's pause undone)
+            command(p, CMD_FULL);
+            return 0;
         case WM_MOUSEMOVE:
             if (p.panning) { image_pan(p, { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }); return 0; }
             full_show_bar(p);

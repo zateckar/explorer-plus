@@ -6,7 +6,7 @@
 // over a raw store that the engine sees as a plaintext store. Contents go through the file
 // format (crypto_file.h), every path component through the name encryption
 // (crypto_names.h); the vault folder is hidden. Stores without a change feed get one cheap
-// poll through the ".ep-vault/head" marker.
+// poll through the vault folder's change marker (".0/5").
 namespace sync {
 
 // reopen: called when a name or file needs a vault key version this vault object doesn't

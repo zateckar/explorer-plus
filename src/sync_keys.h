@@ -11,7 +11,7 @@
 //   ring     the user's keys, the same on every device: user master keys (UMK) by
 //            generation, and the sync password's Argon2id result (so any device can write
 //            password wraps without knowing the password). Kept in Credential Manager.
-//   vault    one per remote location, in its ".ep-vault" folder: vault keys (VK) by
+//   vault    one per remote location, in its ".0" folder (kVaultDir): vault keys (VK) by
 //            version, sealed under one UMK generation, plus the password ("recovery") wrap
 //            of the ring.
 //   device   an X25519 key pair per device; vaults list the devices (sealed records), and a
@@ -170,11 +170,15 @@ Result remove_device(sync::Backend& raw, KeyStore& ks, const std::string& device
 Result change_password(KeyStore& ks, const std::string& newPassword);
 Result refresh_vault_recovery(sync::Backend& raw, KeyStore& ks, sync::Progress& prog);
 
-// the reserved folder on the store
-constexpr wchar_t kVaultDir[] = L".ep-vault";
-constexpr wchar_t kVaultFileRel[] = L".ep-vault/vault";
+// The reserved folder on the store. Its names say nothing of what they hold (nor of the
+// app): ".0/1" the vault, "2" device records, "3" pairing grants, "4" rotation hand-overs,
+// "5" the change marker (sync_crypt.cpp), "6" the manifest's root, "7" its shards
+// (sync_manifest.h).
+constexpr wchar_t kVaultDir[] = L".0";
+constexpr wchar_t kVaultFileRel[] = L".0/1";
 inline bool is_vault_path(const sync::RelPath& p) {
-    return p.compare(0, 9, kVaultDir) == 0 && (p.size() == 9 || p[9] == L'/');
+    constexpr size_t n = sizeof(kVaultDir) / sizeof(wchar_t) - 1;
+    return p.compare(0, n, kVaultDir) == 0 && (p.size() == n || p[n] == L'/');
 }
 
 // small objects on a raw store (in their own transaction where the store has them)
