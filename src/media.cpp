@@ -401,6 +401,8 @@ struct MediaPlayer::Impl {
     LONGLONG queuedSeek = -1;       // asked for while `pending`
     LONGLONG shownPos = -1;         // a seek's target until the session has got there
     float amplitude = 1.0f;
+    bool hidden = false;            // video_hide: the picture goes to `park`
+    HWND park = nullptr;
     std::wstring path;              // the file open (or last open)
     int prefAudio = -1;             // its audio stream chosen (among its audio streams); -1: the file's
     // MCI instead of the session (MIDI, a CD track)
@@ -422,6 +424,7 @@ MediaPlayer::MediaPlayer(HWND notify, UINT msg, HWND video) : d(new Impl) {
 MediaPlayer::~MediaPlayer() {
     close();
     if (d->mciWnd) DestroyWindow(d->mciWnd);
+    if (d->park) DestroyWindow(d->park);
     delete d;
 }
 
@@ -782,7 +785,8 @@ void MediaPlayer::topology_ready() {
     if (m_hasVideo && SUCCEEDED(s_mf.GetService(d->session, kVideoRenderService, IID_PPV_ARGS(&d->display))) && d->display) {
         d->display->SetAspectRatioMode(MFVideoARMode_PreservePicture);
         d->display->SetBorderColor(RGB(0, 0, 0));
-        video_resized();
+        if (d->hidden && d->park) d->display->SetVideoWindow(d->park);
+        else video_resized();
     }
     s_mf.GetService(d->session, MR_STREAM_VOLUME_SERVICE, IID_PPV_ARGS(&d->volume));
     set_volume(d->amplitude);
@@ -904,20 +908,40 @@ void MediaPlayer::set_volume(float amplitude) {
 }
 
 void MediaPlayer::video_resized() {
-    if (!d->display || !d->video) return;
+    if (!d->display || !d->video || d->hidden) return;
     RECT rc{};
     GetClientRect(d->video, &rc);
     d->display->SetVideoPosition(nullptr, &rc);
 }
 
+void MediaPlayer::video_hide(bool hidden) {
+    if (hidden == d->hidden) return;
+    d->hidden = hidden;
+    if (hidden && !d->park)
+        d->park = CreateWindowExW(WS_EX_TOOLWINDOW, L"STATIC", nullptr, WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!d->display) return;
+    d->display->SetVideoWindow(hidden && d->park ? d->park : d->video);
+    if (!hidden) {
+        video_resized();
+        InvalidateRect(d->video, nullptr, FALSE);
+    } else {
+        // (a frame already on its way still lands on the window after the switch: painted
+        // over once more when it has)
+        SetTimer(d->video, (UINT_PTR)&d->park, 200, [](HWND w, UINT, UINT_PTR id, DWORD) {
+            KillTimer(w, id);
+            RedrawWindow(w, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
+        });
+    }
+}
+
 bool MediaPlayer::video_paint() {
-    return d->display && SUCCEEDED(d->display->RepaintVideo());
+    return d->display && !d->hidden && SUCCEEDED(d->display->RepaintVideo());
 }
 
 bool MediaPlayer::video_rect(RECT* r) {
     SIZE native{}, shape{};
     RECT rc{};
-    if (!d->display || !d->video || FAILED(d->display->GetNativeVideoSize(&native, &shape))) return false;
+    if (!d->display || !d->video || d->hidden || FAILED(d->display->GetNativeVideoSize(&native, &shape))) return false;
     if (shape.cx <= 0 || shape.cy <= 0) shape = native;
     GetClientRect(d->video, &rc);
     if (shape.cx <= 0 || shape.cy <= 0 || rc.right <= 0 || rc.bottom <= 0) return false;

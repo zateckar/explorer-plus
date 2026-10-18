@@ -208,6 +208,10 @@ int px(int v) { return MulDiv(v, s_p ? s_p->dpi : 96, 96); }
 // the shown tab's queue: the list's
 PlayQueue& vq(Player& p) { return p.tabs[(size_t)p.shown]->q; }
 bool shown_plays(Player& p) { return &vq(p) == p.q; }
+bool loaded(Player& p);
+// another tab's queue is on (playing, paused, a picture shown) while this one is looked at:
+// the video area and the bar show this one's entry (what its Play plays), the other plays on
+bool away(Player& p) { return !shown_plays(p) && loaded(p); }
 
 // a visualization of visual.cpp's is chosen (and can be drawn): not the spectrogram
 bool vis_on(Player& p) { return p.visStyle != VIS_SPECTROGRAM && !p.vis.failed(); }
@@ -367,7 +371,14 @@ std::wstring url_host(const std::wstring& url) {
     return url.substr(s, e == std::wstring::npos ? std::wstring::npos : e - s);
 }
 
+// (away: the tab playing, by name)
+std::wstring away_detail(Player& p) { return p.playing ? p.playing->name + L" is playing" : std::wstring(); }
+
 std::wstring current_title(Player& p) {
+    if (away(p)) {
+        int k = vq(p).current();
+        return k >= 0 ? entry_name(vq(p).at(k)) : std::wstring();
+    }
     int i = p.q->current();
     if (i < 0) return {};
     if (!image_current(p) && !p.mp->title().empty()) return p.mp->title();
@@ -375,6 +386,7 @@ std::wstring current_title(Player& p) {
 }
 
 std::wstring current_detail(Player& p) {
+    if (away(p)) return away_detail(p);
     if (image_current(p)) {                 // "4032 × 3024 · 250 % · 3 of 120"
         std::wstring s;
         if (p.img.id == p.q->at(p.q->current()).id && p.img.fullW > 0) {
@@ -391,6 +403,7 @@ std::wstring current_detail(Player& p) {
 }
 
 bool seekable(Player& p) {
+    if (away(p)) return false;
     State s = p.mp->state();
     return p.mp->duration() > 0 && (s == State::Playing || s == State::Paused || s == State::Stopped || s == State::Ended);
 }
@@ -400,6 +413,7 @@ bool playing(Player& p) { return image_current(p) ? p.slideshow : p.levelWait ||
 
 std::wstring state_text(Player& p) {
     std::wstring s;
+    if (away(p)) return (vq(p).empty() ? L"Empty \x00B7 " : L"Stopped \x00B7 ") + away_detail(p);
     if (image_current(p)) {
         if (!p.message.empty()) return L"Can't show: " + p.message;
         return std::wstring(p.slideshow ? L"Slide show" : L"Picture") + L" \x00B7 " + std::to_wstring(p.q->current() + 1) +
@@ -456,7 +470,13 @@ void refresh_bar(Player& p) {
     vis_update(p);
 }
 
+void set_playing(Player& p, QueueTab* t);
+
 void refresh_all(Player& p) {
+    // nothing on any more in the tab playing (its queue ended, stopped) while another is
+    // shown: the one shown plays from now on, as when a tab is shown with nothing on
+    if (!shown_plays(p) && !loaded(p) && !p.mp->closing()) set_playing(p, p.tabs[(size_t)p.shown].get());
+    p.mp->video_hide(away(p));                  // (another tab shown: its own entry in the video area)
     refresh_bar(p);
     update_title(p);
     InvalidateRect(p.video, nullptr, FALSE);
@@ -928,7 +948,7 @@ void image_zoom_command(Player& p, UINT cmd) {
 
 // zoomed in further than the area: dragged about
 bool image_pannable(Player& p) {
-    if (p.zoom == 1 || !image_current(p) || !p.message.empty()) return false;
+    if (p.zoom == 1 || away(p) || !image_current(p) || !p.message.empty()) return false;
     RECT rc{};
     GetClientRect(p.video, &rc);
     ImageView v = image_view(p, rc.right, rc.bottom);
@@ -1201,6 +1221,19 @@ void close_tab(Player& p, int i) {
     if (wasShown) show_tab(p, p.shown, false);
     else { layout_tabs(p); invalidate_row(p); keep_soon(p); }
     if (wasPlaying) show_current(p);
+}
+
+// Play, Previous or Next (step 0, -1, 1) in a tab that isn't the one playing: its queue takes
+// the playback over (what played stops), from its entry, or the one before / after it
+void take_over(Player& p, int step) {
+    set_playing(p, p.tabs[(size_t)p.shown].get());
+    p.failsInRow = 0;
+    if (p.q->empty()) { refresh_all(p); return; }
+    int i = p.q->current() >= 0 ? p.q->current() : p.q->first();
+    int to = step > 0 ? p.q->next(false) : step < 0 ? p.q->previous() : -1;
+    if (to >= 0) i = to;
+    // (a picture: Play starts the slide show, a step only shows the one before / after)
+    play_index(p, i, step == 0 || !image_entry(p, i));
 }
 
 // the list's row i played: its tab is the one playing from now on
@@ -1484,11 +1517,14 @@ void full_show_bar(Player& p) {
     SetTimer(p.wnd, TIMER_HIDE_BAR, 2500, nullptr);
 }
 
+bool s_forPlaying = false;          // (playing_command's: the queue playing, whichever tab is shown)
+
 void command(Player& p, UINT cmd) {
+    bool over = away(p) && !s_forPlaying;
     switch (cmd) {
-        case CMD_PLAYPAUSE: play_pause(p); break;
-        case CMD_PREV: previous(p); break;
-        case CMD_NEXT: next(p); break;
+        case CMD_PLAYPAUSE: if (over) take_over(p, 0); else play_pause(p); break;
+        case CMD_PREV: if (over) take_over(p, -1); else previous(p); break;
+        case CMD_NEXT: if (over) take_over(p, 1); else next(p); break;
         case CMD_SHUFFLE: {                 // (all the queues alike)
             bool on = !p.q->shuffle();
             for (auto& t : p.tabs) t->q.set_shuffle(on);
@@ -1568,11 +1604,19 @@ void command(Player& p, UINT cmd) {
     acc_notify(p.bar, EVENT_OBJECT_STATECHANGE, -1);
 }
 
+// the media keys' and the taskbar thumbnail's: they work what is playing (another tab may be
+// shown: its own buttons would take the playback over)
+void playing_command(Player& p, UINT cmd) {
+    s_forPlaying = true;
+    command(p, cmd);
+    s_forPlaying = false;
+}
+
 bool media_command(Player& p, int app) {
     switch (app) {
-        case APPCOMMAND_MEDIA_PLAY_PAUSE: command(p, CMD_PLAYPAUSE); return true;
-        case APPCOMMAND_MEDIA_PLAY: if (!playing(p)) command(p, CMD_PLAYPAUSE); return true;
-        case APPCOMMAND_MEDIA_PAUSE: if (playing(p)) command(p, CMD_PLAYPAUSE); return true;
+        case APPCOMMAND_MEDIA_PLAY_PAUSE: playing_command(p, CMD_PLAYPAUSE); return true;
+        case APPCOMMAND_MEDIA_PLAY: if (!playing(p)) playing_command(p, CMD_PLAYPAUSE); return true;
+        case APPCOMMAND_MEDIA_PAUSE: if (playing(p)) playing_command(p, CMD_PLAYPAUSE); return true;
         case APPCOMMAND_MEDIA_STOP:
             if (image_current(p)) set_slideshow(p, false);
             else {
@@ -1583,8 +1627,8 @@ bool media_command(Player& p, int app) {
             }
             refresh_bar(p);
             return true;
-        case APPCOMMAND_MEDIA_NEXTTRACK: command(p, CMD_NEXT); return true;
-        case APPCOMMAND_MEDIA_PREVIOUSTRACK: command(p, CMD_PREV); return true;
+        case APPCOMMAND_MEDIA_NEXTTRACK: playing_command(p, CMD_NEXT); return true;
+        case APPCOMMAND_MEDIA_PREVIOUSTRACK: playing_command(p, CMD_PREV); return true;
     }
     return false;
 }
@@ -2055,7 +2099,7 @@ void slider(HDC dc, Player& p, const RECT& rail, double frac, bool enabled, bool
 bool part_enabled(Player& p, int part) {
     switch (part) {
         case P_SEEK: return seekable(p);
-        case P_PREV: case P_PLAY: case P_NEXT: return !p.q->empty();
+        case P_PREV: case P_PLAY: case P_NEXT: return away(p) ? !vq(p).empty() : !p.q->empty();
         default: return true;
     }
 }
@@ -2064,7 +2108,7 @@ wchar_t part_glyph(Player& p, int part) {
     switch (part) {
         case P_SHUFFLE: return L'\xE8B1';
         case P_PREV:    return L'\xE892';
-        case P_PLAY:    return playing(p) ? L'\xE769' : L'\xE768';
+        case P_PLAY:    return !away(p) && playing(p) ? L'\xE769' : L'\xE768';
         case P_NEXT:    return L'\xE893';
         case P_REPEAT:  return p.q->repeat == Repeat::One ? L'\xE8ED' : L'\xE8EE';
         case P_MUTE:
@@ -2092,7 +2136,7 @@ std::wstring part_name(Player& p, int part, std::wstring* key = nullptr) {
         case P_SHUFFLE: n = p.q->shuffle() ? L"Shuffle: on" : L"Shuffle: off"; k = L"Ctrl+H"; break;
         case P_PREV:    n = L"Previous"; k = image_current(p) ? L"Left" : L"Ctrl+Left"; break;
         case P_PLAY:
-            n = image_current(p) ? (p.slideshow ? L"Stop slide show" : L"Slide show") : playing(p) ? L"Pause" : L"Play";
+            n = away(p) ? L"Play" : image_current(p) ? (p.slideshow ? L"Stop slide show" : L"Slide show") : playing(p) ? L"Pause" : L"Play";
             k = L"Space";
             break;
         case P_NEXT:    n = L"Next"; k = image_current(p) ? L"Right" : L"Ctrl+Right"; break;
@@ -2118,13 +2162,15 @@ void paint_bar(Player& p) {
     fill_rect(dc, line, c.divider);
     // position
     bool canSeek = seekable(p);
-    LONGLONG dur = p.mp->duration();
-    LONGLONG pos = p.drag == P_SEEK ? p.dragPos : p.mp->position();
+    bool off = away(p);                         // (another tab plays: this one's entry, not started)
+    int k = off ? vq(p).current() : -1;
+    LONGLONG dur = off ? (k >= 0 ? vq(p).at(k).duration : 0) : p.mp->duration();
+    LONGLONG pos = off ? 0 : p.drag == P_SEEK ? p.dragPos : p.mp->position();
     int seekY = (p.seekRail.top + p.seekRail.bottom) / 2;
     RECT tl{ px(12), seekY - px(10), p.seekRail.left - px(12), seekY + px(10) };
     RECT tr{ p.seekRail.right + px(12), seekY - px(10), bp.rc.right - px(12), seekY + px(10) };
     COLORREF timeColor = canSeek ? c.textSecondary : c.textDisabled;
-    if (image_current(p)) {
+    if (!off && image_current(p)) {
         // a picture: which one of how many; the slide show's time to the next one
         text_at(dc, std::to_wstring(p.q->current() + 1) + L" / " + std::to_wstring(p.q->size()), tl, c.textSecondary,
                 p.fontSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -2137,7 +2183,7 @@ void paint_bar(Player& p) {
             done.right = done.left + (int)((done.right - done.left) * f);
             if (done.right > done.left) fill_rrect(dc, done, px(2), c.accent);
         }
-    } else if (dur <= 0 && stream_current(p) && (p.mp->state() == State::Playing || p.mp->state() == State::Paused)) {
+    } else if (!off && dur <= 0 && stream_current(p) && (p.mp->state() == State::Playing || p.mp->state() == State::Paused)) {
         // a stream: how long it has played; no end, no seeking
         text_at(dc, fmt_duration(pos), tl, c.textSecondary, p.fontSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         text_at(dc, L"Live", tr, c.textSecondary, p.fontSmall, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
@@ -2176,7 +2222,7 @@ void paint_bar(Player& p) {
     if (p.titleRight - p.titleLeft > px(40)) {
         int cy = (p.parts[P_PLAY].top + p.parts[P_PLAY].bottom) / 2;
         std::wstring t = current_title(p), d = current_detail(p);
-        if (d.empty() && p.mp->state() == State::Failed) d = p.message;
+        if (d.empty() && !off && p.mp->state() == State::Failed) d = p.message;
         RECT r1{ p.titleLeft, cy - px(20), p.titleRight, d.empty() ? cy + px(20) : cy };
         RECT r2{ p.titleLeft, cy, p.titleRight, cy + px(20) };
         UINT fmt = DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | (d.empty() ? DT_VCENTER : DT_BOTTOM);
@@ -2516,7 +2562,7 @@ bool vis_fills(Player& p) { return vis_on(p) && p.full && now_playing(p) && p.me
 RECT vis_rect(Player& p) {
     RECT rc{};
     GetClientRect(p.video, &rc);
-    if (!vis_on(p) || !now_playing(p)) return {};
+    if (away(p) || !vis_on(p) || !now_playing(p)) return {};
     return vis_fills(p) ? rc : now_rects(p, rc).spec;
 }
 
@@ -2595,6 +2641,35 @@ void paint_idle(Player& p, HDC dc, const RECT& rc) {
     }
 }
 
+// the video area of a tab while another one plays: its own entry, what Play does here
+void paint_away(Player& p, HDC dc, const RECT& rc) {
+    const Palette& c = pal();
+    PlayQueue& q = vq(p);
+    int k = q.current();
+    std::wstring title, detail;
+    wchar_t g = L'\xE8D6';                     // (music note)
+    if (q.empty()) {
+        title = L"Nothing to play";
+        detail = away_detail(p);
+    } else {
+        const std::wstring& path = q.at(k >= 0 ? k : q.first()).path;
+        if (image_file(path)) g = L'\xE91B';    // (picture)
+        else if (media_file_video(path)) g = L'\xE714';     // (video)
+        title = k >= 0 ? entry_name(q.at(k)) : L"Play queue";
+        detail = away_detail(p) + L" \x00B7 Play plays this queue";
+    }
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    if (w < px(80) || h < px(80)) return;
+    int art = std::min(px(120), h / 3);
+    int top = std::max(rc.top + px(8), rc.top + (h - art - px(100)) / 2);
+    RECT ga{ rc.left, top, rc.right, top + art };
+    glyph_at(dc, g, ga, c.textDisabled, p.glyphsArt);
+    RECT tr{ rc.left + px(24), ga.bottom + px(12), rc.right - px(24), ga.bottom + px(52) };
+    text_at(dc, title, tr, c.text, p.fontBig, DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER);
+    RECT dr{ tr.left, tr.bottom, tr.right, tr.bottom + px(24) };
+    text_at(dc, detail, dr, c.textSecondary, p.font, DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER);
+}
+
 // zoomed into: the part in view, drawn from the pixels decoded (much enlarged: as squares)
 void paint_zoomed(Player& p, HDC dc, const RECT& rc, const ImageView& v) {
     const ImageNote& im = p.img;
@@ -2668,6 +2743,7 @@ void paint_image(Player& p, HDC dc, const RECT& rc) {
 // the video area without a video
 void paint_art(Player& p, HDC dc, const RECT& rc) {
     const Palette& c = pal();
+    if (away(p)) { fill_rect(dc, rc, c.content); paint_away(p, dc, rc); return; }
     if (image_current(p)) { paint_image(p, dc, rc); return; }
     if (vis_fills(p)) { fill_rect(dc, rc, RGB(0, 0, 0)); return; }     // (under the visualization)
     fill_rect(dc, rc, c.content);
@@ -3383,7 +3459,7 @@ void view_menu(Player& p, POINT pt) {
 
 // the wheel over a picture: the previous / next one; with Ctrl, zooming at the pointer
 bool image_wheel(Player& p, WPARAM wp) {
-    if (!image_current(p)) return false;
+    if (away(p) || !image_current(p)) return false;
     POINT c{};
     GetCursorPos(&c);
     RECT r{};
@@ -3408,7 +3484,7 @@ LRESULT CALLBACK video_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: {
-            bool video = p.mp->has_video() && p.message.empty();
+            bool video = !away(p) && p.mp->has_video() && p.message.empty();
             if (video) {
                 PAINTSTRUCT ps;
                 HDC dc = BeginPaint(hwnd, &ps);
@@ -3440,7 +3516,7 @@ LRESULT CALLBACK video_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 p.panX = p.zoomX;
                 p.panY = p.zoomY;
                 SetCapture(hwnd);
-            } else if (!activates && !image_current(p) && p.mp->has_video() && p.message.empty() && loaded(p)) {
+            } else if (!activates && !away(p) && !image_current(p) && p.mp->has_video() && p.message.empty() && loaded(p)) {
                 // a click on the video: paused / playing again (at once: a double-click
                 // gives it back as it was, see below)
                 command(p, CMD_PLAYPAUSE);
@@ -4096,7 +4172,8 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // (a tab's name edited: the box left takes it)
             if (lp && (HWND)lp == p.rename && HIWORD(wp) == EN_KILLFOCUS) { PostMessageW(hwnd, WM_RENAME_DONE, 1, lp); return 0; }
             // (menus and accelerators; the taskbar thumbnail's buttons)
-            if ((HIWORD(wp) == 0 || HIWORD(wp) == THBN_CLICKED) && LOWORD(wp) >= CMD_PLAYPAUSE) command(p, LOWORD(wp));
+            if (HIWORD(wp) == THBN_CLICKED && LOWORD(wp) >= CMD_PLAYPAUSE) playing_command(p, LOWORD(wp));
+            else if (HIWORD(wp) == 0 && LOWORD(wp) >= CMD_PLAYPAUSE) command(p, LOWORD(wp));
             return 0;
         case WM_APPCOMMAND:
             if (media_command(p, GET_APPCOMMAND_LPARAM(lp))) return TRUE;

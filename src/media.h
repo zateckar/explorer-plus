@@ -61,6 +61,9 @@ public:
 
     void set_volume(float amplitude);   // 0..1 (0 also for muted)
     void video_resized();               // the video window changed size
+    // the picture kept off the video window (it shows something else meanwhile: the
+    // renderer draws into whichever window it has, so it gets a hidden one), and back
+    void video_hide(bool hidden);
     bool video_paint();                 // WM_PAINT of the video window (after BeginPaint); false: paint it yourself
     // the video's picture as shown, in the video window's client coordinates (letterboxed
     // to its shape); false: no video shown
