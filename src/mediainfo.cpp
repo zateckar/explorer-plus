@@ -89,7 +89,7 @@ bool decode_picture(IWICImagingFactory* wic, const std::wstring& file, int maxPx
             SUCCEEDED(scaler->Initialize(frame, tw, th, WICBitmapInterpolationModeFant)))
             src = scaler;
         else { tw = w; th = h; }
-        if (SUCCEEDED(wic->CreateFormatConverter(&conv)) &&
+        if ((unsigned long long)tw * th <= (1ull << 26) && SUCCEEDED(wic->CreateFormatConverter(&conv)) &&
             SUCCEEDED(conv->Initialize(src, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0,
                                        WICBitmapPaletteTypeCustom))) {
             auto px = std::make_shared<std::vector<uint32_t>>((size_t)tw * th);

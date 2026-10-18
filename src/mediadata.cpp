@@ -128,6 +128,12 @@ void SampleRing::put(long long first, const float* s, size_t n) {
     const size_t cap = m_buf.size();
     if (!cap || !n) return;
     long long last = first + (long long)n;
+    if (first < 0) {                                        // (before the start: not kept)
+        if (last <= 0) return;
+        s += -first;
+        n = (size_t)last;
+        first = 0;
+    }
     if (last <= m_end - (long long)m_held) return;          // (older than all held)
     if (first < m_end - (long long)m_held || first > m_end + (long long)cap) {
         m_end = first;                                      // (a jump: from here on)

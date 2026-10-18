@@ -43,7 +43,7 @@ static void run(std::shared_ptr<SpectrumFeed::Shared> s, std::wstring path, LONG
             const double hop = (double)rate / cps;
             LONGLONG ts = 0;
             while (!s->cancel && (block.clear(), dec.read(block, &ts))) {
-                long long first = (long long)((double)ts * rate / 10000000.0 + 0.5);
+                long long first = (long long)((double)std::max<LONGLONG>(ts, 0) * rate / 10000000.0 + 0.5);
                 if (monoStart < 0 || first > monoStart + (long long)mono.size() + (long long)rate / 10) {
                     mono.clear();                   // (the start, or a gap: from here)
                     monoStart = first;

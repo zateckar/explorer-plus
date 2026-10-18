@@ -765,6 +765,11 @@ static void visuals() {
     SampleRing small(4);
     small.put(0, many, 20);                            // more than it holds: the last 4
     CHECK(small.get(20, out, 4) == 4 && out[0] == 16 && out[3] == 19);
+    SampleRing early(8);
+    early.put(-3, a, 5);                               // (a time before the start: only 0..1 kept)
+    CHECK(early.end() == 2 && early.get(2, out, 2) == 2 && out[0] == 4 && out[1] == 5);
+    early.put(-9, a, 5);                               // (all before it: nothing)
+    CHECK(early.end() == 2);
     // a band's intensity to a level: -62 dB and less nothing, -12 dB and more all
     CHECK(vis_level(0) == 0.0f);
     CHECK(vis_level(255) == 1.0f);
@@ -988,6 +993,8 @@ static void image_formats() {
     }
     qoi[4] = 0x7F;                                                          // (an absurd width)
     CHECK(!qoi_decode(qoi.data(), qoi.size(), im));
+    qoi[4] = 0; qoi[6] = 0x10; qoi[10] = 0x10;                              // (about 4096 x 4096: more than 31 bytes can give)
+    CHECK(!qoi_decode(qoi.data(), qoi.size(), im));
 
     // Radiance HDR: flat, and run-length coded
     std::string hs = "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 2\n";
@@ -1107,6 +1114,14 @@ static void image_formats() {
             const uint8_t crc[4] = { f[8 + 25 + 15 + 10], f[8 + 25 + 15 + 11], f[8 + 25 + 15 + 12], f[8 + 25 + 15 + 13] };
             CHECK(crc[0] == 0xB2 && crc[1] == 0xC4 && crc[2] == 0x87 && crc[3] == 0xDC);   // crc32("IDATxy")
         }
+    }
+    {
+        V away = png;                                  // a frame placed past the canvas (x + w overflowing an int)
+        size_t at = 8 + 25 + 20 + 15 + 8;              // (the first fcTL's data: after IHDR, acTL, PLTE)
+        CHECK(std::string(away.begin() + at - 4, away.begin() + at) == "fcTL");
+        V bad = fctl(0, 2, 2, 0x7FFFFFFF, 0, 1, 10, 0, 0);
+        std::copy(bad.begin(), bad.end(), away.begin() + at);
+        CHECK(!apng_split(away.data(), away.size(), cw, ch, frames));
     }
     chunk(still, "IDAT", { 'a' });
     chunk(still, "IEND", {});

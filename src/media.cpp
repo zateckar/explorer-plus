@@ -1078,7 +1078,8 @@ bool AudioDecoder::open(const std::wstring& path, LONGLONG from) {
     got->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate);
     got->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, &bits);
     got->Release();
-    if (!ch || !rate || bits != 32) return false;
+    // (a damaged header's rate or channels mustn't size buffers of gigabytes)
+    if (!ch || ch > 32 || rate < 1000 || rate > 768000 || bits != 32) return false;
     m_channels = ch;
     m_rate = rate;
     if (from > 0) seek(from);

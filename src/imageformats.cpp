@@ -6,10 +6,17 @@
 
 namespace {
 
-// the most pixels decoded (a damaged header mustn't ask for gigabytes)
-const long long kMaxPixels = 1LL << 28;
+// the most pixels decoded (a damaged header mustn't ask for gigabytes): 512 MB of them
+const long long kMaxPixels = 1LL << 27;
 
 bool size_ok(long long w, long long h) { return w > 0 && h > 0 && w <= 65535 && h <= 65535 && w * h <= kMaxPixels; }
+// the most frames an animation is split into
+const size_t kMaxFrames = 4096;
+
+// and no more than `n` bytes can give, at most `perByte` pixels each (the format's longest run)
+bool size_ok(long long w, long long h, size_t n, long long perByte) {
+    return size_ok(w, h) && w * h <= (long long)std::min<size_t>(n, (size_t)kMaxPixels) * perByte;
+}
 
 uint32_t pm(unsigned r, unsigned g, unsigned b, unsigned a) {
     if (a == 255) return 0xFF000000u | (r << 16) | (g << 8) | b;
@@ -23,8 +30,8 @@ unsigned le16(const uint8_t* p) { return p[0] | (p[1] << 8); }
 unsigned be16(const uint8_t* p) { return (p[0] << 8) | p[1]; }
 uint32_t be32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
 
-bool alloc(RawImage& out, long long w, long long h) {
-    if (!size_ok(w, h)) return false;
+bool alloc(RawImage& out, long long w, long long h, size_t n, long long perByte) {
+    if (!size_ok(w, h, n, perByte)) return false;
     out.w = (int)w;
     out.h = (int)h;
     out.px.assign((size_t)(w * h), 0);
@@ -72,7 +79,7 @@ bool tga_decode(const uint8_t* d, size_t n, RawImage& out) {
         for (unsigned i = 0; i < cmapLen; ++i) cmap.push_back(colour(d + pos + i * eb, cmapBits, cmapBits == 32 || alphaBits));
         pos += (size_t)cmapLen * eb;
     }
-    if (!alloc(out, w, h)) return false;
+    if (!alloc(out, w, h, n, 64)) return false;
     unsigned pb = (bpp + 7) / 8;
     bool alphaPx = base == 2 && (bpp == 32 || (bpp == 16 && alphaBits));
     auto read_px = [&](const uint8_t* p) -> uint32_t {
@@ -128,7 +135,7 @@ bool qoi_decode(const uint8_t* d, size_t n, RawImage& out) {
     if (n < 14 + 8 || std::memcmp(d, "qoif", 4) != 0) return false;
     uint32_t w = be32(d + 4), h = be32(d + 8);
     unsigned channels = d[12];
-    if ((channels != 3 && channels != 4) || !alloc(out, w, h)) return false;
+    if ((channels != 3 && channels != 4) || !alloc(out, w, h, n, 64)) return false;
     uint8_t index[64][4] = {};
     uint8_t px[4] = { 0, 0, 0, 255 };
     size_t pos = 14, total = (size_t)w * h, end = n - 8;
@@ -197,7 +204,7 @@ bool hdr_decode(const uint8_t* d, size_t n, RawImage& out) {
     char ya[2] = {}, xa[2] = {};
     if (sscanf(s.c_str(), "%c%c %ld %c%c %ld", &ys, &ya[0], &hh, &xs, &xa[0], &ww) != 6 || ya[0] != 'Y' || xa[0] != 'X')
         return false;
-    if (!size_ok(ww, hh)) return false;
+    if (!size_ok(ww, hh, n, 256) || hh > (long)(n / 4)) return false;     // (each line at least 4 bytes)
     bool bottomUp = ys == '+', rightToLeft = xs == '-';
     std::vector<float> rgb((size_t)ww * hh * 3);
     std::vector<uint8_t> sc((size_t)ww * 4);
@@ -264,7 +271,7 @@ bool hdr_decode(const uint8_t* d, size_t n, RawImage& out) {
         v = v <= 0.0031308 ? 12.92 * v : 1.055 * std::pow(v, 1 / 2.4) - 0.055;
         return (unsigned)std::clamp(v * 255.0 + 0.5, 0.0, 255.0);
     };
-    if (!alloc(out, ww, hh)) return false;
+    if (!alloc(out, ww, hh, n, 256)) return false;
     for (size_t i = 0; i < count; ++i) {
         const float* c = &rgb[i * 3];
         double r = c[0] * key, g = c[1] * key, b = c[2] * key;
@@ -313,7 +320,7 @@ bool psd_decode(const uint8_t* d, size_t n, RawImage& out) {
     if (pos + 2 > n) return false;
     unsigned compression = be16(d + pos);
     pos += 2;
-    if (!alloc(out, w, h)) return false;
+    if (!alloc(out, w, h, n, 64)) return false;
     size_t rowBytes = depth == 1 ? (w + 7) / 8 : (size_t)w * (depth / 8);
     // the colour channels, planar, as 8-bit values
     std::vector<std::vector<uint8_t>> planes(need, std::vector<uint8_t>((size_t)w * h));
@@ -406,7 +413,7 @@ bool pcx_decode(const uint8_t* d, size_t n, RawImage& out) {
     int w = (int)le16(d + 8) - (int)le16(d + 4) + 1, h = (int)le16(d + 10) - (int)le16(d + 6) + 1;
     bool ok = (bits == 8 && (planes == 1 || planes == 3 || planes == 4)) || (bits == 1 && (planes == 1 || planes == 4)) ||
               (bits == 4 && planes == 1) || (bits == 2 && planes == 1);
-    if (!ok || !bpl || (size_t)bpl * 8 < (size_t)w * bits || !alloc(out, w, h)) return false;
+    if (!ok || !bpl || (size_t)bpl * 8 < (size_t)w * bits || !alloc(out, w, h, n, 256)) return false;
     size_t lineBytes = (size_t)bpl * planes;
     std::vector<uint8_t> line(lineBytes);
     size_t pos = 128;
@@ -491,8 +498,10 @@ const std::vector<uint32_t>& AnimCanvas::add(const AnimFrame& f) {
     if (m_any) {
         if (m_last.dispose == AnimFrame::Clear) {
             int x0 = std::max(0, m_last.x), y0 = std::max(0, m_last.y);
-            int x1 = std::min(m_w, m_last.x + m_last.w), y1 = std::min(m_h, m_last.y + m_last.h);
-            for (int y = y0; y < y1; ++y) std::fill(&m_px[(size_t)y * m_w + x0], &m_px[(size_t)y * m_w + x0] + std::max(0, x1 - x0), 0u);
+            int x1 = (int)std::min<long long>(m_w, (long long)m_last.x + m_last.w);
+            int y1 = (int)std::min<long long>(m_h, (long long)m_last.y + m_last.h);
+            if (x0 < x1)
+                for (int y = y0; y < y1; ++y) std::fill_n(m_px.data() + (size_t)y * m_w + x0, x1 - x0, 0u);
         } else if (m_last.dispose == AnimFrame::Restore && m_saved.size() == m_px.size()) {
             m_px = m_saved;
         }
@@ -585,7 +594,11 @@ bool apng_split(const uint8_t* d, size_t n, int& canvasW, int& canvasH, std::vec
         const Chunk& c = chunks[i];
         if (is(c, "IDAT") || is(c, "fdAT")) { seenData = true; continue; }
         if (seenData || is(c, "acTL") || is(c, "fcTL") || is(c, "IEND")) continue;
+        // (copied into every frame: an ancillary chunk too big for that, text or metadata, is left out)
+        bool critical = !(c.type[0] & 0x20);
+        if (!critical && c.len > (1u << 16) && !is(c, "iCCP")) continue;
         put_chunk(shared, std::string((const char*)c.type, 4).c_str(), c.data, c.len);
+        if (shared.size() > (4u << 20)) return false;
     }
     ApngFrame* cur = nullptr;
     bool idatIsFrame = false;
@@ -622,7 +635,9 @@ bool apng_split(const uint8_t* d, size_t n, int& canvasW, int& canvasH, std::vec
             unsigned disp = c.data[24], blend = c.data[25];
             f.dispose = disp == 1 ? AnimFrame::Clear : disp == 2 ? AnimFrame::Restore : AnimFrame::Keep;
             f.over = blend == 1;
-            if (!size_ok(f.w, f.h) || f.x < 0 || f.y < 0 || f.x + f.w > canvasW || f.y + f.h > canvasH) return false;
+            if (!size_ok(f.w, f.h) || f.x < 0 || f.y < 0 || (long long)f.x + f.w > canvasW || (long long)f.y + f.h > canvasH)
+                return false;
+            if (frames.size() >= kMaxFrames) break;
             if (frames.empty() && f.dispose == AnimFrame::Restore) f.dispose = AnimFrame::Clear;
             frames.push_back(f);
             cur = &frames.back();

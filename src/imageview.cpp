@@ -164,6 +164,7 @@ bool fit(IWICImagingFactory* wic, IWICBitmapSource* frame, int o, int maxW, int 
             }
             UINT ow = 0, oh = 0;
             src->GetSize(&ow, &oh);
+            if ((unsigned long long)ow * oh > (1ull << 28)) ow = oh = 0;       // (1 GB; and its bytes fit a UINT)
             auto px = std::make_shared<std::vector<uint32_t>>((size_t)ow * oh);
             if (ow && oh && SUCCEEDED(src->CopyPixels(nullptr, ow * 4, ow * oh * 4, (BYTE*)px->data()))) {
                 out.pixels = px;
@@ -265,6 +266,9 @@ bool gif_frames(IWICImagingFactory* wic, IWICBitmapDecoder* dec, UINT count, int
         release(frame);
         if (!canvas) {
             if (cw <= 0 || ch <= 0) { cw = f.x + f.w; ch = f.y + f.h; }
+            // (a logical screen no picture could fill: the frame's own size)
+            if ((long long)cw * ch > (1LL << 27)) { cw = f.x + f.w; ch = f.y + f.h; }
+            if ((long long)cw * ch > (1LL << 27)) break;
             canvas = std::make_unique<AnimCanvas>(cw, ch);
         }
         if (!anim.add(canvas->add(f), canvas->w(), canvas->h(), delay)) break;
@@ -486,12 +490,24 @@ const ImageNote* cached(const std::wstring& path, int maxW, int maxH, int page, 
     return nullptr;
 }
 
+// decode, a picture too big for the memory left (or a decoder's exception) failing it
+bool safe_decode(IWICImagingFactory* wic, const std::wstring& path, int maxW, int maxH, int page, ImageNote& img, double enlarge) {
+    try {
+        return decode(wic, path, maxW, maxH, page, img, enlarge);
+    } catch (const std::exception&) {
+        std::wstring p = img.path;
+        img = ImageNote();
+        img.path = p;
+        return false;
+    }
+}
+
 ImageNote load(IWICImagingFactory* wic, const std::wstring& path, int maxW, int maxH, int page, double enlarge) {
     if (const ImageNote* c = cached(path, maxW, maxH, page, enlarge)) return *c;
     ImageNote img;
     img.path = path;
     FILETIME t = write_time(path);
-    if (decode(wic, path, maxW, maxH, page, img, enlarge)) {
+    if (safe_decode(wic, path, maxW, maxH, page, img, enlarge)) {
         img.path = path;
         if ((long long)img.w * img.h <= (1 << 23))         // (one zoomed into, decoded big: not kept)
             s_cache.push_front({ path, maxW, maxH, page, enlarge, t, img });
@@ -538,7 +554,7 @@ bool image_file(const std::wstring& path) {
 bool image_decode_full(const std::wstring& path, ImageNote& out) {
     IWICImagingFactory* wic = nullptr;
     if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic)))) return false;
-    bool ok = decode(wic, path, 1 << 15, 1 << 15, 0, out, 1.0);      // (a drawing at its own size)
+    bool ok = safe_decode(wic, path, 1 << 15, 1 << 15, 0, out, 1.0);     // (a drawing at its own size)
     wic->Release();
     out.path = path;
     out.partial = out.frames.size() > 1 || out.pages > 1 || out.drawing || out.w < out.fullW || out.h < out.fullH;
