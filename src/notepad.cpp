@@ -3150,6 +3150,9 @@ bool create_window() {
     }
     SetWindowPos(w, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     set_app_id(w, true);                    // (before it's shown: the button is made then)
+    // shown cloaked until it is all painted (as the main window): else a white frame first
+    BOOL cloak = TRUE;
+    DwmSetWindowAttribute(w, DWMWA_CLOAK, &cloak, sizeof(cloak));
     NoteSession s;
     restore(*n, s);
     // where it was; else on the monitor with the mouse, centred
@@ -3175,6 +3178,11 @@ bool create_window() {
         int a = s_np->active;
         s_np->active = -1;
         activate(*s_np, a);
+    }
+    if (s_np) {
+        RedrawWindow(w, nullptr, nullptr, RDW_UPDATENOW | RDW_ALLCHILDREN);
+        cloak = FALSE;
+        DwmSetWindowAttribute(w, DWMWA_CLOAK, &cloak, sizeof(cloak));
     }
     if (s_np && !s_np->unread.empty()) {
         SetTimer(w, TIMER_UNREAD, kUnreadRetryMs, nullptr);

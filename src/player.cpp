@@ -4500,7 +4500,13 @@ bool create_player(bool activate) {
     set_app_id(w, true);                    // (before it's shown: the button is made then)
     show_tab(p, p.shown, false);            // (its list where it was left)
     show_current(p);
+    // shown cloaked until it is all painted (as the main window): else a white frame first
+    BOOL cloak = TRUE;
+    DwmSetWindowAttribute(w, DWMWA_CLOAK, &cloak, sizeof(cloak));
     ShowWindow(w, maximized ? SW_SHOWMAXIMIZED : activate ? SW_SHOWNORMAL : SW_SHOWNOACTIVATE);
+    RedrawWindow(w, nullptr, nullptr, RDW_UPDATENOW | RDW_ALLCHILDREN);
+    cloak = FALSE;
+    DwmSetWindowAttribute(w, DWMWA_CLOAK, &cloak, sizeof(cloak));
     if (activate) SetForegroundWindow(w);
     return true;
 }
