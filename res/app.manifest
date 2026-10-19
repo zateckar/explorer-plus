@@ -27,6 +27,9 @@
       <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
       <!-- paths past MAX_PATH work with the Win32 file APIs when the system allows it -->
       <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+      <!-- the NT heap (no heapType): measured against SegmentHeap (10/2026, the same exe but for this),
+           the segment heap took 10-23% less memory and a third less time for a sync pass with nothing
+           to do, but 16% more to open a 40 MB text and 14-16% more to list big folders -->
     </windowsSettings>
   </application>
 </assembly>
