@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <string_view>
 #include <vector>
 
 // The Notepad's text files and its remembered tabs. Pure text handling, unit-tested (tests/).
@@ -26,6 +27,16 @@ TextFile text_decode(const std::string& bytes);
 // the text (any of CR, LF, CRLF ending its lines) as a file's bytes; `lossy`: the encoding
 // (ANSI) can't hold some of its characters. Empty for a non-empty text: the conversion failed.
 std::string text_encode(const std::wstring& text, TextEncoding enc, LineEnding eol, bool* lossy = nullptr);
+
+// a new file with the bytes (in parts, as they are held), on the disk before it returns, so that
+// a crash or a power cut after a move never leaves an empty file in its place. `exclusive`:
+// only where there is no file yet (else one there is written over).
+enum class Wrote { Ok, Failed, NotCreated };
+Wrote write_new(const std::wstring& path, std::string_view data, std::string_view more = {}, bool exclusive = false);
+// the bytes in place of a file: written beside it (under a name of its own, never over another
+// file), then put in its place. A failed write leaves the old one; the file keeps its attributes
+// and permissions. Only a folder that takes no new files has it written over in place.
+bool text_file_write(const std::wstring& path, const std::string& data);
 
 // the tabs the Notepad had, with what wasn't saved (kept in its own folder)
 struct NoteTabState {

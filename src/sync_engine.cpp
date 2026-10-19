@@ -93,7 +93,7 @@ void Engine::set_paused(bool p) {
 void Engine::confirm_deletes(bool deleteThem) {
     std::lock_guard<std::mutex> lk(m_mx);
     if (!m_asked) return;
-    m_confirmed = m_asked;
+    m_confirmed = m_askedDeletes;
     m_confirm = deleteThem ? 1 : -1;
 }
 
@@ -269,8 +269,24 @@ struct HashingSink : ByteSink {
 };
 
 struct Identity { bool exists = false; uint64_t size = 0, mtime = 0, fileId = 0; bool isDir = false; };
-Identity identity_of(const std::wstring& full) {
+Identity identity_of(HANDLE h) {
     Identity id;
+    uint32_t attrs = 0;
+    if (!file_identity(h, id.size, id.mtime, id.fileId, &attrs)) return id;
+    id.exists = true;
+    id.isDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    return id;
+}
+
+Identity identity_of(const std::wstring& full) {
+    HANDLE h = CreateFileW(full.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        Identity id = identity_of(h);
+        CloseHandle(h);
+        if (id.exists) return id;
+    }
+    Identity id;                            // (can't be opened: what the folder says, without its ID)
     WIN32_FILE_ATTRIBUTE_DATA a;
     if (!GetFileAttributesExW(full.c_str(), GetFileExInfoStandard, &a)) return id;
     id.exists = true;
@@ -278,6 +294,23 @@ Identity identity_of(const std::wstring& full) {
     id.size = ((uint64_t)a.nFileSizeHigh << 32) | a.nFileSizeLow;
     id.mtime = ft64(a.ftLastWriteTime);
     return id;
+}
+
+// still the file seen: its size, time and (where both sides know it) its ID; another file put in
+// its place with the same size and time is not
+bool same_file(const Identity& now, uint64_t size, uint64_t mtime, uint64_t fileId) {
+    return now.exists && now.size == size && now.mtime == mtime && (!now.fileId || !fileId || now.fileId == fileId);
+}
+
+// renames the file open as `h` (DELETE access), never over another
+bool rename_handle(HANDLE h, const std::wstring& to) {
+    std::vector<uint8_t> buf(sizeof(FILE_RENAME_INFO) + to.size() * sizeof(wchar_t));
+    auto* ri = reinterpret_cast<FILE_RENAME_INFO*>(buf.data());
+    ri->ReplaceIfExists = FALSE;
+    ri->RootDirectory = nullptr;
+    ri->FileNameLength = (DWORD)(to.size() * sizeof(wchar_t));
+    memcpy(ri->FileName, to.c_str(), ri->FileNameLength);
+    return SetFileInformationByHandle(h, FileRenameInfo, ri, (DWORD)buf.size()) != 0;
 }
 
 std::wstring temp_name() {
@@ -335,32 +368,72 @@ Result Engine::do_download(Ctx& c, const RelPath& path, const RelPath& saveAs, b
     if (res.ok() && ft64(meta.mtime)) SetFileTime(h, nullptr, nullptr, &meta.mtime);
     CloseHandle(h);
     if (!res.ok()) { DeleteFileW(tmp.c_str()); return res; }
-    // the local file must still be as the scan saw it (or absent, as it was)
+    // the local file must still be the one the scan saw (or absent, as it was). Checked on a
+    // handle that keeps writers and renames out, and moved aside through it: the file replaced
+    // is the one checked, and a file that appears in its place meanwhile is never written over.
     std::wstring target = full(saveAs);
     std::wstring tk = key_of(saveAs);
-    Identity now = identity_of(target);
     auto li = c.local.find(tk);
     bool expectAbsent = li == c.local.end() || c.movedAway.count(tk);
-    if (expectAbsent ? now.exists : (!now.exists || now.size != li->second.size || now.mtime != li->second.mtime)) {
+    auto again = [&](const wchar_t* why) {
         DeleteFileW(tmp.c_str());
         std::lock_guard<std::mutex> lk(c.mx);
         c.rep.again = true;
-        return Result::fail(Status::PreconditionFailed, L"changed locally meanwhile");
+        return Result::fail(Status::PreconditionFailed, why);
+    };
+    HANDLE old = INVALID_HANDLE_VALUE;
+    DWORD oldAttrs = INVALID_FILE_ATTRIBUTES;
+    std::wstring aside;
+    if (expectAbsent) {
+        if (GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES) return again(L"changed locally meanwhile");
+    } else {
+        old = CreateFileW(target.c_str(), DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (old == INVALID_HANDLE_VALUE) {
+            DWORD err = GetLastError();
+            return again(err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND ? L"changed locally meanwhile" : L"The file is in use.");
+        }
+        const LocalItem& l = li->second;
+        if (!same_file(identity_of(old), l.size, l.mtime, l.fileId)) { CloseHandle(old); return again(L"changed locally meanwhile"); }
+        // a read-only file is replaced too, and stays read-only
+        oldAttrs = GetFileAttributesW(target.c_str());
+        if (oldAttrs != INVALID_FILE_ATTRIBUTES && (oldAttrs & FILE_ATTRIBUTE_READONLY))
+            SetFileAttributesW(target.c_str(), oldAttrs & ~FILE_ATTRIBUTE_READONLY);
+        aside = tmpDir + L"\\" + temp_name();
+        if (!rename_handle(old, aside)) {
+            if (oldAttrs != INVALID_FILE_ATTRIBUTES) SetFileAttributesW(target.c_str(), oldAttrs);
+            CloseHandle(old);
+            return again(L"The file is in use.");
+        }
     }
+    bool readOnly = oldAttrs != INVALID_FILE_ATTRIBUTES && (oldAttrs & FILE_ATTRIBUTE_READONLY);
     size_t s = target.find_last_of(L'\\');
     make_dirs(target.substr(0, s));
-    // a read-only file is replaced too, and stays read-only
-    DWORD oldAttrs = now.exists ? GetFileAttributesW(target.c_str()) : INVALID_FILE_ATTRIBUTES;
-    bool readOnly = oldAttrs != INVALID_FILE_ATTRIBUTES && (oldAttrs & FILE_ATTRIBUTE_READONLY);
-    if (readOnly) SetFileAttributesW(target.c_str(), oldAttrs & ~FILE_ATTRIBUTE_READONLY);
-    if (!MoveFileExW(tmp.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    if (!MoveFileExW(tmp.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH)) {
         DWORD err = GetLastError();
+        if (old != INVALID_HANDLE_VALUE) {             // the old one back where it was
+            if (rename_handle(old, target)) { if (readOnly) SetFileAttributesW(target.c_str(), oldAttrs); }
+            else {                                     // another file took its name: beside it, as a conflict copy
+                SYSTEMTIME now;
+                GetLocalTime(&now);
+                RelPath copy = join_path(parent_of(saveAs), syncpath::conflict_name(leaf_of(saveAs), m_opt.deviceName, now));
+                for (int i = 2; !rename_handle(old, full(copy)) && i < 100; ++i)
+                    copy = join_path(parent_of(saveAs), syncpath::conflict_name(leaf_of(saveAs), m_opt.deviceName + L" " + std::to_wstring(i), now));
+                c.log("conflict", copy, saveAs);
+            }
+            CloseHandle(old);
+        }
+        if (err == ERROR_ALREADY_EXISTS || err == ERROR_FILE_EXISTS) return again(L"changed locally meanwhile");
         DeleteFileW(tmp.c_str());
-        if (readOnly) SetFileAttributesW(target.c_str(), oldAttrs);
         std::lock_guard<std::mutex> lk(c.mx);
         c.rep.again = true;
         return Result::fail(err == ERROR_SHARING_VIOLATION || err == ERROR_ACCESS_DENIED ? Status::PreconditionFailed : Status::Fatal,
                             L"The file is in use.");
+    }
+    if (old != INVALID_HANDLE_VALUE) {                 // the old one replaced: gone
+        FILE_DISPOSITION_INFO del{ TRUE };
+        bool gone = SetFileInformationByHandle(old, FileDispositionInfo, &del, sizeof(del)) != 0;
+        CloseHandle(old);
+        if (!gone) DeleteFileW(aside.c_str());
     }
     if (readOnly) SetFileAttributesW(target.c_str(), GetFileAttributesW(target.c_str()) | FILE_ATTRIBUTE_READONLY);
     // An older version than one seen: deleted and made anew on another device between two passes
@@ -684,7 +757,7 @@ Result Engine::run_local_phase(Ctx& c, std::vector<Action>& acts) {
                 const BaseEntry* b = m_state.base(fk);
                 auto li = c.local.find(fk);
                 Identity now = identity_of(full(a.from));
-                bool same = b && li != c.local.end() && now.exists && now.size == b->size && now.mtime == b->mtime;
+                bool same = b && li != c.local.end() && same_file(now, li->second.size, li->second.mtime, li->second.fileId);
                 if (same && identity_of(full(a.path)).exists == false) {
                     make_dirs(full(parent_of(a.path)));
                     if (MoveFileExW(full(a.from).c_str(), full(a.path).c_str(), 0)) {
@@ -712,9 +785,13 @@ Result Engine::run_local_phase(Ctx& c, std::vector<Action>& acts) {
             }
             case Act::DeleteLocal: {
                 const BaseEntry* b = m_state.base(k);
+                auto li = c.local.find(k);
                 Identity now = identity_of(full(a.path));
                 if (!now.exists) { c.record([this, k] { m_state.erase_base(k); }); break; }
-                if (!b || now.size != b->size || now.mtime != b->mtime) { c.rep.again = true; break; }   // edited meanwhile: upload wins next pass
+                if (!b || li == c.local.end() || !same_file(now, li->second.size, li->second.mtime, li->second.fileId)) {
+                    c.rep.again = true;                     // edited meanwhile: upload wins next pass
+                    break;
+                }
                 if (recycle(full(a.path), m_opt.trashDir, a.path)) {
                     c.log("delete-local", a.path);
                     ++c.rep.localDeletes;
@@ -1004,30 +1081,30 @@ PassReport Engine::pass(Progress& prog) {
     if (plan.deferred) rep.again = true;
 
     // the mass-delete guard: many files, and a good share of the pair or simply a lot. A
-    // confirmation covers the deletions it was asked for, not more.
-    size_t deletes = plan.localDeletes + plan.remoteDeletes;
+    // confirmation covers the deletions it was asked for, not more: those files, as they were
+    // (one restored and another deleted in its place is asked about again)
+    auto mark = [&](const Action& a) {                    // a deletion: its side, path and revision
+        std::wstring k = key_of(a.path);
+        if (a.act == Act::DeleteRemote) return "r|" + to_utf8(k) + "|" + a.expectedRev;
+        auto b = base.find(k);
+        return "l|" + to_utf8(k) + "|" + (b != base.end() ? b->second.rev : std::string());
+    };
+    auto deletion = [](const Action& a) { return a.act == Act::DeleteLocal || a.act == Act::DeleteRemote; };
     int confirm = 0;
+    std::set<std::string> answered;
     {
         std::lock_guard<std::mutex> lk(m_mx);
         confirm = m_confirm;
-        if (confirm == 1 && deletes > m_confirmed) confirm = 0;
+        answered.swap(m_confirmed);
         m_confirm = 0;
         m_asked = 0;
-        bool many = deletes > m_opt.massDeleteFiles &&
-                    ((double)deletes > m_opt.massDeleteShare * (double)plan.files || deletes > m_opt.massDeleteMax);
-        if (confirm == 0 && many) {
-            m_asked = deletes;
-            m_status.state = PairState::ConfirmDeletes;
-            m_status.pendingDeletes = deletes;
-            m_status.message = std::to_wstring(deletes) + L" files would be deleted.";
-            rep.result = Result::fail(Status::Rejected, m_status.message);
-            return rep;
-        }
+        m_askedDeletes.clear();
     }
-    if (confirm == -1) {                                  // "Restore them": deletions become copies back
+    if (confirm == -1) {                                  // "Restore them": those deletions become copies back
         for (auto& a : plan.actions) {
-            if (a.act == Act::DeleteLocal) { a.act = Act::Upload; a.expectedRev.clear(); }
-            else if (a.act == Act::DeleteRemote) a.act = Act::Download;
+            bool asked = deletion(a) && answered.count(mark(a));
+            if (a.act == Act::DeleteLocal && asked) { a.act = Act::Upload; a.expectedRev.clear(); --plan.localDeletes; }
+            else if (a.act == Act::DeleteRemote && asked) { a.act = Act::Download; --plan.remoteDeletes; }
             else if (a.act == Act::RmdirRemote) a.act = Act::MkdirLocal;
             else if (a.act == Act::RmdirLocal) a.act = Act::MkdirRemote;
         }
@@ -1035,6 +1112,25 @@ PassReport Engine::pass(Progress& prog) {
         for (auto& a : plan.actions)
             if (a.act == Act::Upload && !c.local.count(key_of(a.path))) a.act = Act::Forget;
         order_actions(plan.actions);
+    }
+    size_t deletes = plan.localDeletes + plan.remoteDeletes;
+    std::set<std::string> which;
+    for (auto& a : plan.actions)
+        if (deletion(a)) which.insert(mark(a));
+    {
+        std::lock_guard<std::mutex> lk(m_mx);
+        bool many = deletes > m_opt.massDeleteFiles &&
+                    ((double)deletes > m_opt.massDeleteShare * (double)plan.files || deletes > m_opt.massDeleteMax);
+        bool covered = confirm == 1 && std::includes(answered.begin(), answered.end(), which.begin(), which.end());
+        if (many && !covered) {
+            m_asked = deletes;
+            m_askedDeletes = std::move(which);
+            m_status.state = PairState::ConfirmDeletes;
+            m_status.pendingDeletes = deletes;
+            m_status.message = std::to_wstring(deletes) + L" files would be deleted.";
+            rep.result = Result::fail(Status::Rejected, m_status.message);
+            return rep;
+        }
     }
 
     // what's waiting, for the badges and the status

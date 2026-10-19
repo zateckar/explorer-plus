@@ -446,6 +446,27 @@ static void engine_no_false_deletes() {
     CHECK(r.result.st == Status::Rejected);
     a.eng->confirm_deletes(false);
     a.sync();
+    // a yes covers those files: as many others in their place are asked about again
+    for (int i = 0; i < 12; ++i) tu::remove(a.root, L"many/" + std::to_wstring(i) + L".txt");
+    r = a.sync();
+    CHECK(r.result.st == Status::Rejected);
+    a.eng->confirm_deletes(true);
+    for (int i = 0; i < 12; ++i) tu::write(a.root, L"many/" + std::to_wstring(i) + L".txt", "m");
+    for (int i = 20; i < 32; ++i) tu::remove(a.root, L"many/" + std::to_wstring(i) + L".txt");
+    r = a.sync();
+    CHECK(r.result.st == Status::Rejected && r.remoteDeletes == 0);
+    CHECK(store->objs.count(L"many/20.txt") == 1 && store->objs.count(L"many/31.txt") == 1);
+    a.eng->confirm_deletes(false);
+    a.sync();
+    CHECK(tu::exists(a.root, L"many/20.txt") && tu::exists(a.root, L"many/0.txt"));
+    // "restore them" brings back those asked about; one deleted since goes as any single one would
+    for (int i = 0; i < 12; ++i) tu::remove(a.root, L"many/" + std::to_wstring(i) + L".txt");
+    CHECK(a.sync().result.st == Status::Rejected);
+    a.eng->confirm_deletes(false);
+    tu::remove(a.root, L"many/40.txt");
+    r = a.sync();
+    CHECK(r.result.ok() && r.remoteDeletes == 1);
+    CHECK(tu::exists(a.root, L"many/0.txt") && tu::exists(a.root, L"many/11.txt") && store->objs.count(L"many/40.txt") == 0);
 
     // no server-side move and the upload under the new name fails: the old one stays
     store->fault = [](const char* op, const RelPath& p) {
@@ -488,6 +509,50 @@ static void engine_commit_race() {
     CHECK(tu::read(a.root, L"b.txt") == "from b");
     CHECK(tu::read(b.root, L"a.txt") == "from a");
     CHECK(same(a, b));
+}
+
+// a file saved here while another device's version downloads: kept, even as a new file with the
+// old one's size and time (a save through a new file that keeps the time, a copy back)
+static void engine_download_race() {
+    auto store = std::make_shared<FakeStore>();
+    Dev a(L"da", store), b(L"db", store);
+    tu::write(a.root, L"doc.txt", "base");
+    CHECK(a.sync().result.ok());
+    CHECK(b.sync().result.ok());
+    tu::write(b.root, L"doc.txt", "theirs");
+    CHECK(b.sync().uploads == 1);
+    uint64_t mtime = a.st->base(key_of(L"doc.txt"))->mtime;
+    bool swapped = false;
+    store->fault = [&](const char* op, const RelPath& p) {
+        if (!swapped && std::string(op) == "download" && p == L"doc.txt") {
+            swapped = true;
+            tu::write(a.root, L"new.txt", "edit");
+            HANDLE h = CreateFileW((a.root + L"\\new.txt").c_str(), FILE_WRITE_ATTRIBUTES, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+            FILETIME t = ft_of(mtime);
+            SetFileTime(h, nullptr, nullptr, &t);
+            CloseHandle(h);
+            MoveFileExW((a.root + L"\\new.txt").c_str(), (a.root + L"\\doc.txt").c_str(), MOVEFILE_REPLACE_EXISTING);
+        }
+        return Status::Ok;
+    };
+    a.sync();
+    store->fault = nullptr;
+    a.sync();
+    CHECK(swapped);
+    bool mine = false, theirs = false;
+    for (auto& [p, v] : tu::tree(a.root)) { if (v == "edit") mine = true; if (v == "theirs") theirs = true; }
+    CHECK(mine && theirs);
+    b.sync();
+    CHECK(same(a, b));
+    // a read-only file is still replaced, and stays read-only
+    std::wstring doc = a.root + L"\\doc.txt";
+    SetFileAttributesW(doc.c_str(), GetFileAttributesW(doc.c_str()) | FILE_ATTRIBUTE_READONLY);
+    a.sync();
+    tu::write(b.root, L"doc.txt", "theirs again");
+    b.sync();
+    CHECK(a.sync().downloads == 1);
+    CHECK(tu::read(a.root, L"doc.txt") == "theirs again" && (GetFileAttributesW(doc.c_str()) & FILE_ATTRIBUTE_READONLY));
+    SetFileAttributesW(doc.c_str(), FILE_ATTRIBUTE_NORMAL);
 }
 
 static bool has_problem(Dev& d, const std::wstring& path, const wchar_t* text) {
@@ -649,6 +714,7 @@ void run_engine_only() {
     engine_faults();
     engine_no_false_deletes();
     engine_commit_race();
+    engine_download_race();
 }
 
 // the shell's Recycle Bin takes a local file; a network share has none, and the file stays

@@ -6,6 +6,7 @@
 #include "media.h"
 #include "mediadata.h"
 #include "mediainfo.h"
+#include "openorder.h"
 #include "imageview.h"
 #include "loudness.h"
 #include "spectrum.h"
@@ -87,6 +88,8 @@ struct QueueTab {
     std::wstring name;
     PlayQueue q;
     int top = 0;                    // the list's first row shown, as it was left
+    unsigned id = 0;                // (never another tab's, in this process)
+    unsigned playedGen = 0;         // the request to play (OpenOrder::gen) its queue was last replaced by
 };
 
 struct Player {
@@ -200,6 +203,7 @@ struct Player {
     HWND subWnd = nullptr;          // the window they show in
 };
 Player* s_p = nullptr;
+OpenOrder s_order;                  // requests to play or add made in this process (OpenJob)
 HWND s_msg = nullptr;               // the module's message window (results of its threads)
 ULONGLONG s_lastOpen = 0;           // when a file was last opened by its type (kCopyOpen)
 
@@ -1067,12 +1071,14 @@ void queue_changed(Player& p) {
 
 // into the queue shown. `start`: the entry to begin with (a picture viewed: its folder's
 // pictures from it)
-void add(Player& p, const std::vector<std::wstring>& paths, bool enqueue, const std::wstring& start = {}) {
+// (`into`: that tab's queue; else the one shown)
+void add(Player& p, const std::vector<std::wstring>& paths, bool enqueue, const std::wstring& start = {}, QueueTab* into = nullptr) {
     if (paths.empty()) return;
-    QueueTab* tab = p.tabs[(size_t)p.shown].get();
+    QueueTab* tab = into ? into : p.tabs[(size_t)p.shown].get();
     if (!enqueue) {
         tags_forget();
         set_playing(p, tab);                // (what played before stops: this plays)
+        tab->playedGen = s_order.gen;
         p.q->replace(paths);
         if (!start.empty())
             for (int i = 0; i < p.q->size(); ++i)
@@ -1149,7 +1155,9 @@ std::wstring new_tab_name(const Player& p) {
 
 // a new tab at `at` (shuffle and repeat as the others have them)
 QueueTab* add_tab(Player& p, int at, const std::wstring& name) {
+    static unsigned s_tabIds = 0;
     auto t = std::make_unique<QueueTab>();
+    t->id = ++s_tabIds;
     t->name = name.empty() ? new_tab_name(p) : name;
     t->q.repeat = p.q ? p.q->repeat : (Repeat)std::clamp(settings_pref(L"playerRepeat", 0), 0, 2);
     t->q.set_shuffle(p.q ? p.q->shuffle() : settings_pref(L"playerShuffle", 0) != 0);
@@ -1910,7 +1918,42 @@ bool folder_has_media(const std::wstring& dir) {
 // ------------------------------------------------------------------
 // handing over: to this process's player, or another process's
 // ------------------------------------------------------------------
-struct OpenJob { std::vector<std::wstring> paths; bool enqueue = false; std::wstring start; };
+// a request to play or add, made now, carried out once its files are known (openorder.h)
+struct OpenJob {
+    std::vector<std::wstring> paths;
+    bool enqueue = false;
+    std::wstring start;
+    unsigned gen = 0;               // its number (OpenOrder::request)
+    unsigned tab = 0;               // the tab shown when it was made (QueueTab::id; 0: no player)
+};
+std::vector<OpenJob*> s_parked;     // adds waiting for a play still being listed, in order
+
+void deliver_job(OpenJob* job);
+
+void flush_parked() {
+    std::vector<OpenJob*> v;
+    v.swap(s_parked);
+    for (OpenJob* j : v) deliver_job(j);
+}
+
+OpenJob* new_job(bool enqueue) {
+    if (!enqueue) {                         // (adds waiting for an earlier play: theirs comes no more)
+        s_order.gone(s_order.gen);
+        flush_parked();
+    }
+    auto* job = new OpenJob;
+    job->enqueue = enqueue;
+    job->gen = s_order.request(enqueue);
+    if (s_p && s_p->shown < (int)s_p->tabs.size()) job->tab = s_p->tabs[(size_t)s_p->shown]->id;
+    return job;
+}
+
+// one that comes to nothing (UI thread)
+void drop_job(OpenJob* job) {
+    if (!job->enqueue) s_order.gone(job->gen);
+    delete job;
+    flush_parked();
+}
 
 bool create_player(bool activate);
 
@@ -1943,7 +1986,7 @@ bool hand_over(const std::vector<std::wstring>& paths, bool enqueue, const std::
     return true;
 }
 
-void deliver(const std::vector<std::wstring>& paths, bool enqueue, const std::wstring& start = {}) {
+void deliver(const std::vector<std::wstring>& paths, bool enqueue, const std::wstring& start = {}, QueueTab* into = nullptr) {
     if (paths.empty()) { MessageBeep(MB_ICONASTERISK); return; }
     if (!s_p) {
         if (hand_over(paths, enqueue, start)) return;
@@ -1952,14 +1995,25 @@ void deliver(const std::vector<std::wstring>& paths, bool enqueue, const std::ws
         if (IsIconic(s_p->wnd)) ShowWindow(s_p->wnd, SW_RESTORE);
         SetForegroundWindow(s_p->wnd);
     }
-    add(*s_p, paths, enqueue, start);
+    add(*s_p, paths, enqueue, start, into);
+}
+
+// (and deleted)
+void deliver_job(OpenJob* job) {
+    QueueTab* into = nullptr;
+    if (job->tab && s_p)
+        for (auto& t : s_p->tabs)
+            if (t->id == job->tab) into = t.get();
+    OpenOrder::Then then = s_order.ready(job->enqueue, job->gen, job->tab != 0, into != nullptr, into ? into->playedGen : 0);
+    if (then == OpenOrder::Then::Wait) { s_parked.push_back(job); return; }
+    std::unique_ptr<OpenJob> j(job);
+    if (then == OpenOrder::Then::Do) deliver(j->paths, j->enqueue, j->start, into);
+    if (!j->enqueue) flush_parked();
 }
 
 LRESULT CALLBACK msg_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_PLAYER_OPEN) {
-        auto* job = reinterpret_cast<OpenJob*>(lp);
-        deliver(job->paths, job->enqueue, job->start);
-        delete job;
+        deliver_job(reinterpret_cast<OpenJob*>(lp));
         return 0;
     }
     if (msg == WM_QUEUE_INFO) { tags_apply(); return 0; }
@@ -1989,15 +2043,15 @@ HWND msg_window() {
 // the window) to `deliver`
 void open_items(const std::vector<MediaItem>& items, bool enqueue, bool maybeFolders) {
     HWND target = msg_window();
+    OpenJob* job = new_job(enqueue);
     if (!maybeFolders) {
-        std::vector<std::wstring> paths;
         for (auto& it : items)
-            if (player_file(it.path)) paths.push_back(it.path);
-        deliver(paths, enqueue);
+            if (player_file(it.path)) job->paths.push_back(it.path);
+        deliver_job(job);
         return;
     }
-    std::thread([items, enqueue, target] {
-        auto* job = new OpenJob{ expand(items), enqueue };
+    std::thread([items, job, target] {
+        job->paths = expand(items);
         if (!PostMessageW(target, WM_PLAYER_OPEN, 0, (LPARAM)job)) delete job;
     }).detach();
 }
@@ -2005,8 +2059,10 @@ void open_items(const std::vector<MediaItem>& items, bool enqueue, bool maybeFol
 // one picture viewed: its folder's pictures, from it (listed on a thread: a big folder)
 void open_pictures(const std::wstring& file) {
     HWND target = msg_window();
-    std::thread([file, target] {
-        auto* job = new OpenJob{ folder_pictures(file), false, file };
+    OpenJob* job = new_job(false);
+    job->start = file;
+    std::thread([file, job, target] {
+        job->paths = folder_pictures(file);
         if (!PostMessageW(target, WM_PLAYER_OPEN, 0, (LPARAM)job)) delete job;
     }).detach();
 }
@@ -4246,13 +4302,13 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         cd->dwData != kCopyOpen) ||
                 cd->cbData % sizeof(wchar_t) || cd->cbData > (64u << 20))
                 return FALSE;
-            auto* job = new OpenJob;
-            job->enqueue = cd->dwData == kCopyEnqueue;
+            bool enqueue = cd->dwData == kCopyEnqueue;
             if (cd->dwData == kCopyOpen) {          // (several files opened at once: queued after the first)
                 ULONGLONG now = GetTickCount64();
-                job->enqueue = s_lastOpen && now - s_lastOpen < kOpenTogetherMs;
+                enqueue = s_lastOpen && now - s_lastOpen < kOpenTogetherMs;
                 s_lastOpen = now;
             }
+            auto* job = new_job(enqueue);
             bool view = cd->dwData == kCopyView;    // (the first path: the picture to begin with)
             // (one path at a time, up to the cap: a huge payload isn't all materialised)
             const wchar_t* c = (const wchar_t*)cd->lpData;
@@ -4274,7 +4330,7 @@ LRESULT CALLBACK player_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 c = z + (z < end ? 1 : 0);
             }
             // (played after the sender's call returns: it waits meanwhile)
-            if (job->paths.empty() || !PostMessageW(msg_window(), WM_PLAYER_OPEN, 0, (LPARAM)job)) { delete job; return FALSE; }
+            if (job->paths.empty() || !PostMessageW(msg_window(), WM_PLAYER_OPEN, 0, (LPARAM)job)) { drop_job(job); return FALSE; }
             return TRUE;
         }
         case WM_DROPFILES: {
@@ -4528,7 +4584,10 @@ bool player_open_file(const std::wstring& path) {
         MessageBoxW(nullptr, (why + path).c_str(), L"Explorer Plus", MB_OK | MB_ICONINFORMATION);
     } else if (!hand_over(paths, false, start, true) && create_player(true)) {
         s_lastOpen = GetTickCount64();
-        add(*s_p, paths, false, start);
+        OpenJob* job = new_job(false);          // (what was asked before it: this plays instead)
+        job->paths = std::move(paths);
+        job->start = start;
+        deliver_job(job);
         here = true;
     }
     if (mx) {

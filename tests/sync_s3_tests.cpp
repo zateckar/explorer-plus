@@ -12,6 +12,7 @@
 #include "crypto.h"
 #include <atomic>
 #include <cstdio>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -88,8 +89,14 @@ public:
     std::string bucket = "bkt";
     std::mutex mx;
     std::map<std::string, std::string> objs, etags;
-    std::atomic<int> requests{ 0 }, badSignatures{ 0 }, lists{ 0 }, heads{ 0 };
+    std::atomic<int> requests{ 0 }, badSignatures{ 0 }, lists{ 0 }, heads{ 0 }, deletes{ 0 };
+    std::function<void(const std::string&)> beforeDelete;     // once, with `mx` held: another device, just before a DELETE
     int port = 0;
+    void edit(const std::string& key, const std::string& data) {   // (`mx` held)
+        crypto::Hash32 h = crypto::blake2b(data.data(), data.size());
+        objs[key] = data;
+        etags[key] = crypto::hex(h.data(), 16);
+    }
 
     bool start() {
         WSADATA w;
@@ -267,6 +274,11 @@ private:
             return reply(200, "", { { "ETag", "\"" + etags[key] + "\"" } });
         }
         if (method == "DELETE") {
+            if (beforeDelete) { auto f = std::move(beforeDelete); beforeDelete = nullptr; f(key); it = objs.find(key); }
+            std::string im = hv("if-match");
+            if (!im.empty() && it == objs.end()) return reply(404, "<Error><Code>NoSuchKey</Code></Error>");
+            if (!im.empty() && im != "*" && "\"" + etags[key] + "\"" != im) return reply(412, "<Error><Code>PreconditionFailed</Code></Error>");
+            ++deletes;
             objs.erase(key);
             etags.erase(key);
             return reply(204, "");
@@ -334,6 +346,21 @@ void test_raw() {
     CHECK(s->stat(L"a.txt", st, np).st == Status::NotFound);
     CHECK(s->remove(L"b/a.txt", "stale", np).st == Status::PreconditionFailed);
     CHECK(s->remove(L"b/a.txt", r2, np).ok());
+    // another device's upload between the check and the DELETE: refused, the upload kept
+    std::string r3;
+    CHECK(put(*s, L"c.txt", "mine", "", &r3).ok());
+    m.beforeDelete = [&](const std::string& k) { m.edit(k, "theirs"); };
+    CHECK(s->remove(L"c.txt", r3, np).st == Status::PreconditionFailed);
+    CHECK(m.objs["pfx/c.txt"] == "theirs");
+    m.beforeDelete = [&](const std::string& k) { m.edit(k, "theirs 2"); };
+    CHECK(s->remove(L"c.txt", "", np).st == Status::PreconditionFailed);   // (no revision: the one the HEAD saw)
+    CHECK(m.objs["pfx/c.txt"] == "theirs 2");
+    // ... and while a rename copies: the source stays as uploaded, the copy is taken back
+    CHECK(s->stat(L"c.txt", st, np).ok());
+    m.beforeDelete = [&](const std::string& k) { if (k == "pfx/c.txt") m.edit(k, "theirs, again"); };
+    CHECK(s->move(L"c.txt", L"d.txt", st.rev, mv, np).st == Status::PreconditionFailed);
+    CHECK(m.objs["pfx/c.txt"] == "theirs, again" && !m.objs.count("pfx/d.txt"));
+    CHECK(s->stat(L"c.txt", st, np).ok() && s->remove(L"c.txt", st.rev, np).ok() && !m.objs.count("pfx/c.txt"));
     CHECK(m.badSignatures == 0);
     // a wrong secret: refused as a sign-in problem
     S3Options bad = opts(m);

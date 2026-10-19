@@ -10,6 +10,7 @@
 #include "textfile.h"
 #include "syntax.h"
 #include "textops.h"
+#include "openorder.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -267,6 +268,83 @@ static void note_sessions() {
     CHECK(r.tabs.empty() && r.wrap && r.statusBar && r.zoom == 100 && r.w == 0);
     r = note_session_parse(L"[notepad]\r\nactive=9\r\nzoom=9999\r\n[tab1]\r\nencoding=77\r\n[tab2]\r\npath=a.txt\r\n");
     CHECK(r.tabs.size() == 1 && r.active == 0 && r.zoom == 500);
+}
+
+// saving a text: in its place, nothing else beside it touched, nothing left behind
+static void text_file_saves() {
+    WCHAR tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    std::wstring dir = std::wstring(tmp) + L"ep-unit-save-" + std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    auto get = [](const std::wstring& path) {
+        std::string s;
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return std::string("<missing>");
+        char b[256];
+        DWORD n = 0;
+        while (ReadFile(h, b, sizeof(b), &n, nullptr) && n) s.append(b, n);
+        CloseHandle(h);
+        return s;
+    };
+    auto count = [&] {
+        int n = 0;
+        WIN32_FIND_DATAW fd;
+        HANDLE f = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+        if (f == INVALID_HANDLE_VALUE) return 0;
+        do n += !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY); while (FindNextFileW(f, &fd));
+        FindClose(f);
+        return n;
+    };
+    std::wstring note = dir + L"\\note.txt", other = note + L".saving~";
+    CHECK(write_new(note, "original") == Wrote::Ok && write_new(other, "someone else's") == Wrote::Ok);
+    CHECK(write_new(other, "again", {}, true) == Wrote::NotCreated);     // (exclusive: not over a file there)
+    CHECK(text_file_write(note, "edited"));
+    CHECK(get(note) == "edited" && get(other) == "someone else's" && count() == 2);
+    SetFileAttributesW(other.c_str(), FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN);
+    CHECK(text_file_write(note, "edited twice"));
+    CHECK(get(note) == "edited twice" && get(other) == "someone else's" && count() == 2);
+    SetFileAttributesW(other.c_str(), FILE_ATTRIBUTE_NORMAL);
+    CHECK(text_file_write(dir + L"\\new.txt", "new") && get(dir + L"\\new.txt") == "new" && count() == 3);
+    for (const wchar_t* f : { L"note.txt", L"note.txt.saving~", L"new.txt" }) DeleteFileW((dir + L"\\" + f).c_str());
+    RemoveDirectoryW(dir.c_str());
+}
+
+// the player's requests, carried out as if at once though a folder's files come later
+static void open_order() {
+    using T = OpenOrder::Then;
+    OpenOrder o;
+    // a slow folder played, then a file: the file plays, the folder (ready after) doesn't
+    unsigned slow = o.request(false), file = o.request(false);
+    CHECK(o.ready(false, file, true, true, 0) == T::Do);
+    CHECK(o.ready(false, slow, true, true, 0) == T::Drop);
+    // added to tab A, played over in A by a request made after it: not added to what plays now
+    unsigned add = o.request(true);
+    unsigned play = o.request(false);
+    CHECK(o.ready(false, play, true, true, 0) == T::Do);
+    CHECK(o.ready(true, add, true, true, play) == T::Drop);
+    // ... played over by one made before it: added (to the tab it was asked for in)
+    add = o.request(true);
+    CHECK(o.ready(true, add, true, true, play) == T::Do);
+    // its tab closed meanwhile: nowhere to go
+    CHECK(o.ready(true, o.request(true), true, false, 0) == T::Drop);
+    // an add asked for after a play still being listed waits for it, then goes
+    play = o.request(false);
+    add = o.request(true);
+    CHECK(o.ready(true, add, true, true, 0) == T::Wait);
+    CHECK(o.ready(false, play, true, true, 0) == T::Do);
+    CHECK(o.ready(true, add, true, true, play) == T::Do);
+    // ... or the play comes to nothing
+    play = o.request(false);
+    add = o.request(true);
+    CHECK(o.ready(true, add, true, true, 0) == T::Wait);
+    o.gone(play);
+    CHECK(o.ready(true, add, true, true, 0) == T::Do);
+    // no player when asked: added unless something was played since
+    add = o.request(true);
+    CHECK(o.ready(true, add, false, false, 0) == T::Do);
+    add = o.request(true);
+    o.ready(false, o.request(false), true, true, 0);
+    CHECK(o.ready(true, add, false, false, 0) == T::Drop);
 }
 
 static void command_line_round_trip() {
@@ -1458,6 +1536,8 @@ int wmain(int argc, wchar_t** argv) {
     user_choice();
     text_files();
     note_sessions();
+    text_file_saves();
+    open_order();
     syntax_colours();
     formatting();
     text_operations();

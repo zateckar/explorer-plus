@@ -116,7 +116,8 @@ private:
     std::atomic<bool> m_paused{ false };
     int m_confirm = 0;                  // 1: delete confirmed, -1: restore (m_mx)
     size_t m_asked = 0;                 // deletions the guard asked about (0: no question open)
-    size_t m_confirmed = 0;             // how many the yes covers
+    std::set<std::string> m_askedDeletes;   // which: side, path and revision each
+    std::set<std::string> m_confirmed;      // the ones the answer covers
 };
 
 } // namespace sync

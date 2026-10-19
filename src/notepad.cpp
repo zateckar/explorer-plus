@@ -33,6 +33,9 @@ const UINT WM_NOTEPAD_COLOUR = WM_APP + 71; // the part shown to colour (before 
 const UINT WM_NOTEPAD_WORK = WM_APP + 72;   // a step of the work done between the user's input
 const UINT_PTR TIMER_KEEP = 1;              // the tabs kept a moment after a change
 const UINT_PTR TIMER_WORK = 2;              // (the next step, after the input and painting waiting)
+const UINT WM_NOTEPAD_UNREAD = WM_APP + 73; // kept texts that couldn't be read: said, once the window is up
+const UINT_PTR TIMER_UNREAD = 3;            // ... and tried again every so often
+const UINT kUnreadRetryMs = 3000;
 const size_t kHead = 1 << 18;               // a big text: this many characters go in at once,
 const size_t kPiece = 1 << 16;              // then this many at a time (some 4 ms each)
 const long kLexChunk = 1 << 16;             // lexed this many at a time; a lexer state kept every 32K
@@ -101,6 +104,9 @@ struct Notepad {
     HFONT font = nullptr, glyphs = nullptr, glyphsSmall = nullptr;
     std::vector<std::unique_ptr<Tab>> tabs;
     int active = -1;
+    // tabs whose kept unsaved text couldn't be read when they came back (another program had it
+    // open): not traded for the file as saved; kept in the session as they were, and tried again
+    std::vector<NoteTabState> unread;
     bool wrap = true, statusBar = true;
     int zoom = 100;
     // the layout
@@ -200,48 +206,6 @@ Read read_bytes(const std::wstring& path, std::string& out, ULONGLONG limit = kM
     }
     CloseHandle(h);
     return r;
-}
-
-enum class Wrote { Ok, Failed, NotCreated };
-
-// (the bytes: in parts, as they are held; on the disk before it returns, so that a crash or a
-// power cut after the move never leaves an empty file in its place)
-Wrote write_new(const std::wstring& path, std::string_view data, std::string_view more = {}) {
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return Wrote::NotCreated;
-    bool ok = true;
-    for (std::string_view part : { data, more }) {
-        DWORD done = 0;
-        ok = ok && (part.empty() || (WriteFile(h, part.data(), (DWORD)part.size(), &done, nullptr) && done == part.size()));
-    }
-    ok = ok && FlushFileBuffers(h);
-    CloseHandle(h);
-    if (!ok) DeleteFileW(path.c_str());
-    return ok ? Wrote::Ok : Wrote::Failed;
-}
-
-// (written beside it, then put in its place: a failed write leaves the old one; the file keeps
-// its attributes and permissions. Only a folder that takes no new files has it written over in
-// place; a write that failed (a full disk) never goes on to the file itself.)
-bool write_file(const std::wstring& path, const std::string& data) {
-    std::wstring tmp = path + L".saving~";
-    Wrote w = write_new(tmp, data);
-    if (w == Wrote::Ok) {
-        bool ok = GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES
-                      ? ReplaceFileW(path.c_str(), tmp.c_str(), nullptr, REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS,
-                                     nullptr, nullptr)
-                      : MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
-        if (!ok) DeleteFileW(tmp.c_str());
-        return ok;
-    }
-    if (w == Wrote::Failed || GetLastError() != ERROR_ACCESS_DENIED) return false;
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    DWORD done = 0;
-    bool ok = (data.empty() || (WriteFile(h, data.data(), (DWORD)data.size(), &done, nullptr) && done == data.size())) &&
-              SetEndOfFile(h) && FlushFileBuffers(h);
-    CloseHandle(h);
-    return ok;
 }
 
 // ours (the session, kept text): written beside, then moved over
@@ -1126,7 +1090,7 @@ bool save(Notepad& n, Tab& t, bool as) {
         return false;
     }
     HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-    bool ok = write_file(file, bytes);
+    bool ok = text_file_write(file, bytes);
     SetCursor(old);
     if (!ok) {
         MessageBoxW(n.wnd, (L"The file couldn't be saved:\n" + file).c_str(), L"Notepad", MB_OK | MB_ICONWARNING);
@@ -1251,7 +1215,85 @@ bool keep_now(Notepad& n) {
         }
         s.tabs.push_back(std::move(st));
     }
+    for (auto& st : n.unread) s.tabs.push_back(st);         // (as they were: tried again next time too)
     return write_own(dir + L"\\session.ini", text_encode(note_session_serialize(s), TextEncoding::Utf16Le, LineEnding::CrLf)) && ok;
+}
+
+// a tab as it was left, last: `f` its text (`kept`: its unsaved text, from the notes folder)
+Tab* restore_tab(Notepad& n, const NoteTabState& st, TextFile& f, bool kept) {
+    Tab* t = add_tab(n, (int)n.tabs.size());
+    if (!t) return nullptr;
+    t->path = st.path;
+    t->enc = f.enc;
+    t->eol = f.eol;
+    t->langChosen = !st.syntax.empty();
+    t->lang = t->langChosen ? lang_from_key(st.syntax) : lang_for_file(st.path);
+    set_text(n, *t, f.text);
+    if (kept) {
+        t->dirty = true;
+        t->cache = st.cache;
+        t->fileTime = st.fileTime;
+    } else {
+        t->fileTime = st.path.empty() ? 0 : write_time(st.path);
+        t->caveat = caveat_of(f);
+    }
+    t->pendingSel = { st.selStart, st.selEnd };
+    t->pendingTop = st.top;
+    apply_pending(n, *t);
+    return t;
+}
+
+// a tab's kept unsaved text: Ok, or Failed with the file still there (unread: kept for later),
+// or Failed with it gone
+Read read_kept(const std::wstring& dir, const NoteTabState& st, TextFile& f, bool& unread) {
+    std::string bytes;
+    std::wstring file = dir + L"\\" + st.cache;
+    Read r = read_bytes(file, bytes, 2 * kMaxBytes + 2);
+    unread = r == Read::Failed && GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (r == Read::Ok) {
+        f = text_decode(bytes);
+        f.enc = st.enc;
+        f.eol = st.eol;
+    }
+    return r;
+}
+
+// the unread kept texts tried again: those that can be read now come back as tabs (last, not
+// made the active one: the user may be typing in another). True: none left.
+bool retry_unread(Notepad& n) {
+    std::wstring dir = notes_dir();
+    if (dir.empty()) return n.unread.empty();
+    bool added = false;
+    for (size_t i = 0; i < n.unread.size();) {
+        TextFile f;
+        bool unread = false;
+        Read r = read_kept(dir, n.unread[i], f, unread);
+        if (unread) { ++i; continue; }
+        if (r == Read::Ok && restore_tab(n, n.unread[i], f, true)) added = true;
+        n.unread.erase(n.unread.begin() + (ptrdiff_t)i);   // (gone meanwhile: nothing left to bring back)
+    }
+    if (added && n.wnd) {
+        // (the empty Untitled made for want of them gives way, as to a file opened)
+        if (n.tabs.size() > 1 && n.active == 0 && untouched(*n.tabs[0])) close_tab(n, 0);
+        if (n.active < 0) activate(n, 0);
+        layout(n);
+        InvalidateRect(n.wnd, nullptr, FALSE);
+        keep_soon(n);
+    }
+    return n.unread.empty();
+}
+
+// said once the window is up: what couldn't be read, kept and tried again
+void tell_unread(Notepad& n) {
+    while (!n.unread.empty()) {
+        std::wstring names;
+        for (auto& st : n.unread) names += L"\n" + (st.path.empty() ? std::wstring(L"Untitled") : st.path);
+        std::wstring msg = L"The unsaved text of these tabs couldn't be read (another program may have it open):\n" + names +
+                           L"\n\nIt is kept: the Notepad tries again in a moment, and the next time it opens.";
+        if (MessageBoxW(n.wnd, msg.c_str(), L"Notepad", MB_RETRYCANCEL | MB_ICONWARNING) != IDRETRY) break;
+        retry_unread(n);
+    }
+    if (n.unread.empty()) KillTimer(n.wnd, TIMER_UNREAD);
 }
 
 // the tabs as they were left; the window's place and size into `s`
@@ -1273,42 +1315,27 @@ void restore(Notepad& n, NoteSession& s) {
     std::vector<std::wstring> caches;
     for (int i = 0; i < (int)s.tabs.size(); ++i) {
         const NoteTabState& st = s.tabs[i];
-        // its unsaved text; else its file as it is now; else (an empty Untitled) nothing
+        // its unsaved text; else its file as it is now; else (an empty Untitled) nothing. Unsaved
+        // text that is there but can't be read now isn't traded for the file: kept for later.
         TextFile f;
         bool ok = false, kept = false;
-        std::string bytes;
-        if (st.dirty && !st.cache.empty() && read_bytes(dir + L"\\" + st.cache, bytes, 2 * kMaxBytes + 2) == Read::Ok) {
-            f = text_decode(bytes);
-            f.enc = st.enc;
-            f.eol = st.eol;
-            ok = kept = true;
-        } else if (!st.path.empty() && read_bytes(st.path, bytes) == Read::Ok) {
-            f = text_decode(bytes);
-            ok = !f.binary;
-        } else if (st.path.empty() && !st.dirty) {
-            ok = true;
+        if (st.dirty && !st.cache.empty()) {
+            bool unread = false;
+            ok = kept = read_kept(dir, st, f, unread) == Read::Ok;
+            if (unread) { n.unread.push_back(st); continue; }
+        }
+        if (!ok) {
+            std::string bytes;
+            if (!st.path.empty() && read_bytes(st.path, bytes) == Read::Ok) {
+                f = text_decode(bytes);
+                ok = !f.binary;
+            } else if (st.path.empty() && !st.dirty) {
+                ok = true;
+            }
         }
         if (!ok) continue;
-        Tab* t = add_tab(n, (int)n.tabs.size());
-        if (!t) break;
-        t->path = st.path;
-        t->enc = f.enc;
-        t->eol = f.eol;
-        t->langChosen = !st.syntax.empty();
-        t->lang = t->langChosen ? lang_from_key(st.syntax) : lang_for_file(st.path);
-        set_text(n, *t, f.text);
-        if (kept) {
-            t->dirty = true;
-            t->cache = st.cache;
-            t->fileTime = st.fileTime;
-            caches.push_back(st.cache);
-        } else {
-            t->fileTime = st.path.empty() ? 0 : write_time(st.path);
-            t->caveat = caveat_of(f);
-        }
-        t->pendingSel = { st.selStart, st.selEnd };
-        t->pendingTop = st.top;
-        apply_pending(n, *t);
+        if (!restore_tab(n, st, f, kept)) break;
+        if (kept) caches.push_back(st.cache);
         if (i <= s.active) active = (int)n.tabs.size() - 1;
     }
     // text kept for tabs no longer there: only when the session said so, and only a week after it
@@ -2625,6 +2652,10 @@ LRESULT CALLBACK notepad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_TIMER:
             if (wp == TIMER_KEEP) keep_now(n);
             if (wp == TIMER_WORK) work_step(n);
+            if (wp == TIMER_UNREAD && retry_unread(n)) KillTimer(hwnd, TIMER_UNREAD);
+            return 0;
+        case WM_NOTEPAD_UNREAD:
+            tell_unread(n);
             return 0;
         case WM_NOTEPAD_WORK:
             work_step(n);
@@ -2771,6 +2802,10 @@ bool create_window() {
         int a = s_np->active;
         s_np->active = -1;
         activate(*s_np, a);
+    }
+    if (s_np && !s_np->unread.empty()) {
+        SetTimer(w, TIMER_UNREAD, kUnreadRetryMs, nullptr);
+        PostMessageW(w, WM_NOTEPAD_UNREAD, 0, 0);
     }
     return s_np != nullptr;
 }

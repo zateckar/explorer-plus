@@ -309,3 +309,48 @@ NoteSession note_session_parse(const std::wstring& text) {
     s.active = s.tabs.empty() ? 0 : std::clamp(num(L"notepad", L"active", 0), 0, (int)s.tabs.size() - 1);
     return s;
 }
+
+Wrote write_new(const std::wstring& path, std::string_view data, std::string_view more, bool exclusive) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, exclusive ? CREATE_NEW : CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return Wrote::NotCreated;
+    bool ok = true;
+    for (std::string_view part : { data, more }) {
+        DWORD done = 0;
+        ok = ok && (part.empty() || (WriteFile(h, part.data(), (DWORD)part.size(), &done, nullptr) && done == part.size()));
+    }
+    ok = ok && FlushFileBuffers(h);
+    CloseHandle(h);
+    if (!ok) DeleteFileW(path.c_str());
+    return ok ? Wrote::Ok : Wrote::Failed;
+}
+
+bool text_file_write(const std::wstring& path, const std::string& data) {
+    // beside it: "<name>.<number>.saving~", a name nothing else has (a file of that name already
+    // there is someone's: another number)
+    static unsigned s_seq = (unsigned)GetTickCount64();
+    std::wstring tmp;
+    Wrote w = Wrote::NotCreated;
+    for (int i = 0; i < 100; ++i) {
+        wchar_t tag[40];
+        swprintf(tag, 40, L".%lx-%x.saving~", GetCurrentProcessId(), ++s_seq);
+        tmp = path + tag;
+        w = write_new(tmp, data, {}, true);
+        if (w != Wrote::NotCreated || GetLastError() != ERROR_FILE_EXISTS) break;
+    }
+    if (w == Wrote::Ok) {
+        bool ok = GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES
+                      ? ReplaceFileW(path.c_str(), tmp.c_str(), nullptr, REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS,
+                                     nullptr, nullptr)
+                      : MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH);
+        if (!ok) DeleteFileW(tmp.c_str());
+        return ok;
+    }
+    if (w == Wrote::Failed || GetLastError() != ERROR_ACCESS_DENIED) return false;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD done = 0;
+    bool ok = (data.empty() || (WriteFile(h, data.data(), (DWORD)data.size(), &done, nullptr) && done == data.size())) &&
+              SetEndOfFile(h) && FlushFileBuffers(h);
+    CloseHandle(h);
+    return ok;
+}

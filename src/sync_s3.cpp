@@ -159,14 +159,18 @@ public:
         return {};
     }
 
+    // (the DELETE itself carries the revision seen: another device's upload between the HEAD and
+    // it is refused, not deleted. The HEAD stays for stores that ignore If-Match on a DELETE.)
     Result remove(const RelPath& path, const std::string& expectedRev, Progress& p) override {
+        http::Headers h;
         if (expectedRev != "*") {
             RemoteEntry cur;
             Result s = stat(path, cur, p);
             if (!s.ok()) return s;
             if (!expectedRev.empty() && cur.rev != expectedRev) return Result::fail(Status::PreconditionFailed);
+            if (!cur.rev.empty()) h.push_back({ "If-Match", "\"" + cur.rev + "\"" });
         }
-        http::Response r = call("DELETE", key(path), {}, {}, nullptr, nullptr, p);
+        http::Response r = call("DELETE", key(path), {}, h, nullptr, nullptr, p);
         if (r.status == 204 || r.status == 200) return {};
         return fail(r);
     }
@@ -182,8 +186,15 @@ public:
         http::Response r = call("PUT", key(to), {}, h, nullptr, nullptr, p);
         if (r.status != 200 || r.body.find("<Error>") != std::string::npos) return fail(r);
         std::string etag = unquote(xml_text(r.body, "ETag"));
-        http::Response d = call("DELETE", key(from), {}, {}, nullptr, nullptr, p);
-        if (d.status != 204 && d.status != 200) return fail(d);
+        // the source goes only as it was copied; changed since (another device's upload), the
+        // copy is taken back and both stay as the store has them
+        http::Response d = call("DELETE", key(from), {}, { { "If-Match", "\"" + cur.rev + "\"" } }, nullptr, nullptr, p);
+        if (d.status != 204 && d.status != 200) {
+            Result res = fail(d);
+            if (res.st == Status::PreconditionFailed)
+                call("DELETE", key(to), {}, { { "If-Match", "\"" + (etag.empty() ? cur.rev : etag) + "\"" } }, nullptr, nullptr, p);
+            return res;
+        }
         out = {};
         out.path = to;
         out.size = cur.size;

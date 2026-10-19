@@ -244,12 +244,14 @@ void navigation_open_abs(PCIDLIST_ABSOLUTE abs) {
 
 // Typed-path resolution runs on a worker: SHParseDisplayName / PathFileExists on
 // an unreachable "\\server\share" can block for tens of seconds. Any navigation
-// that happens meanwhile supersedes the pending one (generation counter).
+// that happens meanwhile supersedes the pending one (generation counter); the focus
+// gone to the other list meanwhile, the one it was typed for goes there.
 
 struct TypedNav {
     unsigned gen;
     std::wstring text;
     std::wstring fsDir;              // current folder as a path, empty when virtual
+    Pane* pane = nullptr;            // the list it was typed for (in the active tab: another tab shown supersedes it)
     PIDLIST_ABSOLUTE result = nullptr;
 };
 
@@ -274,11 +276,12 @@ static void typed_run(void* payload) {
 
 static void typed_apply(void* payload) {
     std::unique_ptr<TypedNav> job(static_cast<TypedNav*>(payload));
-    if (job->gen != s_typedGen.load()) {        // superseded by a newer navigation
+    if (job->gen != s_typedGen.load() || !pane_shown(job->pane)) {     // superseded by a newer navigation; its list closed
         if (job->result) CoTaskMemFree(job->result);
         return;
     }
     if (job->result) {
+        PaneScope ps(job->pane);
         navigation_open_abs(job->result);
         CoTaskMemFree(job->result);
         return;
@@ -308,7 +311,7 @@ static void typed_worker(TypedNav* job) {
 }
 
 void navigate_path_text(const std::wstring& text) {
-    auto* job = new TypedNav{ ++s_typedGen, text, {} };
+    auto* job = new TypedNav{ ++s_typedGen, text, {}, g_pane };
     if (!pidl_is_desktop(g_pane->current)) job->fsDir = pidl_fs_path(g_pane->current);
     worker_submit([job] { typed_worker(job); });
 }
