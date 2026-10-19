@@ -237,9 +237,11 @@ static void note_sessions() {
     NoteSession s;
     s.active = 1;
     s.wrap = false;
-    s.zoom = 150;
+    s.lineNumbers = false;
+    s.whitespace = true;
     s.x = -8; s.y = 20; s.w = 900; s.h = 600; s.maximized = true;
     NoteTabState a;
+    a.zoom = 150;
     a.path = L"C:\\Users\\me\\to do = list.txt";
     a.enc = TextEncoding::Utf16Be;
     a.eol = LineEnding::Lf;
@@ -252,11 +254,12 @@ static void note_sessions() {
     b.cache = L"note-1.txt";
     s.tabs = { a, b };
     NoteSession r = note_session_parse(note_session_serialize(s));
-    CHECK(r.active == 1 && !r.wrap && r.statusBar && r.zoom == 150);
+    CHECK(r.active == 1 && !r.wrap && r.statusBar && !r.lineNumbers && r.whitespace);
     CHECK(r.x == -8 && r.y == 20 && r.w == 900 && r.h == 600 && r.maximized);
     CHECK(r.tabs.size() == 2);
     if (r.tabs.size() == 2) {
         CHECK_EQ(r.tabs[0].path, a.path);
+        CHECK(r.tabs[0].zoom == 150 && r.tabs[1].zoom == 100);
         CHECK(r.tabs[0].enc == TextEncoding::Utf16Be && r.tabs[0].eol == LineEnding::Lf && !r.tabs[0].dirty);
         CHECK(r.tabs[0].selStart == 3 && r.tabs[0].selEnd == 7 && r.tabs[0].top == 12 && r.tabs[0].fileTime == a.fileTime);
         CHECK(r.tabs[0].syntax == L"json" && r.tabs[1].syntax.empty());
@@ -265,9 +268,11 @@ static void note_sessions() {
     }
     // nothing, or nonsense: defaults
     r = note_session_parse(L"");
-    CHECK(r.tabs.empty() && r.wrap && r.statusBar && r.zoom == 100 && r.w == 0);
-    r = note_session_parse(L"[notepad]\r\nactive=9\r\nzoom=9999\r\n[tab1]\r\nencoding=77\r\n[tab2]\r\npath=a.txt\r\n");
-    CHECK(r.tabs.size() == 1 && r.active == 0 && r.zoom == 500);
+    CHECK(r.tabs.empty() && r.wrap && r.statusBar && r.lineNumbers && !r.whitespace && r.w == 0);
+    // (a session from before: the window's zoom is each tab's)
+    r = note_session_parse(L"[notepad]\r\nactive=9\r\nzoom=9999\r\n[tab1]\r\nencoding=77\r\n[tab2]\r\npath=a.txt\r\n[tab3]\r\npath=b.txt\r\nzoom=80\r\n");
+    CHECK(r.tabs.size() == 2 && r.active == 1);
+    if (r.tabs.size() == 2) CHECK(r.tabs[0].zoom == 500 && r.tabs[1].zoom == 80);
 }
 
 // saving a text: in its place, nothing else beside it touched, nothing left behind

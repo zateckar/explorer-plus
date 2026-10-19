@@ -238,7 +238,8 @@ std::wstring note_session_serialize(const NoteSession& s) {
     d.set(m, L"active", std::to_wstring(s.active));
     d.set(m, L"wrap", s.wrap ? L"1" : L"0");
     d.set(m, L"statusBar", s.statusBar ? L"1" : L"0");
-    d.set(m, L"zoom", std::to_wstring(s.zoom));
+    d.set(m, L"lineNumbers", s.lineNumbers ? L"1" : L"0");
+    d.set(m, L"whitespace", s.whitespace ? L"1" : L"0");
     if (s.w > 0 && s.h > 0) {
         wchar_t b[96];
         swprintf(b, 96, L"%d,%d,%d,%d,%d", s.x, s.y, s.w, s.h, s.maximized ? 1 : 0);
@@ -261,6 +262,7 @@ std::wstring note_session_serialize(const NoteSession& s) {
             d.set(sec, L"fileTime", b);
         }
         if (!t.syntax.empty()) d.set(sec, L"syntax", t.syntax);
+        d.set(sec, L"zoom", std::to_wstring(t.zoom));
     }
     return ini_serialize(d);
 }
@@ -278,7 +280,9 @@ NoteSession note_session_parse(const std::wstring& text) {
     };
     s.wrap = num(L"notepad", L"wrap", 1) != 0;
     s.statusBar = num(L"notepad", L"statusBar", 1) != 0;
-    s.zoom = std::clamp(num(L"notepad", L"zoom", 100), 10, 500);
+    s.lineNumbers = num(L"notepad", L"lineNumbers", 1) != 0;
+    s.whitespace = num(L"notepad", L"whitespace", 0) != 0;
+    int zoom = num(L"notepad", L"zoom", 100);              // (a session from before: one zoom for all)
     int x, y, w, h, mx;
     if (swscanf(str(L"notepad", L"window").c_str(), L"%d,%d,%d,%d,%d", &x, &y, &w, &h, &mx) == 5 && w > 0 && h > 0) {
         s.x = x; s.y = y; s.w = w; s.h = h;
@@ -302,6 +306,7 @@ NoteSession note_session_parse(const std::wstring& text) {
         t.top = std::max(0, num(sec, L"top", 0));
         t.fileTime = wcstoull(str(sec, L"fileTime").c_str(), nullptr, 16);
         t.syntax = str(sec, L"syntax");
+        t.zoom = std::clamp(num(sec, L"zoom", zoom), 10, 500);
         // (a tab with neither a file nor kept text has nothing to show)
         if (t.path.empty() && t.cache.empty() && !t.untitled) continue;
         s.tabs.push_back(std::move(t));

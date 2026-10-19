@@ -50,12 +50,13 @@ struct NoteTabState {
     int top = 0;                    // the first line shown
     unsigned long long fileTime = 0;     // its file's last write time when read or saved
     std::wstring syntax;            // its colours' language when chosen (syntax.h's key); empty: by its name
+    int zoom = 100;                 // percent (each tab its own; a session from before: the window's)
 };
 struct NoteSession {
     std::vector<NoteTabState> tabs;
     int active = 0;
     bool wrap = true, statusBar = true;
-    int zoom = 100;                 // percent
+    bool lineNumbers = true, whitespace = false;
     int x = 0, y = 0, w = 0, h = 0; // the window (w 0: never placed)
     bool maximized = false;
 };

@@ -999,6 +999,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
                 }
             code = (int)pm.wParam;
         }
+        perf_flush();
         theme_shutdown();
         std::_Exit(code);                   // (as below: detached workers may still run)
     }
