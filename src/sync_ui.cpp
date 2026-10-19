@@ -17,6 +17,7 @@
 #include <vssym32.h>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <functional>
 #include <map>
@@ -1749,46 +1750,24 @@ std::vector<std::pair<std::wstring, int>> sync_root_states(unsigned* gen) {
     return { s_roots.begin(), s_roots.end() };
 }
 
-void sync_draw_badge(HDC dc, const RECT& icon, int state, int dpi) {
+// The badges are drawn by tools/make_icon.py, as the app's own icons (the same symbols, the
+// same set), each with a ring in the list's background round it: a light and a dark one, at
+// every size from 8 pixels. This part of the item's icon: the set's list_scale (the tool's).
+const double kBadgeScale = 0.75;
+
+void sync_draw_badge(HDC dc, const RECT& icon, int state) {
     using S = sync::ItemState;
     S s = (S)state;
     if (s == S::None) return;
-    COLORREF c = s == S::Synced ? (g_dark ? RGB(108, 203, 95) : RGB(16, 124, 16))
-               : s == S::Syncing || s == S::Pending ? (g_dark ? RGB(96, 205, 255) : RGB(0, 103, 192))
-               : s == S::Excluded ? RGB(138, 138, 138)
-                                  : (g_dark ? RGB(255, 153, 164) : RGB(196, 43, 28));
-    int d = std::max(7, MulDiv(9, dpi, 96)), o = MulDiv(2, dpi, 96);
-    RECT b{ icon.left - o, icon.bottom - d + o, icon.left - o + d, icon.bottom + o };
-    int saved = SaveDC(dc);
-    HBRUSH fill = CreateSolidBrush(c);
-    HPEN ring = CreatePen(PS_SOLID, std::max(1, dpi / 96), pal().content);
-    SelectObject(dc, fill);
-    SelectObject(dc, ring);
-    Ellipse(dc, b.left, b.top, b.right, b.bottom);
-    COLORREF mark = g_dark ? RGB(0, 0, 0) : RGB(255, 255, 255);
-    HPEN pen = CreatePen(PS_SOLID, std::max(1, d / 6), mark);
-    SelectObject(dc, pen);
-    int cx = (b.left + b.right) / 2, cy = (b.top + b.bottom) / 2, r = d / 4;
-    if (s == S::Synced) {
-        POINT tick[] = { { cx - r, cy }, { cx - r / 3, cy + r * 2 / 3 }, { cx + r, cy - r * 2 / 3 } };
-        Polyline(dc, tick, 3);
-    } else if (s == S::Syncing || s == S::Pending) {
-        POINT arrow[] = { { cx - r, cy }, { cx + r, cy } };
-        Polyline(dc, arrow, 2);
-        POINT head[] = { { cx, cy - r * 2 / 3 }, { cx + r, cy }, { cx, cy + r * 2 / 3 } };
-        Polyline(dc, head, 3);
-    } else if (s == S::Excluded) {
-        POINT bar[] = { { cx - r, cy }, { cx + r + 1, cy } };
-        Polyline(dc, bar, 2);
-    } else {
-        POINT bang[] = { { cx, cy - r }, { cx, cy + r / 3 } };
-        Polyline(dc, bang, 2);
-        SetPixel(dc, cx, cy + r, mark);
-    }
-    RestoreDC(dc, saved);
-    DeleteObject(fill);
-    DeleteObject(ring);
-    DeleteObject(pen);
+    int k = s == S::Synced ? 0 : s == S::Syncing || s == S::Pending ? 1 : s == S::Excluded ? 3 : 2;
+    int id = IDI_BADGE + 2 * k + (g_dark ? 1 : 0);
+    int size = std::max(8, (int)std::lround((icon.right - icon.left) * kBadgeScale));
+    static std::map<int, HICON> loaded;     // (id, size: never many)
+    HICON& h = loaded[id << 10 | size];
+    if (!h) h = (HICON)LoadImageW(g_hinst, MAKEINTRESOURCEW(id), IMAGE_ICON, size, size, LR_DEFAULTCOLOR);
+    if (!h) return;
+    int o = size / 6;                       // (a little past the icon's bottom left corner)
+    DrawIconEx(dc, icon.left - o, icon.bottom - size + o, h, size, size, 0, nullptr, DI_NORMAL);
 }
 
 SyncMenu sync_menu_for(const std::vector<std::wstring>& paths, const std::vector<bool>& folders) {

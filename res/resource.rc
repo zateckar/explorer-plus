@@ -12,6 +12,14 @@ IDI_SYNC ICON "sync.ico"
 IDI_SYNC_ALERT ICON "sync_alert.ico"
 IDI_SYNC_PAUSED ICON "sync_paused.ico"
 IDI_SCREENSHOT ICON "screenshot.ico"
+IDI_BADGE + 0 ICON "badge_synced_light.ico"
+IDI_BADGE + 1 ICON "badge_synced_dark.ico"
+IDI_BADGE + 2 ICON "badge_syncing_light.ico"
+IDI_BADGE + 3 ICON "badge_syncing_dark.ico"
+IDI_BADGE + 4 ICON "badge_error_light.ico"
+IDI_BADGE + 5 ICON "badge_error_dark.ico"
+IDI_BADGE + 6 ICON "badge_excluded_light.ico"
+IDI_BADGE + 7 ICON "badge_excluded_dark.ico"
 
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION    EP_VERSION_MAJOR, EP_VERSION_MINOR, EP_VERSION_PATCH, EP_VERSION_BUILD

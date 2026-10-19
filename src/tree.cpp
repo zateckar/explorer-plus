@@ -1404,7 +1404,7 @@ static LRESULT custom_draw(NMTVCUSTOMDRAW* cd) {
                 int cx = 16, cy = 16;
                 ImageList_GetIconSize(TreeView_GetImageList(g_tree, TVSIL_NORMAL), &cx, &cy);
                 int left = text.left - cx - S(3), top = (text.top + text.bottom - cy) / 2;
-                sync_draw_badge(cd->nmcd.hdc, RECT{ left, top, left + cx, top + cy }, st, (int)GetDpiForWindow(g_tree));
+                sync_draw_badge(cd->nmcd.hdc, RECT{ left, top, left + cx, top + cy }, st);
             }
             return CDRF_DODEFAULT;
         }

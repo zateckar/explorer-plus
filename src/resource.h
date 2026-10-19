@@ -7,6 +7,9 @@
 #define IDI_SYNC_ALERT 5    // the tray icon when a sync folder needs attention (--sync-alert)
 #define IDI_SYNC_PAUSED 6   // the tray icon when sync is paused (--sync-paused)
 #define IDI_SCREENSHOT 7    // the screenshot editor's window (res/screenshot.ico, --screenshot)
+// the file lists' sync badges: IDI_BADGE + 2 * (synced, syncing, error, excluded) + (dark)
+// (res/badge_<state>_<light|dark>.ico, tools/make_icon.py --badge)
+#define IDI_BADGE 20
 
 #define IDC_TREE      1001
 #define IDC_LIST      1002

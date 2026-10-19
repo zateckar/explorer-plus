@@ -16,7 +16,7 @@ void sync_folders_dialog(HWND owner);
 void sync_view_folder(int pane, const std::wstring& fsPath);   // "" = not a file system folder
 std::wstring sync_view_status(int pane);                       // "" outside sync folders
 int sync_view_item(int pane, const std::wstring& fileName);    // sync::ItemState (0: none); a sync folder's root too
-void sync_draw_badge(HDC dc, const RECT& icon, int state, int dpi);
+void sync_draw_badge(HDC dc, const RECT& icon, int state);    // on an item's icon, at its bottom left
 // the sync folders' roots (lowercased) with their states; `gen` changes when they do
 std::vector<std::pair<std::wstring, int>> sync_root_states(unsigned* gen);
 

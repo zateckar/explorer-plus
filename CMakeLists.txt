@@ -119,9 +119,10 @@ add_executable(explorer-plus WIN32
 
 # Windows resources (res/): manifest, icon, version info; IDs from src/resource.h,
 # version numbers from the generated version.h
+file(GLOB EP_RES_ICONS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/res/*.ico")
 set_source_files_properties(res/resource.rc PROPERTIES
     INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/res;${CMAKE_CURRENT_SOURCE_DIR}/src;${CMAKE_CURRENT_BINARY_DIR}/generated"
-    OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/res/app.manifest;${CMAKE_CURRENT_SOURCE_DIR}/res/app.ico;${CMAKE_CURRENT_SOURCE_DIR}/res/player.ico;${CMAKE_CURRENT_SOURCE_DIR}/res/notepad.ico;${CMAKE_CURRENT_SOURCE_DIR}/src/resource.h;${CMAKE_CURRENT_BINARY_DIR}/generated/version.h")
+    OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/res/app.manifest;${EP_RES_ICONS};${CMAKE_CURRENT_SOURCE_DIR}/src/resource.h;${CMAKE_CURRENT_BINARY_DIR}/generated/version.h")
 
 # optimized for size: a third smaller than -O2, and tools/perf.py measures no difference
 # (listing, sorting, scrolling 30,000 files). The number crunching (loudness scans whole

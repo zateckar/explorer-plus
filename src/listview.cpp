@@ -592,7 +592,7 @@ static void draw_row_images(NMLVCUSTOMDRAW* cd) {
         p.fStyle = ILD_TRANSPARENT | INDEXTOOVERLAYMASK(overlay);
         if (cut) { p.fState = ILS_ALPHA; p.Frame = 128; }
         ImageList_DrawIndirect(&p);
-        if (synced) sync_draw_badge(dc, RECT{ p.x, p.y, p.x + cx, p.y + cy }, synced, (int)GetDpiForWindow(g_pane->list));
+        if (synced) sync_draw_badge(dc, RECT{ p.x, p.y, p.x + cx, p.y + cy }, synced);
     }
     if (g_checkBoxes && (checked || hot)) {
         // the state slot sits right before the icon
