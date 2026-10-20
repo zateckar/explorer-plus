@@ -36,6 +36,8 @@ const UINT_PTR TIMER_KEEP = 1;              // the tabs kept a moment after a ch
 const UINT_PTR TIMER_WORK = 2;              // (the next step, after the input and painting waiting)
 const UINT WM_NOTEPAD_UNREAD = WM_APP + 73; // kept texts that couldn't be read: said, once the window is up
 const UINT_PTR TIMER_UNREAD = 3;            // ... and tried again every so often
+const UINT WM_NOTEPAD_DROP = WM_APP + 74;   // a restored tab whose text couldn't be read: closed (lParam: its id;
+                                            // wParam: say so)
 const UINT kUnreadRetryMs = 3000;
 const size_t kHead = 1 << 18;               // a big text: this many characters go in at once,
 const size_t kPiece = 1 << 16;              // then this many at a time (some 4 ms each)
@@ -67,8 +69,13 @@ const wchar_t* const kMenuNames[] = { L"File", L"Edit", L"View" };
 enum StatusPart { SP_CARET, SP_CHARS, SP_ZOOM, SP_LANG, SP_EOL, SP_ENC, SP_COUNT };
 
 struct Tab {
+    unsigned id = 0;                        // (its own, never another's: a message posted for it)
     HWND edit = nullptr;
     ITextDocument* doc = nullptr;           // its text object model: lines as the file has them
+    // restored from the session: its text is read the first time it is shown (the window opens
+    // with the one shown, not after all of them); `deferKept`: from its unsaved text kept in
+    // `cache`, else from its file
+    bool deferred = false, deferKept = false;
     std::wstring path;                      // empty: Untitled, never saved
     TextEncoding enc = TextEncoding::Utf8;
     LineEnding eol = LineEnding::CrLf;
@@ -196,8 +203,9 @@ std::wstring caveat_of(const TextFile& f) {
 
 enum class Read { Ok, Failed, TooBig };
 
-// (`limit`: the kept text of a file at the limit is UTF-16, twice its size)
-Read read_bytes(const std::wstring& path, std::string& out, ULONGLONG limit = kMaxBytes) {
+// (`limit`: the kept text of a file at the limit is UTF-16, twice its size; `head`: only the
+// first this many bytes)
+Read read_bytes(const std::wstring& path, std::string& out, ULONGLONG limit = kMaxBytes, ULONGLONG head = ULLONG_MAX) {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                            OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (h == INVALID_HANDLE_VALUE) return Read::Failed;
@@ -207,7 +215,7 @@ Read read_bytes(const std::wstring& path, std::string& out, ULONGLONG limit = kM
         if ((ULONGLONG)size.QuadPart > limit) {
             r = Read::TooBig;
         } else {
-            out.resize((size_t)size.QuadPart);
+            out.resize((size_t)std::min<ULONGLONG>(size.QuadPart, head));
             DWORD got = 0;
             if (out.empty() || (ReadFile(h, out.data(), (DWORD)out.size(), &got, nullptr) && got == out.size())) r = Read::Ok;
         }
@@ -1170,7 +1178,9 @@ LRESULT CALLBACK edit_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWO
 }
 
 Tab* add_tab(Notepad& n, int at) {
+    static unsigned ids = 0;
     auto t = std::make_unique<Tab>();
+    t->id = ++ids;
     t->edit = CreateWindowExW(0, MSFTEDIT_CLASS, L"",
                               WS_CHILD | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL |
                                   ES_NOHIDESEL | ES_NOOLEDRAGDROP,
@@ -1196,11 +1206,14 @@ Tab* add_tab(Notepad& n, int at) {
     return p;
 }
 
+bool load_deferred(Notepad& n, Tab& t);
+
 void activate(Notepad& n, int i) {
     if (i < 0 || i >= (int)n.tabs.size()) return;
     Tab* old = cur(n);
     n.active = i;
     Tab& t = *n.tabs[i];
+    if (t.deferred) load_deferred(n, t);
     layout(n);
     ShowWindow(t.edit, SW_SHOW);
     if (old && old != &t) ShowWindow(old->edit, SW_HIDE);
@@ -1386,6 +1399,7 @@ std::wstring ask_save(Notepad& n, Tab& t, TextEncoding& enc) {
 }
 
 bool save(Notepad& n, Tab& t, bool as) {
+    if (t.deferred && !load_deferred(n, t)) return false;
     finish_loading(n, t);
     std::wstring file = t.path;
     TextEncoding enc = t.enc;
@@ -1454,7 +1468,7 @@ bool save(Notepad& n, Tab& t, bool as) {
 void check_files(Notepad& n) {
     for (auto& tp : n.tabs) {
         Tab& t = *tp;
-        if (t.path.empty() || t.dirty) continue;
+        if (t.path.empty() || t.dirty || t.deferred) continue;     // (deferred: read as it is now when shown)
         ULONGLONG now = write_time(t.path);
         if (!now || now == t.fileTime) continue;
         std::string bytes;
@@ -1502,6 +1516,24 @@ std::wstring new_cache_name(const std::wstring& dir) {
     }
 }
 
+// a tab as the session keeps it (its kept unsaved text aside)
+NoteTabState tab_state(Tab& t) {
+    NoteTabState st;
+    st.path = t.path;
+    st.untitled = t.path.empty() ? 1 : 0;
+    st.dirty = t.dirty;
+    st.enc = t.enc;
+    st.eol = t.eol;
+    st.fileTime = t.fileTime;
+    if (t.langChosen) st.syntax = lang_key(t.lang);
+    st.zoom = t.zoom;
+    CHARRANGE cr = t.pendingSel.cpMin >= 0 ? t.pendingSel : selection(t.edit);
+    st.selStart = cr.cpMin;
+    st.selEnd = cr.cpMax;
+    st.top = t.pendingTop >= 0 ? t.pendingTop : (int)SendMessageW(t.edit, EM_GETFIRSTVISIBLELINE, 0, 0);
+    return st;
+}
+
 bool keep_now(Notepad& n) {
     if (n.wnd) KillTimer(n.wnd, TIMER_KEEP);
     std::wstring dir = notes_dir();
@@ -1524,19 +1556,7 @@ bool keep_now(Notepad& n) {
     bool ok = true;
     for (auto& tp : n.tabs) {
         Tab& t = *tp;
-        NoteTabState st;
-        st.path = t.path;
-        st.untitled = t.path.empty() ? 1 : 0;
-        st.dirty = t.dirty;
-        st.enc = t.enc;
-        st.eol = t.eol;
-        st.fileTime = t.fileTime;
-        if (t.langChosen) st.syntax = lang_key(t.lang);
-        st.zoom = t.zoom;
-        CHARRANGE cr = t.pendingSel.cpMin >= 0 ? t.pendingSel : selection(t.edit);
-        st.selStart = cr.cpMin;
-        st.selEnd = cr.cpMax;
-        st.top = t.pendingTop >= 0 ? t.pendingTop : (int)SendMessageW(t.edit, EM_GETFIRSTVISIBLELINE, 0, 0);
+        NoteTabState st = tab_state(t);
         if (t.dirty) {
             if (t.cache.empty()) {
                 t.cache = new_cache_name(dir);
@@ -1596,6 +1616,79 @@ Read read_kept(const std::wstring& dir, const NoteTabState& st, TextFile& f, boo
         f.eol = st.eol;
     }
     return r;
+}
+
+// a tab as it was left, last, its text not read yet (`kept`: from its unsaved text)
+Tab* defer_tab(Notepad& n, const NoteTabState& st, bool kept) {
+    Tab* t = add_tab(n, (int)n.tabs.size());
+    if (!t) return nullptr;
+    t->path = st.path;
+    t->enc = st.enc;
+    t->eol = st.eol;
+    t->langChosen = !st.syntax.empty();
+    t->lang = t->langChosen ? lang_from_key(st.syntax) : lang_for_file(st.path);
+    t->zoom = st.zoom;
+    t->fileTime = st.fileTime;
+    t->dirty = kept;
+    if (kept) t->cache = st.cache;
+    t->pendingSel = { st.selStart, st.selEnd };
+    t->pendingTop = st.top;
+    t->deferred = true;
+    t->deferKept = kept;
+    return t;
+}
+
+// a restored tab's text, the first time it is shown: as restore_tab would have had it. False:
+// it can't be read now (the tab is closed a moment later; unsaved text another program has
+// open is kept, and tried again)
+bool load_deferred(Notepad& n, Tab& t) {
+    t.deferred = false;
+    TextFile f;
+    bool ok = false;
+    if (t.deferKept) {
+        std::wstring dir = notes_dir();
+        NoteTabState st = tab_state(t);
+        st.cache = t.cache;
+        bool unread = false;
+        ok = !dir.empty() && read_kept(dir, st, f, unread) == Read::Ok;
+        if (unread) {
+            n.unread.push_back(st);
+            t.cache.clear();                // (not deleted with the tab: it is the unread one's)
+            t.dirty = false;
+            SetTimer(n.wnd, TIMER_UNREAD, kUnreadRetryMs, nullptr);
+            PostMessageW(n.wnd, WM_NOTEPAD_UNREAD, 0, 0);
+            PostMessageW(n.wnd, WM_NOTEPAD_DROP, FALSE, t.id);
+            return false;
+        }
+        if (!ok) {                          // (gone: its file as saved)
+            t.dirty = false;
+            t.cache.clear();
+        }
+    }
+    bool kept = ok;
+    if (!ok && !t.path.empty()) {
+        std::string bytes;
+        if (read_bytes(t.path, bytes) == Read::Ok) {
+            f = text_decode(bytes);
+            ok = !f.binary;
+        }
+    }
+    if (!ok) {
+        PostMessageW(n.wnd, WM_NOTEPAD_DROP, TRUE, t.id);
+        return false;
+    }
+    CHARRANGE sel = t.pendingSel;
+    int top = t.pendingTop;
+    set_text(n, t, f.text);                 // (styled: the zoom too)
+    t.enc = f.enc;
+    t.eol = f.eol;
+    if (!kept) {
+        t.fileTime = write_time(t.path);
+        t.caveat = caveat_of(f);
+    }
+    t.pendingSel = sel;
+    t.pendingTop = top;
+    return true;
 }
 
 // the unread kept texts tried again: those that can be read now come back as tabs (last, not
@@ -1658,24 +1751,21 @@ void restore(Notepad& n, NoteSession& s) {
         const NoteTabState& st = s.tabs[i];
         // its unsaved text; else its file as it is now; else (an empty Untitled) nothing. Unsaved
         // text that is there but can't be read now isn't traded for the file: kept for later.
-        TextFile f;
-        bool ok = false, kept = false;
-        if (st.dirty && !st.cache.empty()) {
-            bool unread = false;
-            ok = kept = read_kept(dir, st, f, unread) == Read::Ok;
-            if (unread) { n.unread.push_back(st); continue; }
+        // Read when the tab is first shown (load_deferred): here only whether they are there.
+        bool kept = st.dirty && !st.cache.empty() && GetFileAttributesW((dir + L"\\" + st.cache).c_str()) != INVALID_FILE_ATTRIBUTES;
+        Tab* t = nullptr;
+        if (kept || !st.path.empty()) {
+            // (a file gone is left out; one on a share isn't asked: the server may be away)
+            DWORD a = kept || path_is_network(st.path) ? 0 : GetFileAttributesW(st.path.c_str());
+            if (a == INVALID_FILE_ATTRIBUTES || (a & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            t = defer_tab(n, st, kept);
+        } else if (!st.dirty) {
+            TextFile empty;
+            t = restore_tab(n, st, empty, false);
+        } else {
+            continue;
         }
-        if (!ok) {
-            std::string bytes;
-            if (!st.path.empty() && read_bytes(st.path, bytes) == Read::Ok) {
-                f = text_decode(bytes);
-                ok = !f.binary;
-            } else if (st.path.empty() && !st.dirty) {
-                ok = true;
-            }
-        }
-        if (!ok) continue;
-        if (!restore_tab(n, st, f, kept)) break;
+        if (!t) break;
         if (kept) caches.push_back(st.cache);
         if (i <= s.active) active = (int)n.tabs.size() - 1;
     }
@@ -3027,6 +3117,26 @@ LRESULT CALLBACK notepad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_NOTEPAD_UNREAD:
             tell_unread(n);
             return 0;
+        case WM_NOTEPAD_DROP: {
+            // a restored tab whose text couldn't be read when it was shown (gone since)
+            auto find = [&] {
+                for (int i = 0; i < (int)n.tabs.size(); ++i)
+                    if (n.tabs[i]->id == (unsigned)lp) return i;
+                return -1;
+            };
+            int i = find();
+            if (i < 0) return 0;
+            if (wp) {
+                std::wstring msg = L"This file couldn't be opened:\n" + n.tabs[i]->path;
+                MessageBoxW(hwnd, msg.c_str(), L"Notepad", MB_OK | MB_ICONWARNING);
+                if (!s_np || (i = find()) < 0) return 0;
+            }
+            if (n.tabs.size() == 1 && !new_untitled(n)) return 0;     // (the window stays)
+            if ((i = find()) < 0) return 0;
+            n.tabs[i]->dirty = false;
+            close_tab(n, i);
+            return 0;
+        }
         case WM_NOTEPAD_WORK:
             work_step(n);
             return 0;
@@ -3124,7 +3234,7 @@ LRESULT CALLBACK notepad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // its own taskbar button, with its own icon (as the player's)
 void set_app_id(HWND hwnd, bool on) { window_app_id(hwnd, on ? kAppId : nullptr); }
 
-bool create_window() {
+bool create_window(const std::vector<std::wstring>& files) {
     static bool registered = false;
     if (!registered) {
         registered = true;
@@ -3174,15 +3284,23 @@ bool create_window() {
                      SWP_NOZORDER | SWP_NOACTIVATE);
         ShowWindow(w, SW_SHOWNORMAL);
     }
-    if (s_np && s_np->active >= 0) {
-        int a = s_np->active;
+    // the files asked for, before it is shown: it opens with them (not the tab left active, a
+    // moment before them); each in after the tab left active, as when it is open
+    for (auto& f : files) {
+        if (!s_np) break;
+        open_path(*s_np, f);
+    }
+    if (s_np && s_np->active >= 0 && !(GetWindowLongPtrW(s_np->tabs[s_np->active]->edit, GWL_STYLE) & WS_VISIBLE)) {
+        int a = s_np->active;               // (none of them opened: the one left active)
         s_np->active = -1;
         activate(*s_np, a);
     }
+    if (s_np && s_np->tabs.empty()) new_untitled(*s_np);
     if (s_np) {
         RedrawWindow(w, nullptr, nullptr, RDW_UPDATENOW | RDW_ALLCHILDREN);
         cloak = FALSE;
         DwmSetWindowAttribute(w, DWMWA_CLOAK, &cloak, sizeof(cloak));
+        perf_event("notepad.shown", -1, (long long)s_np->tabs.size());
     }
     if (s_np && !s_np->unread.empty()) {
         SetTimer(w, TIMER_UNREAD, kUnreadRetryMs, nullptr);
@@ -3227,7 +3345,7 @@ static bool open_instance(const std::vector<std::wstring>& files) {
         } else {
             if (w == WAIT_OBJECT_0 || w == WAIT_ABANDONED) s_ownerMx = owner;
             else if (owner) CloseHandle(owner);
-            made = create_window();
+            made = create_window(files);
             if (!made) release_instance();
         }
     }
@@ -3236,13 +3354,16 @@ static bool open_instance(const std::vector<std::wstring>& files) {
 }
 
 void notepad_open(const std::vector<std::wstring>& files) {
-    if (!s_np && !open_instance(files)) return;
-    Notepad& n = *s_np;
-    for (auto& f : files) {
-        if (!s_np) return;
-        open_path(n, f);
+    if (!s_np) {
+        if (!open_instance(files)) return;  // (the files opened as it was made)
+    } else {
+        for (auto& f : files) {
+            if (!s_np) return;
+            open_path(*s_np, f);
+        }
     }
     if (!s_np) return;
+    Notepad& n = *s_np;
     if (n.tabs.empty()) new_untitled(n);
     if (IsIconic(n.wnd)) ShowWindow(n.wnd, SW_RESTORE);
     SetForegroundWindow(n.wnd);
@@ -3273,7 +3394,29 @@ bool notepad_text_file(const std::wstring& path) {
         if (lstrcmpiW(ext, e) == 0) return true;
     PERCEIVED type = PERCEIVED_TYPE_UNSPECIFIED;
     PERCEIVEDFLAG flag = 0;
-    return SUCCEEDED(AssocGetPerceivedType(ext, &type, &flag, nullptr)) && type == PERCEIVED_TYPE_TEXT;
+    if (FAILED(AssocGetPerceivedType(ext, &type, &flag, nullptr))) type = PERCEIVED_TYPE_UNSPECIFIED;
+    if (type == PERCEIVED_TYPE_TEXT) return true;
+    // (pictures, music, video, archives, programs: never read to find out)
+    if (type != PERCEIVED_TYPE_UNSPECIFIED && type != PERCEIVED_TYPE_UNKNOWN && type != PERCEIVED_TYPE_DOCUMENT) return false;
+    // any other name (.env.example, a type no app has): by its first bytes
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) return false;
+    // (only in the cloud: not downloaded for a menu)
+    if (a.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN |
+                              FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS))
+        return false;
+    ULONGLONG size = (ULONGLONG)a.nFileSizeHigh << 32 | a.nFileSizeLow;
+    if (size > kMaxBytes) return false;
+    if (size == 0) return true;
+    std::string head;
+    if (read_bytes(path, head, ULLONG_MAX, 4096) != Read::Ok) return false;
+    TextFile f = text_decode(head);
+    if (f.binary) return false;
+    // (text has few control characters besides tabs and line ends; ESC: logs in colour)
+    size_t controls = std::count_if(f.text.begin(), f.text.end(), [](wchar_t c) {
+        return c < 0x20 && c != L'\t' && c != L'\r' && c != L'\n' && c != L'\f' && c != 0x1B;
+    });
+    return controls * 100 <= f.text.size();
 }
 
 HWND notepad_window() { return s_np ? s_np->wnd : nullptr; }

@@ -7,6 +7,7 @@
 #include "mediadata.h"
 #include "mediainfo.h"
 #include "openorder.h"
+#include "perf.h"
 #include "imageview.h"
 #include "loudness.h"
 #include "spectrum.h"
@@ -1672,7 +1673,12 @@ void on_note(Player& p, LPARAM lp) {
             update_title(p);
             break;
         case Change::State:
-            if (p.mp->state() == State::Playing) { p.failsInRow = 0; p.message.clear(); }
+            if (p.mp->state() == State::Playing) {
+                p.failsInRow = 0;
+                p.message.clear();
+                static bool first = true;
+                if (first) { first = false; perf_event("player.playing"); }
+            }
             if (p.mp->state() == State::Ended) { track_ended(p); return; }
             break;
         case Change::Failed: on_failed(p); return;
@@ -4507,6 +4513,7 @@ bool create_player(bool activate) {
     RedrawWindow(w, nullptr, nullptr, RDW_UPDATENOW | RDW_ALLCHILDREN);
     cloak = FALSE;
     DwmSetWindowAttribute(w, DWMWA_CLOAK, &cloak, sizeof(cloak));
+    perf_event("player.shown");
     if (activate) SetForegroundWindow(w);
     return true;
 }
