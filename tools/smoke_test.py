@@ -177,6 +177,10 @@ else:
 
 # navigation pane: every folder node has a folder icon (index 0 is the system list's
 # generic file icon; startup races once left .git-like folders with it)
+# (the tree opens the current folder's ancestors, not the folder: the visit to "sub" opened
+# it only when its sync got there before the "..", not on a slow CI start)
+wait_for(lambda: app.tree_item(app.tree_caret())[0] == 'testdata', 5)
+send(app.tree, 0x1102, 0x0002, app.tree_caret())                    # TVM_EXPAND (TVE_EXPAND) testdata
 wait_for(lambda: any(app.tree_item(h)[0] == '.dotdir' for h in app.tree_nodes()), 5)
 nodes = [app.tree_item(h) for h in app.tree_nodes()]
 check('tree shows the scratch folder\'s subfolders', any(t == '.dotdir' for t, _ in nodes), [t for t, _ in nodes])
