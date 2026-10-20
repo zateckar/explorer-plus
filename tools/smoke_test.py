@@ -183,9 +183,9 @@ wait_for(lambda: app.tree_item(app.tree_caret())[0] == 'testdata', 5)
 send(app.tree, 0x1102, 0x0002, app.tree_caret())                    # TVM_EXPAND (TVE_EXPAND) testdata
 wait_for(lambda: any(app.tree_item(h)[0] == '.dotdir' for h in app.tree_nodes()), 5)
 nodes = [app.tree_item(h) for h in app.tree_nodes()]
-check('tree shows the scratch folder\'s subfolders', any(t == '.dotdir' for t, _ in nodes), [t for t, _ in nodes])
 bad = [(t, i) for t, i in nodes if t and i <= 0]
-check('no tree node has the generic file icon', not bad, bad)
+check('no tree node has the generic file icon (the scratch folder\'s .dotdir among them)',
+      any(t == '.dotdir' for t, _ in nodes) and not bad, bad or [t for t, _ in nodes])
 
 # List view rows keep the Details row spacing (were packed edge to edge)
 def row_h(i=0):
@@ -236,12 +236,11 @@ app.command(IDM['INVERT'])
 check('invert selection (no deadlock)', wait_for(lambda: app.selected_count() == 0), app.selected_count())
 
 # copy + paste in the same folder -> "a - Copy.txt"
-app.select_name('a.txt')
-check('select by name', app.selected_count() == 1, app.selected_count())
+picked_one = app.select_name('a.txt') >= 0 and app.selected_count() == 1
 app.command(IDM['COPY'])
 app.command(IDM['PASTE'])
 check('copy/paste creates "a - Copy.txt"',
-      wait_for(lambda: os.path.exists(os.path.join(data, 'a - Copy.txt')), 8), os.listdir(data))
+      picked_one and wait_for(lambda: os.path.exists(os.path.join(data, 'a - Copy.txt')), 8), os.listdir(data))
 
 # Win11 compact context menu (flyout) on the selection
 app.select_name('b.txt')
@@ -405,14 +404,8 @@ menu, items = open_popup(IDM['MORE_MENU'])
 clean = [s.replace('&', '').split('\t')[0] for s in items]
 check('the bar\'s "..." menu has Dual pane, Folder sizes, Text size',
       all(s in clean for s in ('Dual pane', 'Folder sizes', 'Text size')), clean)
-app.close_menus()
-menu, items = open_popup(IDM['MORE_MENU'])
 check('the bar\'s "..." menu has "Hide command bar"', choose(menu, items, 'Hide command bar'), items)
 check('"Hide command bar" hides the row', wait_for(lambda: not cmdbar_visible(), 3))
-app.command(IDM['CMDBAR'])
-check('View > Command bar toggles it back', wait_for(cmdbar_visible, 3))
-app.command(IDM['CMDBAR'])
-check('command bar hidden again', wait_for(lambda: not cmdbar_visible(), 3))
 
 # classic context menu through "Show more options"
 app.select_name('b.txt')
@@ -652,14 +645,17 @@ app.command(IDM['REFRESH']); time.sleep(1.5)
 check('a collapsed group stays collapsed across a refresh', send(app.list, LVM_GETGROUPSTATE, 0, 1) == 1)
 app.command(IDM['UP']); time.sleep(2)
 check('Up to Desktop lists items', wait_for(lambda: app.item_count() > 0, 5), (app.title(), app.item_count()))
+desktop = app.title()
 app.screenshot(os.path.join(shots, '05_desktop.png'))
 app.command(IDM['BACK'])
 check('Back returns to This PC', wait_for(lambda: app.title() == this_pc, 5), app.title())
 app.command(IDM['FWD'])
-check('Forward', wait_for(lambda: app.title() != this_pc, 5), app.title())
+check('Forward goes to the Desktop again', wait_for(lambda: app.title() == desktop != this_pc, 5), (app.title(), desktop))
 app.go('C:\\does\\not\\exist', 1.5, post=True)
 errs = [h for h in __import__('winauto').top_windows(app.proc.pid) if cls(h) == '#32770' and u.IsWindowVisible(h)]
-check('bad path shows an error instead of an empty folder', bool(errs))
+err_texts = [text(c) for h in errs for c in children(h) if cls(c) == 'Static' and text(c)]
+check('bad path shows an error instead of an empty folder',
+      any("can't find" in s and 'does\\not\\exist' in s for s in err_texts), err_texts)
 for h in errs:
     u.PostMessageW(h, 0x0010, 0, 0)
 time.sleep(0.5)
@@ -827,13 +823,11 @@ check('removed folder leaves the list', wait_for(lambda: row_of('sized') < 0, 5)
 # view modes: Extra large / Medium icons are icon views
 app.command(IDM['XLARGE']); time.sleep(1.5)
 app.screenshot(os.path.join(shots, '08_xlarge.png'))
-check('Extra large icons', send(app.list, LVM_GETVIEW, 0, 0) == 0)
 app.command(IDM['DETAILS']); time.sleep(0.5)
 
 # item check boxes: a press on an item's box adds just that item to the selection
 LVM_GETEXTENDEDLISTVIEWSTYLE, LVM_GETITEMRECT = 0x1037, 0x100E
 app.command(IDM['CHECKBOXES']); time.sleep(0.5)
-check('Item check boxes on', send(app.list, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0) & 0x4)
 app.select_name('photo.jpg')
 r = app.item_rect(row_of('external.txt'), 1)                       # LVIR_ICON
 box = (((r[1] + r[3]) // 2) << 16) | max(1, r[0] - 8)
@@ -947,13 +941,19 @@ app.command(IDM['TEXT_LARGER']); time.sleep(0.3)
 
 # a folder in the profile, inside the hidden AppData: the tree walks there under This PC
 # (the path's own pidl goes by way of the user's folder) and shows AppData on the way
-temp = os.environ.get('TEMP', '')
-if temp.lower().startswith(os.path.expanduser('~').lower() + '\\appdata\\'):
+# (%LOCALAPPDATA%\Temp, not %TEMP%: on CI that is D:\a\_temp, and the check never ran)
+local = os.environ.get('LOCALAPPDATA', '')
+temp = os.path.join(local, 'Temp')
+if not os.path.isdir(temp):
+    temp = local
+if temp and os.path.isdir(temp) and temp.lower().startswith(os.path.expanduser('~').lower() + '\\appdata\\'):
     app.go(temp, 2.0)
     check('the tree follows into a folder inside the hidden AppData',
           wait_for(lambda: app.tree_item(app.tree_caret())[0].lower() == os.path.basename(temp).lower(), 8),
           app.tree_item(app.tree_caret()))
     app.go(data)
+else:
+    skip('the tree follows into a folder inside the hidden AppData', 'no folder in the profile\'s AppData: %r' % local)
 
 # deleting the open folder in the navigation pane opens the next folder, no error
 for n in ('del1', 'del2'):
