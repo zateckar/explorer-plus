@@ -262,7 +262,7 @@ src/visual             player's visualizations (Direct2D on Direct3D 11, a threa
 src/imageview, loudness   player's pictures (WIC, Direct2D SVG, GDI+ metafiles), loudness levelling
 src/imageformats       TGA, QOI, HDR, PSD, PCX decoders; APNG frames; SVG size
 src/screenshot, imageedit, shapes   Alt+Q screenshots, picture editor, its objects' geometry
-src/assoc, userchoice  media file type registration (Media file types), the default-app hash
+src/assoc, userchoice  file type registration (File types), the default-app hash
 src/notepad, textfile  the Notepad window; text encodings, line endings, its kept tabs
 src/syntax, textops    the Notepad's lexers, JSON / XML formatting; line, case, Base64, URL operations
 src/settings, ini, theme, perf, crash   settings.ini, colours and fonts, profiling, crash dumps

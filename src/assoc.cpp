@@ -20,8 +20,8 @@ const wchar_t kAppKey[] = L"Software\\ExplorerPlus";
 const wchar_t kRegApps[] = L"Software\\RegisteredApplications";
 const wchar_t kSettingsPage[] = L"ms-settings:defaultapps?registeredAppUser=Explorer%20Plus";
 
-enum Kind { K_AUDIO, K_VIDEO, K_PICTURE, K_PLAYLIST, K_COUNT };
-const wchar_t* const kKindNames[K_COUNT] = { L"Music and sound", L"Video", L"Pictures", L"Playlists" };
+enum Kind { K_AUDIO, K_VIDEO, K_PICTURE, K_PLAYLIST, K_TEXT, K_COUNT };
+const wchar_t* const kKindNames[K_COUNT] = { L"Music and sound", L"Video", L"Pictures", L"Playlists", L"Text and code" };
 
 // the types offered: the common ones Windows has for each kind
 const wchar_t* const kAudio[] = { L".mp3", L".m4a", L".aac", L".flac", L".wav", L".wma", L".ogg", L".oga", L".opus",
@@ -32,6 +32,15 @@ const wchar_t* const kPictures[] = { L".jpg", L".jpeg", L".jfif", L".png", L".gi
                                      L".heic", L".heif", L".avif", L".jxr", L".jxl", L".ico", L".apng", L".svg", L".emf",
                                      L".wmf", L".tga", L".qoi", L".hdr", L".psd", L".psb", L".pcx" };
 const wchar_t* const kPlaylists[] = { L".m3u", L".m3u8", L".pls", L".wpl", L".zpl", L".asx", L".wax", L".wvx", L".xspf" };
+// (in the Notepad: not the ones another app runs - .bat, .ps1, .js, .py, .reg -, opens in a
+// browser - .html - or is a project of - .sln; .ts is video)
+const wchar_t* const kText[] = { L".txt", L".log", L".ini", L".cfg", L".conf", L".config", L".json", L".jsonc", L".xml",
+                                 L".md", L".markdown", L".csv", L".tsv", L".yml", L".yaml", L".toml", L".properties",
+                                 L".env", L".editorconfig", L".gitignore", L".gitattributes", L".npmrc", L".nfo",
+                                 L".srt", L".vtt", L".ass", L".ssa", L".diff", L".patch", L".tex", L".rst", L".c", L".h",
+                                 L".cpp", L".hpp", L".cc", L".cxx", L".hh", L".cs", L".java", L".kt", L".go", L".rs",
+                                 L".lua", L".sql", L".css", L".scss", L".less", L".tsx", L".jsx", L".asm", L".cmake",
+                                 L".mk", L".gradle" };
 
 struct Row {
     std::wstring ext;
@@ -48,7 +57,9 @@ std::wstring exe_path() {
     return b;
 }
 
-std::wstring open_command() { return L"\"" + exe_path() + L"\" --play \"%1\""; }
+std::wstring open_command(Kind kind) {
+    return L"\"" + exe_path() + (kind == K_TEXT ? L"\" --notepad \"%1\"" : L"\" --play \"%1\"");
+}
 
 std::wstring progid(const std::wstring& ext) { return L"ExplorerPlus." + ext.substr(1); }
 
@@ -80,7 +91,8 @@ bool registered(const std::wstring& ext) {
 void register_app() {
     std::wstring exe = exe_path();
     reg_set(kCaps, L"ApplicationName", kApp);
-    reg_set(kCaps, L"ApplicationDescription", L"Plays music and video and shows pictures (Explorer Plus' media player)");
+    reg_set(kCaps, L"ApplicationDescription",
+            L"Plays music and video, shows pictures and edits text (Explorer Plus' media player and Notepad)");
     reg_set(kCaps, L"ApplicationIcon", L"\"" + exe + L"\",0");
     reg_set(kRegApps, kApp, kCaps);
     // (the name "Open with" shows, short of the exe's whole description)
@@ -112,10 +124,10 @@ void register_type(const std::wstring& ext, Kind kind) {
     if (reg_get(cls + L"\\DefaultIcon", nullptr).empty()) {
         std::wstring icon = assoc_text(ASSOCSTR_DEFAULTICON, ext);
         if (icon.empty() || icon.find(L"explorer-plus") != std::wstring::npos)
-            icon = L"\"" + exe_path() + L"\",-" + std::to_wstring(IDI_PLAYER);
+            icon = L"\"" + exe_path() + L"\",-" + std::to_wstring(kind == K_TEXT ? IDI_NOTEPAD : IDI_PLAYER);
         reg_set(cls + L"\\DefaultIcon", nullptr, icon);
     }
-    reg_set(cls + L"\\shell\\open\\command", nullptr, open_command());
+    reg_set(cls + L"\\shell\\open\\command", nullptr, open_command(kind));
     // offered under the type's Open with, and in Default apps
     RegSetKeyValueW(HKEY_CURRENT_USER, (L"Software\\Classes\\" + ext + L"\\OpenWithProgids").c_str(), progid(ext).c_str(),
                     REG_NONE, nullptr, 0);
@@ -211,13 +223,13 @@ std::wstring opened_by(const std::wstring& ext) {
     return app.empty() ? L"(no app)" : app;
 }
 
-std::vector<Row> media_types() {
+std::vector<Row> file_types() {
     std::vector<Row> rows;
     auto add = [&](const wchar_t* const* list, size_t n, Kind k) {
         for (size_t i = 0; i < n; ++i) {
             std::wstring ext = list[i];
             std::wstring probe = L"x" + ext;
-            bool ok = k == K_PLAYLIST || (k == K_PICTURE ? image_file(probe) : media_file_playable(probe));
+            bool ok = k == K_PLAYLIST || k == K_TEXT || (k == K_PICTURE ? image_file(probe) : media_file_playable(probe));
             if (ok) rows.push_back({ ext, k, registered(ext) });
         }
     };
@@ -225,7 +237,18 @@ std::vector<Row> media_types() {
     add(kVideo, ARRAYSIZE(kVideo), K_VIDEO);
     add(kPictures, ARRAYSIZE(kPictures), K_PICTURE);
     add(kPlaylists, ARRAYSIZE(kPlaylists), K_PLAYLIST);
+    add(kText, ARRAYSIZE(kText), K_TEXT);
     return rows;
+}
+
+// ticked the first time: every media type; a text type only from Windows' Notepad or no app
+// (not taken from an editor, Excel or a browser chosen for it)
+bool first_pick(const Row& r) {
+    if (r.kind != K_TEXT) return true;
+    std::wstring app = assoc_text(ASSOCSTR_FRIENDLYAPPNAME, r.ext), exe = assoc_text(ASSOCSTR_EXECUTABLE, r.ext);
+    // (no app: nothing at all, or Windows' "Pick an app" - OpenWith.exe)
+    return lstrcmpiW(app.c_str(), L"Notepad") == 0 || (app.empty() && exe.empty()) ||
+           lstrcmpiW(PathFindFileNameW(exe.c_str()), L"OpenWith.exe") == 0;
 }
 
 // ------------------------------------------------------------------
@@ -246,11 +269,11 @@ Dlg* s_dlg = nullptr;
 
 int px(const Dlg& d, int v) { return MulDiv(v, d.dpi, 96); }
 
-const wchar_t kHeading[] = L"Open media files with Explorer Plus";
+const wchar_t kHeading[] = L"Open files with Explorer Plus";
 const wchar_t kExplain[] =
     L"Tick the file types Explorer Plus should open - music, video and playlists in its player, pictures in "
-    L"its viewer - and press Apply: Explorer Plus becomes their default app. Unticked types go back to the "
-    L"app they had.\n"
+    L"its viewer, text and code in its Notepad - and press Apply: Explorer Plus becomes their default app. "
+    L"Unticked types go back to the app they had.\n"
     L"To pick an app for one type in Windows' own list, double-click that type.";
 
 void fill_list(Dlg& d) {
@@ -317,7 +340,7 @@ void apply(Dlg& d) {
     if (!refused.empty()) {
         std::wstring msg = L"Windows didn't let Explorer Plus become the app for " + refused +
                            L".\n\nSettings opens at Explorer Plus' page: pick it there for these types.";
-        MessageBoxW(d.wnd, msg.c_str(), L"Media file types", MB_OK | MB_ICONINFORMATION);
+        MessageBoxW(d.wnd, msg.c_str(), L"File types", MB_OK | MB_ICONINFORMATION);
         ShellExecuteW(d.wnd, nullptr, kSettingsPage, nullptr, nullptr, SW_SHOWNORMAL);
     }
 }
@@ -474,10 +497,14 @@ void on_create(Dlg& d, HWND hwnd) {
     d.apply = button(L"Apply", IDOK, true);
     d.close = button(L"Close", IDCANCEL);
     make_fonts(d);
-    // (the first time: every type ticked, ready to apply)
+    // (the first time: the types ticked, ready to apply)
     bool any = std::any_of(d.rows.begin(), d.rows.end(), [](const Row& r) { return r.registered; });
     fill_list(d);
-    if (!any) ListView_SetCheckState(d.list, -1, TRUE);
+    if (!any)
+        for (int i = 0, n = ListView_GetItemCount(d.list); i < n; ++i) {
+            int r = row_of(d, i);
+            if (r >= 0 && first_pick(d.rows[r])) ListView_SetCheckState(d.list, i, TRUE);
+        }
     apply_theme(d);
     layout(d);
 }
@@ -592,7 +619,7 @@ void assoc_dialog(HWND owner) {
     Dlg d;
     d.owner = owner;
     HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-    d.rows = media_types();
+    d.rows = file_types();
     SetCursor(old);
     s_dlg = &d;
     // centred on the owner, at its DPI
@@ -606,7 +633,7 @@ void assoc_dialog(HWND owner) {
     h = std::min(h, (int)(mi.rcWork.bottom - mi.rcWork.top));
     int x = std::clamp((int)(orc.left + orc.right - w) / 2, (int)mi.rcWork.left, (int)mi.rcWork.right - w);
     int y = std::clamp((int)(orc.top + orc.bottom - h) / 2, (int)mi.rcWork.top, (int)mi.rcWork.bottom - h);
-    HWND wnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, L"ExplorerPlusMediaTypes", L"Media file types",
+    HWND wnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, L"ExplorerPlusMediaTypes", L"File types",
                                WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_CLIPCHILDREN, x, y, w, h, owner,
                                nullptr, g_hinst, nullptr);
     if (!wnd) { s_dlg = nullptr; return; }
@@ -652,17 +679,19 @@ void assoc_follow_exe() {
         if (name[0] == L'.') exts.push_back(name);
     }
     RegCloseKey(k);
-    // an exe that is gone (moved, or a new version unzipped elsewhere): its types to this one.
-    // (One that is still there keeps them: another copy, a test build, mustn't take them.)
-    std::wstring cmd = open_command();
+    // an exe that is gone (moved, or a new version unzipped elsewhere): its types to this one,
+    // each with its own arguments (--play, --notepad). (One that is still there keeps them:
+    // another copy, a test build, mustn't take them.)
+    std::wstring self = exe_path();
     bool changed = false;
     for (auto& ext : exts) {
         std::wstring key = L"Software\\Classes\\" + progid(ext) + L"\\shell\\open\\command";
         std::wstring now = reg_get(key, nullptr);
-        if (now.size() < 2 || now[0] != L'"' || lstrcmpiW(now.c_str(), cmd.c_str()) == 0) continue;
-        std::wstring exe = now.substr(1, now.find(L'"', 1) - 1);
-        if (GetFileAttributesW(exe.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
-        reg_set(key, nullptr, cmd);
+        size_t close = now.size() >= 2 && now[0] == L'"' ? now.find(L'"', 1) : std::wstring::npos;
+        if (close == std::wstring::npos) continue;
+        std::wstring exe = now.substr(1, close - 1);
+        if (lstrcmpiW(exe.c_str(), self.c_str()) == 0 || GetFileAttributesW(exe.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+        reg_set(key, nullptr, L"\"" + self + now.substr(close));
         changed = true;
     }
     if (changed) {
