@@ -270,6 +270,15 @@ void list_create() {
     list_apply_view();
 }
 
+// (~2.5 ms: not at startup for a list that doesn't show)
+void list_ensure(Pane* p) {
+    if (p->list || !g_main) return;
+    PaneScope ps(p);
+    list_create();
+    theme_style_list(p->list);
+    dnd_register_list(p->list);
+}
+
 // ---------------------------------------------------------------
 // selection helpers
 

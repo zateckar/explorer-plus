@@ -319,10 +319,14 @@ int sys_icon_index(PCIDLIST_ABSOLUTE abs, bool open, int fallback) {
 }
 
 int sys_folder_icon_index(bool open) {
+    // asked once: asking takes the image list's lock, which a listing adding icons holds
+    // (each row and tab painted, each folder listed asked; the window's first paint waited)
+    static std::atomic<int> known[2] = { -1, -1 };
+    if (int i = known[open].load(); i >= 0) return i;
     SHSTOCKICONINFO sii{ sizeof(sii) };
-    if (SUCCEEDED(SHGetStockIconInfo(open ? SIID_FOLDEROPEN : SIID_FOLDER, SHGSI_SYSICONINDEX, &sii)))
-        return sii.iSysImageIndex;
-    return 0;
+    if (FAILED(SHGetStockIconInfo(open ? SIID_FOLDEROPEN : SIID_FOLDER, SHGSI_SYSICONINDEX, &sii))) return 0;
+    known[open] = sii.iSysImageIndex;
+    return sii.iSysImageIndex;
 }
 
 void sys_imagelist_init() {

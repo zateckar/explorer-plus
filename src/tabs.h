@@ -28,7 +28,10 @@ struct TabState {
 extern int g_activeTab;
 
 // model ops (navigation.cpp calls into these)
-void   tabmodel_init(const std::wstring& openPath, bool restore);   // restored tabs (+ openPath as active tab)
+// restored tabs (+ openPath as active tab): their folders parsed on a thread from _prepare (as
+// early as it can be), the tabs made by _init (the UI thread, where the folders are needed)
+void   tabmodel_prepare(const std::wstring& openPath, bool restore);
+void   tabmodel_init();
 void   tabmodel_new_tab();                         // the active list's folder, one list
 void   tabmodel_open_in_new_tab(PIDLIST_ABSOLUTE abs);   // adopts; new active tab, Back = the folder left
 void   tabmodel_close_tab(int idx);                // -1 = active; closes window when last

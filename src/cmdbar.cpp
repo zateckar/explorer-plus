@@ -283,7 +283,7 @@ void cmdbar_show_menu(int menuCmd) {
         GetCursorPos(&pt);
     }
     s_pressed = idx;
-    InvalidateRect(s_bar, nullptr, FALSE);
+    if (s_bar) InvalidateRect(s_bar, nullptr, FALSE);     // (hidden: maybe never made)
     if (menuCmd == IDM_NEW_MENU) {
         show_new_menu(g_main, pt, align);
     } else {
@@ -294,7 +294,7 @@ void cmdbar_show_menu(int menuCmd) {
         if (id) SendMessageW(g_main, WM_COMMAND, MAKEWPARAM(id, 0), 0);
     }
     s_pressed = -1;
-    InvalidateRect(s_bar, nullptr, FALSE);
+    if (s_bar) InvalidateRect(s_bar, nullptr, FALSE);
 }
 
 // The nav row's "..." while the command bar is hidden: the bar's buttons as the
@@ -479,6 +479,7 @@ static LRESULT CALLBACK bar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 HWND cmdbar_create(HWND parent) {
+    if (s_bar) return s_bar;
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.hInstance = g_hinst;
     wc.lpfnWndProc = bar_proc;

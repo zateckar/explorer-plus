@@ -1035,11 +1035,13 @@ os.makedirs(dual)
 for n in ('x1.txt', 'x2.txt', 'x3.txt'):
     open(os.path.join(dual, n), 'w').close()
 time.sleep(1.0)
-list2 = winauto.child_by_id(app.hwnd, R['IDC_LIST2'])
+list2 = winauto.child_by_id(app.hwnd, R['IDC_LIST2'])                # (made the first time it shows)
 def count2():
     return send(list2, 0x1004, 0, 0)                                  # LVM_GETITEMCOUNT
-check('one list by default', list2 and not u.IsWindowVisible(list2))
+check('one list by default', not list2 or not u.IsWindowVisible(list2))
 app.command(IDM['DUALPANE'])
+wait_for(lambda: winauto.child_by_id(app.hwnd, R['IDC_LIST2']), 5)
+list2 = winauto.child_by_id(app.hwnd, R['IDC_LIST2'])
 check('Dual pane shows a second list on the same folder',
       wait_for(lambda: u.IsWindowVisible(list2) and count2() == app.item_count(), 5), (count2(), app.item_count()))
 check('... with the focus in it', wait_for(lambda: focused() == list2, 3), focused())

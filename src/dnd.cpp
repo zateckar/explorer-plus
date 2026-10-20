@@ -208,14 +208,19 @@ public:
 // ---------------------------------------------------------------
 // registration
 
+static bool s_registered = false;
+
+void dnd_register_list(HWND list) {
+    if (!s_registered || !list) return;
+    auto* lt = new PaneDropTarget(list, false);
+    RegisterDragDrop(list, lt);           // OLE holds its own references
+    lt->Release();
+}
+
 void dnd_register_sources() {
     if (!g_tree) return;
-    for (Pane& p : g_panes) {
-        if (!p.list) continue;
-        auto* lt = new PaneDropTarget(p.list, false);
-        RegisterDragDrop(p.list, lt);     // OLE holds its own references
-        lt->Release();
-    }
+    s_registered = true;
+    for (Pane& p : g_panes) dnd_register_list(p.list);
     auto* tt = new PaneDropTarget(g_tree, true);
     RegisterDragDrop(g_tree, tt);
     tt->Release();

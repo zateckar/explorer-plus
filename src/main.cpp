@@ -453,6 +453,7 @@ static void on_command(WORD id) {
         case IDM_VIEW_CMDBAR:
             g_cmdBarVisible = !g_cmdBarVisible;
             settings_set_pref(L"commandBar", g_cmdBarVisible);
+            if (g_cmdBarVisible) cmdbar_create(g_main);
             navbar_refresh();
             layout_relayout();
             break;
@@ -669,15 +670,20 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             build_search();
             g_navbar = navbar_create(hwnd);
             tabstrip_create(hwnd);
-            cmdbar_create(hwnd);
+            if (g_cmdBarVisible) cmdbar_create(hwnd);   // (hidden: made once it shows)
             statusbar_create(hwnd);
-            for (Pane& p : g_panes) {        // (the second list shows in dual-pane tabs)
-                PaneScope ps(&p);
-                list_create();
-            }
+            list_create();                  // (the second list: made once a dual-pane tab shows)
             detailspane_create(hwnd);
             theme_apply_controls();
             perf_event("create.controls");
+            tabmodel_init();                // (their folders parsed meanwhile)
+            if (TabState* t = tabmodel_active()) {
+                // its folders listed while the rest is built (taken over by its navigation)
+                int lists = t->dual && t->side[1].current ? kPanes : 1;
+                for (int i = 0; i < lists; ++i) enum_start_early(&g_panes[i], t->side[i].current);
+                if (g_treeVisible) tree_prefetch(t->side[t->dual ? t->activeSide : 0].current);
+            }
+            perf_event("tabs");
             initialize_tree(g_tree);
             perf_event("create.tree");
             watcher_init(hwnd);
@@ -1027,15 +1033,9 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         HANDLE owner = CreateMutexW(nullptr, FALSE, name);       // (held for the process' life)
         if (owner && GetLastError() == ERROR_ALREADY_EXISTS) newWindow = true;
     }
-    tabmodel_init(openPath, !newWindow);          // restored tabs (+ command-line folder)
-    if (icons.joinable()) icons.join();
-    if (TabState* t = tabmodel_active()) {
-        // its folders are listed while the window is built (taken over by its navigation)
-        int lists = t->dual && t->side[1].current ? kPanes : 1;
-        for (int i = 0; i < lists; ++i) enum_start_early(&g_panes[i], t->side[i].current);
-        if (g_treeVisible) tree_prefetch(t->side[t->dual ? t->activeSide : 0].current);   // ready by WM_CREATE
-    }
-    perf_event("tabs");
+    // restored tabs (+ command-line folder): their folders parsed on a thread while the window
+    // and its controls are made (WM_CREATE makes the tabs)
+    tabmodel_prepare(openPath, !newWindow);
     detailspane_set_mode(settings_pref(L"paneMode", PANE_DETAILS) == PANE_PREVIEW ? PANE_PREVIEW : PANE_DETAILS);
     detailspane_set_visible(sp.detailsVisible);   // sets flags only (window created later)
 
@@ -1084,16 +1084,24 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
             wy = work.top  + (work.bottom - work.top - wh) / 2;
         }
     }
+    if (icons.joinable()) icons.join();
     HWND wnd = CreateWindowExW(0, APP_CLASS, L"Explorer Plus",
                                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                                wx, wy, ww, wh, nullptr, nullptr, g_hinst, nullptr);
-    if (!wnd) return 2;
+    if (!wnd) { tabmodel_init(); return 2; }        // (its thread joined)
     s_mainOpen = true;
     perf_event("window.created");
     enum_early_done();
     // the folder's listing is usually done by now (it started before the window): its rows
     // and icons go into the first paint, not into an empty list a moment after it. A slow
     // folder isn't waited for long.
+    // (30 ms by a high-resolution timer: the system tick that timeouts go by is ~15.6 ms, and
+    // a big folder held the window up to 46)
+    HANDLE cap = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_MANUAL_RESET |
+                                        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    LARGE_INTEGER due{};
+    due.QuadPart = -30 * 10000LL;                   // (relative, in 100 ns)
+    if (cap && !SetWaitableTimer(cap, &due, 0, nullptr, nullptr, FALSE)) { CloseHandle(cap); cap = nullptr; }
     for (ULONGLONG until = GetTickCount64() + 30; !enum_startup_settled();) {
         MSG em;
         if (PeekMessageW(&em, wnd, WM_ENUM_DONE, WM_ENUM_DONE, PM_REMOVE) ||
@@ -1102,9 +1110,10 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
             continue;
         }
         ULONGLONG now = GetTickCount64();
-        if (now >= until) break;
-        MsgWaitForMultipleObjects(0, nullptr, FALSE, (DWORD)(until - now), QS_POSTMESSAGE);
+        if (cap ? WaitForSingleObject(cap, 0) == WAIT_OBJECT_0 : now >= until) break;
+        MsgWaitForMultipleObjects(cap ? 1 : 0, &cap, FALSE, cap ? 100 : (DWORD)(until - now), QS_POSTMESSAGE);
     }
+    if (cap) CloseHandle(cap);
     perf_event("window.listing");
 
     // shown cloaked until it is all painted: DWM would now and then put up a frame of the

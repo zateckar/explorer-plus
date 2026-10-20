@@ -2,6 +2,7 @@
 #include "appstate.h"
 
 void list_create();
+void list_ensure(Pane* p);                 // p's list, made the first time it shows (the second: dual-pane tabs)
 LRESULT list_notify(HWND hwnd, WPARAM wp, LPARAM lp);
 void list_apply_view();                    // switch LV_VIEW_* + imagelists
 void list_context_menu(POINT screenPt);    // (-1,-1) = keyboard invocation

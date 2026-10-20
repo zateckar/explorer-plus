@@ -84,6 +84,7 @@ void navigation_show_tab(TabState* t, bool anotherTab) {
     if (!t) return;
     if (t->dual && !t->side[1].current) t->dual = false;    // (nothing to show there)
     g_dual = t->dual;
+    if (g_dual) list_ensure(&g_panes[1]);
     if (anotherTab) tree_restore_state(t->tree);             // (before the tree syncs to the folder)
     HWND focus = GetFocus();
     bool listFocused = !focus || is_pane_list(focus) || is_pane_list(GetParent(focus));
@@ -118,7 +119,9 @@ void navigation_activate_pane(Pane* p) {
 // else the first list's), or back to one
 void navigation_toggle_dual() {
     TabState* t = tabmodel_active();
-    if (!t || !g_panes[1].list) return;
+    if (!t) return;
+    if (!t->dual) list_ensure(&g_panes[1]);
+    if (!g_panes[1].list) return;
     if (!t->dual) {
         PaneNav& n = t->side[1];
         if (!n.current) {

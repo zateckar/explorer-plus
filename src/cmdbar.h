@@ -2,7 +2,7 @@
 #include "appstate.h"
 
 // Win11 command bar: New | Cut Copy Paste Rename Share Delete | Sort View | ...  Details
-HWND cmdbar_create(HWND parent);     // id = IDC_CMDBAR
+HWND cmdbar_create(HWND parent);     // id = IDC_CMDBAR (made once it shows: null until then)
 HWND cmdbar_hwnd();
 void cmdbar_refresh();               // selection / clipboard / pane state changed
 // drop-down menus (also reachable from the keyboard / other UI)

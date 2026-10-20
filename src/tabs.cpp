@@ -14,6 +14,7 @@ using std::min;
 #include <memory>
 #include <atomic>
 #include <thread>
+#include <utility>
 #include "workers.h"
 #include "acc.h"
 #include "kbdrow.h"
@@ -375,10 +376,11 @@ static void parse_saved(std::vector<SavedFolder>& v) {
     for (auto& t : helpers) t.join();
 }
 
-void tabs_deserialize(const std::wstring& tabs, int active) {
-    for (auto& t : s_tabs) free_tab(t);
-    s_tabs.clear();
-    std::vector<std::vector<std::wstring>> lines;
+using SavedLines = std::vector<std::vector<std::wstring>>;
+
+// the saved tab set: a line per tab, its fields \x01 apart (ten of them, the missing ones empty)
+static SavedLines split_saved(const std::wstring& tabs) {
+    SavedLines lines;
     size_t pos = 0;
     while (pos < tabs.size()) {
         size_t nl = tabs.find(L'\n', pos);
@@ -396,13 +398,33 @@ void tabs_deserialize(const std::wstring& tabs, int active) {
         while (f.size() < 10) f.push_back(L"");
         lines.push_back(std::move(f));
     }
-    // each tab's folder, and the second list's where it had one
+    return lines;
+}
+
+// each tab's folder, and the second list's where it had one
+static std::vector<SavedFolder> saved_folders(const SavedLines& lines) {
     std::vector<SavedFolder> folders;
     for (auto& f : lines) {
         folders.push_back({ f[0], f[1] });
         if (!f[5].empty()) folders.push_back({ f[5], f[6] });
     }
-    parse_saved(folders);
+    return folders;
+}
+
+// first run: Home, like Windows 11 (older systems: the user's profile)
+static PIDLIST_ABSOLUTE home_folder() {
+    PIDLIST_ABSOLUTE dp = nullptr;
+    if (FAILED(SHParseDisplayName(L"shell:::{f874310e-b6b7-47dc-bc84-b9e6b38f5903}", nullptr, &dp, 0, nullptr)) &&
+        FAILED(SHGetKnownFolderIDList(FOLDERID_Profile, 0, nullptr, &dp)))
+        dp = nullptr;
+    return dp;
+}
+
+// the tabs from their lines and their folders as parsed (the pidls taken); none: Home (`home`
+// when it was parsed already, taken)
+static void apply_saved(const SavedLines& lines, std::vector<SavedFolder>& folders, int active, PIDLIST_ABSOLUTE home) {
+    for (auto& t : s_tabs) free_tab(t);
+    s_tabs.clear();
     size_t k = 0;
     for (auto& f : lines) {
         SavedFolder& first = folders[k++];
@@ -430,18 +452,20 @@ void tabs_deserialize(const std::wstring& tabs, int active) {
             t.tree.saved = true;
         }
         s_tabs.push_back(std::move(t));
-    }    if (s_tabs.empty()) {
-        // first run: Home, like Windows 11 (older systems: the user's profile)
-        PIDLIST_ABSOLUTE dp = nullptr;
-        if (FAILED(SHParseDisplayName(L"shell:::{f874310e-b6b7-47dc-bc84-b9e6b38f5903}", nullptr, &dp, 0, nullptr)) &&
-            FAILED(SHGetKnownFolderIDList(FOLDERID_Profile, 0, nullptr, &dp)))
-            dp = nullptr;
-        s_tabs.push_back(make_tab(dp));
     }
+    if (s_tabs.empty()) s_tabs.push_back(make_tab(home ? home : home_folder()));
+    else if (home) CoTaskMemFree(home);
     // `active` indexes the saved order: pick the tab first, then let the sort keep it active
     g_activeTab = max(0, min(active, (int)s_tabs.size() - 1));
     sort_pinned_first();
     current_replace(pidl_clone(tabmodel_active()->side[0].current));
+}
+
+void tabs_deserialize(const std::wstring& tabs, int active) {
+    SavedLines lines = split_saved(tabs);
+    std::vector<SavedFolder> folders = saved_folders(lines);
+    parse_saved(folders);
+    apply_saved(lines, folders, active, nullptr);
 }
 
 void tabs_serialize_lines(std::vector<std::wstring>& lines, int& outActive) {
@@ -477,45 +501,97 @@ void tabs_serialize_lines(std::vector<std::wstring>& lines, int& outActive) {
     outActive = g_activeTab;
 }
 
-void tabmodel_init(const std::wstring& openPath, bool restore) {
-    std::wstring saved; int active = 0;
-    s_persist = restore;
-    if (restore) settings_tabs(saved, active);
-    if (restore || openPath.empty()) tabs_deserialize(saved, active);
-    if (openPath.empty()) return;
-    // "explorer-plus.exe <folder>": open it in a new, active tab
-    PIDLIST_ABSOLUTE p = nullptr;
+// The shell's part of making the tabs: their folders parsed (the process's first use of the
+// shell, some 20 ms however few they are), on a thread of its own while the window's controls
+// are made. Nothing of the app's state is touched there: tabmodel_init makes the tabs.
+struct TabsPrepared {
+    std::wstring openPath;
+    bool restore = false;
+    int active = 0;
+    SavedLines lines;
+    std::vector<SavedFolder> folders;
+    PIDLIST_ABSOLUTE home = nullptr;        // Home, parsed when there is no other tab
+    PIDLIST_ABSOLUTE open = nullptr;        // the command line's folder; nullptr: none, or it didn't parse
     std::wstring netName;                   // a share's tab name, known without the server
-    if (openPath == L"::desktop") {
-        p = pidl_desktop();
-    } else if (path_is_network(openPath)) {
-        // a share or mapped drive opens without asking the server: it may be offline, and
-        // the window would wait for its timeout before it even shows
-        std::wstring path = openPath;
-        while (path.size() > 3 && path.back() == L'\\') path.pop_back();
-        p = SHSimpleIDListFromPath(path.c_str());
-        netName = PathFindFileNameW(path.c_str());
-    } else if (FAILED(parse_typed(openPath, &p))) {
-        p = nullptr;
+    std::wstring select;                    // the command line's file: selected in its folder
+};
+static TabsPrepared s_prep;
+static std::thread s_prepThread;
+
+static void prepare_tabs(TabsPrepared& p) {
+    ComInit ci;
+    bool restoring = p.restore || p.openPath.empty();
+    if (restoring) {
+        p.folders = saved_folders(p.lines);
+        parse_saved(p.folders);
     }
-    if (!p) {
-        if (s_tabs.empty()) tabs_deserialize(L"", 0);      // fresh window, bad path: Home
-        return;
-    }
-    // a file: its folder, with the file selected (like "Open file location")
-    if (netName.empty() && !pidl_is_desktop(p)) {
-        com_ptr<IShellItem> si;
-        SFGAOF a = 0;
-        if (SUCCEEDED(SHCreateItemFromIDList(p, IID_PPV_ARGS(si.put()))) && si &&
-            SUCCEEDED(si->GetAttributes(SFGAO_FOLDER, &a)) && !(a & SFGAO_FOLDER)) {
-            PWSTR name = nullptr;
-            if (SUCCEEDED(si->GetDisplayName(SIGDN_PARENTRELATIVEPARSING, &name)) && name) {
-                ILRemoveLastID(p);
-                enum_select_on_arrival(name, p);
-                CoTaskMemFree(name);
+    if (!p.openPath.empty()) {
+        // "explorer-plus.exe <folder>": open it in a new, active tab
+        if (p.openPath == L"::desktop") {
+            p.open = pidl_desktop();
+        } else if (path_is_network(p.openPath)) {
+            // a share or mapped drive opens without asking the server: it may be offline, and
+            // the window would wait for its timeout before it even shows
+            std::wstring path = p.openPath;
+            while (path.size() > 3 && path.back() == L'\\') path.pop_back();
+            p.open = SHSimpleIDListFromPath(path.c_str());
+            p.netName = PathFindFileNameW(path.c_str());
+        } else if (FAILED(parse_typed(p.openPath, &p.open))) {
+            p.open = nullptr;
+        }
+        // a file: its folder, with the file selected (like "Open file location")
+        if (p.open && p.netName.empty() && !pidl_is_desktop(p.open)) {
+            com_ptr<IShellItem> si;
+            SFGAOF a = 0;
+            if (SUCCEEDED(SHCreateItemFromIDList(p.open, IID_PPV_ARGS(si.put()))) && si &&
+                SUCCEEDED(si->GetAttributes(SFGAO_FOLDER, &a)) && !(a & SFGAO_FOLDER)) {
+                PWSTR name = nullptr;
+                if (SUCCEEDED(si->GetDisplayName(SIGDN_PARENTRELATIVEPARSING, &name)) && name) {
+                    ILRemoveLastID(p.open);
+                    p.select = name;
+                    CoTaskMemFree(name);
+                }
             }
         }
     }
+    // Home: no tab saved; or a fresh window whose path didn't parse
+    if (restoring ? p.lines.empty() : !p.open) p.home = home_folder();
+}
+
+void tabmodel_prepare(const std::wstring& openPath, bool restore) {
+    s_prep.openPath = openPath;
+    s_prep.restore = restore;
+    s_persist = restore;
+    std::wstring saved;
+    if (restore) settings_tabs(saved, s_prep.active);      // (the settings: read here, not on the thread)
+    s_prep.lines = split_saved(saved);
+    try { s_prepThread = std::thread([] { prepare_tabs(s_prep); }); } catch (...) { prepare_tabs(s_prep); }
+}
+
+void tabmodel_init() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    if (s_prepThread.joinable()) s_prepThread.join();
+    TabsPrepared& prep = s_prep;
+    if (prep.restore || prep.openPath.empty()) apply_saved(prep.lines, prep.folders, prep.active, std::exchange(prep.home, nullptr));
+    PIDLIST_ABSOLUTE p = std::exchange(prep.open, nullptr);
+    std::wstring netName = prep.netName, select = prep.select, openPath = prep.openPath;
+    PIDLIST_ABSOLUTE home = std::exchange(prep.home, nullptr);
+    prep = TabsPrepared{};
+    if (openPath.empty()) return;
+    if (!p) {
+        if (s_tabs.empty()) {                           // fresh window, bad path: Home
+            SavedLines none;
+            std::vector<SavedFolder> noFolders;
+            apply_saved(none, noFolders, 0, home);
+        } else if (home) {
+            CoTaskMemFree(home);
+        }
+        return;
+    }
+    if (home) CoTaskMemFree(home);
+    if (!select.empty()) enum_select_on_arrival(select, p);
     // already open: just activate it (the tab that was active, if it is one of them)
     for (int k = -1; k < (int)s_tabs.size(); ++k) {
         int i = k < 0 ? g_activeTab : k;
