@@ -213,6 +213,7 @@ pwsh tools/package.ps1 -Version 1.2.0     # -> dist/explorer-plus-1.2.0-win-x64.
 ctest --test-dir build --output-on-failure                          # unit tests (INI, command line, play queue, kept queues, text files)
 python -I tools/smoke_test.py build\explorer-plus.exe build\smoke   # GUI smoke test
 python -I tools/perf.py build\explorer-plus.exe build\perf 5         # startup / 30k files / scroll / sort / views / resize
+python -I tools/startup.py build\explorer-plus.exe build\startup 7     # startup as seen: main window, Notepad (and its tabs), player
 python -I tools/sync_test.py build\explorer-plus.exe build\synctest  # three devices syncing through the agents
 build\explorer-plus-sync-tests.exe --bench 10000 2048                # sync benchmark: small files + a 2 GB file, encrypted vs. copied
 ```
