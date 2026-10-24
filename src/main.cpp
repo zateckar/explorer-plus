@@ -52,6 +52,41 @@ static DragKind s_dragKind = DragKind::None;
 static bool s_mainOpen = false;             // the main window is there (not: closed, or --play)
 static HANDLE s_tabsOwner = nullptr;        // held while this window owns the saved tab set
 
+// A folder opened (from Windows, as the default file manager, or "explorer-plus.exe <folder>")
+// while the window with the saved tabs is open: a tab there, not another window. That window
+// carries its settings file's key (the tests' windows have their own).
+static const wchar_t kTabsProp[] = L"ExplorerPlus.Tabs";
+static const ULONG_PTR kCopyOpenPath = 0x45504F50;     // WM_COPYDATA: a path to open ('EPOP')
+
+static uint32_t tabs_key() {
+    std::wstring ini = settings_file_path();
+    CharLowerBuffW(ini.data(), (DWORD)ini.size());
+    uint32_t h = 2166136261u;
+    for (wchar_t c : ini) { h ^= (uint32_t)c; h *= 16777619u; }
+    return h ? h : 1;
+}
+
+// true: the window that owns the tabs took the path
+static bool open_in_tabs_window(const std::wstring& path, uint32_t key) {
+    struct Find { uint32_t key; HWND wnd; } f{ key, nullptr };
+    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+        auto* f = (Find*)lp;
+        WCHAR c[64];
+        if (GetClassNameW(h, c, ARRAYSIZE(c)) && lstrcmpW(c, APP_CLASS) == 0 && (uint32_t)(UINT_PTR)GetPropW(h, kTabsProp) == f->key) {
+            f->wnd = h;
+            return FALSE;
+        }
+        return TRUE;
+    }, (LPARAM)&f);
+    if (!f.wnd) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(f.wnd, &pid);
+    AllowSetForegroundWindow(pid);              // (it comes forward: this process was allowed to)
+    COPYDATASTRUCT cd{ kCopyOpenPath, (DWORD)((path.size() + 1) * sizeof(wchar_t)), (void*)path.c_str() };
+    DWORD_PTR took = 0;
+    return SendMessageTimeoutW(f.wnd, WM_COPYDATA, 0, (LPARAM)&cd, SMTO_ABORTIFHUNG, 5000, &took) && took == TRUE;
+}
+
 void exit_app() { DestroyWindow(g_main); }
 
 void app_window_closed() {
@@ -502,6 +537,7 @@ static void on_command(WORD id) {
             break;
         case IDM_SCREENSHOT: screenshot_start(300); break;     // (the menu's fade first)
         case IDM_MEDIA_TYPES: assoc_dialog(g_main); break;
+        case IDM_DEFAULT_FOLDERS: assoc_folders_toggle(g_main); break;
         case IDM_SYNC_FOLDERS: sync_folders_dialog(g_main); break;
         case IDM_NOTEPAD: notepad_open({}); break;
         case IDM_PLAYER: player_show(); break;
@@ -894,6 +930,18 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_CLOSE: DestroyWindow(hwnd); return 0;
 
+        case WM_COPYDATA: {
+            // another start's folder (open_in_tabs_window): its tab, brought forward
+            auto* cd = (const COPYDATASTRUCT*)lp;
+            if (cd->dwData != kCopyOpenPath || !cd->lpData || cd->cbData < sizeof(wchar_t)) break;
+            std::wstring path((const wchar_t*)cd->lpData, cd->cbData / sizeof(wchar_t));
+            path.resize(wcsnlen(path.c_str(), path.size()));
+            if (path.empty() || !tabmodel_open_path(path)) return FALSE;
+            if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(GetLastActivePopup(hwnd));      // (a dialog open over it: that)
+            return TRUE;
+        }
+
         case WM_ENDSESSION:
             // Windows is shutting down / logging off: the process ends without WM_DESTROY
             if (wp) save_window_state(hwnd);
@@ -907,6 +955,7 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // the tabs are saved: the next window started gets them, though an editor or the
             // player still open keeps this process (it opened as an extra window without them)
             if (s_tabsOwner) { CloseHandle(s_tabsOwner); s_tabsOwner = nullptr; }
+            RemovePropW(hwnd, kTabsProp);
             // gone from the screen now (saved first: the placement says whether it is
             // maximized): destroying the children takes a while with a big navigation pane,
             // the tree control spends ~50 us on each node it deletes
@@ -1021,28 +1070,31 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         std::_Exit(0);
     }
     perf_event("settings");
+    uint32_t tabsKey = tabs_key();
+    if (!newWindow) {
+        // the saved tab set belongs to one window: a second one started meanwhile opens as a
+        // new window (both saving it, the last to write won and the other's tabs were lost);
+        // started with a folder, it is a tab in that window instead
+        WCHAR name[64];
+        swprintf(name, ARRAYSIZE(name), L"Local\\ExplorerPlus.Tabs.%08x", tabsKey);
+        HANDLE owner = CreateMutexW(nullptr, FALSE, name);       // (held while the window is open)
+        if (owner && GetLastError() == ERROR_ALREADY_EXISTS) {
+            CloseHandle(owner);
+            if (!openPath.empty() && open_in_tabs_window(openPath, tabsKey)) {
+                perf_flush();
+                theme_shutdown();
+                std::_Exit(0);
+            }
+            newWindow = true;
+        } else {
+            s_tabsOwner = owner;
+        }
+    }
     // the system image list is set up here, once, before any worker asks for icons (those
     // asking while it is still being initialized get no index: the tree showed "unknown
     // file" icons) — on a thread while the tabs are read
     std::thread icons;
     try { icons = std::thread([] { ComInit ci; sys_imagelist_init(); }); } catch (...) { sys_imagelist_init(); }
-    if (!newWindow) {
-        // the saved tab set belongs to one window: a second one started meanwhile opens as a
-        // new window (both saving it, the last to write won and the other's tabs were lost)
-        std::wstring ini = settings_file_path();
-        CharLowerBuffW(ini.data(), (DWORD)ini.size());
-        uint32_t h = 2166136261u;
-        for (wchar_t c : ini) { h ^= (uint32_t)c; h *= 16777619u; }
-        WCHAR name[64];
-        swprintf(name, ARRAYSIZE(name), L"Local\\ExplorerPlus.Tabs.%08x", h);
-        HANDLE owner = CreateMutexW(nullptr, FALSE, name);       // (held while the window is open)
-        if (owner && GetLastError() == ERROR_ALREADY_EXISTS) {
-            newWindow = true;
-            CloseHandle(owner);
-        } else {
-            s_tabsOwner = owner;
-        }
-    }
     // restored tabs (+ command-line folder): their folders parsed on a thread while the window
     // and its controls are made (WM_CREATE makes the tabs)
     tabmodel_prepare(openPath, !newWindow);
@@ -1100,6 +1152,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
                                wx, wy, ww, wh, nullptr, nullptr, g_hinst, nullptr);
     if (!wnd) { tabmodel_init(); return 2; }        // (its thread joined)
     s_mainOpen = true;
+    if (s_tabsOwner) SetPropW(wnd, kTabsProp, (HANDLE)(UINT_PTR)tabsKey);
     perf_event("window.created");
     enum_early_done();
     // the folder's listing is usually done by now (it started before the window): its rows

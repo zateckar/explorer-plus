@@ -49,6 +49,14 @@ File Explorer while starting in well under 100 ms.
   included. "Create playlist..." writes one from files and folders; Ctrl+S saves a queue.
 - **Media file types** ("…" ▸ Media file types...): make Explorer Plus the default app for the
   music, video, picture and playlist types you tick, for your account only.
+- **Default file manager** ("…" ▸ Default file manager): folders opened anywhere in Windows
+  open in Explorer Plus instead of File Explorer: on the desktop, drives in This PC, Win+E,
+  "Open folder" / "Show in folder" in other apps (the folder opens, nothing is selected in
+  it). A folder opened while Explorer Plus is open becomes a tab there. File Explorer stays
+  the taskbar and desktop and keeps what isn't a folder on disk (Control Panel, the Recycle
+  Bin, This PC, libraries); `explorer.exe <folder>` still opens File Explorer. For your account
+  only; unticking it removes everything it wrote. Untick it before deleting Explorer Plus
+  (a moved exe is followed on its next start).
 - **Notepad** (its button beside Refresh, or "Edit in Explorer Plus"): text files in tabs, as
   in Windows 11, kept with unsaved text across restarts. Keeps each file's encoding and line
   endings; find and replace, go to line, word wrap, zoom; syntax colours for some 25
@@ -142,7 +150,7 @@ Get-Content SHA256SUMS.txt | ForEach-Object {
 Unsigned builds trigger a SmartScreen prompt on first run ("More info" → "Run anyway").
 
 Command line: `explorer-plus.exe [--new-window] [folder or file]`; a file opens its folder
-with the file selected. `explorer-plus.exe --play <file>` plays a media file or playlist (or
+with the file selected. Without `--new-window`, a window already open takes the folder as a tab. `explorer-plus.exe --play <file>` plays a media file or playlist (or
 shows a picture) in the player, as the registered file types do. `explorer-plus.exe --notepad
 [file]` opens the Notepad (with the file in a tab); a Notepad already open takes it.
 `explorer-plus.exe --sync` runs the sync agent; `--sync-folders` opens the Sync folders
@@ -178,6 +186,7 @@ Environment variables (diagnostics and tests):
 | `EXPLORERPLUS_SETTINGS=<file>` | use another settings file |
 | `EXPLORERPLUS_THEME=light\|dark` | override the Windows theme |
 | `EXPLORERPLUS_PERF=<log file>` | write timing events (startup, listings, paints, slow UI messages) |
+| `EXPLORERPLUS_TEST_REGISTRY=<key>` | tests: Default file manager writes under `HKCU\<key>`, where the shell never looks (needs no `EXPLORERPLUS_TEST`: it only keeps writes off the real keys) |
 | `EXPLORERPLUS_TEST=1` | tests: the test-only variables below count (without it they're ignored) |
 | `EXPLORERPLUS_SYNC_KDF_KIB=<KiB>` | tests: a cheaper Argon2id for sync codes (only with `EXPLORERPLUS_SETTINGS`) |
 | `EXPLORERPLUS_SYNC_MANIFEST_GRACE=<s>` | tests: how long the storage and the manifest may disagree before it's reported |
@@ -263,7 +272,7 @@ src/visual             player's visualizations (Direct2D on Direct3D 11, a threa
 src/imageview, loudness   player's pictures (WIC, Direct2D SVG, GDI+ metafiles), loudness levelling
 src/imageformats       TGA, QOI, HDR, PSD, PCX decoders; APNG frames; SVG size
 src/screenshot, imageedit, shapes   Alt+Q screenshots, picture editor, its objects' geometry
-src/assoc, userchoice  file type registration (File types), the default-app hash
+src/assoc, userchoice  file type registration (File types), Default file manager, the default-app hash
 src/notepad, textfile  the Notepad window; text encodings, line endings, its kept tabs
 src/syntax, textops    the Notepad's lexers, JSON / XML formatting; line, case, Base64, URL operations
 src/settings, ini, theme, perf, crash   settings.ini, colours and fonts, profiling, crash dumps

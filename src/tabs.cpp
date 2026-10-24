@@ -518,6 +518,39 @@ struct TabsPrepared {
 static TabsPrepared s_prep;
 static std::thread s_prepThread;
 
+// "explorer-plus.exe <folder>": the folder (nullptr: it didn't parse); a share's tab name,
+// known without the server; a file: its folder, the file's name to select in it
+static PIDLIST_ABSOLUTE parse_open_path(const std::wstring& openPath, std::wstring& netName, std::wstring& select) {
+    PIDLIST_ABSOLUTE open = nullptr;
+    if (openPath == L"::desktop") {
+        open = pidl_desktop();
+    } else if (path_is_network(openPath)) {
+        // a share or mapped drive opens without asking the server: it may be offline, and
+        // the window would wait for its timeout before it even shows
+        std::wstring path = openPath;
+        while (path.size() > 3 && path.back() == L'\\') path.pop_back();
+        open = SHSimpleIDListFromPath(path.c_str());
+        netName = PathFindFileNameW(path.c_str());
+    } else if (FAILED(parse_typed(openPath, &open))) {
+        open = nullptr;
+    }
+    // a file: its folder, with the file selected (like "Open file location")
+    if (open && netName.empty() && !pidl_is_desktop(open)) {
+        com_ptr<IShellItem> si;
+        SFGAOF a = 0;
+        if (SUCCEEDED(SHCreateItemFromIDList(open, IID_PPV_ARGS(si.put()))) && si &&
+            SUCCEEDED(si->GetAttributes(SFGAO_FOLDER, &a)) && !(a & SFGAO_FOLDER)) {
+            PWSTR name = nullptr;
+            if (SUCCEEDED(si->GetDisplayName(SIGDN_PARENTRELATIVEPARSING, &name)) && name) {
+                ILRemoveLastID(open);
+                select = name;
+                CoTaskMemFree(name);
+            }
+        }
+    }
+    return open;
+}
+
 static void prepare_tabs(TabsPrepared& p) {
     ComInit ci;
     bool restoring = p.restore || p.openPath.empty();
@@ -525,35 +558,8 @@ static void prepare_tabs(TabsPrepared& p) {
         p.folders = saved_folders(p.lines);
         parse_saved(p.folders);
     }
-    if (!p.openPath.empty()) {
-        // "explorer-plus.exe <folder>": open it in a new, active tab
-        if (p.openPath == L"::desktop") {
-            p.open = pidl_desktop();
-        } else if (path_is_network(p.openPath)) {
-            // a share or mapped drive opens without asking the server: it may be offline, and
-            // the window would wait for its timeout before it even shows
-            std::wstring path = p.openPath;
-            while (path.size() > 3 && path.back() == L'\\') path.pop_back();
-            p.open = SHSimpleIDListFromPath(path.c_str());
-            p.netName = PathFindFileNameW(path.c_str());
-        } else if (FAILED(parse_typed(p.openPath, &p.open))) {
-            p.open = nullptr;
-        }
-        // a file: its folder, with the file selected (like "Open file location")
-        if (p.open && p.netName.empty() && !pidl_is_desktop(p.open)) {
-            com_ptr<IShellItem> si;
-            SFGAOF a = 0;
-            if (SUCCEEDED(SHCreateItemFromIDList(p.open, IID_PPV_ARGS(si.put()))) && si &&
-                SUCCEEDED(si->GetAttributes(SFGAO_FOLDER, &a)) && !(a & SFGAO_FOLDER)) {
-                PWSTR name = nullptr;
-                if (SUCCEEDED(si->GetDisplayName(SIGDN_PARENTRELATIVEPARSING, &name)) && name) {
-                    ILRemoveLastID(p.open);
-                    p.select = name;
-                    CoTaskMemFree(name);
-                }
-            }
-        }
-    }
+    // "explorer-plus.exe <folder>": open it in a new, active tab
+    if (!p.openPath.empty()) p.open = parse_open_path(p.openPath, p.netName, p.select);
     // Home: no tab saved; or a fresh window whose path didn't parse
     if (restoring ? p.lines.empty() : !p.open) p.home = home_folder();
 }
@@ -608,6 +614,39 @@ void tabmodel_init() {
     s_tabs.push_back(std::move(t));
     g_activeTab = (int)s_tabs.size() - 1;
     current_replace(pidl_clone(tabmodel_active()->side[0].current));
+}
+
+bool tabmodel_open_path(const std::wstring& path) {
+    std::wstring netName, select;
+    PIDLIST_ABSOLUTE p = parse_open_path(path, netName, select);
+    if (!p) return false;
+    // already open: that tab (the active one, if it is one of them)
+    int at = -1;
+    for (int k = -1; k < (int)s_tabs.size() && at < 0; ++k) {
+        int i = k < 0 ? g_activeTab : k;
+        if (i >= 0 && i < (int)s_tabs.size() && pidl_equal(s_tabs[i].side[0].current, p)) at = i;
+    }
+    bool shown = at >= 0 && at == g_activeTab;
+    if (at >= 0) {
+        CoTaskMemFree(p);
+    } else {
+        TabState t = netName.empty() ? make_tab(p) : make_tab_named(p, netName);
+        t.side[0].view = view_for_folder(t.side[0].current);
+        s_tabs.push_back(std::move(t));
+        at = (int)s_tabs.size() - 1;
+    }
+    if (!select.empty()) {
+        PaneScope ps(&g_panes[0]);
+        enum_select_on_arrival(select, s_tabs[at].side[0].current);
+        if (shown) navigation_refresh();        // (listed again: the file selected as it arrives)
+    }
+    if (!shown) {
+        g_activeTab = at;
+        show_active();
+        tabs_persist_soon();
+        tabstrip_refresh();
+    }
+    return true;
 }
 
 // ------------------------------------------------------------------

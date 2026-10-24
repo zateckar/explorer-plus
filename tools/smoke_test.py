@@ -1104,6 +1104,126 @@ app.command(IDM['DUALPANE'])
 check('Dual pane off: one list again', wait_for(lambda: not u.IsWindowVisible(list2), 3))
 app.close()
 
+# Default file manager: folders opened anywhere in Windows open here. Its registry keys go to a
+# key of the test's own under HKCU (EXPLORERPLUS_TEST_REGISTRY), where the shell never looks.
+# Settings of its own.
+import winreg
+HKCU = winreg.HKEY_CURRENT_USER
+sandbox = r'Software\ExplorerPlusTest\smoke-%d' % os.getpid()
+def reg_delete_tree(path):
+    try:
+        with winreg.OpenKey(HKCU, path) as k:
+            subs = [winreg.EnumKey(k, i) for i in range(winreg.QueryInfoKey(k)[0])]
+        for s in subs:
+            reg_delete_tree(path + '\\' + s)
+        winreg.DeleteKey(HKCU, path)
+    except OSError:
+        pass
+def reg_sandbox_cleanup():
+    reg_delete_tree(sandbox)
+    try:
+        winreg.DeleteKey(HKCU, r'Software\ExplorerPlusTest')          # (when no other run's is in it)
+    except OSError:
+        pass
+atexit.register(reg_sandbox_cleanup)
+def reg_value(key, name=''):
+    try:
+        with winreg.OpenKey(HKCU, sandbox + '\\' + key) as k:
+            return winreg.QueryValueEx(k, name)[0]
+    except OSError:
+        return None
+def reg_contents(path=''):
+    """(keys, values) under the test key, relative to it."""
+    keys, values = [], []
+    try:
+        with winreg.OpenKey(HKCU, sandbox + ('\\' + path if path else '')) as k:
+            nk, nv, _ = winreg.QueryInfoKey(k)
+            values = [(path, winreg.EnumValue(k, i)[0]) for i in range(nv)]
+            subs = [winreg.EnumKey(k, i) for i in range(nk)]
+    except OSError:
+        return keys, values
+    for s in subs:
+        p = path + '\\' + s if path else s
+        keys.append(p)
+        sk, sv = reg_contents(p)
+        keys += sk
+        values += sv
+    return keys, values
+FOLDER_CMDS = [r'Software\Classes\%s\shell\%s\command' % (t, v) for t in ('Directory', 'Drive') for v in ('open', 'explore')]
+WIN_E = r'Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\OpenNewWindow\command'
+def same_exe(cmd, want):
+    return bool(cmd) and cmd.lower() == want.lower()
+ini_folders = ini + '.folders'
+if os.path.exists(ini_folders):
+    os.remove(ini_folders)
+reg_delete_tree(sandbox)
+def folders_app(*args):
+    os.environ['EXPLORERPLUS_TEST_REGISTRY'] = sandbox
+    try:
+        return App(exe, *args, settings=ini_folders)
+    finally:
+        del os.environ['EXPLORERPLUS_TEST_REGISTRY']
+app = folders_app(data)
+app.wait_idle(1.5)
+def folders_dialog():
+    return next((h for h in dialogs() if text(h) == 'Default file manager'), None)
+u.PostMessageW(app.hwnd, 0x0111, IDM['TOOLS_MENU'], 0)
+fly = app.flyout() if wait_for(lambda: app.flyout() is not None, 5) else None
+entries = app.flyout_entries(fly) if fly else []
+check('"..." offers Default file manager', 'Default file manager' in entries, entries)
+if fly:
+    u.PostMessageW(fly, 0x0102, ord('m'), 0)                         # "Default file &manager"
+dlg = folders_dialog() if wait_for(lambda: folders_dialog() is not None, 5) else None
+check('Default file manager asks before it changes anything', dlg and reg_contents()[1] == [], reg_contents())
+if dlg:
+    u.PostMessageW(dlg, 0x0111, 1, 0)                                 # OK
+cmd = '"%s" "%%1"' % exe
+wait_for(lambda: reg_value(r'Software\ExplorerPlus\Folders', 'Command'), 5)
+got = [reg_value(k) for k in FOLDER_CMDS]
+check('turned on: folders and drives open with Explorer Plus', all(same_exe(c, cmd) for c in got) and
+      all(reg_value(k, 'DelegateExecute') == '' for k in FOLDER_CMDS) and
+      reg_value(r'Software\Classes\Directory\shell') == 'open' and reg_value(r'Software\Classes\Drive\shell') == 'open', got)
+check('... Win+E too', same_exe(reg_value(WIN_E), '"%s"' % exe), reg_value(WIN_E))
+check('... Folder left alone (Control Panel, Recycle Bin stay File Explorer\'s), Explore not in menus',
+      not any(k.startswith(r'Software\Classes\Folder') for k in reg_contents()[0]) and
+      reg_value(r'Software\Classes\Directory\shell\explore', 'ProgrammaticAccessOnly') == '', reg_contents()[0])
+# the exe moved (a new version unzipped elsewhere): the next start points it all at itself
+gone = os.path.join(work, 'moved', 'explorer-plus.exe')
+for k in FOLDER_CMDS + [WIN_E, r'Software\ExplorerPlus\Folders']:
+    name = 'Command' if k.endswith('Folders') else ''
+    v = reg_value(k, name)
+    if v:
+        with winreg.OpenKey(HKCU, sandbox + '\\' + k, 0, winreg.KEY_SET_VALUE) as hk:
+            winreg.SetValueEx(hk, name, 0, winreg.REG_SZ, v.lower().replace(exe.lower(), gone))
+app2 = folders_app('--new-window', data)
+check('an exe moved since: the folders open with this one',
+      wait_for(lambda: all(same_exe(reg_value(k), cmd) for k in FOLDER_CMDS) and same_exe(reg_value(WIN_E), '"%s"' % exe), 8),
+      [reg_value(k) for k in FOLDER_CMDS + [WIN_E]])
+app2.close()
+# a folder opened (from Windows, or the command line) while the window is open: a tab there
+app.go(os.path.join(data, '.dotdir'))
+app.go(data)                                                         # (the tab's Back: .dotdir)
+before = set(winauto.windows_of_class('ExplorerPlusMainWnd'))
+started = subprocess.Popen([exe, os.path.join(data, 'sub')], env=dict(os.environ, EXPLORERPLUS_SETTINGS=ini_folders))
+check('a folder started while the window is open is a tab there, not another window',
+      wait_for(lambda: started.poll() is not None, 10) and started.returncode == 0 and
+      wait_for(lambda: app.title().startswith('sub'), 5) and set(winauto.windows_of_class('ExplorerPlusMainWnd')) == before,
+      (started.poll(), app.title()))
+started = subprocess.Popen([exe, data], env=dict(os.environ, EXPLORERPLUS_SETTINGS=ini_folders))
+check('... one already open: back to its tab', wait_for(lambda: started.poll() is not None, 10) and
+      wait_for(lambda: 'testdata' in app.title(), 5) and set(winauto.windows_of_class('ExplorerPlusMainWnd')) == before,
+      (started.poll(), app.title()))
+app.command(IDM['BACK'])
+check('... the same tab, its history with it', wait_for(lambda: app.title().startswith('.dotdir'), 3), app.title())
+u.PostMessageW(app.hwnd, 0x0111, R['IDM_DEFAULT_FOLDERS'], 0)                 # off: nothing asked
+wait_for(lambda: reg_value(r'Software\ExplorerPlus\Folders', 'Command') is None, 5)
+keys, values = reg_contents()
+check('turned off: nothing of it left', values == [] and set(keys) <= {'Software', r'Software\Classes'} and
+      folders_dialog() is None, (keys, values))
+app.close()
+check('exits cleanly after Default file manager', app.proc.returncode == 0, app.proc.returncode)
+reg_sandbox_cleanup()
+
 # the media player: Play / Queue in Explorer Plus in the compact menu, the player window and its
 # queue. Whether anything is heard isn't checked (a runner may have no audio device, or no
 # Media Foundation at all): the state is printed only. Settings of its own.

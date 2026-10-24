@@ -34,6 +34,9 @@ void   tabmodel_prepare(const std::wstring& openPath, bool restore);
 void   tabmodel_init();
 void   tabmodel_new_tab();                         // the active list's folder, one list
 void   tabmodel_open_in_new_tab(PIDLIST_ABSOLUTE abs);   // adopts; new active tab, Back = the folder left
+// another start's command-line path (a folder; a file: its folder, the file selected): the
+// tab already on it, else a new one, made active; false when it doesn't parse
+bool   tabmodel_open_path(const std::wstring& path);
 void   tabmodel_close_tab(int idx);                // -1 = active; closes window when last
 void   tabmodel_switch_to(int idx);
 void   tabmodel_show_active();                     // (again: views reset)

@@ -63,15 +63,15 @@ std::wstring open_command(Kind kind) {
 
 std::wstring progid(const std::wstring& ext) { return L"ExplorerPlus." + ext.substr(1); }
 
-bool reg_set(const std::wstring& key, const wchar_t* name, const std::wstring& value) {
-    return RegSetKeyValueW(HKEY_CURRENT_USER, key.c_str(), name, REG_SZ, value.c_str(),
+bool reg_set(const std::wstring& key, const wchar_t* name, const std::wstring& value, HKEY root = HKEY_CURRENT_USER) {
+    return RegSetKeyValueW(root, key.c_str(), name, REG_SZ, value.c_str(),
                            (DWORD)((value.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
 }
 
-std::wstring reg_get(const std::wstring& key, const wchar_t* name) {
+std::wstring reg_get(const std::wstring& key, const wchar_t* name, HKEY root = HKEY_CURRENT_USER) {
     WCHAR b[1024];
     DWORD n = sizeof(b);
-    if (RegGetValueW(HKEY_CURRENT_USER, key.c_str(), name, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND, nullptr, b, &n) != ERROR_SUCCESS)
+    if (RegGetValueW(root, key.c_str(), name, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND, nullptr, b, &n) != ERROR_SUCCESS)
         return {};
     return b;
 }
@@ -249,6 +249,119 @@ bool first_pick(const Row& r) {
     // (no app: nothing at all, or Windows' "Pick an app" - OpenWith.exe)
     return lstrcmpiW(app.c_str(), L"Notepad") == 0 || (app.empty() && exe.empty()) ||
            lstrcmpiW(PathFindFileNameW(exe.c_str()), L"OpenWith.exe") == 0;
+}
+
+// ------------------------------------------------------------------
+// folders: Explorer Plus in File Explorer's place (HKEY_CURRENT_USER only)
+// ------------------------------------------------------------------
+// Directory (a folder on disk) and Drive get an "open" and an "explore" verb of their own,
+// running explorer-plus.exe "%1", "open" their default; Win+E - and explorer.exe started with
+// nothing - the Explorer object's OpenNewWindow verb. Folder itself is left as it is: what
+// isn't a folder on disk (Control Panel, the Recycle Bin, This PC, libraries) opens in File
+// Explorer as before. Measured on Windows 11 23H2: these take the desktop, This PC, Win+E,
+// ShellExecute with or without a verb and SHOpenFolderAndSelectItems ("Show in folder": the
+// folder only, nothing selected in it); "explorer.exe <folder>" and "explorer.exe /select,"
+// stay File Explorer's whatever the registry says.
+const wchar_t* const kFolderTypes[] = { L"Directory", L"Drive" };
+const wchar_t* const kFolderVerbs[] = { L"open", L"explore" };
+const wchar_t kWinE[] = L"Software\\Classes\\CLSID\\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}";
+// what was there before (a default verb another app set: given back) and the command written
+const wchar_t kFoldersSaved[] = L"Software\\ExplorerPlus\\Folders";
+
+// HKEY_CURRENT_USER; the tests: a key of their own under it (EXPLORERPLUS_TEST_REGISTRY), where
+// the shell never looks. Null when that can't be made: nothing is written then.
+HKEY folders_root() {
+    static HKEY root = [] {
+        WCHAR sub[256];
+        DWORD n = GetEnvironmentVariableW(L"EXPLORERPLUS_TEST_REGISTRY", sub, ARRAYSIZE(sub));
+        if (!n) return HKEY_CURRENT_USER;
+        HKEY k = nullptr;
+        if (n >= ARRAYSIZE(sub) ||
+            RegCreateKeyExW(HKEY_CURRENT_USER, sub, 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &k, nullptr) != ERROR_SUCCESS)
+            return (HKEY) nullptr;
+        return k;
+    }();
+    return root;
+}
+
+std::wstring folder_shell(const wchar_t* type) { return std::wstring(L"Software\\Classes\\") + type + L"\\shell"; }
+std::wstring folder_command(const std::wstring& exe) { return L"\"" + exe + L"\" \"%1\""; }
+
+// a key we made, now holding nothing: removed (and so on up)
+void delete_if_empty(HKEY root, const std::wstring& key) {
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(root, key.c_str(), 0, KEY_READ, &k) != ERROR_SUCCESS) return;
+    DWORD subkeys = 1, values = 1;
+    RegQueryInfoKeyW(k, nullptr, nullptr, nullptr, &subkeys, nullptr, nullptr, &values, nullptr, nullptr, nullptr, nullptr);
+    RegCloseKey(k);
+    if (subkeys == 0 && values == 0) RegDeleteKeyW(root, key.c_str());
+}
+
+bool folders_on() {
+    HKEY r = folders_root();
+    if (!r) return false;
+    std::wstring cmd = reg_get(kFoldersSaved, L"Command", r);
+    return !cmd.empty() && reg_get(folder_shell(L"Directory") + L"\\open\\command", nullptr, r) == cmd;
+}
+
+// every key written, pointing at `exe`
+bool folders_write(HKEY r, const std::wstring& exe) {
+    std::wstring cmd = folder_command(exe);
+    bool ok = true;
+    for (const wchar_t* type : kFolderTypes) {
+        for (const wchar_t* verb : kFolderVerbs) {
+            std::wstring k = folder_shell(type) + L"\\" + verb;
+            ok = ok && reg_set(k + L"\\command", nullptr, cmd, r) &&
+                 reg_set(k + L"\\command", L"DelegateExecute", L"", r) &&     // (over Folder's, which runs File Explorer)
+                 reg_set(k, L"MultiSelectModel", L"Document", r);             // (several folders: a launch each, as Folder's)
+            if (ok && lstrcmpW(verb, L"explore") == 0) ok = reg_set(k, L"ProgrammaticAccessOnly", L"", r);   // (not in menus)
+        }
+        ok = ok && reg_set(folder_shell(type), nullptr, L"open", r);
+    }
+    std::wstring wine = std::wstring(kWinE) + L"\\shell\\OpenNewWindow\\command";
+    ok = ok && reg_set(wine, nullptr, L"\"" + exe + L"\"", r) && reg_set(wine, L"DelegateExecute", L"", r);
+    return ok && reg_set(kFoldersSaved, L"Command", cmd, r);
+}
+
+void folders_remove() {
+    HKEY r = folders_root();
+    if (!r) return;
+    for (const wchar_t* type : kFolderTypes) {
+        std::wstring shell = folder_shell(type);
+        for (const wchar_t* verb : kFolderVerbs) RegDeleteTreeW(r, (shell + L"\\" + verb).c_str());
+        std::wstring prev = reg_get(kFoldersSaved, type, r);
+        if (!prev.empty()) reg_set(shell, nullptr, prev, r);
+        else if (reg_get(shell, nullptr, r) == L"open") RegDeleteKeyValueW(r, shell.c_str(), nullptr);
+        delete_if_empty(r, shell);
+        delete_if_empty(r, std::wstring(L"Software\\Classes\\") + type);
+    }
+    RegDeleteTreeW(r, (std::wstring(kWinE) + L"\\shell\\OpenNewWindow").c_str());
+    delete_if_empty(r, std::wstring(kWinE) + L"\\shell");
+    delete_if_empty(r, kWinE);
+    delete_if_empty(r, L"Software\\Classes\\CLSID");
+    RegDeleteTreeW(r, kFoldersSaved);
+    delete_if_empty(r, kAppKey);
+    // (the test key: those keys gone, it is left empty for the test to remove)
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+}
+
+bool folders_add() {
+    HKEY r = folders_root();
+    if (!r) return false;
+    if (!folders_on()) {
+        // another app's verbs are replaced whole; a default verb it set is given back later
+        for (const wchar_t* type : kFolderTypes) {
+            for (const wchar_t* verb : kFolderVerbs) RegDeleteTreeW(r, (folder_shell(type) + L"\\" + verb).c_str());
+            std::wstring prev = reg_get(folder_shell(type), nullptr, r);
+            if (!prev.empty() && prev != L"open") reg_set(kFoldersSaved, type, prev, r);
+        }
+    }
+    if (!folders_write(r, exe_path())) {
+        folders_remove();
+        return false;
+    }
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+    return true;
 }
 
 // ------------------------------------------------------------------
@@ -664,10 +777,43 @@ void assoc_dialog(HWND owner) {
     if (quit) PostQuitMessage((int)m.wParam);
 }
 
+bool assoc_folders_on() { return folders_on(); }
+
+void assoc_folders_toggle(HWND owner) {
+    if (folders_on()) {
+        folders_remove();
+        return;
+    }
+    int answer = MessageBoxW(owner,
+        L"Folders you open anywhere in Windows - on the desktop, in This PC, with Win+E or \"Show in folder\" "
+        L"in another app - will open in Explorer Plus instead of File Explorer.\n\n"
+        L"Control Panel, the Recycle Bin and other places that aren't folders on disk still open in File "
+        L"Explorer, and File Explorer stays your taskbar and desktop.\n\n"
+        L"To go back, untick Default file manager in this menu - do that before you delete Explorer Plus, "
+        L"or Windows has nothing to open folders with.",
+        L"Default file manager", MB_OKCANCEL | MB_ICONINFORMATION);
+    if (answer != IDOK) return;
+    if (!folders_add())
+        MessageBoxW(owner, L"Windows didn't let Explorer Plus become the app that opens folders: nothing was changed.",
+                    L"Default file manager", MB_OK | MB_ICONWARNING);
+}
+
 void assoc_follow_exe() {
-    // (tests: never the user's registrations)
+    // (tests: never the user's registrations; the folders' in a test key of their own)
     WCHAR env[8];
-    if (GetEnvironmentVariableW(L"EXPLORERPLUS_SETTINGS", env, ARRAYSIZE(env))) return;
+    bool test = GetEnvironmentVariableW(L"EXPLORERPLUS_SETTINGS", env, ARRAYSIZE(env)) != 0;
+    if (test && !GetEnvironmentVariableW(L"EXPLORERPLUS_TEST_REGISTRY", env, ARRAYSIZE(env))) return;
+    // folders opened by an exe that is gone: by this one (as the types below)
+    if (folders_on()) {
+        HKEY r = folders_root();
+        std::wstring now = reg_get(kFoldersSaved, L"Command", r), self = exe_path();
+        size_t close = now.size() >= 2 && now[0] == L'"' ? now.find(L'"', 1) : std::wstring::npos;
+        std::wstring exe = close == std::wstring::npos ? std::wstring() : now.substr(1, close - 1);
+        if (!exe.empty() && lstrcmpiW(exe.c_str(), self.c_str()) != 0 && GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES &&
+            folders_write(r, self))
+            SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+    }
+    if (test) return;
     HKEY k = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, (std::wstring(kCaps) + L"\\FileAssociations").c_str(), 0, KEY_READ, &k) != ERROR_SUCCESS)
         return;
