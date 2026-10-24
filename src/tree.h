@@ -10,6 +10,7 @@ void tree_sync_to_current();           // expand & select current folder in tree
 void tree_sync_to_current_deferred();  // async (posted) version for hot paths
 void tree_prefetch(PCIDLIST_ABSOLUTE folder);   // startup: list the folder's ancestors before the window exists
 void tree_refresh_all();               // rebuild (hidden items, pins changed); re-syncs to current
+void tree_refresh_shown();             // F5: the current folder's node and the open local ones re-listed
 void tree_reread_pins();                    // Quick access pins changed (pin / unpin)
 void tree_refresh_node(PCIDLIST_ABSOLUTE folder);   // re-list one node's children if shown
 void tree_rename_selected();           // F2 in the navigation pane

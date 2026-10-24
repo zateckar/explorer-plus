@@ -32,6 +32,7 @@ struct NodeData {
     bool listFailed = false;       // the last listing failed: syncs don't retry it (expanding does)
     bool refreshing = false;       // a worker is re-listing the children
     bool refreshAgain = false;     // another refresh was asked for meanwhile
+    ULONGLONG listedAt = 0;        // tick of the last listing that came in
     bool pinned = false;           // Quick access pin (glyph on the right)
     NodeKind kind = NodeKind::Folder;
     ULONGLONG id = 0;              // its parsing name's hash, once asked (node_id)
@@ -397,6 +398,7 @@ static void expand_apply(void* payload) {
     } else {
         d->listed = true;
         d->listFailed = false;
+        d->listedAt = GetTickCount64();
         TreeNoRedraw nr(g_tree);
         insert_children(g_tree, job->item, job->kids);
         if (!job->kids.empty()) TreeView_Expand(g_tree, job->item, TVE_EXPAND);
@@ -559,6 +561,7 @@ static int use_prefetch(HWND tree, HTREEITEM h, NodeData* d) {
         s_prefetch.erase(it);
     }
     d->listed = true;
+    d->listedAt = GetTickCount64();
     insert_children(tree, h, kids);                 // (takes the pidls)
     return 1;
 }
@@ -962,6 +965,13 @@ void tree_sync_to_current() {
     clear_prefetch();
     if (perf_on()) perf_event("tree.synced", -1, h ? 1 : 0);
     if (h) {
+        // its children listed a while ago: subfolders made since, while another folder was
+        // shown, weren't watched for — read again on a worker, once per visit
+        NodeData* d = node_data(g_tree, h);
+        if (d && d->listed && !remote && GetTickCount64() - d->listedAt > 2000 && !s_relisted.count(d->serial)) {
+            s_relisted.insert(d->serial);
+            start_refresh(h, d);
+        }
         TreeView_SelectItem(g_tree, h);     // programmatic: TVN_SELCHANGED ignores it
         if (!keep_restored_top(target)) TreeView_EnsureVisible(g_tree, h);
     } else {
@@ -977,6 +987,24 @@ void tree_refresh_all() {
     TreeView_DeleteAllItems(g_tree);          // TVN_DELETEITEM frees every node's data
     initialize_tree(g_tree);
     tree_sync_to_current();
+}
+
+// the open folders on local disks, read again (diffed in place: what is expanded stays)
+static void refresh_open_below(HTREEITEM first) {
+    for (HTREEITEM h = first; h; h = TreeView_GetNextSibling(g_tree, h)) {
+        bool open = false;
+        NodeData* d = node_and_state(h, &open);
+        if (!d || d->kind != NodeKind::Folder || !d->listed || !open) continue;
+        std::wstring path = pidl_folder_path(d->abs);
+        if (!d->refreshing && !path.empty() && !path_is_network(path)) start_refresh(h, d);
+        refresh_open_below(TreeView_GetChild(g_tree, h));
+    }
+}
+
+void tree_refresh_shown() {
+    if (!g_tree) return;
+    tree_refresh_node(active_pane()->current);      // (wherever it is, open or not)
+    refresh_open_below(TreeView_GetRoot(g_tree));
 }
 
 void tree_reread_pins() { if (g_tree) read_pins(); }
@@ -1227,6 +1255,7 @@ static void refresh_apply(void* payload) {
         for (auto& [key, c] : existing) TreeView_DeleteItem(g_tree, c);   // TVN_DELETEITEM frees
         set_has_children(h, !job->kids.empty());
         job->kids.clear();
+        d->listedAt = GetTickCount64();
     } else {
         free_infos(job->kids);      // couldn't be read now: keep what is shown
     }

@@ -50,6 +50,7 @@ static HBRUSH s_searchBrush = nullptr;
 static COLORREF s_searchBrushColor = CLR_INVALID;
 static DragKind s_dragKind = DragKind::None;
 static bool s_mainOpen = false;             // the main window is there (not: closed, or --play)
+static HANDLE s_tabsOwner = nullptr;        // held while this window owns the saved tab set
 
 void exit_app() { DestroyWindow(g_main); }
 
@@ -415,6 +416,7 @@ static void on_command(WORD id) {
         case IDM_VIEW_REFRESH:
             foldersizes_forget_shown();         // a refresh asked for: sizes too, not the ones kept
             navigation_refresh();
+            tree_refresh_shown();               // (the navigation pane too)
             break;
 
         case IDM_VIEW_DETAILS: set_view_mode({ LV_VIEW_DETAILS, 0, g_pane->view.groupBy }, true); break;
@@ -844,7 +846,7 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             switch (GET_APPCOMMAND_LPARAM(lp)) {
                 case APPCOMMAND_BROWSER_BACKWARD: navigation_go_back(); return TRUE;
                 case APPCOMMAND_BROWSER_FORWARD:  navigation_go_forward(); return TRUE;
-                case APPCOMMAND_BROWSER_REFRESH:  navigation_refresh(); return TRUE;
+                case APPCOMMAND_BROWSER_REFRESH:  on_command(IDM_NAV_REFRESH); return TRUE;
             }
             if (player_app_command(GET_APPCOMMAND_LPARAM(lp))) return TRUE;   // media keys: the player's
             break;
@@ -902,6 +904,9 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             workers_shutdown();             // no new background work, results dropped
             RemoveClipboardFormatListener(hwnd);
             save_window_state(hwnd);
+            // the tabs are saved: the next window started gets them, though an editor or the
+            // player still open keeps this process (it opened as an extra window without them)
+            if (s_tabsOwner) { CloseHandle(s_tabsOwner); s_tabsOwner = nullptr; }
             // gone from the screen now (saved first: the placement says whether it is
             // maximized): destroying the children takes a while with a big navigation pane,
             // the tree control spends ~50 us on each node it deletes
@@ -1030,8 +1035,13 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         for (wchar_t c : ini) { h ^= (uint32_t)c; h *= 16777619u; }
         WCHAR name[64];
         swprintf(name, ARRAYSIZE(name), L"Local\\ExplorerPlus.Tabs.%08x", h);
-        HANDLE owner = CreateMutexW(nullptr, FALSE, name);       // (held for the process' life)
-        if (owner && GetLastError() == ERROR_ALREADY_EXISTS) newWindow = true;
+        HANDLE owner = CreateMutexW(nullptr, FALSE, name);       // (held while the window is open)
+        if (owner && GetLastError() == ERROR_ALREADY_EXISTS) {
+            newWindow = true;
+            CloseHandle(owner);
+        } else {
+            s_tabsOwner = owner;
+        }
     }
     // restored tabs (+ command-line folder): their folders parsed on a thread while the window
     // and its controls are made (WM_CREATE makes the tabs)
