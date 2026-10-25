@@ -1347,27 +1347,30 @@ static void delete_node(HTREEITEM h, bool permanent) {
     PIDLIST_ABSOLUTE abs = pidl_clone(d->abs);
     PIDLIST_ABSOLUTE parentAbs = pidl_clone(d->abs);
     ILRemoveLastID(parentAbs);
-    bool current = holds_current(abs);
     PIDLIST_ABSOLUTE next = nullptr;
     if (HTREEITEM n = neighbor_folder(h)) next = tree_get_pidl_of_item(n);
     if (!next) next = pidl_clone(parentAbs);
 
     PITEMID_CHILD own = pidl_clone_child(child);           // (the node may be gone after the delete)
-    fileops_delete_items(g_main, parent.get(), { own }, permanent, false);
+    // (runs on a thread of its own: the rest once it is over)
+    fileops_delete_items(g_main, parent.get(), { own }, permanent, [abs, parentAbs, next]() mutable {
+        PaneScope ps(active_pane());
+        bool current = holds_current(abs);
+        bool gone = !pidl_exists(abs);
+        if (perf_on()) perf_event("tree.delete", -1, (current ? 1 : 0) + (gone ? 2 : 0), pidl_folder_path(next).c_str());
+        // (cancelled at the confirmation, or failed: the folder is still there)
+        if (gone && current) {
+            navigate_in_place(next);                     // Back must not lead to the deleted folder
+            next = nullptr;
+        } else {
+            navigation_refresh();
+        }
+        if (next) CoTaskMemFree(next);
+        tree_refresh_node(parentAbs);                    // the node goes; the selection follows the current folder
+        CoTaskMemFree(parentAbs);
+        CoTaskMemFree(abs);
+    });
     CoTaskMemFree(own);
-    bool gone = !pidl_exists(abs);
-    if (perf_on()) perf_event("tree.delete", -1, (current ? 1 : 0) + (gone ? 2 : 0), pidl_folder_path(next).c_str());
-    // (cancelled at the confirmation, or failed: the folder is still there)
-    if (gone && current) {
-        navigate_in_place(next);                     // Back must not lead to the deleted folder
-        next = nullptr;
-    } else {
-        navigation_refresh();
-    }
-    if (next) CoTaskMemFree(next);
-    tree_refresh_node(parentAbs);                    // the node goes; the selection follows the current folder
-    CoTaskMemFree(parentAbs);
-    CoTaskMemFree(abs);
 }
 
 void tree_delete_selected(bool permanent) {

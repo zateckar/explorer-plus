@@ -549,6 +549,10 @@ static void show_cm(HWND hwnd, POINT pt, IShellFolder* parent, PCIDLIST_ABSOLUTE
             PIDLIST_ABSOLUTE f = full();
             tabmodel_new_tab();
             navigate_owned(f);
+        } else if (verb == L"paste" && folder) {
+            PIDLIST_ABSOLUTE f = full();                   // (the shell's paste copies on this thread)
+            fileops_paste_into(f);
+            CoTaskMemFree(f);
         } else if (verb == L"rename") {
             if (src == MenuSource::List) list_rename_selected();
             else tree_rename_menu_node();

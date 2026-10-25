@@ -146,6 +146,7 @@ enum : UINT {
     WM_TREE_SYNC,                   // expand/select current folder in tree (deferred)
     WM_SELECTION_CHANGED,           // coalesced LVN_ITEMCHANGED (status bar + details pane); wp = pane index
     WM_RUN_LATER,                   // wp = AsyncHandler, lp = its payload (post_later)
+    WM_FILEOPS_ENDED,               // to the UI thread (no window): the last paste / delete ended
 };
 
 // timers on g_main (the per-pane ones: pane_timer)

@@ -1,5 +1,6 @@
 #pragma once
 #include "appstate.h"
+#include <functional>
 
 // clipboard
 bool clipboard_has_files();
@@ -13,9 +14,19 @@ void fileops_set_cut_items(const std::vector<PCITEMID_CHILD>& children);   // em
 bool fileops_is_cut(PCITEMID_CHILD child);    // ghost this row (cut, not yet pasted)
 
 // FileOperations via IFileOperation
-// (synchronous; refresh = list the current folder again afterwards)
-void fileops_delete_items(HWND hwnd, IShellFolder* parent,
-                          const std::vector<PCITEMID_CHILD>& children, bool permanent, bool refresh = true);
+// Paste and delete run on a thread of their own (the window takes input meanwhile); rename
+// and New folder are synchronous.
+// done: on the UI thread once the delete is over (none: the panes showing the folder are
+// listed again); not when the window has closed meanwhile
+void fileops_delete_items(HWND hwnd, IShellFolder* parent, const std::vector<PCITEMID_CHILD>& children,
+                          bool permanent, std::function<void()> done = nullptr);
+// a paste, delete or asynchronous drop still running (a closed window's process waits for
+// it); the last one to end posts WM_FILEOPS_ENDED to the UI thread
+bool fileops_running();
+// (UI thread) one more running elsewhere: a drop target copying our dragged items on a
+// thread of its own
+void fileops_op_begin();
+void fileops_op_end();
 // exactFileName: newName is the complete file name, even where Windows hides extensions;
 // true when the item was renamed (not cancelled, not failed)
 bool fileops_rename_item(HWND hwnd, IShellFolder* parent, PCITEMID_CHILD child,

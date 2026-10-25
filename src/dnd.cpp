@@ -2,6 +2,7 @@
 #include "listview.h"
 #include "tree.h"
 #include "detailspane.h"
+#include "fileops.h"
 
 // ---------------------------------------------------------------
 // IDropSource
@@ -29,6 +30,71 @@ public:
         return S_OK;
     }
     IFACEMETHODIMP GiveFeedback(DWORD) override { return DRAGDROP_S_USEDEFAULTCURSORS; }
+};
+
+// ---------------------------------------------------------------
+// The dragged items' data object, able to go asynchronous: a drop target that asks (the
+// shell's folders, in this window or in Explorer) copies on a thread of its own instead of
+// inside the drop, where this window took no input until the copy was done. The shell's own
+// data object takes SetAsyncMode but keeps answering no; this one says yes, and hands the
+// rest to it. A copy it runs keeps the process until it ends (the window may close first).
+
+class AsyncDataObject final : public IDataObject, public IDataObjectAsyncCapability {
+    LONG m_ref = 1;
+    com_ptr<IDataObject> m_inner;
+    BOOL m_async = TRUE;
+    bool m_inOp = false;
+
+public:
+    explicit AsyncDataObject(IDataObject* inner) { inner->AddRef(); m_inner.attach(inner); }
+    ~AsyncDataObject() { if (m_inOp) fileops_op_end(); }    // (a target that never said it ended)
+
+    IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IDataObject) *ppv = static_cast<IDataObject*>(this);
+        else if (riid == IID_IDataObjectAsyncCapability) *ppv = static_cast<IDataObjectAsyncCapability*>(this);
+        else { *ppv = nullptr; return E_NOINTERFACE; }
+        AddRef();
+        return S_OK;
+    }
+    IFACEMETHODIMP_(ULONG) AddRef() override { return (ULONG)InterlockedIncrement(&m_ref); }
+    IFACEMETHODIMP_(ULONG) Release() override {
+        LONG r = InterlockedDecrement(&m_ref);
+        if (!r) delete this;
+        return (ULONG)r;
+    }
+
+    // IDataObject: the shell's
+    IFACEMETHODIMP GetData(FORMATETC* fe, STGMEDIUM* sm) override { return m_inner->GetData(fe, sm); }
+    IFACEMETHODIMP GetDataHere(FORMATETC* fe, STGMEDIUM* sm) override { return m_inner->GetDataHere(fe, sm); }
+    IFACEMETHODIMP QueryGetData(FORMATETC* fe) override { return m_inner->QueryGetData(fe); }
+    IFACEMETHODIMP GetCanonicalFormatEtc(FORMATETC* in, FORMATETC* out) override { return m_inner->GetCanonicalFormatEtc(in, out); }
+    IFACEMETHODIMP SetData(FORMATETC* fe, STGMEDIUM* sm, BOOL release) override { return m_inner->SetData(fe, sm, release); }
+    IFACEMETHODIMP EnumFormatEtc(DWORD dir, IEnumFORMATETC** out) override { return m_inner->EnumFormatEtc(dir, out); }
+    IFACEMETHODIMP DAdvise(FORMATETC* fe, DWORD f, IAdviseSink* sink, DWORD* conn) override { return m_inner->DAdvise(fe, f, sink, conn); }
+    IFACEMETHODIMP DUnadvise(DWORD conn) override { return m_inner->DUnadvise(conn); }
+    IFACEMETHODIMP EnumDAdvise(IEnumSTATDATA** out) override { return m_inner->EnumDAdvise(out); }
+
+    // IDataObjectAsyncCapability
+    IFACEMETHODIMP SetAsyncMode(BOOL async) override { m_async = async; return S_OK; }
+    IFACEMETHODIMP GetAsyncMode(BOOL* async) override {
+        if (!async) return E_POINTER;
+        *async = m_async;
+        return S_OK;
+    }
+    IFACEMETHODIMP StartOperation(IBindCtx*) override {
+        if (!m_inOp) { m_inOp = true; fileops_op_begin(); }
+        return S_OK;
+    }
+    IFACEMETHODIMP InOperation(BOOL* in) override {
+        if (!in) return E_POINTER;
+        *in = m_inOp;
+        return S_OK;
+    }
+    IFACEMETHODIMP EndOperation(HRESULT, IBindCtx*, DWORD) override {
+        if (m_inOp) { m_inOp = false; fileops_op_end(); }
+        return S_OK;
+    }
 };
 
 // ---------------------------------------------------------------
@@ -238,11 +304,13 @@ void dnd_begin_list_drag() {
     if (sel.empty()) return;
     com_ptr<IShellFolder> psf;
     if (FAILED(bind_list(g_pane->current, IID_PPV_ARGS(psf.put()))) || !psf) return;
-    com_ptr<IDataObject> pdo;
-    if (FAILED(dataobject_from_children(g_main, psf.get(), sel, pdo.put())) || !pdo) return;
+    com_ptr<IDataObject> shellData;
+    if (FAILED(dataobject_from_children(g_main, psf.get(), sel, shellData.put())) || !shellData) return;
+    auto* pdo = new AsyncDataObject(shellData.get());     // (the drop may copy on a thread of its own)
     DWORD effect = 0;
     DropSource* src = new DropSource;
     detailspane_release_files();        // the drop may move the previewed file elsewhere
-    SHDoDragDrop(g_main, pdo.get(), src, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK, &effect);
+    SHDoDragDrop(g_main, pdo, src, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK, &effect);
     src->Release();
+    pdo->Release();
 }

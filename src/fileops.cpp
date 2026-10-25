@@ -4,7 +4,10 @@
 #include "detailspane.h"
 #include "watcher.h"
 #include "perf.h"
+#include "searchbox.h"
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <unordered_set>
 
 // the watcher waits while an operation runs (they pump messages); deletes and renames
@@ -15,6 +18,60 @@ struct WatchHold {
     WatchHold(const WatchHold&) = delete;
     WatchHold& operator=(const WatchHold&) = delete;
 };
+
+// ---------------------------------------------------------------
+// operations on a thread of their own
+//
+// A paste or a delete lasts as long as the files take. Run on the UI thread, the shell's
+// copy engine waited there with the progress window up: it answers sent messages only, so
+// the main window took no input (clicks, keys, navigation) until the copy was done. Each now
+// runs on a thread of its own (OLE: the clipboard, drop targets), still owned by the main
+// window so its questions come up over it, and what follows is done back on the UI thread.
+// A window closed meanwhile leaves the process running until the last one ends.
+
+static std::atomic<int> s_running{ 0 };
+static DWORD s_uiThread = 0;
+
+bool fileops_running() { return s_running > 0; }
+
+void fileops_op_begin() {
+    s_uiThread = GetCurrentThreadId();
+    ++s_running;
+}
+
+void fileops_op_end() {
+    // the last one: a process whose window closed meanwhile may end now
+    if (--s_running == 0) PostThreadMessageW(s_uiThread, WM_FILEOPS_ENDED, 0, 0);
+}
+
+struct UiTask { std::function<void()> fn; };
+static void run_ui_task(void* p) {
+    std::unique_ptr<UiTask> t(static_cast<UiTask*>(p));
+    t->fn();
+}
+// (dropped when the window has closed meanwhile)
+static void on_ui(std::function<void()> fn) { post_async(run_ui_task, new UiTask{ std::move(fn) }); }
+
+static void run_detached(std::function<void()> work) {
+    fileops_op_begin();
+    auto body = [work = std::move(work)] {
+        {
+            OleInit ole;
+            if (ole.ok()) work();
+        }
+        fileops_op_end();
+    };
+    try {
+        std::thread(body).detach();
+    } catch (...) {
+        body();             // (no thread: here, as before)
+    }
+}
+
+// the panes that show `folder` list it again
+static void refresh_panes_showing(PCIDLIST_ABSOLUTE folder) {
+    for_each_pane([folder] { if (pidl_equal(folder, g_pane->current)) navigation_refresh(); }, true);
+}
 
 // ---------------------------------------------------------------
 // clipboard helpers
@@ -117,12 +174,11 @@ bool fileops_is_cut(PCITEMID_CHILD child) {
 // Drop `pdo` onto a folder through the folder's own drop target — the same path
 // Explorer uses for paste, so collisions, "- Copy" naming, archives, undo and
 // cross-volume rules behave identically. False when the folder refused it.
-static bool drop_into_folder(PCIDLIST_ABSOLUTE folder, IDataObject* pdo, DWORD effect) {
-    detailspane_release_files();        // a moved file may be the one previewed
+static bool drop_into_folder(HWND owner, PCIDLIST_ABSOLUTE folder, IDataObject* pdo, DWORD effect) {
     com_ptr<IShellFolder> psf;
     if (FAILED(bind_list(folder, IID_PPV_ARGS(psf.put()))) || !psf) return false;
     com_ptr<IDropTarget> dt;
-    if (FAILED(psf->CreateViewObject(g_main, IID_PPV_ARGS(dt.put()))) || !dt) return false;
+    if (FAILED(psf->CreateViewObject(owner, IID_PPV_ARGS(dt.put()))) || !dt) return false;
     POINTL pt{ 0, 0 };
     DWORD eff = effect;
     if (FAILED(dt->DragEnter(pdo, MK_LBUTTON, pt, &eff)) || !(eff & effect)) {
@@ -160,24 +216,30 @@ static bool cut_files_still_there(IDataObject* pdo) {
 void fileops_paste_into_current() { fileops_paste_into(g_pane->current); }
 
 void fileops_paste_into(PCIDLIST_ABSOLUTE target) {
-    com_ptr<IDataObject> pdo;
-    if (FAILED(OleGetClipboard(pdo.put())) || !pdo || !target) return;
-    // its own copy: the drop can pump messages (a conflict dialog), and a navigation meanwhile
-    // frees the pane's folder that `target` may be
+    if (!target) return;
+    // its own copy: a navigation meanwhile frees the pane's folder that `target` may be
     PIDLIST_ABSOLUTE folder = pidl_clone(target);
     if (!folder) return;
-    bool move = clipboard_prefers_move(pdo.get());
-    if (!drop_into_folder(folder, pdo.get(), move ? DROPEFFECT_MOVE : DROPEFFECT_COPY)) {
-        MessageBeep(MB_ICONASTERISK);
-        CoTaskMemFree(folder);
-        return;
-    }
-    if (move && !cut_files_still_there(pdo.get())) {
-        OleSetClipboard(nullptr);    // a cut is consumed by the paste
-        s_cutSigs.clear();
-    }
-    for_each_pane([folder] { if (pidl_equal(folder, g_pane->current)) navigation_refresh(); }, true);
-    CoTaskMemFree(folder);
+    detailspane_release_files();        // a moved file may be the one previewed
+    HWND owner = g_main;
+    DWORD seq = GetClipboardSequenceNumber();
+    run_detached([owner, folder, seq] {
+        com_ptr<IDataObject> pdo;
+        if (FAILED(OleGetClipboard(pdo.put())) || !pdo) { CoTaskMemFree(folder); return; }
+        bool move = clipboard_prefers_move(pdo.get());
+        bool dropped = drop_into_folder(owner, folder, pdo.get(), move ? DROPEFFECT_MOVE : DROPEFFECT_COPY);
+        if (!dropped) MessageBeep(MB_ICONASTERISK);
+        bool consumed = dropped && move && !cut_files_still_there(pdo.get());
+        on_ui([folder, seq, consumed] {
+            // a cut is consumed by the paste (unless something else was put on the clipboard meanwhile)
+            if (consumed && GetClipboardSequenceNumber() == seq) {
+                OleSetClipboard(nullptr);
+                s_cutSigs.clear();
+            }
+            refresh_panes_showing(folder);
+            CoTaskMemFree(folder);
+        });
+    });
 }
 
 bool fileops_set_clipboard(IShellFolder* parent, const std::vector<PCITEMID_CHILD>& children, bool cut) {
@@ -207,13 +269,21 @@ bool fileops_set_clipboard(IShellFolder* parent, const std::vector<PCITEMID_CHIL
     return onClipboard;
 }
 
-void fileops_delete_items(HWND hwnd, IShellFolder* parent,
-                          const std::vector<PCITEMID_CHILD>& children, bool permanent, bool refresh) {
+void fileops_delete_items(HWND hwnd, IShellFolder* parent, const std::vector<PCITEMID_CHILD>& children,
+                          bool permanent, std::function<void()> done) {
     if (!parent || children.empty()) return;
-    detailspane_release_files();        // the preview handler may hold the file open
-    com_ptr<IFileOperation> fo;
-    if (FAILED(CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL,
-                                IID_PPV_ARGS(fo.put()))) || !fo) return;
+    // the items as absolute pidls, for the operation's thread (found by a search: where they are)
+    PIDLIST_ABSOLUTE folder = nullptr;
+    if (FAILED(SHGetIDListFromObject(parent, &folder)) || !folder) return;
+    bool results = search_is_results(folder);
+    std::vector<PIDLIST_ABSOLUTE> items;
+    for (PCITEMID_CHILD c : children) {
+        PIDLIST_ABSOLUTE f = ILCombine(folder, c);
+        if (f && results)
+            if (PIDLIST_ABSOLUTE real = search_real_location(f)) { CoTaskMemFree(f); f = real; }
+        if (f) items.push_back(f);
+    }
+    if (items.empty()) { CoTaskMemFree(folder); return; }
     // permanent delete always asks "Are you sure...?"; recycling asks only when the
     // Recycle Bin's "Display delete confirmation dialog" setting is on (as Explorer) —
     // but an item that can't be recycled (network, too big) still asks before it is
@@ -225,17 +295,28 @@ void fileops_delete_items(HWND hwnd, IShellFolder* parent,
         SHGetSetSettings(&ss, SSF_NOCONFIRMRECYCLE, FALSE);
         if (ss.fNoConfirmRecycle) flags |= FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING;
     }
-    fo->SetOperationFlags(flags);
-    fo->SetOwnerWindow(hwnd);
-    com_ptr<IShellItemArray> arr;
-    if (FAILED(SHCreateShellItemArray(nullptr, parent, (UINT)children.size(),
-                                      (PCUITEMID_CHILD_ARRAY)children.data(), arr.put())) || !arr)
-        return;
-    if (SUCCEEDED(fo->DeleteItems(arr.get()))) {
-        WatchHold hold(true);
-        fo->PerformOperations();
-    }
-    if (refresh) navigation_refresh();
+    detailspane_release_files();        // the preview handler may hold the file open
+    watcher_hold_begin(true);
+    run_detached([hwnd, flags, items, folder, done] {
+        com_ptr<IFileOperation> fo;
+        com_ptr<IShellItemArray> arr;
+        if (SUCCEEDED(CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL, IID_PPV_ARGS(fo.put()))) && fo &&
+            SUCCEEDED(SHCreateShellItemArrayFromIDLists((UINT)items.size(),
+                                                        (PCIDLIST_ABSOLUTE_ARRAY)items.data(), arr.put())) && arr) {
+            fo->SetOperationFlags(flags);
+            fo->SetOwnerWindow(hwnd);
+            if (SUCCEEDED(fo->DeleteItems(arr.get()))) fo->PerformOperations();
+        }
+        arr.reset();
+        fo.reset();
+        on_ui([items, folder, done] {
+            watcher_hold_end();
+            if (done) done();
+            else refresh_panes_showing(folder);
+            for (PIDLIST_ABSOLUTE f : items) CoTaskMemFree(f);
+            CoTaskMemFree(folder);
+        });
+    });
 }
 
 bool fileops_rename_item(HWND hwnd, IShellFolder* parent, PCITEMID_CHILD child,

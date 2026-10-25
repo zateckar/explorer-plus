@@ -90,7 +90,9 @@ static bool open_in_tabs_window(const std::wstring& path, uint32_t key) {
 void exit_app() { DestroyWindow(g_main); }
 
 void app_window_closed() {
-    if (!s_mainOpen && !player_window() && !imageedit_any() && !notepad_window()) PostQuitMessage(0);
+    // (a copy or delete still running ends first: WM_FILEOPS_ENDED asks again)
+    if (!s_mainOpen && !player_window() && !imageedit_any() && !notepad_window() && !fileops_running())
+        PostQuitMessage(0);
 }
 
 // the windows that keep their keys (no main window shortcuts for them): the player, the
@@ -1196,6 +1198,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     HACCEL acc = s_accel;
     MSG m{};
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
+        if (!m.hwnd && m.message == WM_FILEOPS_ENDED) { app_window_closed(); continue; }
         bool key = m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN;
         if (tool_window_message(m)) continue;  // the player's, an editor's: their keys, not the main window's
         if (key && preview_translate_accelerator(&m)) continue;     // (an in-process handler's keys)
