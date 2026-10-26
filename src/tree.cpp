@@ -1431,7 +1431,8 @@ static LRESULT custom_draw(NMTVCUSTOMDRAW* cd) {
             }
             // the sync folder's badge on its icon (left of the name, as the list has it)
             RECT text{};
-            *(HTREEITEM*)&text = (HTREEITEM)cd->nmcd.dwItemSpec;
+            HTREEITEM item = (HTREEITEM)cd->nmcd.dwItemSpec;     // (TVM_GETITEMRECT's in-parameter)
+            memcpy(&text, &item, sizeof item);
             if (int st = sync_root_state_of(d); st && SendMessageW(g_tree, TVM_GETITEMRECT, TRUE, (LPARAM)&text)) {
                 int cx = 16, cy = 16;
                 ImageList_GetIconSize(TreeView_GetImageList(g_tree, TVSIL_NORMAL), &cx, &cy);
