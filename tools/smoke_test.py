@@ -1276,6 +1276,27 @@ def media_entry(name, entry):
 PLAY, QUEUE = 'Play in Explorer Plus', 'Queue in Explorer Plus'   # (never a media app's own "Play")
 entries = media_entry('notes.txt', None)
 check('no Play for a file that isn\'t media', entries and PLAY not in entries, entries)
+# Edit in Explorer Plus on any file; one that isn't text (a silent WAV: zeros): the Notepad comes
+# up and says so (its box was once owned by the window still cloaked: both unseen, the app stuck)
+def shown(pred):
+    for h in winauto.top_windows(app.proc.pid):
+        v = ctypes.c_uint(0)
+        ctypes.windll.dwmapi.DwmGetWindowAttribute(h, 14, ctypes.byref(v), 4)     # DWMWA_CLOAKED
+        if pred(h) and u.IsWindowVisible(h) and not v.value:
+            return h
+notepad_wnd = lambda: shown(lambda h: 'Notepad' in cls(h))
+msg_box = lambda: shown(lambda h: cls(h) == '#32770')
+entries = media_entry('one.wav', 'Edit in Explorer Plus')
+check('Edit in Explorer Plus on a file that isn\'t text: the Notepad and its box are on screen',
+      'Edit in Explorer Plus' in entries and wait_for(lambda: notepad_wnd() and msg_box(), 5), (entries, notepad_wnd(), msg_box()))
+box = msg_box()
+ok = next((c for c in children(box) if text(c) == 'OK'), None) if box else None
+if ok:
+    u.PostMessageW(ok, 0x00F5, 0, 0)                                       # BM_CLICK
+if notepad_wnd():
+    wait_for(lambda: msg_box() is None, 3)
+    u.PostMessageW(notepad_wnd(), 0x0010, 0, 0)                            # WM_CLOSE
+check('...and both close', wait_for(lambda: notepad_wnd() is None and msg_box() is None, 5), (notepad_wnd(), msg_box()))
 entries = media_entry('one.wav', PLAY)
 check('the compact menu of a sound file offers Play / Queue in Explorer Plus',
       PLAY in entries and QUEUE in entries, entries)

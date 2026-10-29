@@ -38,6 +38,7 @@ const UINT WM_NOTEPAD_UNREAD = WM_APP + 73; // kept texts that couldn't be read:
 const UINT_PTR TIMER_UNREAD = 3;            // ... and tried again every so often
 const UINT WM_NOTEPAD_DROP = WM_APP + 74;   // a restored tab whose text couldn't be read: closed (lParam: its id;
                                             // wParam: say so)
+const UINT WM_NOTEPAD_FAILED = WM_APP + 75; // the files the window opened with that couldn't be: said, once it is up
 const UINT kUnreadRetryMs = 3000;
 const size_t kHead = 1 << 18;               // a big text: this many characters go in at once,
 const size_t kPiece = 1 << 16;              // then this many at a time (some 4 ms each)
@@ -119,6 +120,9 @@ struct Notepad {
     // tabs whose kept unsaved text couldn't be read when they came back (another program had it
     // open): not traded for the file as saved; kept in the session as they were, and tried again
     std::vector<NoteTabState> unread;
+    // files asked for that couldn't be opened (too big, not text): said in one box by the one
+    // who asked (report_failed), once the window is on screen
+    std::wstring failed;
     bool wrap = true, statusBar = true, lineNumbers = true, whitespace = false;
     // the line numbers, left of the text: their own window, in the text's font at its zoom
     HWND gutter = nullptr;
@@ -1282,22 +1286,28 @@ bool close_tab(Notepad& n, int i) {
 // ------------------------------------------------------------------
 bool same_file(const std::wstring& a, const std::wstring& b) { return !a.empty() && lstrcmpiW(a.c_str(), b.c_str()) == 0; }
 
+// what open_path couldn't open, all in one box (call with the window on screen)
+void report_failed(Notepad& n) {
+    if (n.failed.empty()) return;
+    std::wstring msg;
+    msg.swap(n.failed);                     // (taken first: the box's loop may open more)
+    MessageBoxW(n.wnd, msg.c_str(), L"Notepad", MB_OK | MB_ICONINFORMATION);
+}
+
 bool open_path(Notepad& n, const std::wstring& path) {
     for (int i = 0; i < (int)n.tabs.size(); ++i)
         if (same_file(n.tabs[i]->path, path)) { activate(n, i); return true; }
+    // (not said here: the window may still be cloaked, and a box it owns with it - an invisible
+    // modal loop, the Notepad stuck. The caller says it: report_failed)
+    auto fail = [&](const wchar_t* why) {
+        n.failed += (n.failed.empty() ? L"" : L"\n\n") + std::wstring(why) + L"\n" + path;
+        return false;
+    };
     std::string bytes;
     Read r = read_bytes(path, bytes);
-    if (r != Read::Ok) {
-        std::wstring msg = r == Read::TooBig ? L"This file is too large for the Notepad (over 64 MB):\n" + path
-                                             : L"This file couldn't be opened:\n" + path;
-        MessageBoxW(n.wnd, msg.c_str(), L"Notepad", MB_OK | MB_ICONWARNING);
-        return false;
-    }
+    if (r != Read::Ok) return fail(r == Read::TooBig ? L"This file is too large for the Notepad (over 64 MB):" : L"This file couldn't be opened:");
     TextFile f = text_decode(bytes);
-    if (f.binary) {
-        MessageBoxW(n.wnd, (L"This isn't a text file:\n" + path).c_str(), L"Notepad", MB_OK | MB_ICONINFORMATION);
-        return false;
-    }
+    if (f.binary) return fail(L"This isn't a text file:");
     // (an Untitled tab with nothing in it gives way)
     Tab* t = cur(n);
     int at = n.active;
@@ -1360,6 +1370,7 @@ void open_dialog(Notepad& n) {
     }
     d->Release();
     for (auto& f : files) open_path(n, f);
+    report_failed(n);
 }
 
 // the Save dialog, with the encoding to write: the file chosen, empty when cancelled
@@ -3158,6 +3169,7 @@ LRESULT CALLBACK notepad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             DragFinish(drop);
             for (auto& f : files) open_path(n, f);
+            report_failed(n);
             return 0;
         }
         case WM_COPYDATA: {
@@ -3174,8 +3186,12 @@ LRESULT CALLBACK notepad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (n.tabs.empty()) new_untitled(n);
             if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
             SetForegroundWindow(hwnd);
+            report_failed(n);
             return 0;
         }
+        case WM_NOTEPAD_FAILED:
+            report_failed(n);
+            return 0;
         case WM_SETFOCUS:
             if (Tab* t = cur(n)) SetFocus(t->edit);
             return 0;
@@ -3305,6 +3321,8 @@ bool create_window(const std::vector<std::wstring>& files) {
         SetTimer(w, TIMER_UNREAD, kUnreadRetryMs, nullptr);
         PostMessageW(w, WM_NOTEPAD_UNREAD, 0, 0);
     }
+    // (from the message loop: the window up, and the instance's Start mutex let go of)
+    if (s_np && !s_np->failed.empty()) PostMessageW(w, WM_NOTEPAD_FAILED, 0, 0);
     return s_np != nullptr;
 }
 
@@ -3366,6 +3384,7 @@ void notepad_open(const std::vector<std::wstring>& files) {
     if (n.tabs.empty()) new_untitled(n);
     if (IsIconic(n.wnd)) ShowWindow(n.wnd, SW_RESTORE);
     SetForegroundWindow(n.wnd);
+    report_failed(n);                       // (on screen by now, a window just made too)
 }
 
 bool notepad_open_file(const std::wstring& path) {

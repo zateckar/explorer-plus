@@ -71,6 +71,64 @@ struct ActiveMenu {
     }
 };
 
+// While it builds a menu (and fills a submenu), the shell's own menu puts up the wait cursor -
+// a spinning wheel on every right-click, longer on a slow PC - unless the menu's site has a
+// wait cursor manager (IWaitCursorManager: not in the SDK, registered with a proxy since
+// Windows 7; File Explorer's view is one). Ours says nothing: the menu shows when it is built.
+// (Seen with SetCursor hooked: shell32 asks the site's service first, SetCursor(IDC_WAIT)
+// only without one.)
+enum CURSORID { CID_WAIT = 0, CID_APPSTARTING = 1 };
+struct IWaitCursorManager : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE Start(CURSORID id) = 0;
+    virtual HRESULT STDMETHODCALLTYPE Restore() = 0;
+    virtual HRESULT STDMETHODCALLTYPE Stop(CURSORID id) = 0;
+};
+static const GUID kIIDWaitCursorManager = { 0xfc992f1f, 0xdebb, 0x4596, { 0xb3, 0x55, 0x50, 0xc7, 0xa6, 0xdd, 0x12, 0x22 } };
+
+struct NoWaitCursor : IWaitCursorManager {
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IUnknown || riid == kIIDWaitCursorManager) { *ppv = this; return S_OK; }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return 2; }     // static instance
+    STDMETHODIMP_(ULONG) Release() override { return 1; }
+    STDMETHODIMP Start(CURSORID) override { return S_OK; }
+    STDMETHODIMP Restore() override { return S_OK; }
+    STDMETHODIMP Stop(CURSORID) override { return S_OK; }
+};
+
+struct MenuSite : IServiceProvider {
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IUnknown || riid == IID_IServiceProvider) { *ppv = this; return S_OK; }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return 2; }     // static instance
+    STDMETHODIMP_(ULONG) Release() override { return 1; }
+    STDMETHODIMP QueryService(REFGUID service, REFIID riid, void** ppv) override {
+        static NoWaitCursor none;
+        if (service == kIIDWaitCursorManager) return none.QueryInterface(riid, ppv);
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+};
+
+// RAII: the menu's site while it is built and shown (let go of before a command runs: a
+// program it starts gets Windows' usual starting cursor)
+struct QuietMenu {
+    com_ptr<IObjectWithSite> ows;
+    QuietMenu(IContextMenu* cm) {
+        static MenuSite site;
+        if (cm && SUCCEEDED(cm->QueryInterface(IID_PPV_ARGS(ows.put()))) && ows) ows->SetSite(&site);
+    }
+    ~QuietMenu() { done(); }
+    void done() {
+        if (ows) ows->SetSite(nullptr);
+        ows.reset();
+    }
+};
+
 // Building a file's menu opens its property store several times (the pin handlers look
 // for an app ID), and for audio / video every open runs a Media Foundation parser:
 // ~50 ms each for MPEG-TS, 7 opens per menu. No menu verb uses media metadata, so while
@@ -468,6 +526,7 @@ static void show_cm(HWND hwnd, POINT pt, IShellFolder* parent, PCIDLIST_ABSOLUTE
     double t0 = perf_now();
     if (FAILED(item_menu(hwnd, parent, folderAbs, apidl, cidl, cm)) || !cm) return;
     perf_event("menu.create", perf_now() - t0);
+    QuietMenu quiet(cm.get());
     HMENU m = CreatePopupMenu();
     if (!m) return;
     UINT flags = CMF_NORMAL | CMF_EXPLORE | CMF_CANRENAME;
@@ -523,6 +582,7 @@ static void show_cm(HWND hwnd, POINT pt, IShellFolder* parent, PCIDLIST_ABSOLUTE
     SyncMenu sync = sync_menu_for(paths, dirs);
     perf_event("menu.checks", perf_now() - t0, (long long)cidl);
     UINT id = track(hwnd, cm.get(), m, pt, [&] { return item_flyout(hwnd, cm.get(), m, pt, folder, offer, picture, text, sync); });
+    quiet.done();
     if (id == kFlySyncNow) {
         sync_now_for(paths);
     } else if (id == kFlySyncExclude) {
@@ -618,9 +678,11 @@ void show_tree_context_menu(HWND hwnd, POINT pt, PCIDLIST_ABSOLUTE abs) {
         com_ptr<IContextMenu> cm;
         if (FAILED(SHGetDesktopFolder(desk.put())) ||
             FAILED(desk->CreateViewObject(hwnd, IID_PPV_ARGS(cm.put()))) || !cm) return;
+        QuietMenu quiet(cm.get());
         HMENU m = CreatePopupMenu();
         if (SUCCEEDED(cm->QueryContextMenu(m, 0, kIdFirst, kIdLast, CMF_NORMAL))) {
             UINT id = track(hwnd, cm.get(), m, pt);
+            quiet.done();
             if (id >= kIdFirst && id <= kIdLast) invoke_id(hwnd, cm.get(), id, pt, abs);
         }
         DestroyMenu(m);
@@ -731,8 +793,11 @@ void show_bg_context_menu(HWND hwnd, POINT pt) {
     com_ptr<IContextMenu> cm;
     if (SUCCEEDED(bind_list(g_pane->current, IID_PPV_ARGS(psf.put()))) && psf)
         psf->CreateViewObject(hwnd, IID_PPV_ARGS(cm.put()));
-    if (cm && FAILED(cm->QueryContextMenu(m, fixed, kIdFirst, kIdLast, CMF_NORMAL)))
+    QuietMenu quiet(cm.get());
+    if (cm && FAILED(cm->QueryContextMenu(m, fixed, kIdFirst, kIdLast, CMF_NORMAL))) {
+        quiet.done();
         cm.reset();
+    }
     // the folder menu brings its own Paste on most folders: drop ours then
     if (cm) {
         for (int i = (int)fixed; i < GetMenuItemCount(m); ++i) {
@@ -749,6 +814,7 @@ void show_bg_context_menu(HWND hwnd, POINT pt) {
         if (cm) newSub = find_new_submenu(hwnd, cm.get(), m, (int)fixed);
         return bg_flyout(hwnd, cm.get(), m, pt, view, sort, group, (int)fixed, newSub);
     });
+    quiet.done();
     if (id >= kIdFirst && id <= kIdLast && cm) {
         std::wstring verb = verb_of(cm.get(), id);
         if (verb == L"paste") fileops_paste_into_current();
@@ -802,6 +868,7 @@ void show_new_menu(HWND hwnd, POINT pt, UINT tpmAlign) {
     if (FAILED(bind_list(g_pane->current, IID_PPV_ARGS(psf.put()))) || !psf ||
         FAILED(psf->CreateViewObject(hwnd, IID_PPV_ARGS(cm.put()))) || !cm)
         return;
+    QuietMenu quiet(cm.get());
     HMENU host = CreatePopupMenu();
     if (FAILED(cm->QueryContextMenu(host, 0, kIdFirst, kIdLast, CMF_NORMAL))) { DestroyMenu(host); return; }
     UINT id = 0;
@@ -811,6 +878,7 @@ void show_new_menu(HWND hwnd, POINT pt, UINT tpmAlign) {
         if (sub) id = TrackPopupMenuEx(sub, TPM_RETURNCMD | TPM_LEFTBUTTON | tpmAlign, pt.x, pt.y, hwnd, nullptr);
         else MessageBeep(MB_ICONASTERISK);      // nothing can be created here (This PC, ...)
     }
+    quiet.done();
     if (id >= kIdFirst && id <= kIdLast) invoke_new_item(hwnd, cm.get(), id, pt);
     DestroyMenu(host);
 }
@@ -849,6 +917,7 @@ static bool invoke_verb_with(HWND hwnd, IShellFolder* parent, PIDLIST_ABSOLUTE f
         HRESULT hr;
         {
             MediaPropsOff fast(parent, (PCUITEMID_CHILD_ARRAY)own.data(), (UINT)own.size());
+            QuietMenu quiet(cm.get());
             hr = cm->QueryContextMenu(m, 0, kIdFirst, kIdLast, CMF_NORMAL);
         }
         if (SUCCEEDED(hr)) {
