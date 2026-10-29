@@ -57,7 +57,7 @@ File Explorer while starting in well under 100 ms.
   Bin, This PC, libraries); `explorer.exe <folder>` still opens File Explorer. For your account
   only; unticking it removes everything it wrote. Untick it before deleting Explorer Plus
   (a moved exe is followed on its next start).
-- **Notepad** (its button beside Refresh, or "Edit in Explorer Plus"): text files in tabs, as
+- **Notepad** (its button beside Refresh, or "Edit in Explorer Plus" on any file): text files in tabs, as
   in Windows 11, kept with unsaved text across restarts. Keeps each file's encoding and line
   endings; find and replace, go to line, word wrap, zoom; syntax colours for some 25
   languages; JSON / XML formatting; line tools (duplicate, move, sort, remove duplicates,

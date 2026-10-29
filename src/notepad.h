@@ -10,9 +10,6 @@ void notepad_open(const std::vector<std::wstring>& files);
 // explorer-plus.exe --notepad [file]: to a Notepad already running, else to one of this
 // process. True: this process has the window (it ends when the window closes)
 bool notepad_open_file(const std::wstring& path);
-// the file list's context menu offers "Edit in Explorer Plus" for these: text by its type,
-// else (a name no type tells, .env.example) by its first bytes
-bool notepad_text_file(const std::wstring& path);
 
 HWND notepad_window();                      // this process's Notepad, or nullptr
 bool notepad_owns(HWND h);                  // h is the Notepad or one of its windows

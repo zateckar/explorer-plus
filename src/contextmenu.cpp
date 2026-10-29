@@ -19,6 +19,7 @@
 #include "sync_ui.h"
 #include <algorithm>
 #include <map>
+#include <thread>
 #include <unordered_set>
 
 // ------------------------------------------------------------------
@@ -345,11 +346,13 @@ static void fly_app_verbs(std::vector<FlyEntry>& list, const std::vector<ShellEn
             list.push_back(fly_from(e, L'\xE7EF'));
 }
 
-// `picture`: one picture chosen (Edit picture); `text`: text files (Edit in Explorer Plus);
+// `picture`: one picture chosen (Edit picture); `text`: files (Edit in Explorer Plus);
 // `sync`: the sync entries (items inside a sync folder)
 static UINT item_flyout(HWND hwnd, IContextMenu* cm, HMENU m, POINT pt, bool folder, PlayerOffer media, bool picture,
                         bool text, const SyncMenu& sync) {
+    double t0 = perf_now();
     auto items = menu_entries(cm, m);
+    perf_event("menu.entries", perf_now() - t0, (long long)items.size());
     std::vector<FlyButton> row;
     static const struct { const wchar_t* verb; wchar_t glyph; const wchar_t* tip; } kRow[] = {
         { L"cut", L'\xE8C6', L"Cut (Ctrl+X)" }, { L"copy", L'\xE8C8', L"Copy (Ctrl+C)" },
@@ -462,12 +465,14 @@ static bool verb_keeps_files(const std::wstring& verb) {
 static void show_cm(HWND hwnd, POINT pt, IShellFolder* parent, PCIDLIST_ABSOLUTE folderAbs,
                     PCUITEMID_CHILD_ARRAY apidl, UINT cidl, MenuSource src) {
     com_ptr<IContextMenu> cm;
+    double t0 = perf_now();
     if (FAILED(item_menu(hwnd, parent, folderAbs, apidl, cidl, cm)) || !cm) return;
+    perf_event("menu.create", perf_now() - t0);
     HMENU m = CreatePopupMenu();
     if (!m) return;
     UINT flags = CMF_NORMAL | CMF_EXPLORE | CMF_CANRENAME;
     if (key_down(VK_SHIFT)) flags |= CMF_EXTENDED;     // Shift+right-click verbs
-    double t0 = perf_now();
+    t0 = perf_now();
     HRESULT hr;
     {
         MediaPropsOff fast(parent, apidl, cidl);
@@ -475,6 +480,7 @@ static void show_cm(HWND hwnd, POINT pt, IShellFolder* parent, PCIDLIST_ABSOLUTE
     }
     if (FAILED(hr)) { DestroyMenu(m); return; }
     perf_event("menu.query", perf_now() - t0, GetMenuItemCount(m));
+    t0 = perf_now();
 
     bool single = cidl == 1;
     bool folder = single && is_plain_folder(parent, apidl[0]);
@@ -507,13 +513,15 @@ static void show_cm(HWND hwnd, POINT pt, IShellFolder* parent, PCIDLIST_ABSOLUTE
     }
     // (a picture: drawn on and written, by the picture editor)
     bool picture = media.size() == 1 && cidl == 1 && !media[0].folder && image_file(media[0].path);
-    // (text files, all of them: each in a tab of the Notepad)
+    // (files, any type, as Notepad++ offers itself: each in a tab of the Notepad, which says so
+    // of one that isn't text. Nothing read to find out: that took a disk read per menu.)
     bool text = !media.empty() && media.size() == cidl && media.size() <= 100 &&
-                std::all_of(media.begin(), media.end(), [](const MediaItem& i) { return !i.folder && notepad_text_file(i.path); });
+                std::none_of(media.begin(), media.end(), [](const MediaItem& i) { return i.folder; });
     std::vector<std::wstring> paths;
     std::vector<bool> dirs;
     for (auto& i : media) { paths.push_back(i.path); dirs.push_back(i.folder); }
     SyncMenu sync = sync_menu_for(paths, dirs);
+    perf_event("menu.checks", perf_now() - t0, (long long)cidl);
     UINT id = track(hwnd, cm.get(), m, pt, [&] { return item_flyout(hwnd, cm.get(), m, pt, folder, offer, picture, text, sync); });
     if (id == kFlySyncNow) {
         sync_now_for(paths);
@@ -860,6 +868,43 @@ static bool invoke_verb_with(HWND hwnd, IShellFolder* parent, PIDLIST_ABSOLUTE f
     for (auto c : own) CoTaskMemFree(c);
     CoTaskMemFree(folderAbs);
     return ok;
+}
+
+// The first menu a process builds starts the shell's menu handlers up (loads them; Open with's
+// and Pin to Start's app lists, the sharing service): ~5 times what a later menu takes, and
+// each window is a process of its own - on a slow PC a spinning cursor on its first right-click
+// (and its first double-click, ShellExecute's default verb is a menu too). A file's menu and a
+// folder's built once on a thread here (this exe's, its folder's), the first one shown costs
+// about what any later one does: measured 107 ms down to 33 (a later one: 15 - 30).
+void contextmenu_warm_up() {
+    std::thread([] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        Sleep(1000);                                // (after the window's first listing and icons)
+        ComInit ci;
+        if (!ci.ok()) return;
+        double t0 = perf_now();
+        std::wstring exe = module_file();
+        size_t slash = exe.find_last_of(L'\\');
+        if (slash == std::wstring::npos) return;
+        int items = 0;
+        for (const std::wstring& path : { exe, exe.substr(0, slash) }) {
+            PIDLIST_ABSOLUTE abs = nullptr;
+            if (FAILED(SHParseDisplayName(path.c_str(), nullptr, &abs, 0, nullptr)) || !abs) continue;
+            com_ptr<IShellFolder> parent;
+            PCUITEMID_CHILD child = nullptr;
+            com_ptr<IContextMenu> cm;
+            if (SUCCEEDED(bind_parent(abs, parent.put(), &child)) && parent &&
+                SUCCEEDED(parent->GetUIObjectOf(nullptr, 1, &child, IID_IContextMenu, nullptr, (void**)cm.put())) && cm) {
+                if (HMENU m = CreatePopupMenu()) {
+                    if (SUCCEEDED(cm->QueryContextMenu(m, 0, kIdFirst, kIdLast, CMF_NORMAL | CMF_EXPLORE | CMF_CANRENAME)))
+                        items += GetMenuItemCount(m);
+                    DestroyMenu(m);
+                }
+            }
+            CoTaskMemFree(abs);
+        }
+        perf_event("menu.warm_up", perf_now() - t0, items);
+    }).detach();
 }
 
 void contextmenu_properties(HWND hwnd) {

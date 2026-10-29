@@ -777,6 +777,18 @@ void assoc_dialog(HWND owner) {
     if (quit) PostQuitMessage((int)m.wParam);
 }
 
+OwnApp assoc_own_app(const std::wstring& path) {
+    const wchar_t* ext = PathFindExtensionW(PathFindFileNameW(path.c_str()));
+    if (!ext[0] || !ext[1]) return OwnApp::None;
+    std::wstring prog = progid(ext);
+    if (lstrcmpiW(assoc_text(ASSOCSTR_PROGID, ext).c_str(), prog.c_str()) != 0) return OwnApp::None;
+    // (by what its command runs: another copy's exe opens it as this one would)
+    std::wstring cmd = reg_get(L"Software\\Classes\\" + prog + L"\\shell\\open\\command", nullptr);
+    if (cmd.find(L"\" --notepad ") != std::wstring::npos) return OwnApp::Notepad;
+    if (cmd.find(L"\" --play ") != std::wstring::npos) return OwnApp::Player;
+    return OwnApp::None;
+}
+
 bool assoc_folders_on() { return folders_on(); }
 
 void assoc_folders_toggle(HWND owner) {

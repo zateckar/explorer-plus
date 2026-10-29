@@ -203,9 +203,8 @@ std::wstring caveat_of(const TextFile& f) {
 
 enum class Read { Ok, Failed, TooBig };
 
-// (`limit`: the kept text of a file at the limit is UTF-16, twice its size; `head`: only the
-// first this many bytes)
-Read read_bytes(const std::wstring& path, std::string& out, ULONGLONG limit = kMaxBytes, ULONGLONG head = ULLONG_MAX) {
+// (`limit`: the kept text of a file at the limit is UTF-16, twice its size)
+Read read_bytes(const std::wstring& path, std::string& out, ULONGLONG limit = kMaxBytes) {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                            OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (h == INVALID_HANDLE_VALUE) return Read::Failed;
@@ -215,7 +214,7 @@ Read read_bytes(const std::wstring& path, std::string& out, ULONGLONG limit = kM
         if ((ULONGLONG)size.QuadPart > limit) {
             r = Read::TooBig;
         } else {
-            out.resize((size_t)std::min<ULONGLONG>(size.QuadPart, head));
+            out.resize((size_t)size.QuadPart);
             DWORD got = 0;
             if (out.empty() || (ReadFile(h, out.data(), (DWORD)out.size(), &got, nullptr) && got == out.size())) r = Read::Ok;
         }
@@ -3374,49 +3373,6 @@ bool notepad_open_file(const std::wstring& path) {
     if (!path.empty()) files.push_back(path);
     notepad_open(files);
     return s_np != nullptr;
-}
-
-bool notepad_text_file(const std::wstring& path) {
-    const wchar_t* name = PathFindFileNameW(path.c_str());
-    const wchar_t* ext = PathFindExtensionW(name);
-    if (!*ext) return true;                 // (README, LICENSE, Makefile)
-    static const wchar_t* const kText[] = {
-        L".txt", L".log", L".ini", L".inf", L".cfg", L".conf", L".config", L".json", L".jsonc", L".xml", L".xaml",
-        L".md", L".markdown", L".csv", L".tsv", L".yml", L".yaml", L".toml", L".reg", L".bat", L".cmd", L".ps1",
-        L".psm1", L".psd1", L".vbs", L".js", L".mjs", L".cjs", L".ts", L".tsx", L".jsx", L".css", L".scss", L".less",
-        L".html", L".htm", L".xhtml", L".c", L".h", L".cpp", L".hpp", L".cc", L".cxx", L".hh", L".cs", L".java",
-        L".kt", L".py", L".rb", L".go", L".rs", L".php", L".pl", L".lua", L".sql", L".sh", L".bash", L".zsh",
-        L".properties", L".gradle", L".cmake", L".mk", L".diff", L".patch", L".srt", L".vtt", L".ass", L".ssa",
-        L".m3u", L".m3u8", L".pls", L".nfo", L".tex", L".rst", L".asm", L".gitignore", L".gitattributes",
-        L".editorconfig", L".env", L".npmrc", L".manifest", L".rc", L".in", L".sln", L".vcxproj", L".csproj", L".props",
-    };
-    for (auto e : kText)
-        if (lstrcmpiW(ext, e) == 0) return true;
-    PERCEIVED type = PERCEIVED_TYPE_UNSPECIFIED;
-    PERCEIVEDFLAG flag = 0;
-    if (FAILED(AssocGetPerceivedType(ext, &type, &flag, nullptr))) type = PERCEIVED_TYPE_UNSPECIFIED;
-    if (type == PERCEIVED_TYPE_TEXT) return true;
-    // (pictures, music, video, archives, programs: never read to find out)
-    if (type != PERCEIVED_TYPE_UNSPECIFIED && type != PERCEIVED_TYPE_UNKNOWN && type != PERCEIVED_TYPE_DOCUMENT) return false;
-    // any other name (.env.example, a type no app has): by its first bytes
-    WIN32_FILE_ATTRIBUTE_DATA a{};
-    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) return false;
-    // (only in the cloud: not downloaded for a menu)
-    if (a.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN |
-                              FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS))
-        return false;
-    ULONGLONG size = (ULONGLONG)a.nFileSizeHigh << 32 | a.nFileSizeLow;
-    if (size > kMaxBytes) return false;
-    if (size == 0) return true;
-    std::string head;
-    if (read_bytes(path, head, ULLONG_MAX, 4096) != Read::Ok) return false;
-    TextFile f = text_decode(head);
-    if (f.binary) return false;
-    // (text has few control characters besides tabs and line ends; ESC: logs in colour)
-    size_t controls = std::count_if(f.text.begin(), f.text.end(), [](wchar_t c) {
-        return c < 0x20 && c != L'\t' && c != L'\r' && c != L'\n' && c != L'\f' && c != 0x1B;
-    });
-    return controls * 100 <= f.text.size();
 }
 
 HWND notepad_window() { return s_np ? s_np->wnd : nullptr; }

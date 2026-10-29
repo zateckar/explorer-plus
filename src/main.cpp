@@ -1194,6 +1194,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     screenshot_init();              // Alt+Q
     std::thread(assoc_follow_exe).detach();     // (the media types registered: by an exe since moved?)
     std::thread(sync_agent_ensure_running).detach();    // (sync folders: their agent, when it isn't running)
+    contextmenu_warm_up();
 
     HACCEL acc = s_accel;
     MSG m{};

@@ -303,6 +303,7 @@ void navigation_open_selected() {
     // a single folder (or folder shortcut) opens in place; multiple items each get
     // their default verb, folders among them navigate to the first one
     PIDLIST_ABSOLUTE navTarget = nullptr;
+    std::vector<PCIDLIST_ABSOLUTE> files;
     for (PIDLIST_ABSOLUTE f : full) {
         com_ptr<IShellItem> si;
         SFGAOF a = 0;
@@ -311,8 +312,9 @@ void navigation_open_selected() {
         bool folder = (a & SFGAO_FOLDER) && !(a & SFGAO_STREAM);
         if (folder) { if (!navTarget) navTarget = f; continue; }
         if (full.size() == 1) navigation_open_abs(f);     // resolves folder shortcuts
-        else shell_open_abs(g_main, f);
+        else files.push_back(f);
     }
+    if (!files.empty()) navigation_open_files(files);
     if (navTarget) {
         // a folder found by a search opens at its real location, not inside the result set
         PIDLIST_ABSOLUTE real = search_is_results(g_pane->current) ? search_real_location(navTarget) : nullptr;

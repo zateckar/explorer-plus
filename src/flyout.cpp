@@ -1,6 +1,7 @@
 #include "flyout.h"
 #include "theme.h"
 #include "acc.h"
+#include "perf.h"
 #include <dwmapi.h>
 #include <algorithm>
 using std::max;
@@ -574,6 +575,7 @@ UINT flyout_track(HWND owner, POINT pt, const std::vector<FlyButton>& row, const
     DwmSetWindowAttribute(f.hwnd, 34 /*DWMWA_BORDER_COLOR*/, &border, sizeof(border));
     SetWindowPos(f.hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     NotifyWinEvent(EVENT_SYSTEM_MENUPOPUPSTART, f.hwnd, OBJID_CLIENT, CHILDID_SELF);
+    perf_event("flyout.shown", -1, (long long)f.entries.size());
     // tooltips for the icon row ("Cut (Ctrl+X)"); destroyed with the flyout
     if (!f.row.empty()) {
         HWND tip = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, TOOLTIPS_CLASSW, nullptr,

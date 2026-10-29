@@ -14,6 +14,9 @@ void navigate_to(PCIDLIST_ABSOLUTE pidl);   // clones; nullptr = Desktop
 void navigate_in_place(PIDLIST_ABSOLUTE pidl); // adopts; replaces the current folder, no history entry
 void navigate_path_text(const std::wstring& text);
 void navigation_open_abs(PCIDLIST_ABSOLUTE abs);   // folder -> navigate, file -> default verb
+// files (no folders) by their default verb; the types Explorer Plus' Notepad or player opens
+// (assoc_own_app) in them, in this process, the files of each together
+void navigation_open_files(const std::vector<PCIDLIST_ABSOLUTE>& files);
 void navigation_open_new_window(PCIDLIST_ABSOLUTE folder);   // Ctrl+N, "Open in new window"
 void navigation_go_back();
 void navigation_go_forward();

@@ -21,6 +21,9 @@
 #include <memory>
 #include "workers.h"
 #include "sync_ui.h"
+#include "assoc.h"
+#include "notepad.h"
+#include "player.h"
 
 static std::vector<std::wstring> g_addrHistory;
 // bumped by every navigation; a typed path resolved after that is dropped
@@ -242,7 +245,26 @@ void navigation_open_abs(PCIDLIST_ABSOLUTE abs) {
             }
         }
     }
-    shell_open_abs(g_main, abs);
+    navigation_open_files({ abs });
+}
+
+void navigation_open_files(const std::vector<PCIDLIST_ABSOLUTE>& files) {
+    std::vector<std::wstring> notes;
+    std::vector<MediaItem> media;
+    for (PCIDLIST_ABSOLUTE f : files) {
+        PWSTR path = nullptr;
+        OwnApp app = OwnApp::None;
+        if (SUCCEEDED(SHGetNameFromIDList(f, SIGDN_FILESYSPATH, &path)) && path) {
+            app = assoc_own_app(path);
+            if (app == OwnApp::Notepad) notes.push_back(path);
+            else if (app == OwnApp::Player) media.push_back({ path, false });
+            CoTaskMemFree(path);
+        }
+        if (app == OwnApp::None) shell_open_abs(g_main, f);
+    }
+    if (perf_on() && (!notes.empty() || !media.empty())) perf_event("open.own", -1, (long long)(notes.size() + media.size()));
+    if (!notes.empty()) notepad_open(notes);
+    if (!media.empty()) player_open(media, false);
 }
 
 // Typed-path resolution runs on a worker: SHParseDisplayName / PathFileExists on
